@@ -2082,6 +2082,7 @@ async def settings_add_user(
     _user: Annotated[dict, Depends(require_admin)],
     username: Annotated[str, Form()],
     password: Annotated[str, Form()],
+    admin: Annotated[str, Form()] = "",
 ):
     """Add a new user."""
     username = username.strip()
@@ -2091,7 +2092,7 @@ async def settings_add_user(
         raise HTTPException(400, "Password must be at least 8 characters")
     if username in auth.get_all_usernames():
         raise HTTPException(400, "User already exists")
-    auth.create_user(username, password)
+    auth.create_user(username, password, admin=admin == "on")
     return {"status": "ok"}
 
 

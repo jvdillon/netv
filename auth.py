@@ -46,8 +46,7 @@ def _hash_password(password: str, salt: str | None = None) -> str:
 def _verify_hashed_password(password: str, hashed: str) -> bool:
     """Verify password against hash."""
     if ":" not in hashed:
-        # Legacy plaintext password - migrate on next save
-        return password == hashed
+        return False  # Invalid hash format
     salt, _ = hashed.split(":", 1)
     return hmac.compare_digest(_hash_password(password, salt), hashed)
 
@@ -56,22 +55,11 @@ def _get_users() -> dict[str, dict[str, Any]]:
     """Get users from settings. Returns empty dict if no users configured.
 
     User format: {username: {password: str, admin: bool}}
-    Legacy format {username: password_str} is migrated on read.
     """
     settings_file = _get_settings_file()
     if settings_file.exists():
         settings = json.loads(settings_file.read_text())
-        users = settings.get("users", {})
-        # Migrate legacy format
-        migrated = False
-        for username, data in list(users.items()):
-            if isinstance(data, str):
-                users[username] = {"password": data, "admin": False}
-                migrated = True
-        if migrated:
-            settings["users"] = users
-            settings_file.write_text(json.dumps(settings, indent=2))
-        return users
+        return settings.get("users", {})
     return {}
 
 
@@ -103,6 +91,13 @@ def create_user(username: str, password: str, admin: bool = False) -> None:
     user_dir.mkdir(parents=True, exist_ok=True)
 
 
+def _ensure_one_admin(users: dict[str, dict[str, Any]]) -> None:
+    """Ensure at least one user is admin. Promotes first user if needed."""
+    if not users or any(u.get("admin") for u in users.values()):
+        return
+    next(iter(users.values()))["admin"] = True
+
+
 def delete_user(username: str) -> bool:
     """Delete a user. Returns True if deleted, False if not found."""
     settings_file = _get_settings_file()
@@ -113,28 +108,19 @@ def delete_user(username: str) -> bool:
     if username not in users:
         return False
     del users[username]
+    _ensure_one_admin(users)
     settings["users"] = users
     settings_file.write_text(json.dumps(settings, indent=2))
-    # Optionally remove user settings dir (keep for now - manual cleanup)
     return True
 
 
 def verify_password(username: str, password: str) -> bool:
-    """Verify username and password. Migrates legacy plaintext passwords."""
+    """Verify username and password."""
     users = _get_users()
     user_data = users.get(username, {"password": _hash_password("dummy")})
     stored = user_data["password"]
     valid = _verify_hashed_password(password, stored)
-    if not valid or username not in users:
-        return False
-    # Migrate legacy plaintext password to hashed
-    if ":" not in stored:
-        settings_file = _get_settings_file()
-        settings = json.loads(settings_file.read_text()) if settings_file.exists() else {}
-        if username in settings.get("users", {}):
-            settings["users"][username]["password"] = _hash_password(password)
-            settings_file.write_text(json.dumps(settings, indent=2))
-    return True
+    return valid and username in users
 
 
 def change_password(username: str, new_password: str) -> bool:
@@ -153,10 +139,8 @@ def change_password(username: str, new_password: str) -> bool:
 
 
 def is_admin(username: str) -> bool:
-    """Check if user is an admin. Single user is always admin."""
+    """Check if user is an admin."""
     users = _get_users()
-    if len(users) <= 1:
-        return True
     user_data = users.get(username, {})
     return user_data.get("admin", False)
 
@@ -171,6 +155,7 @@ def set_admin(username: str, admin: bool) -> bool:
     if username not in users:
         return False
     users[username]["admin"] = admin
+    _ensure_one_admin(users)
     settings["users"] = users
     settings_file.write_text(json.dumps(settings, indent=2))
     return True
@@ -179,10 +164,7 @@ def set_admin(username: str, admin: bool) -> bool:
 def get_users_with_admin() -> list[dict[str, Any]]:
     """Get list of users with their admin status."""
     users = _get_users()
-    single_user = len(users) <= 1
-    return [
-        {"username": u, "admin": single_user or d.get("admin", False)} for u, d in users.items()
-    ]
+    return [{"username": u, "admin": d.get("admin", False)} for u, d in users.items()]
 
 
 def create_token(payload: dict[str, Any]) -> str:

@@ -139,14 +139,17 @@
     </p>
   </div>
 
+  {% if is_admin %}
   <h3 class="text-lg text-gray-400 mb-3 mt-8">Server Settings</h3>
+  {% endif %}
 
   <!-- Users management -->
   <div id="users" class="mb-8 p-4 bg-gray-800 rounded">
-    <h3 class="text-xl font-semibold mb-4">Users</h3>
+    <h3 class="text-xl font-semibold mb-4">{% if is_admin %}Users{% else %}Account{% endif %}</h3>
     {% if all_users %}
     <div class="space-y-2 mb-4">
       {% for u in all_users %}
+      {% if is_admin or u.username == current_user %}
       <details class="bg-gray-700 rounded group" data-username="{{ u.username }}">
         <summary class="flex items-center justify-between p-2 cursor-pointer hover:bg-gray-600 rounded">
           <div class="flex items-center gap-2">
@@ -188,6 +191,7 @@
           </div>
         </div>
       </details>
+      {% endif %}
       {% endfor %}
     </div>
     {% endif %}
@@ -209,6 +213,10 @@
             </button>
           </div>
         </div>
+        <label class="flex items-center gap-1.5 cursor-pointer">
+          <input type="checkbox" name="admin" class="w-4 h-4 rounded bg-gray-600 border-gray-500 text-blue-500">
+          <span class="text-sm">Admin</span>
+        </label>
         <button type="submit" class="px-3 py-1 text-sm bg-blue-600 hover:bg-blue-700 rounded">Add</button>
         <span id="add-user-msg" class="text-sm hidden"></span>
       </form>
@@ -216,6 +224,7 @@
     {% endif %}
   </div>
 
+  {% if is_admin %}
   <!-- Transcoding settings -->
   <div id="transcoding" class="mb-8 p-4 bg-gray-800 rounded">
     <h3 class="text-xl font-semibold mb-4">Transcoding</h3>
@@ -518,6 +527,7 @@
     </form>
     </div>
   </div>
+  {% endif %}
 </div>
 
 <!-- Delete Self Modal -->
