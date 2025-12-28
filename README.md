@@ -17,9 +17,10 @@ clunky apps that didn't work well across devices.
 **neTV is intentionally minimal.** It does one thing: play your IPTV streams
 with a clean UI that works on desktop, tablet, mobile, and Chromecast.
 
-We also prioritize **keyboard navigation** throughout. The entire app is
-usable with just arrow keys, Enter, and Escape -- perfect for media PCs,
-HTPCs, or anyone who prefers keeping hands on the keyboard.
+We also prioritize **keyboard navigation** throughout (though still rough
+around the edges). The entire app is theoretically usable with just arrow keys,
+Enter, and Escape -- perfect for media PCs, HTPCs, or anyone who prefers
+keeping hands on the keyboard (like me).
 
 ### Consider Alternatives First
 
@@ -58,7 +59,7 @@ through their IPTV providers.
 git clone https://github.com/jvdillon/netv.git
 cd netv
 chmod +x main.py
-./main.py --port 8000
+./main.py --port 8000  # --https
 ```
 
 Open `http://localhost:8000`, create an admin account, and add your IPTV source.
@@ -90,6 +91,11 @@ sudo systemctl status netv      # Check status
 sudo systemctl restart netv     # Restart after updates
 journalctl -u netv -f           # View logs
 ```
+
+Theres also some gems in `tools/`:
+- `zap2xml.py`: Scrape guide data into to XML (I `crontab` this at 5am daily).
+- `alignm3u.py`: Useful for reworking your HDHomeRun m3u to align with guide.
+- `xtream2m3u.py`: Dump xtream to m3u, useful for making Emby work with IPTV.
 
 ## Adding Sources
 
