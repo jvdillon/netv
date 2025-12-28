@@ -1184,9 +1184,21 @@ async def player_page(
     server_settings = load_server_settings()
     user_settings = load_user_settings(username)
     transcode_mode = server_settings.get("transcode_mode", "auto")
-    needs_transcode = info.is_m3u or ext in ("mkv", "mp4", "avi", "wmv", "flv")
-    if transcode_mode != "never" and needs_transcode:
-        transcode_mode = "always"
+
+    # Determine if transcoding is needed based on container and codec
+    if transcode_mode != "never":
+        if info.is_m3u or ext in ("mkv", "avi", "wmv", "flv"):
+            # HLS or non-browser containers always need transcode
+            transcode_mode = "always"
+        elif ext == "mp4":
+            # For series, stream_id is episode_id
+            ep_id = int(stream_id) if stream_type == "series" and stream_id.isdigit() else None
+            # Check probe cache - if h264+aac, browser can play directly
+            compat = transcoding.is_browser_compatible(info.url, series_id, ep_id)
+            if compat is True:
+                transcode_mode = "auto"  # Try direct play, fallback to transcode
+            else:
+                transcode_mode = "always"  # Not compatible or not cached
 
     # Get saved watch position for VOD (per-user)
     resume_position = 0.0

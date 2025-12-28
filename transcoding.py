@@ -315,6 +315,43 @@ def invalidate_series_probe_cache(series_id: int, episode_id: int | None = None)
     _save_series_probe_cache()
 
 
+def is_browser_compatible(
+    url: str,
+    series_id: int | None = None,
+    episode_id: int | None = None,
+) -> bool | None:
+    """Check probe cache for browser-compatible codecs (h264+aac).
+
+    Returns True if compatible, False if not, None if not in cache.
+    """
+    with _probe_lock:
+        media_info = None
+        # Check series cache first
+        if series_id is not None:
+            series_data = _series_probe_cache.get(series_id)
+            if series_data:
+                episodes = series_data.get("episodes", {})
+                if episode_id is not None and episode_id in episodes:
+                    cache_time, media_info, _ = episodes[episode_id]
+                    if time.time() - cache_time >= _SERIES_PROBE_CACHE_TTL_SEC:
+                        media_info = None
+                elif mru_eid := series_data.get("mru"):
+                    if mru_eid in episodes:
+                        cache_time, media_info, _ = episodes[mru_eid]
+                        if time.time() - cache_time >= _SERIES_PROBE_CACHE_TTL_SEC:
+                            media_info = None
+        # Check URL cache
+        if media_info is None:
+            cached = _probe_cache.get(url)
+            if cached:
+                cache_time, media_info, _ = cached
+                if time.time() - cache_time >= _PROBE_CACHE_TTL_SEC:
+                    media_info = None
+        if media_info is None:
+            return None
+        return media_info.video_codec == "h264" and media_info.audio_codec == "aac"
+
+
 def probe_media(
     url: str,
     series_id: int | None = None,
