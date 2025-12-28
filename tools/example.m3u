@@ -1,0 +1,143 @@
+#EXTM3U x-tvg-url="http://192.168.1.100/xmltv.xml"
+#EXTINF:-1 channel-id="1.1" channel-number="1.1" tvg-name="CATCHY" tvg-id="KAXTLD2" group-title="OTA | Other", CATCHY
+http://192.168.1.87:5004/auto/v1.1
+#EXTINF:-1 channel-id="2.1" channel-number="2.1" tvg-name="KTVU-HD" group-title="OTA | Favorites" tvg-id="KTVUDT", KTVU-HD
+http://192.168.1.87:5004/auto/v2.1
+#EXTINF:-1 channel-id="2.2" channel-number="2.2" tvg-name="FOXWX" tvg-id="KTVUDT2" group-title="OTA | Other", FOXWX
+http://192.168.1.87:5004/auto/v2.2
+#EXTINF:-1 channel-id="2.3" channel-number="2.3" tvg-name="MOVIES!" tvg-id="KTVULD3" group-title="OTA | Other", MOVIES!
+http://192.168.1.87:5004/auto/v2.3
+#EXTINF:-1 channel-id="2.4" channel-number="2.4" tvg-name="BUZZR" tvg-id="KTVUDT4" group-title="OTA | Other", BUZZR
+http://192.168.1.87:5004/auto/v2.4
+#EXTINF:-1 channel-id="4.1" channel-number="4.1" tvg-name="KRON-TV" group-title="OTA | Favorites" tvg-id="KRONDT", KRON-TV
+http://192.168.1.87:5004/auto/v4.1
+#EXTINF:-1 channel-id="4.2" channel-number="4.2" tvg-name="Antenna" tvg-id="KRONDT2" group-title="OTA | Other", Antenna
+http://192.168.1.87:5004/auto/v4.2
+#EXTINF:-1 channel-id="4.3" channel-number="4.3" tvg-name="Rewind" tvg-id="KRONDT3" group-title="OTA | Other", Rewind
+http://192.168.1.87:5004/auto/v4.3
+#EXTINF:-1 channel-id="4.4" channel-number="4.4" tvg-name="TBD" tvg-id="KRONDT4" group-title="OTA | Other", TBD
+http://192.168.1.87:5004/auto/v4.4
+#EXTINF:-1 channel-id="4.5" channel-number="4.5" tvg-name="DEFY" tvg-id="KRONDT5" group-title="OTA | Other", DEFY
+http://192.168.1.87:5004/auto/v4.5
+#EXTINF:-1 channel-id="5.1" channel-number="5.1" tvg-name="KPIX-TV" group-title="OTA | Favorites" tvg-id="KPIXDT", KPIX-TV
+http://192.168.1.87:5004/auto/v5.1
+#EXTINF:-1 channel-id="5.2" channel-number="5.2" tvg-name="StartTV" tvg-id="KPIXDT2" group-title="OTA | Other", StartTV
+http://192.168.1.87:5004/auto/v5.2
+#EXTINF:-1 channel-id="5.3" channel-number="5.3" tvg-name="Dabl" tvg-id="KPIXDT3" group-title="OTA | Other", Dabl
+http://192.168.1.87:5004/auto/v5.3
+#EXTINF:-1 channel-id="5.4" channel-number="5.4" tvg-name="FAVE TV" tvg-id="KPIXDT4" group-title="OTA | Other", FAVE TV
+http://192.168.1.87:5004/auto/v5.4
+#EXTINF:-1 channel-id="5.5" channel-number="5.5" tvg-name="COMET" tvg-id="KPIXDT5" group-title="OTA | Other", COMET
+http://192.168.1.87:5004/auto/v5.5
+#EXTINF:-1 channel-id="7.1" channel-number="7.1" tvg-name="KGO-HD" group-title="OTA | Favorites" tvg-id="KGODT", KGO-HD
+http://192.168.1.87:5004/auto/v7.1
+#EXTINF:-1 channel-id="7.2" channel-number="7.2" tvg-name="LOCLish" group-title="OTA | Favorites" tvg-id="KGOLD2", LOCLish
+http://192.168.1.87:5004/auto/v7.2
+#EXTINF:-1 channel-id="7.3" channel-number="7.3" tvg-name="Charge!" tvg-id="KGOLD3" group-title="OTA | Other", Charge!
+http://192.168.1.87:5004/auto/v7.3
+#EXTINF:-1 channel-id="9.1" channel-number="9.1" tvg-name="KQED-HD" group-title="OTA | Favorites" tvg-id="KQEDDT", KQED-HD
+http://192.168.1.87:5004/auto/v9.1
+#EXTINF:-1 channel-id="9.2" channel-number="9.2" tvg-name="KQED+HD" group-title="OTA | Favorites" tvg-id="KQEDDT2", KQED+HD
+http://192.168.1.87:5004/auto/v9.2
+#EXTINF:-1 channel-id="9.3" channel-number="9.3" tvg-name="WORLD" tvg-id="KQEDDT3" group-title="OTA | Other", WORLD
+http://192.168.1.87:5004/auto/v9.3
+#EXTINF:-1 channel-id="9.4" channel-number="9.4" tvg-name="KIDS" tvg-id="KQEDDT4" group-title="OTA | Other", KIDS
+http://192.168.1.87:5004/auto/v9.4
+#EXTINF:-1 channel-id="11.1" channel-number="11.1" tvg-name="KNTV HD" group-title="OTA | Favorites" tvg-id="KNTVDT", KNTV HD
+http://192.168.1.87:5004/auto/v11.1
+#EXTINF:-1 channel-id="11.2" channel-number="11.2" tvg-name="COZI-TV" tvg-id="KNTVDT2" group-title="OTA | Other", COZI-TV
+http://192.168.1.87:5004/auto/v11.2
+#EXTINF:-1 channel-id="11.3" channel-number="11.3" tvg-name="KNTV-HD" group-title="OTA | Favorites" tvg-id="KSTSDT3", KNTV-HD
+http://192.168.1.87:5004/auto/v11.3
+#EXTINF:-1 channel-id="11.4" channel-number="11.4" tvg-name="COZI-TV" tvg-id="KSTSDT4" group-title="OTA | Other", COZI-TV
+http://192.168.1.87:5004/auto/v11.4
+#EXTINF:-1 channel-id="11.5" channel-number="11.5" tvg-name="CRIMES" tvg-id="KNTVDT5" group-title="OTA | Other", CRIMES
+http://192.168.1.87:5004/auto/v11.5
+#EXTINF:-1 channel-id="14.3" channel-number="14.3" tvg-name="getTV" tvg-id="KDTVDT3" group-title="OTA | Other", getTV
+http://192.168.1.87:5004/auto/v14.3
+#EXTINF:-1 channel-id="14.4" channel-number="14.4" tvg-name="Mystery" tvg-id="KDTVDT4" group-title="OTA | Other", Mystery
+http://192.168.1.87:5004/auto/v14.4
+#EXTINF:-1 channel-id="15.5" channel-number="15.5" tvg-name="Newsmax" tvg-id="KAAPLD8" group-title="OTA | Other", Newsmax
+http://192.168.1.87:5004/auto/v15.5
+#EXTINF:-1 channel-id="24.1" channel-number="24.1" tvg-name="Diya TV" group-title="OTA | Other", Diya TV
+http://192.168.1.87:5004/auto/v24.1
+#EXTINF:-1 channel-id="24.3" channel-number="24.3" tvg-name="Antenna" tvg-id="KAAPLD3" group-title="OTA | Other", Antenna
+http://192.168.1.87:5004/auto/v24.3
+#EXTINF:-1 channel-id="24.7" channel-number="24.7" tvg-name="OANPlus" tvg-id="KAAPLD7" group-title="OTA | Other", OANPlus
+http://192.168.1.87:5004/auto/v24.7
+#EXTINF:-1 channel-id="24.8" channel-number="24.8" tvg-name="AWEPlus" tvg-id="AWE.us" group-title="OTA | Other", AWEPlus
+http://192.168.1.87:5004/auto/v24.8
+#EXTINF:-1 channel-id="32.1" channel-number="32.1" tvg-name="KMTP" tvg-id="KMTPDT" group-title="OTA | Other", KMTP
+http://192.168.1.87:5004/auto/v32.1
+#EXTINF:-1 channel-id="36.1" channel-number="36.1" tvg-name="KICU-HD" group-title="OTA | Favorites" tvg-id="KICUDT", KICU-HD
+http://192.168.1.87:5004/auto/v36.1
+#EXTINF:-1 channel-id="36.3" channel-number="36.3" tvg-name="NOSEY" tvg-id="KICUDT3" group-title="OTA | Other", NOSEY
+http://192.168.1.87:5004/auto/v36.3
+#EXTINF:-1 channel-id="36.4" channel-number="36.4" tvg-name="CATCHY" tvg-id="KICUDT4" group-title="OTA | Other", CATCHY
+http://192.168.1.87:5004/auto/v36.4
+#EXTINF:-1 channel-id="36.5" channel-number="36.5" tvg-name="TheGrio" tvg-id="KICUDT5" group-title="OTA | Other", TheGrio
+http://192.168.1.87:5004/auto/v36.5
+#EXTINF:-1 channel-id="44.1" channel-number="44.1" tvg-name="KPYX-DT" group-title="OTA | Favorites" tvg-id="KPYXDT", KPYX-DT
+http://192.168.1.87:5004/auto/v44.1
+#EXTINF:-1 channel-id="44.2" channel-number="44.2" tvg-name="Nest" tvg-id="KPYXDT2" group-title="OTA | Other", Nest
+http://192.168.1.87:5004/auto/v44.2
+#EXTINF:-1 channel-id="44.3" channel-number="44.3" tvg-name="MeTV" tvg-id="KPYXDT3" group-title="OTA | Other", MeTV
+http://192.168.1.87:5004/auto/v44.3
+#EXTINF:-1 channel-id="44.4" channel-number="44.4" tvg-name="CONFESS" group-title="OTA | Other", CONFESS
+http://192.168.1.87:5004/auto/v44.4
+#EXTINF:-1 channel-id="48.5" channel-number="48.5" tvg-name="CRIMES" tvg-id="KSTSDT5" group-title="OTA | Other", CRIMES
+http://192.168.1.87:5004/auto/v48.5
+#EXTINF:-1 channel-id="48.6" channel-number="48.6" tvg-name="Oxygen" tvg-id="KSTSDT6" group-title="OTA | Other", Oxygen
+http://192.168.1.87:5004/auto/v48.6
+#EXTINF:-1 channel-id="50.4" channel-number="50.4" tvg-name="Outlaw" tvg-id="KEMODT4" group-title="OTA | Other", Outlaw
+http://192.168.1.87:5004/auto/v50.4
+#EXTINF:-1 channel-id="54.1" channel-number="54.1" tvg-name="KQED+HD" group-title="OTA | Favorites" tvg-id="KQEHDT", KQED+HD
+http://192.168.1.87:5004/auto/v54.1
+#EXTINF:-1 channel-id="54.2" channel-number="54.2" tvg-name="KQED-HD" group-title="OTA | Favorites" tvg-id="KQEHDT2", KQED-HD
+http://192.168.1.87:5004/auto/v54.2
+#EXTINF:-1 channel-id="54.3" channel-number="54.3" tvg-name="WORLD" tvg-id="KQEHDT3" group-title="OTA | Other", WORLD
+http://192.168.1.87:5004/auto/v54.3
+#EXTINF:-1 channel-id="54.4" channel-number="54.4" tvg-name="KIDS" tvg-id="KQEHDT4" group-title="OTA | Other", KIDS
+http://192.168.1.87:5004/auto/v54.4
+#EXTINF:-1 channel-id="60.2" channel-number="60.2" tvg-name="PJKF24" tvg-id="KPJKDT2" group-title="OTA | Other", PJKF24
+http://192.168.1.87:5004/auto/v60.2
+#EXTINF:-1 channel-id="60.3" channel-number="60.3" tvg-name="PJKNHK" tvg-id="KPJKDT3" group-title="OTA | Other", PJKNHK
+http://192.168.1.87:5004/auto/v60.3
+#EXTINF:-1 channel-id="60.4" channel-number="60.4" tvg-name="PJKDW" tvg-id="KPJKDT4" group-title="OTA | Other", PJKDW
+http://192.168.1.87:5004/auto/v60.4
+#EXTINF:-1 channel-id="60.5" channel-number="60.5" tvg-name="PJKFNX" tvg-id="KPJKDT5" group-title="OTA | Other", PJKFNX
+http://192.168.1.87:5004/auto/v60.5
+#EXTINF:-1 channel-id="60.6" channel-number="60.6" tvg-name="PJKJAZZ" group-title="OTA | Favorites" tvg-id="KPJKDT6", PJKJAZZ
+http://192.168.1.87:5004/auto/v60.6
+#EXTINF:-1 channel-id="65.1" channel-number="65.1" tvg-name="ION" group-title="OTA | Favorites" tvg-id="KKPXDT", ION
+http://192.168.1.87:5004/auto/v65.1
+#EXTINF:-1 channel-id="65.2" channel-number="65.2" tvg-name="Bounce" group-title="OTA | Favorites" tvg-id="KKPXDT2", Bounce
+http://192.168.1.87:5004/auto/v65.2
+#EXTINF:-1 channel-id="65.3" channel-number="65.3" tvg-name="CourtTV" tvg-id="KKPXDT3" group-title="OTA | Other", CourtTV
+http://192.168.1.87:5004/auto/v65.3
+#EXTINF:-1 channel-id="65.4" channel-number="65.4" tvg-name="IONPlus" tvg-id="KKPXDT4" group-title="OTA | Other", IONPlus
+http://192.168.1.87:5004/auto/v65.4
+#EXTINF:-1 channel-id="65.5" channel-number="65.5" tvg-name="Laff" tvg-id="KKPXDT5" group-title="OTA | Other", Laff
+http://192.168.1.87:5004/auto/v65.5
+#EXTINF:-1 channel-id="65.6" channel-number="65.6" tvg-name="Grit" tvg-id="KKPXDT6" group-title="OTA | Other", Grit
+http://192.168.1.87:5004/auto/v65.6
+#EXTINF:-1 channel-id="66.4" channel-number="66.4" tvg-name="Grit" tvg-id="KFSFDT4" group-title="OTA | Other", Grit
+http://192.168.1.87:5004/auto/v66.4
+#EXTINF:-1 channel-id="66.5" channel-number="66.5" tvg-name="CRIME" tvg-id="KFSFDT5" group-title="OTA | Other", CRIME
+http://192.168.1.87:5004/auto/v66.5
+#EXTINF:-1 channel-id="68.1" channel-number="68.1" tvg-name="HEROES" group-title="OTA | Favorites" tvg-id="KTLNDT", HEROES
+http://192.168.1.87:5004/auto/v68.1
+#EXTINF:-1 channel-id="68.2" channel-number="68.2" tvg-name="MeTV" group-title="OTA | Favorites" tvg-id="KTLNDT2", MeTV
+http://192.168.1.87:5004/auto/v68.2
+#EXTINF:-1 channel-id="68.3" channel-number="68.3" tvg-name="STORY" tvg-id="KTLNDT3" group-title="OTA | Other", STORY
+http://192.168.1.87:5004/auto/v68.3
+#EXTINF:-1 channel-id="68.4" channel-number="68.4" tvg-name="METV+" tvg-id="KTLNDT4" group-title="OTA | Other", METV+
+http://192.168.1.87:5004/auto/v68.4
+#EXTINF:-1 channel-id="68.5" channel-number="68.5" tvg-name="QuestTV" tvg-id="KTLNDT5" group-title="OTA | Other", QuestTV
+http://192.168.1.87:5004/auto/v68.5
+#EXTINF:-1 channel-id="68.6" channel-number="68.6" tvg-name="TOONS" tvg-id="KTLNDT6" group-title="OTA | Other", TOONS
+http://192.168.1.87:5004/auto/v68.6
+#EXTINF:-1 channel-id="104.1" channel-number="104.1" tvg-name="KRON-TV" group-title="OTA | Favorites | ATSC3" tvg-id="KRONDT", KRON-TV
+http://192.168.1.87:5004/auto/v104.1
+#EXTINF:-1 channel-id="107.1" channel-number="107.1" tvg-name="KGO-HD" group-title="OTA | Favorites | ATSC3" tvg-id="KGODT", KGO-HD
+http://192.168.1.87:5004/auto/v107.1

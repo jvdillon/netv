@@ -186,6 +186,34 @@ x265, AV1).
 - Use HTTPS for Chromecast and remote access
 - The app binds to `0.0.0.0` -- use a firewall to restrict access
 
+## Q&A
+
+**Where can I get IPTV?**
+
+Check out [iptv-org/iptv](https://github.com/iptv-org/iptv) -- a community-maintained
+collection of publicly available IPTV channels from around the world.
+
+**How do I set up HDHomeRun?**
+
+HDHomeRun devices provide an M3U playlist, but it lacks EPG channel IDs. Use the
+tools in `tools/` to fetch guide data and align it:
+
+```bash
+# 1. Get your HDHomeRun lineup (replace IP with your device's IP)
+wget http://192.168.1.100/lineup.m3u -O tools/lineup.m3u
+
+# 2. Fetch TV guide data for your area
+./tools/zap2xml.py --zip 90210
+
+# 3. Align the M3U with the guide (adds tvg-id for EPG matching)
+./tools/alignm3u.py --input tools/lineup.m3u --xmltv tools/xmltv.xml --output tools/ota.m3u
+```
+
+Then add `tools/ota.m3u` as an M3U source in neTV settings.
+
+Set up a cron job to refresh the guide daily (e.g.,
+`0 5 * * *  /usr/bin/python3 /path/to/netv/tools/zap2xml.py --zip 90210 && cp /path/to/netv/tools/xmltv.xml /var/www/html/`).
+
 ## What Does "neTV" Mean?
 
 Yes.
