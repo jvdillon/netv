@@ -99,7 +99,7 @@ devices:
 # Use: docker compose --profile nvidia up -d
 ```
 
-### Debian/Ubuntu
+### Debian/Ubuntu (`systemd`)
 
 For peak FFMPEG performance, Chromecast (requires HTTPS), and auto-start:
 
