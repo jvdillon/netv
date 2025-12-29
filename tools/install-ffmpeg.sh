@@ -14,6 +14,18 @@ BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 
 NPROC=$(nproc)
 
+# Add CUDA repo if not present
+if ! dpkg -l cuda-keyring 2>/dev/null | grep -q ^ii; then
+  wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+  sudo dpkg -i cuda-keyring_1.1-1_all.deb
+  rm cuda-keyring_1.1-1_all.deb
+  sudo apt-get update
+fi
+
+# Get latest CUDA version
+CUDA_VERSION=$(apt-cache search '^cuda-nvcc-[0-9]' | sed 's/cuda-nvcc-//' | cut -d' ' -f1 | sort -V | tail -1)
+echo "Using CUDA version: $CUDA_VERSION"
+
 sudo apt install -y \
   autoconf \
   automake \
@@ -56,7 +68,9 @@ sudo apt install -y \
   libxcb-shm0-dev \
   libxcb-xfixes0-dev \
   libxcb1-dev \
-  zlib1g-dev
+  zlib1g-dev \
+  cuda-nvcc-$CUDA_VERSION \
+  cuda-cudart-dev-$CUDA_VERSION
 
 mkdir -p "$SRC_DIR"
 
@@ -103,14 +117,15 @@ if [ "$BUILD_NV_HEADERS" = "1" ]; then
   make PREFIX="$BUILD_DIR" install
 fi
 
-# Detect CUDA capability
-CUDA_FLAGS=""
+# CUDA flags (always enabled since we install CUDA packages)
+CUDA_FLAGS="--enable-cuda-nvcc --enable-nvenc --enable-cuvid"
 NVCC_GENCODE=""
+
+# Detect GPU compute capability for optimized nvcc flags
 if command -v nvidia-smi &> /dev/null; then
   COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)
   if [ -n "$COMPUTE_CAP" ]; then
     COMPUTE_CAP_NUM=$(echo $COMPUTE_CAP | tr -d '.')
-    CUDA_FLAGS="--enable-cuda-nvcc --enable-nvenc --enable-cuvid"
     NVCC_GENCODE="-gencode arch=compute_${COMPUTE_CAP_NUM},code=sm_${COMPUTE_CAP_NUM}"
     echo "Detected NVIDIA GPU with compute capability ${COMPUTE_CAP} (sm_${COMPUTE_CAP_NUM})"
   fi
@@ -124,12 +139,8 @@ if [ ! -d "ffmpeg" ]; then
 fi
 cd ffmpeg && \
 # Build configure flags
-EXTRA_CFLAGS="-I$BUILD_DIR/include -O3 -march=native -mtune=native"
-EXTRA_LDFLAGS="-L$BUILD_DIR/lib -s"
-if [ -n "$CUDA_FLAGS" ]; then
-  EXTRA_CFLAGS="$EXTRA_CFLAGS -I/usr/local/cuda/include"
-  EXTRA_LDFLAGS="$EXTRA_LDFLAGS -L/usr/local/cuda/lib64"
-fi
+EXTRA_CFLAGS="-I$BUILD_DIR/include -I/usr/local/cuda/include -O3 -march=native -mtune=native"
+EXTRA_LDFLAGS="-L$BUILD_DIR/lib -L/usr/local/cuda/lib64 -s"
 
 CONFIGURE_CMD=(
   ./configure

@@ -18,15 +18,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV FFMPEG_BUILD=/opt/ffmpeg_build
 ENV PATH="/opt/bin:$PATH"
 
-# Add CUDA repo for nvcc
-RUN apt-get update && apt-get install -y wget && \
+# Add CUDA repo and install build dependencies
+RUN apt-get update && apt-get install -y wget gnupg && \
     wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb && \
     dpkg -i cuda-keyring_1.1-1_all.deb && \
     rm cuda-keyring_1.1-1_all.deb && \
-    apt-get update
-
-# Build dependencies
-RUN apt-get install -y \
+    apt-get update && \
+    CUDA_VERSION=$(apt-cache search '^cuda-nvcc-[0-9]' | sed 's/cuda-nvcc-//' | cut -d' ' -f1 | sort -V | tail -1) && \
+    apt-get install -y \
     autoconf \
     automake \
     build-essential \
@@ -37,23 +36,26 @@ RUN apt-get install -y \
     ninja-build \
     pkg-config \
     texinfo \
-    wget \
     yasm \
     libaom-dev \
     libass-dev \
     libdav1d-dev \
     libfdk-aac-dev \
+    libffmpeg-nvenc-dev \
     libfontconfig1-dev \
     libfreetype6-dev \
     libsoxr-dev \
     libsrt-openssl-dev \
     libssl-dev \
+    libunistring-dev \
     libwebp-dev \
     libzimg-dev \
     liblzma-dev \
+    liblzo2-dev \
     libmp3lame-dev \
     libnuma-dev \
     libopus-dev \
+    libsdl2-dev \
     libtool \
     libva-dev \
     libvdpau-dev \
@@ -65,8 +67,8 @@ RUN apt-get install -y \
     libxcb-xfixes0-dev \
     libxcb1-dev \
     zlib1g-dev \
-    # CUDA for nvcc (minimal, ~500MB vs full toolkit ~4GB)
-    cuda-nvcc \
+    cuda-nvcc-$CUDA_VERSION \
+    cuda-cudart-dev-$CUDA_VERSION \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
