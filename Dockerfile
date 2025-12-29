@@ -1,5 +1,14 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build: compile FFmpeg with all HW accel, then copy to slim runtime
+#
+# We use Ubuntu 24.04 for BOTH stages because:
+# - Newer codec libraries (libvpx 1.14, x265, etc.) = better quality/performance
+# - libfdk-aac available without non-free repo config
+# - Better hardware encoding support (NVENC, VAAPI, QSV headers)
+# - Matching library ABIs between builder and runtime (critical!)
+#
+# Using mismatched distros (e.g., Ubuntu builder + Debian runtime) breaks at
+# runtime due to shared library soname mismatches (libvpx.so.9 vs .so.7, etc.)
 
 # =============================================================================
 # Stage 1: Build FFmpeg with NVENC, VAAPI, QSV + all codecs
@@ -119,12 +128,14 @@ RUN wget -O ffmpeg-snapshot.tar.bz2 https://ffmpeg.org/releases/ffmpeg-snapshot.
 # =============================================================================
 # Stage 2: Runtime image
 # =============================================================================
-FROM python:3.12-slim
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Runtime libraries for FFmpeg + VAAPI/QSV drivers
+# Python + runtime libraries for FFmpeg + VAAPI/QSV drivers
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
     libass9 \
     libdav1d7 \
     libfdk-aac2 \
@@ -159,7 +170,7 @@ COPY templates/ templates/
 COPY static/ static/
 
 # Install Python dependencies
-RUN pip install --no-cache-dir .
+RUN python3 -m pip install --no-cache-dir --break-system-packages .
 
 # Runtime config
 EXPOSE 8000
@@ -173,4 +184,4 @@ RUN useradd -m netv
 USER netv
 
 # Shell form to expand env vars; NETV_HTTPS=1 adds --https flag
-CMD python main.py --port ${NETV_PORT} ${NETV_HTTPS:+--https}
+CMD python3 main.py --port ${NETV_PORT} ${NETV_HTTPS:+--https}
