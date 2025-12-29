@@ -18,8 +18,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV FFMPEG_BUILD=/opt/ffmpeg_build
 ENV PATH="/opt/bin:$PATH"
 
+# Add CUDA repo for nvcc
+RUN apt-get update && apt-get install -y wget && \
+    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb && \
+    dpkg -i cuda-keyring_1.1-1_all.deb && \
+    rm cuda-keyring_1.1-1_all.deb && \
+    apt-get update
+
 # Build dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get install -y \
     autoconf \
     automake \
     build-essential \
@@ -58,6 +65,8 @@ RUN apt-get update && apt-get install -y \
     libxcb-xfixes0-dev \
     libxcb1-dev \
     zlib1g-dev \
+    # CUDA for nvcc (minimal, ~500MB vs full toolkit ~4GB)
+    cuda-nvcc \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -103,8 +112,8 @@ RUN wget -O ffmpeg-snapshot.tar.bz2 https://ffmpeg.org/releases/ffmpeg-snapshot.
         --prefix=$FFMPEG_BUILD \
         --bindir=/opt/bin \
         --pkg-config-flags="--static" \
-        --extra-cflags="-I$FFMPEG_BUILD/include -O3 -march=native -mtune=native" \
-        --extra-ldflags="-L$FFMPEG_BUILD/lib -s" \
+        --extra-cflags="-I$FFMPEG_BUILD/include -I/usr/local/cuda/include -O3 -march=native -mtune=native" \
+        --extra-ldflags="-L$FFMPEG_BUILD/lib -L/usr/local/cuda/lib64 -s" \
         --extra-libs="-lpthread -lm" \
         --ld="g++" \
         --enable-gpl \
@@ -129,7 +138,9 @@ RUN wget -O ffmpeg-snapshot.tar.bz2 https://ffmpeg.org/releases/ffmpeg-snapshot.
         --enable-libsoxr \
         --enable-libsrt \
         --enable-vaapi \
+        --enable-cuda-nvcc \
         --enable-nvenc \
+        --enable-cuvid \
         --enable-nonfree && \
     make -j$(nproc) && \
     make install
