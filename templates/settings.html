@@ -332,22 +332,6 @@
                class="setting-input w-32 px-3 py-2 bg-gray-700 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm">
         <p class="text-xs text-gray-400 mt-1">Keep transcoded VOD for reuse (0 = disabled)</p>
       </div>
-      <div>
-        <label class="block text-sm font-medium mb-2">Probe Media (detect codecs/subs)</label>
-        <div class="flex gap-4">
-          <label class="flex items-center gap-2">
-            <input type="checkbox" name="probe_movies" {% if probe_movies %}checked{% endif %}
-                   class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500 rounded">
-            <span>Movies</span>
-          </label>
-          <label class="flex items-center gap-2">
-            <input type="checkbox" name="probe_series" {% if probe_series %}checked{% endif %}
-                   class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500 rounded">
-            <span>Series</span>
-          </label>
-        </div>
-        <p class="text-xs text-gray-400 mt-1">Probing adds ~8s delay on first play but enables better transcoding decisions. Results are cached.</p>
-      </div>
     </div>
   </div>
 
@@ -400,6 +384,27 @@
     <div class="flex items-center justify-between mb-4">
       <h3 class="text-xl font-semibold">Probe Cache</h3>
       <button id="clear-all-probe-cache" class="px-2 py-1 text-xs bg-gray-600 hover:bg-red-600 rounded">Clear All</button>
+    </div>
+    <div class="mb-4">
+      <label class="block text-sm font-medium mb-2">Probe Media (detect codecs/subs)</label>
+      <div class="flex gap-4">
+        <label class="flex items-center gap-2">
+          <input type="checkbox" name="probe_live" {% if probe_live %}checked{% endif %}
+                 class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500 rounded">
+          <span>Live TV</span>
+        </label>
+        <label class="flex items-center gap-2">
+          <input type="checkbox" name="probe_movies" {% if probe_movies %}checked{% endif %}
+                 class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500 rounded">
+          <span>Movies</span>
+        </label>
+        <label class="flex items-center gap-2">
+          <input type="checkbox" name="probe_series" {% if probe_series %}checked{% endif %}
+                 class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500 rounded">
+          <span>Series</span>
+        </label>
+      </div>
+      <p class="text-xs text-gray-400 mt-1">Probing adds a few seconds delay on first play but enables hardware decode pipeline. Results are cached.</p>
     </div>
     <p class="text-sm text-gray-400 mb-4">Cached probe results avoid re-probing episodes in the same series.</p>
     <div id="probe-cache-list" class="space-y-2 max-h-96 overflow-y-auto">
@@ -489,6 +494,14 @@
                    class="w-full px-3 py-1.5 bg-gray-600 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none text-sm">
             <span class="text-xs text-gray-400">Auto-detected on first refresh, or set manually</span>
           </div>
+          <div class="non-epg-only" style="{% if source.type == 'epg' %}display:none{% endif %}">
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" name="deinterlace_fallback" {% if source.deinterlace_fallback is not defined or source.deinterlace_fallback %}checked{% endif %}
+                     class="w-4 h-4 rounded bg-gray-600 border-gray-500 text-blue-500 focus:ring-blue-500">
+              <span class="text-sm">Deinterlace when probe skipped</span>
+            </label>
+            <span class="text-xs text-gray-400 ml-6">Enable for OTA/HDHomeRun, disable for IPTV</span>
+          </div>
           <div>
             <label class="block text-sm font-medium mb-1">Refresh</label>
             <div class="flex gap-2" data-source-id="{{ source.id }}" data-source-type="{{ source.type }}">
@@ -547,6 +560,14 @@
                  class="w-4 h-4 rounded bg-gray-600 border-gray-500 text-blue-500 focus:ring-blue-500">
           <span class="text-sm">Fetch EPG from this source</span>
         </label>
+      </div>
+      <div id="deinterlace-field">
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input type="checkbox" name="deinterlace_fallback"
+                 class="w-4 h-4 rounded bg-gray-600 border-gray-500 text-blue-500 focus:ring-blue-500">
+          <span class="text-sm">Deinterlace when probe skipped</span>
+        </label>
+        <span class="text-xs text-gray-400 ml-6">Enable for OTA/HDHomeRun, disable for IPTV</span>
       </div>
       <div id="xtream-fields" class="grid grid-cols-2 gap-3">
         <div>

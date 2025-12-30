@@ -546,6 +546,7 @@
       if (cfg.seriesId) url += '&series_id=' + cfg.seriesId;
       if (cfg.episodeId) url += '&episode_id=' + cfg.episodeId;
       if (cfg.seriesName) url += '&series_name=' + encodeURIComponent(cfg.seriesName);
+      if (cfg.deinterlaceFallback !== undefined) url += '&deinterlace_fallback=' + (cfg.deinterlaceFallback ? '1' : '0');
       const resp = await fetch(url);
       if (!resp.ok) throw new Error('Transcode start failed: ' + resp.status);
       const data = await resp.json();

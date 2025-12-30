@@ -255,6 +255,7 @@ class Source:
     epg_schedule: list[str] = field(default_factory=list)  # ["03:00", "15:00"]
     epg_enabled: bool = True  # Whether to fetch EPG from this source
     epg_url: str = ""  # EPG URL (auto-detected from M3U/Xtream, or manual override)
+    deinterlace_fallback: bool = True  # Deinterlace when probe is skipped (for OTA/HDHomeRun)
 
 
 def load_server_settings() -> dict[str, Any]:
@@ -266,6 +267,7 @@ def load_server_settings() -> dict[str, Any]:
     data.setdefault("transcode_mode", "auto")
     data.setdefault("transcode_hw", _default_encoder())
     data.setdefault("vod_transcode_cache_mins", 60)
+    data.setdefault("probe_live", True)
     data.setdefault("probe_movies", True)
     data.setdefault("probe_series", False)
     data.setdefault("sources", [])

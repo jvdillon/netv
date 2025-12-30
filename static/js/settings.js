@@ -86,9 +86,17 @@
     if (!typeSelect) return;
     typeSelect.addEventListener('change', function() {
       const isXtream = this.value === 'xtream';
+      const isM3u = this.value === 'm3u';
       const isEpg = this.value === 'epg';
       document.getElementById('xtream-fields').style.display = isXtream ? 'grid' : 'none';
       document.getElementById('epg-enabled-field').style.display = isEpg ? 'none' : 'block';
+      // Deinterlace: hide for EPG, default checked for M3U (OTA), unchecked for Xtream (IPTV)
+      const deinterlaceField = document.getElementById('deinterlace-field');
+      if (deinterlaceField) {
+        deinterlaceField.style.display = isEpg ? 'none' : 'block';
+        const checkbox = deinterlaceField.querySelector('input[name="deinterlace_fallback"]');
+        if (checkbox) checkbox.checked = isM3u;
+      }
       const urlInput = document.querySelector('#add-source-form input[name="url"]');
       const placeholders = { xtream: 'https://server.com', m3u: 'http://server.com/playlist.m3u', epg: 'http://server.com/epg.xml' };
       urlInput.placeholder = placeholders[this.value] || placeholders.xtream;

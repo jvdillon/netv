@@ -1008,6 +1008,7 @@ class PlayerInfo:
     channel_name: str = ""
     program_title: str = ""
     program_desc: str = ""
+    deinterlace_fallback: bool = True  # Used when probe is skipped
 
 
 def _get_episode_desc(ep: dict) -> str:
@@ -1042,6 +1043,14 @@ def _get_live_player_info(stream_id: str) -> PlayerInfo:
         base, user, pwd = stream["source_url"], stream["source_username"], stream["source_password"]
         orig_id = stream_id.split("_")[-1] if "_" in stream_id else stream_id
         info.url = f"{base}/live/{user}/{pwd}/{orig_id}.m3u8"
+
+    # Look up source's deinterlace_fallback setting
+    source_id = stream.get("source_id")
+    if source_id:
+        sources = load_server_settings().get("sources", [])
+        source = next((s for s in sources if s.get("id") == source_id), None)
+        if source:
+            info.deinterlace_fallback = source.get("deinterlace_fallback", True)
 
     # Look up current program from EPG
     epg_id = stream.get("epg_channel_id") or ""
@@ -1214,6 +1223,7 @@ async def player_page(
             "cc_style": user_settings.get("cc_style", {}),
             "cast_host": user_settings.get("cast_host", ""),
             "next_episode_url": next_episode_url,
+            "deinterlace_fallback": info.deinterlace_fallback,
         },
     )
 
@@ -1350,9 +1360,11 @@ async def transcode_start(
     series_id: int | None = None,
     episode_id: int | None = None,
     series_name: str = "",
+    deinterlace_fallback: str = "1",  # "1" or "0"
 ):
     """Start a transcode session, return session ID."""
-    return await transcoding._start_transcode(url, content_type, series_id, episode_id, series_name)
+    deinterlace_fb = deinterlace_fallback == "1"
+    return await transcoding._start_transcode(url, content_type, series_id, episode_id, series_name, deinterlace_fb)
 
 
 @app.get("/transcode/seek/{session_id}")
@@ -1506,6 +1518,7 @@ async def settings_page(request: Request, user: Annotated[dict, Depends(require_
             "max_resolution": server_settings.get("max_resolution", "1080p"),
             "quality": server_settings.get("quality", "high"),
             "vod_transcode_cache_mins": server_settings.get("vod_transcode_cache_mins", 60),
+            "probe_live": server_settings.get("probe_live", True),
             "probe_movies": server_settings.get("probe_movies", True),
             "probe_series": server_settings.get("probe_series", False),
             "user_agent_preset": server_settings.get("user_agent_preset", "default"),
@@ -1552,6 +1565,7 @@ async def settings_add_source(
     epg_timeout: Annotated[int, Form()] = 120,
     epg_schedule: Annotated[str, Form()] = "",
     epg_enabled: Annotated[str, Form()] = "",  # Checkbox: "on" if checked
+    deinterlace_fallback: Annotated[str, Form()] = "",  # Checkbox: "on" if checked
 ):
     # Validate inputs
     if source_type not in ("xtream", "m3u", "epg"):
@@ -1583,6 +1597,7 @@ async def settings_add_source(
             "epg_timeout": max(1, min(3600, epg_timeout)),
             "epg_schedule": schedule_list,
             "epg_enabled": epg_enabled == "on" or source_type == "epg",
+            "deinterlace_fallback": deinterlace_fallback == "on",
         }
     )
     settings["sources"] = sources
@@ -1604,6 +1619,7 @@ async def settings_edit_source(
     epg_schedule: Annotated[str, Form()] = "",
     epg_enabled: Annotated[str, Form()] = "",  # Checkbox: "on" if checked
     epg_url: Annotated[str, Form()] = "",
+    deinterlace_fallback: Annotated[str, Form()] = "",  # Checkbox: "on" if checked
 ):
     # Validate inputs
     if source_type not in ("xtream", "m3u", "epg"):
@@ -1633,6 +1649,7 @@ async def settings_edit_source(
             s["epg_schedule"] = schedule_list
             s["epg_enabled"] = epg_enabled == "on" or source_type == "epg"
             s["epg_url"] = epg_url.strip()
+            s["deinterlace_fallback"] = deinterlace_fallback == "on"
             break
     save_server_settings(settings)
     clear_all_caches()
@@ -1911,6 +1928,7 @@ async def settings_transcode(
     max_resolution: Annotated[str, Form()] = "1080p",
     quality: Annotated[str, Form()] = "high",
     vod_transcode_cache_mins: Annotated[int, Form()] = 60,
+    probe_live: Annotated[str | None, Form()] = None,
     probe_movies: Annotated[str | None, Form()] = None,
     probe_series: Annotated[str | None, Form()] = None,
 ):
@@ -1920,6 +1938,7 @@ async def settings_transcode(
     settings["max_resolution"] = max_resolution
     settings["quality"] = quality if quality in ("high", "medium", "low") else "high"
     settings["vod_transcode_cache_mins"] = max(0, vod_transcode_cache_mins)
+    settings["probe_live"] = probe_live == "on"
     settings["probe_movies"] = probe_movies == "on"
     settings["probe_series"] = probe_series == "on"
     save_server_settings(settings)
@@ -2029,6 +2048,7 @@ async def update_settings_api(
         "transcode_mode",
         "transcode_hw",
         "vod_transcode_cache_mins",
+        "probe_live",
         "probe_movies",
         "probe_series",
         "vod_order",

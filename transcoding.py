@@ -170,6 +170,7 @@ def _load_series_probe_cache() -> None:
                         duration=entry.get("duration", 0),
                         height=entry.get("height", 0),
                         video_bitrate=entry.get("video_bitrate", 0),
+                        interlaced=entry.get("interlaced", False),
                     )
                     subs = [
                         SubtitleStream(s["index"], s.get("lang", "und"), s.get("name", ""))
@@ -211,6 +212,7 @@ def _save_series_probe_cache() -> None:
                     "duration": media_info.duration,
                     "height": media_info.height,
                     "video_bitrate": media_info.video_bitrate,
+                    "interlaced": media_info.interlaced,
                     "subtitles": [
                         {
                             "index": s.index,
@@ -260,6 +262,7 @@ class MediaInfo:
     duration: float = 0.0
     height: int = 0
     video_bitrate: int = 0  # bits per second, 0 if unknown
+    interlaced: bool = False  # True if field_order indicates interlaced
 
 
 class _DeadProcess:
@@ -458,6 +461,7 @@ def probe_media(
 
     height = 0
     video_bitrate = 0
+    interlaced = False
     for stream in data.get("streams", []):
         codec = stream.get("codec_name", "").lower()
         codec_type = stream.get("codec_type", "")
@@ -465,6 +469,9 @@ def probe_media(
             video_codec = codec
             pix_fmt = stream.get("pix_fmt", "")
             height = stream.get("height", 0) or 0
+            # Detect interlacing from field_order (tt, bb, tb, bt = interlaced)
+            field_order = stream.get("field_order", "").lower()
+            interlaced = field_order in ("tt", "bb", "tb", "bt")
             # Try to get bitrate from stream, fall back to format
             with suppress(ValueError, TypeError):
                 video_bitrate = int(stream.get("bit_rate", 0) or 0)
@@ -511,6 +518,7 @@ def probe_media(
         duration=duration,
         height=height,
         video_bitrate=video_bitrate,
+        interlaced=interlaced,
     )
     with _probe_lock:
         _probe_cache[url] = (time.time(), media_info, subtitles)
@@ -651,6 +659,7 @@ def build_hls_ffmpeg_cmd(
     max_resolution: str = "1080p",
     quality: str = "high",
     user_agent: str | None = None,
+    deinterlace_fallback: bool | None = None,
 ) -> list[str]:
     # Check if we can copy streams directly (VOD with compatible codecs)
     max_h = _MAX_RES_HEIGHT.get(max_resolution, 9999)
@@ -677,11 +686,16 @@ def build_hls_ffmpeg_cmd(
         and (hw != "nvidia" or (media_info and media_info.video_codec in _get_gpu_nvdec_codecs()))
     )
 
+    # Deinterlace: use probe result if available, else use fallback setting
+    # (fallback defaults to True for live, False for VOD when not explicitly set)
+    fallback = deinterlace_fallback if deinterlace_fallback is not None else (not is_vod)
+    deinterlace = media_info.interlaced if media_info else fallback
+
     # Build component arg lists
     video_pre, video_post = _build_video_args(
         copy_video=copy_video,
         hw=hw,
-        deinterlace=not is_vod,
+        deinterlace=deinterlace,
         use_hw_pipeline=use_hw_pipeline,
         max_resolution=max_resolution,
         quality=quality,
@@ -720,8 +734,12 @@ def build_hls_ffmpeg_cmd(
             "1",
             "-reconnect_streamed",
             "1",
+            "-reconnect_on_network_error",
+            "1",
+            "-reconnect_on_http_error",
+            "4xx,5xx",
             "-reconnect_delay_max",
-            "2",
+            "30",
         ]
     )
     if user_agent:
@@ -1243,6 +1261,7 @@ async def _do_start_transcode(
     episode_id: int | None,
     old_seek_offset: float,
     series_name: str = "",
+    deinterlace_fallback: bool = True,
 ) -> dict[str, Any]:
     """Core transcode logic. Raises HTTPException on failure."""
     settings = _load_settings()
@@ -1250,8 +1269,8 @@ async def _do_start_transcode(
     max_resolution = settings.get("max_resolution", "1080p")
     quality = settings.get("quality", "high")
     is_vod = content_type in ("movie", "series")
-    probe_key = {"movie": "probe_movies", "series": "probe_series"}
-    do_probe = is_vod and settings.get(probe_key.get(content_type, ""), False)
+    probe_key = {"movie": "probe_movies", "series": "probe_series", "live": "probe_live"}
+    do_probe = settings.get(probe_key.get(content_type, ""), False)
 
     session_id = str(uuid.uuid4())
     output_dir = tempfile.mkdtemp(prefix=f"netv_transcode_{session_id}_")
@@ -1275,11 +1294,12 @@ async def _do_start_transcode(
                 else "?"
             )
             log.info(
-                "Probe: video=%s/%s/%dp/%s audio=%s/%dch/%dHz duration=%.0fs subs=%s",
+                "Probe: video=%s/%s/%dp/%s%s audio=%s/%dch/%dHz duration=%.0fs subs=%s",
                 media_info.video_codec,
                 media_info.pix_fmt,
                 media_info.height,
                 bitrate_str,
+                "/interlaced" if media_info.interlaced else "",
                 media_info.audio_codec,
                 media_info.audio_channels,
                 media_info.audio_sample_rate,
@@ -1297,6 +1317,7 @@ async def _do_start_transcode(
         max_resolution,
         quality,
         get_user_agent(),
+        deinterlace_fallback,
     )
     if old_seek_offset > 0:
         i_idx = cmd.index("-i")
@@ -1404,6 +1425,7 @@ async def _start_transcode(
     series_id: int | None = None,
     episode_id: int | None = None,
     series_name: str = "",
+    deinterlace_fallback: bool = True,
 ) -> dict[str, Any]:
     is_vod = content_type in ("movie", "series")
     existing_id, is_valid, old_seek_offset = (
@@ -1442,7 +1464,7 @@ async def _start_transcode(
     # Try transcode, retry once if series cache was stale
     try:
         return await _do_start_transcode(
-            url, content_type, series_id, episode_id, old_seek_offset, series_name
+            url, content_type, series_id, episode_id, old_seek_offset, series_name, deinterlace_fallback
         )
     except HTTPException:
         if series_id is not None:
@@ -1450,7 +1472,7 @@ async def _start_transcode(
             log.info("Transcode failed, clearing MRU and retrying")
             invalidate_series_probe_cache(series_id, episode_id)
             return await _do_start_transcode(
-                url, content_type, series_id, episode_id, old_seek_offset, series_name
+                url, content_type, series_id, episode_id, old_seek_offset, series_name, deinterlace_fallback
             )
         raise
 
