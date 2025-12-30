@@ -2216,5 +2216,6 @@ if __name__ == "__main__":
         port=args.port,
         access_log=args.debug,
         log_level=uv_log,
+        timeout_graceful_shutdown=5,
         **ssl_args,  # pyright: ignore[reportArgumentType]
     )
