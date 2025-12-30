@@ -42,7 +42,7 @@ users who find them overkill and just want a simple IPTV player.
 - **Live TV** with EPG grid guide
 - **Movies & Series** with metadata, seasons, episodes
 - **Chromecast** support (HTTPS required)
-- **Hardware transcoding** (NVIDIA NVENC, VAAPI, QSV)
+- **Hardware transcoding** (NVIDIA NVENC, Intel/AMD VA-API)
 - **Closed captions** with style customization
 - **Search** across all content (supports regex)
 - **Favorites** with drag-and-drop ordering
@@ -89,9 +89,12 @@ NETV_HTTPS=1 docker compose up -d          # enable HTTPS (mount certs first)
 First build takes ~15-20 min (compiles FFmpeg with all HW acceleration).
 
 **Hardware transcoding:**
-- **VAAPI (Intel/AMD)**: Enabled by default. If `/dev/dri` doesn't exist on
-  your system, comment out the `devices` and `group_add` sections in
-  `docker-compose.yml`.
+- **VAAPI (Intel/AMD)**: Set your render group GID in `.env`:
+  ```bash
+  stat -c 'RENDER_GID=%g' /dev/dri/renderD128 >> .env
+  ```
+  If `/dev/dri` doesn't exist, comment out the `devices` and `group_add`
+  sections in `docker-compose.yml`.
 - **NVIDIA**: Requires nvidia-container-toolkit. Use: `docker compose --profile
   nvidia up -d`
 
@@ -142,7 +145,7 @@ Settings are stored in `cache/settings.json`:
 | Setting | Values | Description |
 |---------|--------|-------------|
 | `transcode_mode` | `auto`, `always`, `never` | When to transcode streams |
-| `transcode_hw` | `nvidia`, `vaapi`, `qsv`, `software` | Hardware encoder |
+| `transcode_hw` | `nvidia`, `vaapi`, `software` | Hardware encoder |
 | `captions_enabled` | `true`, `false` | Default caption state |
 
 ## Hardware Transcoding

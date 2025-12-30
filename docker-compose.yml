@@ -26,13 +26,13 @@ services:
     restart: unless-stopped
 
     # --- Hardware Acceleration ---
-    # VAAPI enabled by default (Intel/AMD GPU)
-    # Comment both devices and group_add if /dev/dri doesn't exist on your system
+    # VAAPI (Intel/AMD GPU) - comment out if /dev/dri doesn't exist
+    # Find render group GID and add to .env:
+    #   stat -c 'RENDER_GID=%g' /dev/dri/renderD128 >> .env
     devices:
       - /dev/dri:/dev/dri
     group_add:
-      - video
-      - render
+      - "${RENDER_GID:?Set RENDER_GID in .env (see comment above)}"
 
   # NVIDIA GPU (use: docker compose --profile nvidia up -d)
   netv-nvidia:
