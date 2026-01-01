@@ -9,17 +9,14 @@ __pycache__/
 uv.lock
 
 # App data
-settings.json
 cache/
 
 # Certificates
 *.pem
 
 # Tools - user data and generated files
-tools/xtream.json
-tools/*.m3u
-tools/*.pickle.gz
-tools/authentication.json
-tools/get_*.json
-tools/xmltv.xml
+**/*.gz
+**/*.json
+**/*.m3u
+**/*.xml
 tools/.zap2xml/
