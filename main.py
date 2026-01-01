@@ -644,6 +644,11 @@ async def guide_page(
         epg_db.get_programs_batch(epg_ids_set, window_start, window_end) if epg_ids_set else {}
     )
 
+    # Log streams with EPG IDs that returned no programs (potential misconfiguration)
+    for s, epg_id in zip(streams, epg_ids, strict=False):
+        if epg_id and not programs_map.get(epg_id):
+            log.warning("Stream '%s' has epg_channel_id='%s' but no EPG programs found", s["name"], epg_id)
+
     # Build channel list and grid data
     window_end_mobile = window_start + timedelta(hours=2)
     grid_data = []
@@ -2591,7 +2596,12 @@ if __name__ == "__main__":
     parser.add_argument("--key", help="SSL private key file (e.g., privkey.pem)")
     args = parser.parse_args()
 
-    log_level = logging.DEBUG if args.debug else logging.INFO
+    # LOG_LEVEL env var takes precedence, then --debug flag, then default INFO
+    log_level_env = os.environ.get("LOG_LEVEL", "").upper()
+    if log_level_env in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        log_level = getattr(logging, log_level_env)
+    else:
+        log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s | %(levelname)s | %(message)s",

@@ -186,6 +186,49 @@ x265, AV1).
 - Use HTTPS for Chromecast and remote access
 - The app binds to `0.0.0.0` -- use a firewall to restrict access
 
+## Troubleshooting
+
+### Debug Logging
+
+Enable verbose logs to diagnose EPG, M3U parsing, or other issues.
+
+**Docker:**
+
+In `docker-compose.yml`, change `LOG_LEVEL=INFO` to `LOG_LEVEL=DEBUG`, then restart:
+
+```bash
+docker compose down && docker compose up -d
+docker compose logs -f
+```
+
+**Systemd:**
+
+```bash
+sudo systemctl edit netv
+```
+
+Add:
+
+```ini
+[Service]
+Environment="LOG_LEVEL=DEBUG"
+```
+
+Then restart and view logs:
+
+```bash
+sudo systemctl restart netv
+journalctl -u netv -f
+```
+
+**Manual / Development:**
+
+```bash
+LOG_LEVEL=DEBUG ./main.py
+# or
+./main.py --debug
+```
+
 ## Q&A
 
 **Where can I get free IPTV?**

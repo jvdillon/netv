@@ -88,6 +88,14 @@ def parse_m3u(content: str, source_id: str) -> tuple[list[dict], list[dict], str
             )
         i += 1
 
+    streams_with_epg = sum(1 for s in streams if s.get("epg_channel_id"))
+    log.debug(
+        "M3U parsed: %d streams (%d with tvg-id, %d without), %d categories",
+        len(streams),
+        streams_with_epg,
+        len(streams) - streams_with_epg,
+        len(categories),
+    )
     return list(categories.values()), streams, epg_url
 
 

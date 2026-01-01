@@ -89,8 +89,10 @@ def fetch_epg(
             raise
 
     # Parse channels directly into sqlite
+    channel_ids: set[str] = set()
     for ch in root.findall("channel"):
         ch_id = ch.get("id", "")
+        channel_ids.add(ch_id)
         name_el = ch.find("display-name")
         name = name_el.text if name_el is not None and name_el.text else ch_id
         epg_db.insert_channel(ch_id, name, source_id)
@@ -102,9 +104,11 @@ def fetch_epg(
     batch: list[tuple[str, str, float, float, str, str]] = []
     batch_size = 10000
     program_count = 0
+    program_channel_ids: set[str] = set()
 
     for prog in root.findall("programme"):
         ch_id = prog.get("channel", "")
+        program_channel_ids.add(ch_id)
         start_str = prog.get("start", "")
         stop_str = prog.get("stop", "")
 
@@ -131,6 +135,12 @@ def fetch_epg(
         epg_db.insert_programs(batch)
 
     epg_db.commit()
+    log.debug(
+        "EPG parsed: %d channels, %d unique program channel IDs, %d programs",
+        len(channel_ids),
+        len(program_channel_ids),
+        program_count,
+    )
     return program_count
 
 

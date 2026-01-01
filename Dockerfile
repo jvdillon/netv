@@ -252,6 +252,7 @@ VOLUME /app/cache
 
 ENV NETV_PORT=8000
 ENV NETV_HTTPS=""
+ENV LOG_LEVEL=INFO
 
 # Run as non-root
 RUN useradd -m netv

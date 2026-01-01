@@ -6,8 +6,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+import logging
 import sqlite3
 import threading
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -212,6 +215,12 @@ def get_programs_batch(
                     source_id=row["source_id"] or "",
                 )
             )
+    channels_with_programs = sum(1 for progs in result.values() if progs)
+    log.debug(
+        "EPG batch query: requested %d channel IDs, found programs for %d",
+        len(channel_ids),
+        channels_with_programs,
+    )
     return result
 
 

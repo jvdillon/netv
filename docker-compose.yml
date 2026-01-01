@@ -23,6 +23,7 @@ services:
     environment:
       - NETV_PORT=8000
       - NETV_HTTPS=${NETV_HTTPS:-}
+      - LOG_LEVEL=INFO  # DEBUG for verbose logging
     volumes:
       - ./cache:/app/cache
       - /etc/localtime:/etc/localtime:ro  # Use host timezone for EPG
