@@ -41,8 +41,8 @@ def client(tmp_path: Path, mock_deps):
         patch("auth.SERVER_SETTINGS_FILE", tmp_path / "server_settings.json"),
         patch("auth.USERS_DIR", tmp_path / "users"),
         patch("epg_db.init"),
-        patch("transcoding.init"),
-        patch("transcoding.cleanup_and_recover_sessions"),
+        patch("ffmpeg_command.init"),
+        patch("ffmpeg_session.cleanup_and_recover_sessions"),
     ):
         (tmp_path / "users").mkdir(exist_ok=True)
         import main
@@ -65,8 +65,8 @@ def auth_client(tmp_path: Path, mock_deps):
         patch("auth.SERVER_SETTINGS_FILE", tmp_path / "server_settings.json"),
         patch("auth.USERS_DIR", tmp_path / "users"),
         patch("epg_db.init"),
-        patch("transcoding.init"),
-        patch("transcoding.cleanup_and_recover_sessions"),
+        patch("ffmpeg_command.init"),
+        patch("ffmpeg_session.cleanup_and_recover_sessions"),
     ):
         (tmp_path / "users").mkdir(exist_ok=True)
         import auth
@@ -631,23 +631,23 @@ class TestTranscodeRoutes:
     """Tests for transcode routes (with mocked transcoding module)."""
 
     def test_transcode_file_not_found(self, auth_client):
-        with patch("main.transcoding.get_session", return_value=None):
+        with patch("main.ffmpeg_session.get_session", return_value=None):
             resp = auth_client.get("/transcode/invalid-session/stream.m3u8")
             assert resp.status_code == 404
 
     def test_transcode_stop(self, auth_client):
-        with patch("main.transcoding.stop_session"):
+        with patch("main.ffmpeg_session.stop_session"):
             resp = auth_client.delete("/transcode/test-session")
             assert resp.status_code == 200
             assert resp.json()["status"] == "stopped"
 
     def test_transcode_stop_post(self, auth_client):
-        with patch("main.transcoding.stop_session"):
+        with patch("main.ffmpeg_session.stop_session"):
             resp = auth_client.post("/transcode/test-session/stop")
             assert resp.status_code == 200
 
     def test_transcode_progress_not_found(self, auth_client):
-        with patch("main.transcoding.get_session_progress", return_value=None):
+        with patch("main.ffmpeg_session.get_session_progress", return_value=None):
             resp = auth_client.get("/transcode/progress/invalid-session")
             assert resp.status_code == 404
 
@@ -660,7 +660,7 @@ class TestSubtitleRoutes:
         assert resp.status_code == 400
 
     def test_subtitle_session_not_found(self, auth_client):
-        with patch("main.transcoding.get_session", return_value=None):
+        with patch("main.ffmpeg_session.get_session", return_value=None):
             resp = auth_client.get("/subs/invalid-session/sub0.vtt")
             assert resp.status_code == 404
 
@@ -669,19 +669,19 @@ class TestProbeCache:
     """Tests for probe cache endpoints."""
 
     def test_get_probe_cache(self, auth_client):
-        with patch("main.transcoding.get_series_probe_cache_stats", return_value=[]):
+        with patch("main.ffmpeg_command.get_series_probe_cache_stats", return_value=[]):
             resp = auth_client.get("/settings/probe-cache")
             assert resp.status_code == 200
             assert "series" in resp.json()
 
     def test_clear_probe_cache(self, auth_client):
-        with patch("main.transcoding.clear_all_probe_cache", return_value=5):
+        with patch("main.ffmpeg_command.clear_all_probe_cache", return_value=5):
             resp = auth_client.post("/settings/probe-cache/clear")
             assert resp.status_code == 200
             assert resp.json()["cleared"] == 5
 
     def test_clear_series_probe_cache(self, auth_client):
-        with patch("main.transcoding.invalidate_series_probe_cache"):
+        with patch("main.ffmpeg_command.invalidate_series_probe_cache"):
             resp = auth_client.post("/settings/probe-cache/clear/123")
             assert resp.status_code == 200
 

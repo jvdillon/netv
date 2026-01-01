@@ -88,7 +88,8 @@ from xtream import XtreamClient
 
 import auth
 import epg_db
-import transcoding
+import ffmpeg_command
+import ffmpeg_session
 
 
 log = logging.getLogger()
@@ -128,7 +129,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     epg_db.init(CACHE_DIR)
 
     # Initialize transcoding module with settings callback
-    transcoding.init(load_server_settings)
+    ffmpeg_command.init(load_server_settings)
 
     # Kill orphaned ffmpeg processes
     try:
@@ -148,7 +149,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception:
         pass
     # Clean up orphaned dirs and recover valid VOD sessions
-    transcoding.cleanup_and_recover_sessions()
+    ffmpeg_session.cleanup_and_recover_sessions()
 
     # Preload all data in background threads (parallel)
     def load_live():
@@ -207,7 +208,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     def cleanup_loop():
         while not cleanup_stop.wait(60):  # Check every minute
-            transcoding.cleanup_expired_sessions()
+            ffmpeg_session.cleanup_expired_sessions()
 
     cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
     cleanup_thread.start()
@@ -263,7 +264,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _shutdown_event.set()
     cleanup_stop.set()
     scheduler_stop.set()
-    transcoding.shutdown()
+    ffmpeg_session.shutdown()
 
 
 app = FastAPI(title="neTV", lifespan=lifespan)
@@ -1538,7 +1539,7 @@ async def playlist_xspf(
 
 
 # =============================================================================
-# Transcoding routes (logic in transcoding.py)
+# Transcoding routes (logic in ffmpeg_session.py)
 # =============================================================================
 
 
@@ -1571,7 +1572,7 @@ async def transcode_start(
         if source:
             source_max_streams = source.get("max_streams", 0)
 
-    return await transcoding._start_transcode(
+    return await ffmpeg_session.start_transcode(
         url,
         content_type,
         series_id,
@@ -1592,7 +1593,7 @@ async def transcode_seek(
     _user: Annotated[dict, Depends(require_auth)],
 ):
     """Seek VOD transcode to a new position."""
-    return await transcoding.seek_transcode(session_id, time)
+    return await ffmpeg_session.seek_transcode(session_id, time)
 
 
 @app.get("/transcode/progress/{session_id}")
@@ -1601,7 +1602,7 @@ async def transcode_progress(
     _user: Annotated[dict, Depends(require_auth)],
 ):
     """Get transcode progress (segment count, duration)."""
-    progress = transcoding.get_session_progress(session_id)
+    progress = ffmpeg_session.get_session_progress(session_id)
     if not progress:
         raise HTTPException(404, "Session not found")
     return progress
@@ -1619,7 +1620,7 @@ async def transcode_file(
     if safe_filename != filename or ".." in filename:
         raise HTTPException(400, "Invalid filename")
 
-    session = transcoding.get_session(session_id)
+    session = ffmpeg_session.get_session(session_id)
     if not session:
         log.debug(f"[CAST] 404 session not found: {session_id}")
         raise HTTPException(404, "Transcode session not found")
@@ -1657,7 +1658,7 @@ async def subtitle_file(session_id: str, filename: str):
         raise HTTPException(400, "Invalid filename")
     if not safe_filename.endswith(".vtt"):
         raise HTTPException(400, "Only VTT files allowed")
-    session = transcoding.get_session(session_id)
+    session = ffmpeg_session.get_session(session_id)
     if not session:
         raise HTTPException(404, "Session not found")
     file_path = pathlib.Path(session["dir"]) / safe_filename
@@ -1666,7 +1667,11 @@ async def subtitle_file(session_id: str, filename: str):
         if file_path.exists() and file_path.stat().st_size > 20:
             break
         await asyncio.sleep(0.2)
-    content = file_path.read_text() if file_path.exists() else "WEBVTT\n\n"
+    try:
+        content = file_path.read_text() if file_path.exists() else "WEBVTT\n\n"
+    except (UnicodeDecodeError, OSError):
+        # File may be partially written or corrupted
+        content = "WEBVTT\n\n"
     return Response(
         content=content,
         media_type="text/vtt",
@@ -1680,7 +1685,7 @@ async def transcode_stop(
     _user: Annotated[dict, Depends(require_auth)],
 ):
     """Stop a transcode session (VOD sessions stay cached)."""
-    transcoding.stop_session(session_id, force=False)
+    ffmpeg_session.stop_session(session_id, force=False)
     return {"status": "stopped"}
 
 
@@ -1690,7 +1695,7 @@ async def transcode_stop_post(
     _user: Annotated[dict, Depends(require_auth)],
 ):
     """Stop a transcode session (POST for sendBeacon, VOD cached)."""
-    transcoding.stop_session(session_id, force=False)
+    ffmpeg_session.stop_session(session_id, force=False)
     return {"status": "stopped"}
 
 
@@ -1700,9 +1705,9 @@ async def transcode_clear(
     _user: Annotated[dict, Depends(require_auth)],
 ):
     """Force-delete any cached transcode session for a URL."""
-    session_id = transcoding.clear_url_session(url)
+    session_id = ffmpeg_session.clear_url_session(url)
     if session_id:
-        transcoding.stop_session(session_id, force=True)
+        ffmpeg_session.stop_session(session_id, force=True)
         log.info("Force-cleared transcode session %s for URL", session_id)
     return {"status": "cleared", "session_id": session_id}
 
@@ -2360,7 +2365,7 @@ async def get_probe_cache(
 ):
     """Get probe cache stats for settings UI."""
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    stats = transcoding.get_series_probe_cache_stats()
+    stats = ffmpeg_command.get_series_probe_cache_stats()
     xtream = get_first_xtream_client()
     if not xtream:
         return {"series": stats}
@@ -2371,7 +2376,7 @@ async def get_probe_cache(
 @app.post("/settings/probe-cache/clear")
 async def clear_probe_cache(_user: Annotated[dict, Depends(require_admin)]):
     """Clear all probe caches."""
-    count = transcoding.clear_all_probe_cache()
+    count = ffmpeg_command.clear_all_probe_cache()
     return {"ok": True, "cleared": count}
 
 
@@ -2382,7 +2387,7 @@ async def clear_series_probe_cache(
     episode_id: int | None = None,
 ):
     """Clear probe cache for a specific series or episode."""
-    transcoding.invalidate_series_probe_cache(series_id, episode_id)
+    ffmpeg_command.invalidate_series_probe_cache(series_id, episode_id)
     return {"ok": True}
 
 
@@ -2392,7 +2397,7 @@ async def clear_series_mru(
     _user: Annotated[dict, Depends(require_admin)],
 ):
     """Clear only the MRU for a series, keeping episode cache intact."""
-    transcoding.clear_series_mru(series_id)
+    ffmpeg_command.clear_series_mru(series_id)
     return {"ok": True}
 
 
