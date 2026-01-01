@@ -117,6 +117,22 @@ APP_DIR = pathlib.Path(__file__).parent
 TEMPLATES = Jinja2Templates(directory=APP_DIR / "templates")
 TEMPLATES.env.auto_reload = True
 
+# Super-resolution model path (compact model for real-time processing)
+SR_MODEL_PATH = pathlib.Path(
+    os.environ.get("SR_MODEL_PATH", pathlib.Path.home() / "ffmpeg_build/models/realesr-general-x4v3.pt")
+)
+
+# LibTorch library path for ffmpeg DNN backend
+LIBTORCH_LIB_PATH = os.environ.get(
+    "LIBTORCH_LIB_PATH",
+    str(pathlib.Path.home() / "research/.venv/lib/python3.12/site-packages/torch/lib")
+)
+
+
+def is_sr_available() -> bool:
+    """Check if super-resolution is available (model and libtorch exist)."""
+    return SR_MODEL_PATH.exists() and pathlib.Path(LIBTORCH_LIB_PATH).exists()
+
 # Thread locks for fetch operations
 _fetch_locks: dict[str, threading.Lock] = {
     "live": threading.Lock(),
@@ -132,8 +148,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Initialize EPG database
     epg_db.init(CACHE_DIR)
 
-    # Initialize transcoding module with settings callback
-    transcoding.init(load_server_settings)
+    # Initialize transcoding module with settings callback and SR config
+    transcoding.init(
+        load_server_settings,
+        sr_model_path=str(SR_MODEL_PATH) if is_sr_available() else "",
+        sr_libtorch_path=LIBTORCH_LIB_PATH if is_sr_available() else "",
+    )
 
     # Kill orphaned ffmpeg processes
     try:
@@ -1836,6 +1856,8 @@ async def settings_page(request: Request, user: Annotated[dict, Depends(require_
             "probe_live": server_settings.get("probe_live", True),
             "probe_movies": server_settings.get("probe_movies", True),
             "probe_series": server_settings.get("probe_series", False),
+            "sr_available": is_sr_available(),
+            "sr_mode": server_settings.get("sr_mode", "off"),
             "user_agent_preset": server_settings.get("user_agent_preset", "default"),
             "user_agent_custom": server_settings.get("user_agent_custom", ""),
             "available_encoders": AVAILABLE_ENCODERS,
@@ -2256,6 +2278,7 @@ async def settings_transcode(
     probe_live: Annotated[str | None, Form()] = None,
     probe_movies: Annotated[str | None, Form()] = None,
     probe_series: Annotated[str | None, Form()] = None,
+    sr_mode: Annotated[str, Form()] = "off",
 ):
     settings = load_server_settings()
     settings["transcode_mode"] = mode
@@ -2266,6 +2289,8 @@ async def settings_transcode(
     settings["probe_live"] = probe_live == "on"
     settings["probe_movies"] = probe_movies == "on"
     settings["probe_series"] = probe_series == "on"
+    if sr_mode in ("off", "enhance", "upscale_1080", "upscale_4k"):
+        settings["sr_mode"] = sr_mode
     save_server_settings(settings)
     return {"ok": True}
 

@@ -7,10 +7,17 @@ set -e
 BUILD_LIBAOM=${BUILD_LIBAOM:-0}
 BUILD_NV_HEADERS=${BUILD_NV_HEADERS:-1}
 
+# Enable LibTorch for DNN super-resolution
+# Set ENABLE_LIBTORCH=1 to enable. Will auto-detect existing PyTorch installation.
+ENABLE_LIBTORCH=${ENABLE_LIBTORCH:-0}
+
 # Build paths
 SRC_DIR="${SRC_DIR:-$HOME/ffmpeg_sources}"
 BUILD_DIR="${BUILD_DIR:-$HOME/ffmpeg_build}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+
+# LibTorch path - auto-detect from pip-installed PyTorch or use standalone
+LIBTORCH_DIR="${LIBTORCH_DIR:-}"
 
 NPROC=$(nproc)
 
@@ -118,6 +125,34 @@ if [ "$BUILD_NV_HEADERS" = "1" ]; then
   make PREFIX="$BUILD_DIR" install
 fi
 
+# LibTorch for DNN super-resolution
+if [ "$ENABLE_LIBTORCH" = "1" ]; then
+  if [ -n "$LIBTORCH_DIR" ]; then
+    # Use provided path
+    if [ ! -f "$LIBTORCH_DIR/lib/libtorch.so" ]; then
+      echo "Error: libtorch.so not found at $LIBTORCH_DIR/lib/"
+      exit 1
+    fi
+    echo "Using LibTorch at: $LIBTORCH_DIR"
+  else
+    # Download standalone LibTorch
+    LIBTORCH_DIR="$BUILD_DIR/libtorch"
+    LIBTORCH_VERSION="${LIBTORCH_VERSION:-2.5.1}"
+    LIBTORCH_CUDA="${LIBTORCH_CUDA:-cu124}"
+
+    if [ ! -f "$LIBTORCH_DIR/lib/libtorch.so" ]; then
+      echo "Downloading LibTorch ${LIBTORCH_VERSION} (${LIBTORCH_CUDA})..."
+      cd "$SRC_DIR"
+      LIBTORCH_URL="https://download.pytorch.org/libtorch/${LIBTORCH_CUDA}/libtorch-cxx11-abi-shared-with-deps-${LIBTORCH_VERSION}%2B${LIBTORCH_CUDA}.zip"
+      wget -q --show-progress -O "libtorch.zip" "$LIBTORCH_URL"
+      echo "Extracting..."
+      unzip -q -o "libtorch.zip" -d "$BUILD_DIR"
+      rm "libtorch.zip"
+    fi
+    echo "Using LibTorch at: $LIBTORCH_DIR"
+  fi
+fi
+
 # CUDA flags (always enabled since we install CUDA packages)
 CUDA_FLAGS="--enable-cuda-nvcc --enable-nvenc --enable-cuvid"
 NVCC_GENCODE=""
@@ -138,18 +173,46 @@ if [ ! -d "ffmpeg" ]; then
   wget -O ffmpeg-snapshot.tar.bz2 https://ffmpeg.org/releases/ffmpeg-snapshot.tar.bz2 && \
   tar xjvf ffmpeg-snapshot.tar.bz2
 fi
-cd ffmpeg && \
+cd ffmpeg
+
+# Patch for PyTorch 2.9+ API compatibility (initXPU -> init)
+if [ "$ENABLE_LIBTORCH" = "1" ] && grep -q "initXPU()" libavfilter/dnn/dnn_backend_torch.cpp 2>/dev/null; then
+  # Check PyTorch version from version.py
+  TORCH_VERSION=$(grep -oP "__version__ = '\K[0-9]+\.[0-9]+" "$LIBTORCH_DIR/version.py" 2>/dev/null || echo "0.0")
+  TORCH_MAJOR=$(echo "$TORCH_VERSION" | cut -d. -f1)
+  TORCH_MINOR=$(echo "$TORCH_VERSION" | cut -d. -f2)
+  if [ "$TORCH_MAJOR" -ge 2 ] && [ "$TORCH_MINOR" -ge 9 ] 2>/dev/null; then
+    echo "Detected PyTorch $TORCH_VERSION - patching dnn_backend_torch.cpp for API compatibility..."
+    sed -i 's/initXPU()/init()/' libavfilter/dnn/dnn_backend_torch.cpp
+  fi
+fi
 # Build configure flags
 EXTRA_CFLAGS="-I$BUILD_DIR/include -I/usr/local/cuda/include -O3 -march=native -mtune=native"
 EXTRA_LDFLAGS="-L$BUILD_DIR/lib -L/usr/local/cuda/lib64 -s"
+EXTRA_LIBS="-lpthread -lm"
+
+# Add LibTorch paths if enabled
+LIBTORCH_FLAGS=""
+EXTRA_CXXFLAGS=""
+if [ "$ENABLE_LIBTORCH" = "1" ] && [ -d "$LIBTORCH_DIR" ]; then
+  echo "Configuring ffmpeg with LibTorch support..."
+  LIBTORCH_INCLUDES="-I$LIBTORCH_DIR/include -I$LIBTORCH_DIR/include/torch/csrc/api/include"
+  EXTRA_CFLAGS="$EXTRA_CFLAGS $LIBTORCH_INCLUDES"
+  EXTRA_CXXFLAGS="$LIBTORCH_INCLUDES"
+  EXTRA_LDFLAGS="$EXTRA_LDFLAGS -L$LIBTORCH_DIR/lib"
+  LIBTORCH_FLAGS="--enable-libtorch"
+  # LibTorch needs these at runtime
+  export LD_LIBRARY_PATH="$LIBTORCH_DIR/lib:$LD_LIBRARY_PATH"
+fi
 
 CONFIGURE_CMD=(
   ./configure
   --prefix="$BUILD_DIR"
   --pkg-config-flags="--static"
   --extra-cflags="$EXTRA_CFLAGS"
+  --extra-cxxflags="$EXTRA_CXXFLAGS"
   --extra-ldflags="$EXTRA_LDFLAGS"
-  --extra-libs="-lpthread -lm"
+  --extra-libs="$EXTRA_LIBS"
   --ld="g++"
   --bindir="$BIN_DIR"
   --enable-gpl
@@ -177,6 +240,7 @@ CONFIGURE_CMD=(
   --enable-libvpl
   --enable-nonfree
   $CUDA_FLAGS
+  $LIBTORCH_FLAGS
 )
 
 if [ -n "$NVCC_GENCODE" ]; then
@@ -190,8 +254,35 @@ hash -r
 
 grep -q "$BUILD_DIR/share/man" "$HOME/.manpath" 2>/dev/null || echo "MANPATH_MAP $BIN_DIR $BUILD_DIR/share/man" >> "$HOME/.manpath"
 
+# If LibTorch was enabled, set up environment and print instructions
+if [ "$ENABLE_LIBTORCH" = "1" ] && [ -d "$LIBTORCH_DIR" ]; then
+  # Add to shell profile if not already present
+  LIBTORCH_ENV="export LD_LIBRARY_PATH=\"$LIBTORCH_DIR/lib:\$LD_LIBRARY_PATH\""
+  if ! grep -q "libtorch" "$HOME/.bashrc" 2>/dev/null; then
+    echo "" >> "$HOME/.bashrc"
+    echo "# LibTorch for ffmpeg DNN super-resolution" >> "$HOME/.bashrc"
+    echo "$LIBTORCH_ENV" >> "$HOME/.bashrc"
+  fi
+
+  echo ""
+  echo "============================================"
+  echo "LibTorch enabled! To use super-resolution:"
+  echo "============================================"
+  echo ""
+  echo "1. Reload your shell or run:"
+  echo "   $LIBTORCH_ENV"
+  echo ""
+  echo "2. Download/convert an SR model (e.g., Real-ESRGAN):"
+  echo "   See: tools/download-sr-models.sh"
+  echo ""
+  echo "3. Use with ffmpeg:"
+  echo "   ffmpeg -i input.mp4 -vf \"dnn_processing=dnn_backend=torch:model=realesrgan_x2.pt\" output.mp4"
+  echo ""
+fi
+
+# Cleanup notes:
 # rm -rf ~/ffmpeg_build ~/.local/bin/{ffmpeg,ffprobe,ffplay,x264,x265}
 # sed -i '/ffmpeg_build/d' ~/.manpath
+# sed -i '/libtorch/d' ~/.bashrc
 # hash -r
-# --extra-cflags="-D_GNU_SOURCE"
-# cat ~/ffmpeg_sources/ffmpeg/ffbuild/config.log
+# Debug: cat ~/ffmpeg_sources/ffmpeg/ffbuild/config.log

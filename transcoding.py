@@ -87,6 +87,22 @@ _USER_AGENT_PRESETS = {
     "tivimate": "TiviMate/4.7.0",
 }
 
+# Super-resolution configuration (set by init())
+_sr_model_path: str = ""
+_sr_libtorch_path: str = ""
+
+
+def _get_ffmpeg_env() -> dict[str, str] | None:
+    """Get environment for ffmpeg subprocess, including libtorch path if needed."""
+    if not _sr_libtorch_path:
+        return None
+    import os
+    env = os.environ.copy()
+    ld_path = env.get("LD_LIBRARY_PATH", "")
+    if _sr_libtorch_path not in ld_path:
+        env["LD_LIBRARY_PATH"] = f"{_sr_libtorch_path}:{ld_path}" if ld_path else _sr_libtorch_path
+    return env
+
 
 def get_user_agent() -> str | None:
     """Get user-agent string from settings, or None to use FFmpeg default."""
@@ -228,10 +244,18 @@ def _save_series_probe_cache() -> None:
         log.warning("Failed to save series probe cache: %s", e)
 
 
-def init(load_settings: Callable[[], dict[str, Any]]) -> None:
-    global _load_settings
+def init(
+    load_settings: Callable[[], dict[str, Any]],
+    sr_model_path: str = "",
+    sr_libtorch_path: str = "",
+) -> None:
+    global _load_settings, _sr_model_path, _sr_libtorch_path
     _load_settings = load_settings
+    _sr_model_path = sr_model_path
+    _sr_libtorch_path = sr_libtorch_path
     _load_series_probe_cache()
+    if _sr_model_path and _sr_libtorch_path:
+        log.info("SR enabled: model=%s", _sr_model_path)
 
 
 def shutdown() -> None:
@@ -596,6 +620,38 @@ _QUALITY_CRF: dict[str, int] = {
 }
 
 
+def _build_sr_filter(sr_mode: str, source_height: int, target_height: int) -> str:
+    """Build SR filter string if needed. Returns empty string if no SR."""
+    if not _sr_model_path or sr_mode == "off":
+        return ""
+
+    # Determine if SR should be applied based on mode and source resolution
+    # SR model is 4x upscale, so we upscale then use Area to scale to target
+    apply_sr = False
+
+    if sr_mode == "enhance":
+        # Always apply SR for enhancement (cleanup/sharpen), then scale back
+        apply_sr = True
+    elif sr_mode == "upscale_1080":
+        # Apply SR if source is below 1080p
+        apply_sr = source_height < 1080
+    elif sr_mode == "upscale_4k":
+        # Apply SR if source is below 4K
+        apply_sr = source_height < 2160
+
+    if not apply_sr:
+        return ""
+
+    # Build SR filter chain:
+    # 1. Convert to RGB (model expects 3-channel RGB input)
+    # 2. Apply SR via dnn_processing (outputs 4x resolution)
+    # 3. Scale to target using Area algorithm (best for downscaling)
+    sr_filter = f"format=rgb24,dnn_processing=dnn_backend=torch:model={_sr_model_path}"
+    if target_height:
+        sr_filter += f",scale=-2:{target_height}:flags=area"
+    return sr_filter
+
+
 def _build_video_args(
     *,
     copy_video: bool,
@@ -604,18 +660,24 @@ def _build_video_args(
     use_hw_pipeline: bool,
     max_resolution: str,
     quality: str,
+    sr_mode: str = "off",
+    source_height: int = 0,
 ) -> tuple[list[str], list[str]]:
     """Build video args. Returns (pre_input_args, post_input_args)."""
     if copy_video:
         return [], ["-c:v", "copy"]
 
-    # Height expr for scale filter (scale down only, -2 keeps width divisible by 2)
     max_h = _MAX_RES_HEIGHT.get(max_resolution)
-    h = f"'min(ih,{max_h})'" if max_h else None
     qp = _QUALITY_QP.get(quality, 28)
 
+    # Check if SR should be applied (VOD only, NVIDIA only for now)
+    sr_filter = ""
+    if sr_mode != "off" and hw == "nvidia" and _sr_model_path:
+        sr_filter = _build_sr_filter(sr_mode, source_height, max_h or 0)
+
     if hw == "nvidia":
-        if use_hw_pipeline:
+        if use_hw_pipeline and not sr_filter:
+            # Full GPU pipeline (no SR)
             pre = [
                 "-hwaccel",
                 "cuda",
@@ -624,14 +686,24 @@ def _build_video_args(
                 "-extra_hw_frames",
                 "3",
             ]
+            h = f"'min(ih,{max_h})'" if max_h else None
             scale = f"scale_cuda=-2:{h}:format=nv12" if h else "scale_cuda=format=nv12"
             vf = f"yadif_cuda=1,{scale}" if deinterlace else scale
         else:
+            # Software pipeline for SR (SR runs on GPU via torch but needs CPU frames)
             pre = []
+            filters = []
             if deinterlace:
-                vf = f"yadif=1,scale=-2:{h}" if h else "yadif=1"
+                filters.append("yadif=1")
+            if sr_filter:
+                # SR includes scaling, so just append it
+                filters.append(sr_filter)
             else:
-                vf = f"scale=-2:{h},format=nv12" if h else "format=nv12"
+                # No SR - just scale
+                if max_h:
+                    filters.append(f"scale=-2:'min(ih,{max_h})'")
+            filters.append("format=nv12")
+            vf = ",".join(filters)
         preset = "p4" if deinterlace else "p2"
         encoder = "h264_nvenc"
         enc_opts = ["-preset", preset, "-rc", "constqp", "-qp", str(qp)]
@@ -645,6 +717,7 @@ def _build_video_args(
             "-hwaccel_device",
             "/dev/dri/renderD128",
         ]
+        h = f"'min(ih,{max_h})'" if max_h else None
         scale = f"scale_vaapi=w=-2:h={h}:format=nv12" if h else "scale_vaapi=format=nv12"
         vf = f"deinterlace_vaapi,{scale}" if deinterlace else scale
         encoder = "h264_vaapi"
@@ -652,6 +725,7 @@ def _build_video_args(
 
     elif hw == "intel":
         pre = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+        h = f"'min(ih,{max_h})'" if max_h else None
         scale = f"scale_qsv=w=-2:h={h}:format=nv12" if h else "scale_qsv=format=nv12"
         vf = f"vpp_qsv=deinterlace=2,{scale}" if deinterlace else scale
         encoder = "h264_qsv"
@@ -659,10 +733,16 @@ def _build_video_args(
 
     elif hw == "software":
         pre = []
+        filters = []
         if deinterlace:
-            vf = f"yadif=1,scale=-2:{h}" if h else "yadif=1"
+            filters.append("yadif=1")
+        if sr_filter:
+            filters.append(sr_filter)
         else:
-            vf = f"scale=-2:{h},format=yuv420p" if h else "format=yuv420p"
+            if max_h:
+                filters.append(f"scale=-2:'min(ih,{max_h})'")
+        filters.append("format=yuv420p")
+        vf = ",".join(filters)
         crf = _QUALITY_CRF.get(quality, 26)
         encoder = "libx264"
         enc_opts = ["-preset", "veryfast", "-crf", str(crf)]
@@ -693,16 +773,22 @@ def build_hls_ffmpeg_cmd(
     quality: str = "high",
     user_agent: str | None = None,
     deinterlace_fallback: bool | None = None,
+    sr_mode: str = "off",
 ) -> list[str]:
     # Check if we can copy streams directly (VOD with compatible codecs)
     max_h = _MAX_RES_HEIGHT.get(max_resolution, 9999)
     needs_scale = media_info and media_info.height > max_h
+
+    # SR requires re-encode (can't copy video when SR is active)
+    sr_active = is_vod and sr_mode != "off" and _sr_model_path
+
     copy_video = bool(
         is_vod
         and media_info
         and media_info.video_codec == "h264"
         and media_info.pix_fmt == "yuv420p"
         and not needs_scale
+        and not sr_active
     )
     copy_audio = bool(
         is_vod
@@ -712,9 +798,10 @@ def build_hls_ffmpeg_cmd(
         and media_info.audio_sample_rate in (44100, 48000)
     )
 
-    # Full hardware pipeline if GPU supports the codec
+    # Full hardware pipeline if GPU supports the codec (disabled when SR is active)
     use_hw_pipeline = bool(
         not copy_video
+        and not sr_active
         and hw in ("nvidia", "intel", "vaapi")
         and (hw != "nvidia" or (media_info and media_info.video_codec in _get_gpu_nvdec_codecs()))
     )
@@ -732,6 +819,8 @@ def build_hls_ffmpeg_cmd(
         use_hw_pipeline=use_hw_pipeline,
         max_resolution=max_resolution,
         quality=quality,
+        sr_mode=sr_mode if is_vod else "off",
+        source_height=media_info.height if media_info else 0,
     )
     audio_args = _build_audio_args(
         copy_audio=copy_audio,
@@ -1238,6 +1327,7 @@ async def _handle_existing_vod_session(
     do_probe: bool,
     max_resolution: str = "1080p",
     quality: str = "high",
+    sr_mode: str = "off",
 ) -> dict[str, Any] | None:
     """Handle existing VOD session: reuse active, return cached, or append.
 
@@ -1293,6 +1383,7 @@ async def _handle_existing_vod_session(
         max_resolution,
         quality,
         get_user_agent(),
+        sr_mode=sr_mode,
     )
 
     i_idx = cmd.index("-i")
@@ -1310,6 +1401,7 @@ async def _handle_existing_vod_session(
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_get_ffmpeg_env(),
     )
     if not _update_session_process(existing_id, process):
         _kill_process(process)
@@ -1371,6 +1463,7 @@ async def _do_start_transcode(
     hw = settings.get("transcode_hw", "software")
     max_resolution = settings.get("max_resolution", "1080p")
     quality = settings.get("quality", "high")
+    sr_mode = settings.get("sr_mode", "off")
     is_vod = content_type in ("movie", "series")
     probe_key = {"movie": "probe_movies", "series": "probe_series", "live": "probe_live"}
     do_probe = settings.get(probe_key.get(content_type, ""), False)
@@ -1421,6 +1514,7 @@ async def _do_start_transcode(
         quality,
         get_user_agent(),
         deinterlace_fallback,
+        sr_mode=sr_mode if is_vod else "off",
     )
     if old_seek_offset > 0:
         i_idx = cmd.index("-i")
@@ -1440,6 +1534,7 @@ async def _do_start_transcode(
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_get_ffmpeg_env(),
     )
 
     stderr_lines: list[str] = []
@@ -1558,6 +1653,7 @@ async def _start_transcode(
             hw = settings.get("transcode_hw", "software")
             max_resolution = settings.get("max_resolution", "1080p")
             quality = settings.get("quality", "high")
+            sr_mode = settings.get("sr_mode", "off")
             probe_key = {"movie": "probe_movies", "series": "probe_series"}
             do_probe = settings.get(probe_key.get(content_type, ""), False)
             result = await _handle_existing_vod_session(
@@ -1567,6 +1663,7 @@ async def _start_transcode(
                 do_probe,
                 max_resolution,
                 quality,
+                sr_mode,
             )
             if result:
                 return result
@@ -1684,6 +1781,7 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
     hw = settings.get("transcode_hw", "software")
     max_resolution = settings.get("max_resolution", "1080p")
     quality = settings.get("quality", "high")
+    sr_mode = settings.get("sr_mode", "off")
     segment_num = int(seek_time / _HLS_SEGMENT_DURATION_SEC)
 
     # Kill existing process
@@ -1725,6 +1823,7 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
         max_resolution,
         quality,
         get_user_agent(),
+        sr_mode=sr_mode,
     )
     i_idx = cmd.index("-i")
     cmd.insert(i_idx, str(seek_time))
@@ -1749,6 +1848,7 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_get_ffmpeg_env(),
     )
 
     if not _update_seek_session(

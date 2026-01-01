@@ -446,6 +446,34 @@
                class="setting-input w-32 px-3 py-2 bg-gray-700 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm">
         <p class="text-xs text-gray-400 mt-1">Keep transcoded VOD for reuse (0 = disabled)</p>
       </div>
+      {% if sr_available %}
+      <div>
+        <label class="block text-sm font-medium mb-2">Super Resolution (VOD only)</label>
+        <div class="flex gap-4 flex-wrap">
+          <label class="flex items-center gap-2 text-sm">
+            <input type="radio" name="sr_mode" value="off" {% if sr_mode == 'off' or not sr_mode %}checked{% endif %}
+                   class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
+            <span>Off</span>
+          </label>
+          <label class="flex items-center gap-2 text-sm">
+            <input type="radio" name="sr_mode" value="enhance" {% if sr_mode == 'enhance' %}checked{% endif %}
+                   class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
+            <span>Enhance (1080p→1080p)</span>
+          </label>
+          <label class="flex items-center gap-2 text-sm">
+            <input type="radio" name="sr_mode" value="upscale_1080" {% if sr_mode == 'upscale_1080' %}checked{% endif %}
+                   class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
+            <span>Upscale to 1080p</span>
+          </label>
+          <label class="flex items-center gap-2 text-sm">
+            <input type="radio" name="sr_mode" value="upscale_4k" {% if sr_mode == 'upscale_4k' %}checked{% endif %}
+                   class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
+            <span>Upscale to 4K</span>
+          </label>
+        </div>
+        <p class="text-xs text-gray-400 mt-1">AI upscaling via Real-ESRGAN. Very slow - results are cached.</p>
+      </div>
+      {% endif %}
     </div>
   </div>
 
