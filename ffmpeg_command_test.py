@@ -393,7 +393,8 @@ class TestAspectRatioHandling:
         )
         vf = cmd[cmd.index("-vf") + 1]
         max_h = _MAX_RES_HEIGHT.get(max_res, 9999)
-        height_expr = f"min(ih,{max_h})"
+        # Comma is escaped in FFmpeg filter expressions
+        height_expr = f"min(ih\\,{max_h})"
         assert height_expr in vf, f"Expected {height_expr} in {vf}"
 
 

@@ -240,10 +240,14 @@ def _load_series_probe_cache() -> None:
                     eid = int(eid_str)
                     if eid in _series_probe_cache[sid]["episodes"]:
                         continue
+                    # Use .get() for all fields to handle corrupt/incomplete cache
+                    video_codec = entry.get("video_codec", "")
+                    if not video_codec:
+                        continue  # Skip entries without video codec
                     media_info = MediaInfo(
-                        video_codec=entry["video_codec"],
-                        audio_codec=entry["audio_codec"],
-                        pix_fmt=entry["pix_fmt"],
+                        video_codec=video_codec,
+                        audio_codec=entry.get("audio_codec", ""),
+                        pix_fmt=entry.get("pix_fmt", ""),
                         audio_channels=entry.get("audio_channels", 0),
                         audio_sample_rate=entry.get("audio_sample_rate", 0),
                         subtitle_codecs=entry.get("subtitle_codecs"),
@@ -296,6 +300,7 @@ def _save_series_probe_cache() -> None:
                     "subtitles": [{"index": s.index, "lang": s.lang, "name": s.name} for s in subs],
                 }
     try:
+        _SERIES_PROBE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _SERIES_PROBE_CACHE_FILE.write_text(json.dumps(data, indent=2))
     except Exception as e:
         log.warning("Failed to save series probe cache: %s", e)
@@ -636,7 +641,7 @@ def _build_video_args(
 
     # Height expr for scale filter (scale down only, -2 keeps width divisible by 2)
     max_h = _MAX_RES_HEIGHT.get(max_resolution)
-    h = f"'min(ih,{max_h})'" if max_h else None
+    h = f"min(ih\\,{max_h})" if max_h else None
     qp = _QUALITY_QP.get(quality, 28)
 
     if hw == "nvidia":
@@ -662,23 +667,43 @@ def _build_video_args(
         enc_opts = ["-preset", preset, "-rc", "constqp", "-qp", str(qp)]
 
     elif hw == "vaapi":
-        pre = [
-            "-hwaccel",
-            "vaapi",
-            "-hwaccel_output_format",
-            "vaapi",
-            "-hwaccel_device",
-            "/dev/dri/renderD128",
-        ]
-        scale = f"scale_vaapi=w=-2:h={h}:format=nv12" if h else "scale_vaapi=format=nv12"
-        vf = f"deinterlace_vaapi,{scale}" if deinterlace else scale
+        if use_hw_pipeline:
+            pre = [
+                "-hwaccel",
+                "vaapi",
+                "-hwaccel_output_format",
+                "vaapi",
+                "-hwaccel_device",
+                "/dev/dri/renderD128",
+            ]
+            scale = f"scale_vaapi=w=-2:h={h}:format=nv12" if h else "scale_vaapi=format=nv12"
+            vf = f"deinterlace_vaapi,{scale}" if deinterlace else scale
+        else:
+            # Software decode, upload to GPU for encoding
+            pre = ["-vaapi_device", "/dev/dri/renderD128"]
+            if deinterlace:
+                vf = (
+                    f"yadif=1,scale=-2:{h},format=nv12,hwupload"
+                    if h
+                    else "yadif=1,format=nv12,hwupload"
+                )
+            else:
+                vf = f"scale=-2:{h},format=nv12,hwupload" if h else "format=nv12,hwupload"
         encoder = "h264_vaapi"
         enc_opts = ["-rc_mode", "CQP", "-qp", str(qp)]
 
     elif hw == "intel":
-        pre = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
-        scale = f"scale_qsv=w=-2:h={h}:format=nv12" if h else "scale_qsv=format=nv12"
-        vf = f"vpp_qsv=deinterlace=2,{scale}" if deinterlace else scale
+        if use_hw_pipeline:
+            pre = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+            scale = f"scale_qsv=w=-2:h={h}:format=nv12" if h else "scale_qsv=format=nv12"
+            vf = f"vpp_qsv=deinterlace=2,{scale}" if deinterlace else scale
+        else:
+            # Software decode, QSV encode (encoder handles upload)
+            pre = []
+            if deinterlace:
+                vf = f"yadif=1,scale=-2:{h}" if h else "yadif=1"
+            else:
+                vf = f"scale=-2:{h},format=nv12" if h else "format=nv12"
         encoder = "h264_qsv"
         enc_opts = ["-preset", "medium", "-global_quality", str(qp)]
 
@@ -749,7 +774,7 @@ def build_hls_ffmpeg_cmd(
 
     # Full hardware pipeline if GPU supports the codec
     codec = media_info.video_codec if media_info else ""
-    use_hw_pipeline = (
+    use_hw_pipeline = bool(
         not copy_video
         and media_info
         and (

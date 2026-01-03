@@ -350,7 +350,7 @@ def cleanup_and_recover_sessions() -> None:
                     "started": info.get("started", mtime),
                     "url": url,
                     "is_vod": True,
-                    "last_access": mtime,
+                    "last_access": now,  # Use current time, not mtime, to avoid immediate expiration
                     "subtitles": info.get("subtitles") or info.get("subtitle_indices"),
                     "duration": info.get("duration", 0),
                     "seek_offset": new_seek,
@@ -454,7 +454,10 @@ async def _monitor_resume_ffmpeg(
             log.info("Resume failed quickly, invalidating session %s", session_id)
             with _transcode_lock:
                 _url_to_session.pop(url, None)
-                _transcode_sessions.pop(session_id, None)
+                session = _transcode_sessions.pop(session_id, None)
+            # Clean up output directory
+            if session:
+                shutil.rmtree(session["dir"], ignore_errors=True)
 
 
 async def _monitor_seek_ffmpeg(
@@ -691,7 +694,7 @@ async def _handle_existing_vod_session(
     # Case 3: Dead session with seek_offset - return cached content
     if snap.seek_offset > 0:
         log.info(
-            "Returning cached session %s (seek_offset=%d)",
+            "Returning cached session %s (seek_offset=%.1f)",
             existing_id,
             snap.seek_offset,
         )
@@ -701,7 +704,7 @@ async def _handle_existing_vod_session(
     hls_duration = _calc_hls_duration(playlist_path, len(segments))
     log.info("Resuming session %s from %.1fs", existing_id, hls_duration)
 
-    media_info = probe_media(url)[0] if do_probe else None
+    media_info = (await asyncio.to_thread(probe_media, url))[0] if do_probe else None
     cmd = build_hls_ffmpeg_cmd(
         url,
         hw,
@@ -1181,7 +1184,17 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
     # Use probe_series if series_id, else probe_movies
     probe_setting = "probe_series" if info.series_id else "probe_movies"
     do_probe = settings.get(probe_setting, False)
-    media_info = probe_media(info.url, info.series_id, info.episode_id)[0] if do_probe else None
+    if do_probe:
+        media_info = (
+            await asyncio.to_thread(
+                probe_media,
+                info.url,
+                info.series_id,
+                info.episode_id,
+            )
+        )[0]
+    else:
+        media_info = None
 
     subtitles: list[SubtitleStream] = []
     for s in info.subtitles:
