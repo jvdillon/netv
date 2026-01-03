@@ -57,7 +57,7 @@ users who find them overkill and just want a simple IPTV player.
 | **Stream limits** | ✅ Per-user, per-source | ❌ | ⚠️ Per-user | ⚠️ Per-user | ⚠️ Per-user |
 | **Library permissions** | N/A | N/A | ✅ Per-library | ✅ Per-library | ✅ Per-library |
 | **Favorites** | ✅ Drag-and-drop | ✅ | ✅ | ✅ | ✅ |
-| **Search** | ✅ Regex | ⚠️ Basic | ⚠️ Basic | ⚠️ Basic | ⚠️ Basic |
+| **Search** | ✅ Regex | ✅ Basic | ✅ Basic | ✅ Basic | ✅ Basic |
 | **Video transcoding** | ✅ | ❌ | ✅ | ✅ | ✅ |
 | **Audio transcoding** | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Transcode only if needed** | ✅ Auto mode | ❌ | ⚠️ Per-library | ⚠️ Per-library | ⚠️ Per-client |
