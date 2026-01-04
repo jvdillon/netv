@@ -1,17 +1,21 @@
 # Docker Compose for neTV
 #
-# Usage:
+# Build:
+#   docker compose build                              # Default (optimized FFmpeg)
+#   FFMPEG_IMAGE=ubuntu:24.04 docker compose build    # Alternative (apt FFmpeg)
+#
+# Run:
 #   docker compose up -d                    # Auto-detects hardware (Intel/AMD)
 #   docker compose --profile nvidia up -d   # NVIDIA GPU
 #
 # No GPU or /dev/dri? Comment out the 'devices' section below.
-#
-# Build:
-#   docker compose build              # First build takes ~15-20 min
 
 services:
   netv:
-    build: .
+    build:
+      context: .
+      args:
+        FFMPEG_IMAGE: ${FFMPEG_IMAGE:-ghcr.io/jvdillon/netv-ffmpeg:latest}
     image: netv
     container_name: netv
     ports:

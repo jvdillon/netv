@@ -1,28 +1,30 @@
 # netv application image
-# Uses pre-built FFmpeg base image for fast builds (~2 min vs 15 min)
 #
-# The FFmpeg base image is built daily with:
+# Default build uses pre-built FFmpeg with full hardware support:
+#   docker compose build
+#
+# Alternative: use apt FFmpeg (fewer codecs, no NVENC/QSV):
+#   FFMPEG_IMAGE=ubuntu:24.04 docker compose build
+#
+# The optimized FFmpeg base image includes:
 # - NVENC (NVIDIA hardware encoding)
 # - VAAPI (Intel/AMD hardware encoding)
 # - QSV/VPL (Intel QuickSync)
 # - All major codecs (x264, x265, VP9, AV1, etc.)
-#
-# For local builds, set FFMPEG_IMAGE:
-#   docker build --build-arg FFMPEG_IMAGE=ghcr.io/jvdillon/netv-ffmpeg:latest .
-#
-# To use a specific date's snapshot:
-#   docker build --build-arg FFMPEG_IMAGE=ghcr.io/jvdillon/netv-ffmpeg:2026-01-04 .
 
-ARG FFMPEG_IMAGE
+ARG FFMPEG_IMAGE=ghcr.io/jvdillon/netv-ffmpeg:latest
 FROM ${FFMPEG_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install Python (not included in FFmpeg base image)
+# Install dependencies
+# - If using apt ffmpeg (ubuntu base): install ffmpeg + python
+# - If using compiled ffmpeg (netv-ffmpeg base): ffmpeg already present, just install python
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gosu \
     python3 \
     python3-pip \
+    $(if [ ! -f /usr/local/bin/ffmpeg ]; then echo "ffmpeg"; fi) \
     && rm -rf /var/lib/apt/lists/*
 
 # App setup
