@@ -131,6 +131,17 @@ def _logo_url_filter(url: str) -> str:
 
 TEMPLATES.env.filters["logo_url"] = _logo_url_filter
 
+
+def _safe_float(value: float | str | None, default: float = 0.0) -> float:
+    """Safely convert value to float, returning default on failure."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
 # Thread locks for fetch operations
 _fetch_locks: dict[str, threading.Lock] = {
     "live": threading.Lock(),
@@ -863,7 +874,7 @@ async def vod_page(
     if sort == "alpha":
         streams.sort(key=lambda s: (s.get("name") or "").lower())
     elif sort == "rating":
-        streams.sort(key=lambda s: float(s.get("rating") or 0), reverse=True)
+        streams.sort(key=lambda s: _safe_float(s.get("rating")), reverse=True)
     elif sort == "newest":
         streams.sort(key=lambda s: int(s.get("added") or 0), reverse=True)
 
@@ -972,7 +983,7 @@ async def series_page(
     if sort == "alpha":
         series.sort(key=lambda s: (s.get("name") or "").lower())
     elif sort == "rating":
-        series.sort(key=lambda s: float(s.get("rating") or 0), reverse=True)
+        series.sort(key=lambda s: _safe_float(s.get("rating")), reverse=True)
     elif sort == "newest":
         series.sort(key=lambda s: int(s.get("last_modified") or 0), reverse=True)
 
