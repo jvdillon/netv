@@ -1098,9 +1098,12 @@ async def movie_detail_page(
 
     # Fetch detailed movie info
     if movie:
-        xtream = get_first_xtream_client()
+        source_id = movie.get("source_id", "")
+        xtream = get_xtream_client_by_source(source_id) if source_id else None
+        if not xtream:
+            xtream = get_first_xtream_client()
         if xtream:
-            cache_key = f"vod_info_{stream_id}"
+            cache_key = f"vod_info_{source_id}_{stream_id}" if source_id else f"vod_info_{stream_id}"
             try:
                 vod_info = await asyncio.to_thread(
                     get_cached_info, cache_key, lambda: xtream.get_vod_info(stream_id)
