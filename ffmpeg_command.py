@@ -114,6 +114,7 @@ class MediaInfo:
     pix_fmt: str
     audio_channels: int = 0
     audio_sample_rate: int = 0
+    audio_profile: str = ""  # e.g. "LC", "HE-AAC", "HE-AACv2"
     subtitle_codecs: list[str] | None = None
     duration: float = 0.0
     height: int = 0
@@ -526,7 +527,7 @@ def probe_media(
         log.warning("Failed to probe media: %s", e)
         return None, []
 
-    video_codec = audio_codec = pix_fmt = ""
+    video_codec = audio_codec = pix_fmt = audio_profile = ""
     audio_channels = audio_sample_rate = 0
     subtitle_codecs: list[str] = []
     subtitles: list[SubtitleStream] = []
@@ -551,6 +552,7 @@ def probe_media(
             audio_codec = codec
             audio_channels = stream.get("channels", 0)
             audio_sample_rate = int(stream.get("sample_rate", 0) or 0)
+            audio_profile = stream.get("profile", "")
         elif codec_type == "subtitle":
             subtitle_codecs.append(codec)
             if codec in TEXT_SUBTITLE_CODECS:
@@ -586,12 +588,17 @@ def probe_media(
         pix_fmt=pix_fmt,
         audio_channels=audio_channels,
         audio_sample_rate=audio_sample_rate,
+        audio_profile=audio_profile,
         subtitle_codecs=subtitle_codecs or None,
         duration=duration,
         height=height,
         video_bitrate=video_bitrate,
         interlaced=interlaced,
     )
+    # Only cache if we got valid video info (height > 0)
+    if height <= 0:
+        log.warning("Probe returned invalid height=%d, not caching: %s", height, url[:80])
+        return media_info, subtitles
     with _probe_lock:
         _probe_cache[url] = (time.time(), media_info, subtitles)
         # Cache by series_id/episode_id if provided
@@ -770,6 +777,8 @@ def build_hls_ffmpeg_cmd(
         and media_info.audio_codec == "aac"
         and media_info.audio_channels <= 2
         and media_info.audio_sample_rate in (44100, 48000)
+        # HE-AAC has browser compatibility issues - only copy LC-AAC
+        and "HE" not in media_info.audio_profile
     )
 
     # Full hardware pipeline if GPU supports the codec
