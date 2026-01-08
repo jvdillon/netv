@@ -84,6 +84,7 @@ APT_PACKAGES=(
     libsoxr-dev
     libsrt-openssl-dev
     libssl-dev
+    libzstd-dev
     libzimg-dev
     liblzma-dev
     liblzo2-dev
@@ -167,6 +168,45 @@ if [ "$BUILD_NVIDIA" = "1" ]; then
     fi
     echo "Using CUDA path: $CUDA_PATH"
 
+    # Patch CUDA headers for glibc 2.42+ compatibility (Ubuntu 25.04+)
+    # glibc 2.42 added rsqrt/rsqrtf to mathcalls.h which conflicts with CUDA's definitions
+    # This causes "exception specification is incompatible" errors during nvcc compilation
+    CUDA_MATH_HEADER="$CUDA_PATH/targets/x86_64-linux/include/crt/math_functions.h"
+    if [ -f "$CUDA_MATH_HEADER" ]; then
+        GLIBC_VERSION=$(ldd --version | head -1 | grep -oP '\d+\.\d+$')
+        GLIBC_MAJOR=$(echo "$GLIBC_VERSION" | cut -d. -f1)
+        GLIBC_MINOR=$(echo "$GLIBC_VERSION" | cut -d. -f2)
+
+        # Only patch if glibc >= 2.42 and patch not already applied
+        if [ "$GLIBC_MAJOR" -gt 2 ] || ([ "$GLIBC_MAJOR" -eq 2 ] && [ "$GLIBC_MINOR" -ge 42 ]); then
+            # Check for our patch OR NVIDIA's fix (they use __NV_GLIBC_PROVIDES_IEC_60559_FUNCS for similar issues)
+            if grep -q "rsqrt" "$CUDA_MATH_HEADER" && \
+               ! grep -B2 "double[[:space:]]*rsqrt(double" "$CUDA_MATH_HEADER" | grep -q "GLIBC"; then
+                echo "Patching CUDA headers for glibc $GLIBC_VERSION compatibility..."
+                # Backup original if no backup exists
+                [ ! -f "${CUDA_MATH_HEADER}.bak" ] && sudo cp "$CUDA_MATH_HEADER" "${CUDA_MATH_HEADER}.bak"
+                # Add guards around rsqrt declaration (prevent conflict with glibc's rsqrt)
+                sudo sed -i '/extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ double[[:space:]]*rsqrt(double/c\
+#if !(defined(__GLIBC__) \&\& __GLIBC_USE_IEC_60559_FUNCS_EXT_C23)\
+extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ double                 rsqrt(double x);\
+#endif' "$CUDA_MATH_HEADER"
+                # Add guards around rsqrtf declaration
+                sudo sed -i '/extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ float[[:space:]]*rsqrtf(float/c\
+#if !(defined(__GLIBC__) \&\& __GLIBC_USE_IEC_60559_FUNCS_EXT_C23)\
+extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ float                  rsqrtf(float x);\
+#endif' "$CUDA_MATH_HEADER"
+                # Verify patch was applied
+                if grep -B2 "double[[:space:]]*rsqrt(double" "$CUDA_MATH_HEADER" | grep -q "GLIBC"; then
+                    echo "CUDA header patched successfully"
+                else
+                    echo "Warning: CUDA header patch may have failed - rsqrt declaration not found" >&2
+                    echo "CUDA version may have different header format. Check $CUDA_MATH_HEADER" >&2
+                fi
+            else
+                echo "CUDA headers already patched for glibc compatibility"
+            fi
+        fi
+    fi
 
     CUDA_FLAGS=(--enable-cuda-nvcc --enable-nvenc --enable-cuvid)
 
