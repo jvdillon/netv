@@ -801,7 +801,9 @@ class TestProbeMedia:
             media_info, _ = probe_media(f"http://test/{color_transfer or 'unknown'}.mkv")
 
         assert media_info is not None
-        assert media_info.is_hdr is expected, f"color_transfer={color_transfer} should be is_hdr={expected}"
+        assert media_info.is_hdr is expected, (
+            f"color_transfer={color_transfer} should be is_hdr={expected}"
+        )
 
     def test_probe_failure(self):
         """Test probe failure returns None."""
