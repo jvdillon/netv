@@ -506,6 +506,8 @@ def load_server_settings() -> dict[str, Any]:
     data.setdefault("users", {})
     data.setdefault("user_agent_preset", "tivimate")
     data.setdefault("user_agent_custom", "")
+    data.setdefault("m3u_export_enabled", False)
+    data.setdefault("m3u_export_mode", "redirect")  # "redirect" or "proxy"
     return data
 
 

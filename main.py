@@ -95,6 +95,7 @@ import auth
 import epg
 import ffmpeg_command
 import ffmpeg_session
+import m3u_export
 
 
 log = logging.getLogger()
@@ -1784,6 +1785,99 @@ async def playlist_xspf(
 
 
 # =============================================================================
+# M3U export routes for external IPTV players (logic in m3u_export.py)
+# =============================================================================
+
+
+def _external_base_url(request: Request) -> str:
+    """Base URL as seen by the client (honors reverse proxy headers)."""
+    scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = (
+        request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or request.url.netloc
+    )
+    return f"{scheme}://{host}"
+
+
+def _require_export_auth(request: Request, username: str, password: str) -> None:
+    """Auth for export endpoints (credentials in URL, not cookies)."""
+    if not load_server_settings().get("m3u_export_enabled"):
+        raise HTTPException(404, "Not Found")
+    ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(ip)
+    if not m3u_export.verify_credentials(username, password):
+        _login_attempts.setdefault(ip, []).append(time.time())
+        raise HTTPException(401, "Invalid credentials")
+
+
+def _load_live_cats_and_streams() -> tuple[list[dict], list[dict]]:
+    """Load live categories and streams into cache (without EPG fetch)."""
+    if "live_streams" not in get_cache():
+        cats, streams, epg_urls = load_all_live_data()
+        with get_cache_lock():
+            get_cache()["live_categories"] = cats
+            get_cache()["live_streams"] = streams
+            get_cache()["epg_urls"] = epg_urls
+    return get_cache().get("live_categories", []), get_cache().get("live_streams", [])
+
+
+@app.get("/get.php")
+async def m3u_export_playlist(request: Request, username: str = "", password: str = ""):
+    """Xtream-style M3U playlist of the user's allowed live channels."""
+    _require_export_auth(request, username, password)
+    cats, streams = await asyncio.to_thread(_load_live_cats_and_streams)
+    streams = m3u_export.allowed_live_streams(streams, username)
+    content = m3u_export.build_playlist(
+        cats, streams, _external_base_url(request), username, password
+    )
+    return Response(
+        content=content,
+        media_type="audio/x-mpegurl",
+        headers={"Content-Disposition": 'attachment; filename="playlist.m3u"'},
+    )
+
+
+@app.get("/xmltv.php")
+async def m3u_export_xmltv(request: Request, username: str = "", password: str = ""):
+    """XMLTV guide for the user's allowed live channels."""
+    _require_export_auth(request, username, password)
+    _, streams = await asyncio.to_thread(_load_live_cats_and_streams)
+    streams = m3u_export.allowed_live_streams(streams, username)
+    content = await asyncio.to_thread(m3u_export.build_xmltv, streams)
+    return Response(content=content, media_type="application/xml")
+
+
+@app.get("/live/{username}/{password}/{stream_spec}")
+async def m3u_export_live(request: Request, username: str, password: str, stream_spec: str):
+    """Play a live channel from the exported playlist (redirect or proxy)."""
+    _require_export_auth(request, username, password)
+    stream_id = m3u_export.strip_stream_ext(stream_spec)
+    _, streams = await asyncio.to_thread(_load_live_cats_and_streams)
+    stream = next((s for s in streams if str(s.get("stream_id")) == stream_id), None)
+    if not stream:
+        raise HTTPException(404, "Channel not found")
+    user_limits = auth.get_user_limits(username)
+    if not m3u_export.stream_allowed(stream, set(user_limits.get("unavailable_groups", []))):
+        raise HTTPException(403, "Access to this channel is restricted")
+    url = m3u_export.upstream_url(stream)
+    if not url:
+        raise HTTPException(404, "Stream not found")
+    mode = load_server_settings().get("m3u_export_mode", "redirect")
+    # HLS direct URLs are always redirected: proxying them would require
+    # rewriting the segment URLs inside the playlist.
+    if mode != "proxy" or url.endswith(".m3u8"):
+        return RedirectResponse(url, status_code=302)
+    source_id = stream.get("source_id", "")
+    if not m3u_export.try_acquire_stream(username, source_id):
+        raise HTTPException(429, "Stream limit reached")
+    return StreamingResponse(
+        m3u_export.iter_proxy_stream(url, username, source_id),
+        media_type="video/mp2t",
+    )
+
+
+# =============================================================================
 # Transcoding routes (logic in ffmpeg_session.py)
 # =============================================================================
 
@@ -2120,6 +2214,9 @@ async def settings_page(request: Request, user: Annotated[dict, Depends(require_
             "probe_series": server_settings.get("probe_series", False),
             "user_agent_preset": server_settings.get("user_agent_preset", "default"),
             "user_agent_custom": server_settings.get("user_agent_custom", ""),
+            "m3u_export_enabled": server_settings.get("m3u_export_enabled", False),
+            "m3u_export_mode": server_settings.get("m3u_export_mode", "redirect"),
+            "external_base_url": _external_base_url(request),
             "available_encoders": AVAILABLE_ENCODERS,
             "sr_available": is_sr_available(),
             "sr_models": get_sr_models(),
@@ -2675,6 +2772,21 @@ async def settings_transcode(
     return {"ok": True}
 
 
+@app.post("/settings/m3u-export")
+async def settings_m3u_export(
+    _user: Annotated[dict, Depends(require_admin)],
+    m3u_export_enabled: Annotated[str | None, Form()] = None,
+    m3u_export_mode: Annotated[str, Form()] = "redirect",
+):
+    settings = load_server_settings()
+    settings["m3u_export_enabled"] = m3u_export_enabled == "on"
+    settings["m3u_export_mode"] = (
+        m3u_export_mode if m3u_export_mode in ("redirect", "proxy") else "redirect"
+    )
+    save_server_settings(settings)
+    return {"ok": True}
+
+
 @app.post("/settings/refresh-encoders")
 async def settings_refresh_encoders(
     _user: Annotated[dict, Depends(require_admin)],
@@ -2804,6 +2916,8 @@ async def update_settings_api(
         "probe_series",
         "vod_order",
         "series_order",
+        "m3u_export_enabled",
+        "m3u_export_mode",
     }
     settings = load_server_settings()
     for key in allowed_keys:
@@ -2855,6 +2969,7 @@ async def settings_delete_user(
         if not password or not auth.verify_password(username, password):
             raise HTTPException(400, "Password required to delete your own account")
         auth.delete_user(username)
+        m3u_export.clear_credential_cache(username)
         response = RedirectResponse("/login", status_code=303)
         response.delete_cookie("token")
         return response
@@ -2863,6 +2978,7 @@ async def settings_delete_user(
         raise HTTPException(403, "Admin access required")
     if not auth.delete_user(username):
         raise HTTPException(404, "User not found")
+    m3u_export.clear_credential_cache(username)
     return RedirectResponse("/settings", status_code=303)
 
 
@@ -2912,6 +3028,7 @@ async def settings_change_own_password(
         raise HTTPException(400, "Password must be at least 8 characters")
     if not auth.change_password(username, new_password):
         raise HTTPException(404, "User not found")
+    m3u_export.clear_credential_cache(username)
     return {"status": "ok"}
 
 
@@ -2929,6 +3046,7 @@ async def settings_change_password(
         raise HTTPException(400, "Password must be at least 8 characters")
     if not auth.change_password(target_user, new_password):
         raise HTTPException(404, "User not found")
+    m3u_export.clear_credential_cache(target_user)
     return {"status": "ok"}
 
 
