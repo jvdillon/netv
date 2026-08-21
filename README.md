@@ -160,6 +160,11 @@ docker compose up -d
 
 Open http://localhost:8000. To update: `docker compose pull && docker compose up -d`
 
+The `latest` image is published on tagged releases, on application changes
+merged to `main`, and when a maintainer triggers a rebuild manually. Scheduled
+FFmpeg base-image builds do not republish application images, so
+`docker compose pull` will not report an update every day.
+
 #### Optional: Nonfree (proprietary) FFMPEG optimized for Nvidia or AMD and/or Intel GPU
 
 We provide a custom built ffmpeg with Nvidia, AMD, and Intel _proprietary
