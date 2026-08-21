@@ -1,18 +1,14 @@
 name: AI Upscale Image
 
 on:
-  workflow_dispatch:  # Manual trigger
+  # Run manually when an FFmpeg base-image update should be published immediately.
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
       - "Dockerfile.ai_upscale"
       - "entrypoint-ai_upscale.sh"
       - ".github/workflows/ai-upscale.yml"
-  workflow_run:
-    # Also trigger after ffmpeg-base completes to pick up new ffmpeg image
-    workflows: ["FFmpeg Base Image"]
-    types: [completed]
-    branches: [main]
 
 env:
   REGISTRY: ghcr.io
@@ -21,8 +17,6 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Skip if triggered by failed ffmpeg workflow
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     permissions:
       contents: read
       packages: write
@@ -48,8 +42,6 @@ jobs:
           df -h
 
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

@@ -3,6 +3,7 @@ name: FFmpeg Base Image
 on:
   schedule:
     # Build daily at 3 AM UTC
+    # Application images are rebuilt separately on code changes or manual dispatch.
     - cron: "0 3 * * *"
   push:
     branches: [main]
