@@ -17,7 +17,7 @@ import threading
 import time
 
 # Import VAAPI auto-detection results (avoid circular import by importing constants only)
-from cache import AVAILABLE_ENCODERS, VAAPI_DEVICE
+from cache import AVAILABLE_ENCODERS, VAAPI_DEVICE, get_user_agent
 
 
 log = logging.getLogger(__name__)
@@ -52,13 +52,6 @@ TEXT_SUBTITLE_CODECS = {
     "mov_text",
     "webvtt",
     "srt",
-}
-
-# User-Agent presets
-_USER_AGENT_PRESETS = {
-    "vlc": "VLC/3.0.20 LibVLC/3.0.20",
-    "chrome": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "tivimate": "TiviMate/4.7.0",
 }
 
 # NVDEC capabilities by minimum compute capability
@@ -352,22 +345,6 @@ def _has_libplacebo_filter() -> bool:
     except Exception as e:
         log.debug("libplacebo probe failed: %s", e)
     return _has_libplacebo
-
-
-# ===========================================================================
-# User-Agent
-# ===========================================================================
-
-
-def get_user_agent() -> str | None:
-    """Get user-agent string from settings, or None to use FFmpeg default."""
-    settings = _load_settings()
-    preset = settings.get("user_agent_preset", "default")
-    if preset == "default":
-        return None
-    if preset == "custom":
-        return settings.get("user_agent_custom") or None
-    return _USER_AGENT_PRESETS.get(preset)
 
 
 # ===========================================================================

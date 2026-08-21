@@ -21,6 +21,8 @@ class XtreamClient:
     base_url: str
     username: str
     password: str
+    # Some providers reject API requests with an unexpected User-Agent (HTTP 403).
+    user_agent: str | None = None
 
     def __post_init__(self) -> None:
         # Normalize URL: strip trailing slashes
@@ -36,7 +38,7 @@ class XtreamClient:
         return f"{self.base_url}/player_api.php?{params}"
 
     def _fetch(self, url: str, timeout: int = 30) -> str:
-        with safe_urlopen(url, timeout=timeout) as resp:
+        with safe_urlopen(url, timeout=timeout, user_agent=self.user_agent) as resp:
             return resp.read().decode("utf-8")
 
     def _api(self, action: str | None = None, timeout: int = 30, **params: Any) -> Any:
