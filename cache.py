@@ -514,6 +514,24 @@ def save_server_settings(settings: dict[str, Any]) -> None:
     SERVER_SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
 
 
+USER_AGENT_PRESETS = {
+    "vlc": "VLC/3.0.20 LibVLC/3.0.20",
+    "chrome": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "tivimate": "TiviMate/4.7.0",
+}
+
+
+def get_user_agent() -> str | None:
+    """Get the configured User-Agent, or None for the caller's own default."""
+    settings = load_server_settings()
+    preset = settings.get("user_agent_preset", "default")
+    if preset == "default":
+        return None
+    if preset == "custom":
+        return settings.get("user_agent_custom") or None
+    return USER_AGENT_PRESETS.get(preset)
+
+
 def _validate_username(username: str) -> None:
     """Validate username to prevent path traversal and length attacks."""
     if (

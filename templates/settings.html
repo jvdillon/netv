@@ -612,7 +612,7 @@
   <!-- User-Agent -->
   <div id="user-agent" class="mb-8 p-4 bg-gray-800 rounded">
     <h3 class="text-xl font-semibold mb-4">User-Agent</h3>
-    <p class="text-sm text-gray-400 mb-4">HTTP User-Agent header sent when fetching streams. Only affects transcoding; passthrough uses the client's native user-agent.</p>
+    <p class="text-sm text-gray-400 mb-4">HTTP User-Agent header sent when fetching streams, channel lists, VOD/series metadata, and EPG. Some providers reject requests with an unexpected User-Agent (HTTP 403). Stream passthrough uses the client's native user-agent.</p>
     <div class="space-y-4" id="user-agent-settings">
       <div class="space-y-2">
         <label class="flex items-center gap-3 cursor-pointer text-sm">

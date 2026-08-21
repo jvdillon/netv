@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import json
 
 import pytest
+
+import cache
 
 
 @pytest.fixture
@@ -120,6 +126,27 @@ class TestFetchLocks:
     def test_get_refresh_in_progress(self, m3u_module):
         rip = m3u_module.get_refresh_in_progress()
         assert isinstance(rip, set)
+
+
+class TestMakeClientUserAgent:
+    """m3u fetches must use the configured User-Agent (issue #57)."""
+
+    def test_make_client_uses_persisted_user_agent(self, m3u_module):
+        source = SimpleNamespace(url="http://example.com", username="u", password="p")
+        cache.SERVER_SETTINGS_FILE.write_text(
+            json.dumps({"user_agent_preset": "custom", "user_agent_custom": "MyAgent/9.9"})
+        )
+        assert m3u_module._make_client(source).user_agent == "MyAgent/9.9"
+
+    def test_fetch_m3u_sends_user_agent(self, m3u_module):
+        cache.SERVER_SETTINGS_FILE.write_text(json.dumps({"user_agent_preset": "vlc"}))
+        resp = MagicMock()
+        resp.read.return_value = b"#EXTM3U\n"
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        with patch.object(m3u_module, "safe_urlopen", return_value=resp) as mock_open:
+            m3u_module.fetch_m3u("http://example.com/list.m3u", "src1")
+        assert mock_open.call_args.kwargs["user_agent"] == cache.USER_AGENT_PRESETS["vlc"]
 
 
 if __name__ == "__main__":

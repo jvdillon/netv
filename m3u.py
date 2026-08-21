@@ -16,6 +16,7 @@ from cache import (
     get_cache,
     get_cache_lock,
     get_sources,
+    get_user_agent,
     load_file_cache,
     save_file_cache,
     update_source_epg_url,
@@ -33,6 +34,13 @@ _fetch_locks: dict[str, threading.Lock] = {
     "series": threading.Lock(),
     "epg": threading.Lock(),
 }
+
+
+def _make_client(source: Any) -> XtreamClient:
+    """Build an Xtream client using the configured User-Agent."""
+    return XtreamClient(
+        source.url, source.username, source.password, user_agent=get_user_agent()
+    )
 
 
 def parse_m3u(content: str, source_id: str) -> tuple[list[dict], list[dict], str]:
@@ -101,7 +109,7 @@ def parse_m3u(content: str, source_id: str) -> tuple[list[dict], list[dict], str
 
 def fetch_m3u(url: str, source_id: str, timeout: int = 30) -> tuple[list[dict], list[dict], str]:
     """Fetch and parse M3U from URL, return (categories, streams, epg_url)."""
-    with safe_urlopen(url, timeout=timeout) as resp:
+    with safe_urlopen(url, timeout=timeout, user_agent=get_user_agent()) as resp:
         content = resp.read().decode("utf-8")
     return parse_m3u(content, source_id)
 
@@ -115,7 +123,7 @@ def _fetch_all_live_data() -> tuple[list[dict], list[dict], list[tuple[str, int,
     for source in get_sources():
         try:
             if source.type == "xtream":
-                client = XtreamClient(source.url, source.username, source.password)
+                client = _make_client(source)
                 cats = client.get_live_categories()
                 streams = client.get_live_streams()
                 for c in cats:
@@ -155,7 +163,7 @@ def fetch_source_live_data(source: Any) -> tuple[list[dict], list[dict], str | N
     epg_url: str | None = None
 
     if source.type == "xtream":
-        client = XtreamClient(source.url, source.username, source.password)
+        client = _make_client(source)
         cats = client.get_live_categories()
         streams = client.get_live_streams()
         for c in cats:
@@ -186,7 +194,7 @@ def fetch_source_vod_data(source: Any) -> tuple[list[dict], list[dict]]:
     """Fetch VOD data for a single Xtream source."""
     if source.type != "xtream":
         return [], []
-    client = XtreamClient(source.url, source.username, source.password)
+    client = _make_client(source)
     cats = client.get_vod_categories()
     streams = client.get_vod_streams()
     # Tag with source_id for playback
@@ -257,7 +265,7 @@ def _fetch_vod_data() -> tuple[list[dict], list[dict]]:
         if source.type != "xtream":
             continue
         try:
-            client = XtreamClient(source.url, source.username, source.password)
+            client = _make_client(source)
             cats = client.get_vod_categories()
             streams = client.get_vod_streams()
             # Tag with source_id for playback and access control
@@ -323,7 +331,7 @@ def _fetch_series_data() -> tuple[list[dict], list[dict]]:
         if source.type != "xtream":
             continue
         try:
-            client = XtreamClient(source.url, source.username, source.password)
+            client = _make_client(source)
             cats = client.get_series_categories()
             series = client.get_series()
             # Tag with source_id for playback and access control
@@ -385,7 +393,7 @@ def get_first_xtream_client() -> XtreamClient | None:
     """Get the first available Xtream client (for VOD/series)."""
     for source in get_sources():
         if source.type == "xtream":
-            return XtreamClient(source.url, source.username, source.password)
+            return _make_client(source)
     return None
 
 
@@ -393,7 +401,7 @@ def get_xtream_client_by_source(source_id: str) -> XtreamClient | None:
     """Get Xtream client for a specific source ID."""
     for source in get_sources():
         if source.id == source_id and source.type == "xtream":
-            return XtreamClient(source.url, source.username, source.password)
+            return _make_client(source)
     return None
 
 
@@ -401,7 +409,7 @@ def get_first_xtream_source_and_client() -> tuple[str, XtreamClient] | tuple[Non
     """Get the first available Xtream source ID and client."""
     for source in get_sources():
         if source.type == "xtream":
-            return source.id, XtreamClient(source.url, source.username, source.password)
+            return source.id, _make_client(source)
     return None, None
 
 

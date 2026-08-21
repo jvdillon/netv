@@ -575,19 +575,19 @@ class TestUserAgent:
 
     def test_default_user_agent(self):
         """Test default preset returns None."""
-        with patch("ffmpeg_command._load_settings", return_value={"user_agent_preset": "default"}):
+        with patch("cache.load_server_settings", return_value={"user_agent_preset": "default"}):
             assert get_user_agent() is None
 
     def test_vlc_user_agent(self):
         """Test VLC preset."""
-        with patch("ffmpeg_command._load_settings", return_value={"user_agent_preset": "vlc"}):
+        with patch("cache.load_server_settings", return_value={"user_agent_preset": "vlc"}):
             ua = get_user_agent()
             assert ua is not None
             assert "VLC" in ua
 
     def test_chrome_user_agent(self):
         """Test Chrome preset."""
-        with patch("ffmpeg_command._load_settings", return_value={"user_agent_preset": "chrome"}):
+        with patch("cache.load_server_settings", return_value={"user_agent_preset": "chrome"}):
             ua = get_user_agent()
             assert ua is not None
             assert "Chrome" in ua
@@ -595,7 +595,7 @@ class TestUserAgent:
     def test_custom_user_agent(self):
         """Test custom user agent."""
         with patch(
-            "ffmpeg_command._load_settings",
+            "cache.load_server_settings",
             return_value={"user_agent_preset": "custom", "user_agent_custom": "MyAgent/1.0"},
         ):
             assert get_user_agent() == "MyAgent/1.0"
@@ -603,7 +603,7 @@ class TestUserAgent:
     def test_custom_empty_returns_none(self):
         """Test empty custom user agent returns None."""
         with patch(
-            "ffmpeg_command._load_settings",
+            "cache.load_server_settings",
             return_value={"user_agent_preset": "custom", "user_agent_custom": ""},
         ):
             assert get_user_agent() is None

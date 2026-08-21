@@ -294,6 +294,36 @@ class TestXtreamClientApi:
         assert "limit=5" in url
 
 
+class TestXtreamClientUserAgent:
+    """The configured User-Agent must be sent on API calls (issue #57).
+
+    Some providers return HTTP 403 for channel list / VOD / series requests
+    that omit the same User-Agent used for stream playback.
+    """
+
+    @pytest.fixture
+    def mock_urlopen(self):
+        with patch("xtream.safe_urlopen") as mock:
+            resp = MagicMock()
+            resp.read.return_value = b"[]"
+            resp.__enter__ = MagicMock(return_value=resp)
+            resp.__exit__ = MagicMock(return_value=False)
+            mock.return_value = resp
+            yield mock
+
+    def test_defaults_to_none(self):
+        assert XtreamClient("http://example.com", "user", "pass").user_agent is None
+
+    def test_user_agent_forwarded_to_urlopen(self, mock_urlopen):
+        client = XtreamClient("http://example.com", "user", "pass", user_agent="TiviMate/4.7.0")
+        client.get_live_streams()
+        assert mock_urlopen.call_args.kwargs["user_agent"] == "TiviMate/4.7.0"
+
+    def test_none_user_agent_forwarded_so_default_applies(self, mock_urlopen):
+        XtreamClient("http://example.com", "user", "pass").get_live_streams()
+        assert mock_urlopen.call_args.kwargs["user_agent"] is None
+
+
 if __name__ == "__main__":
     from testing import run_tests
 
