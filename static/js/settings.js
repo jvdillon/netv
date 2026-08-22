@@ -575,6 +575,26 @@
     customInput?.addEventListener('change', function() { save(this); });
   }
 
+  function setupM3uExportSettings() {
+    const container = document.getElementById('m3u-export-settings');
+    if (!container) return;
+
+    const enabledCb = container.querySelector('input[name="m3u_export_enabled"]');
+    const urlsBox = document.getElementById('m3u-export-urls');
+
+    async function save(triggerEl) {
+      const form = new FormData();
+      if (enabledCb?.checked) form.append('m3u_export_enabled', 'on');
+      form.append('m3u_export_mode', container.querySelector('input[name="m3u_export_mode"]:checked')?.value || 'redirect');
+      await saveWithFeedback('/settings/m3u-export', { method: 'POST', body: form }, getFeedbackEl(triggerEl));
+      urlsBox?.classList.toggle('hidden', !enabledCb?.checked);
+    }
+
+    container.querySelectorAll('.setting-input').forEach(el => {
+      el.addEventListener('change', function() { save(this); });
+    });
+  }
+
   // ============================================================
   // Data & Probe Cache
   // ============================================================
@@ -926,6 +946,7 @@
     setupGuideSettings();
     setupTranscodeSettings();
     setupUserAgentSettings();
+    setupM3uExportSettings();
     setupDataCache();
     setupProbeCache();
     setupRefreshButtons();

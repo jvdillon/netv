@@ -653,6 +653,43 @@
     </div>
   </div>
 
+  <!-- M3U Export -->
+  <div id="m3u-export" class="mb-8 p-4 bg-gray-800 rounded">
+    <h3 class="text-xl font-semibold mb-4">M3U Export</h3>
+    <p class="text-sm text-gray-400 mb-4">Expose live channels as an M3U playlist + XMLTV guide for external IPTV players (TiviMate, IPTV Smarters, VLC). Users sign in with their neTV username and password; channel restrictions apply.</p>
+    <div class="space-y-4" id="m3u-export-settings">
+      <label class="flex items-center gap-2 cursor-pointer text-sm">
+        <input type="checkbox" name="m3u_export_enabled" {% if m3u_export_enabled %}checked{% endif %}
+               class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500 rounded">
+        <span>Enable M3U export</span>
+      </label>
+      <div>
+        <label class="block text-sm font-medium mb-2">Playback Mode</label>
+        <div class="flex gap-4">
+          <label class="flex items-center gap-2 cursor-pointer text-sm">
+            <input type="radio" name="m3u_export_mode" value="redirect" {% if m3u_export_mode == 'redirect' %}checked{% endif %}
+                   class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
+            <span>Redirect</span>
+          </label>
+          <label class="flex items-center gap-2 cursor-pointer text-sm">
+            <input type="radio" name="m3u_export_mode" value="proxy" {% if m3u_export_mode == 'proxy' %}checked{% endif %}
+                   class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
+            <span>Proxy</span>
+          </label>
+        </div>
+        <p class="text-xs text-gray-400 mt-1">Redirect: players fetch streams directly from the provider (no server bandwidth, provider URL visible to clients). Proxy: streams flow through this server (hides provider, enforces stream limits, uses your upload bandwidth).</p>
+      </div>
+      <div class="{% if not m3u_export_enabled %}hidden{% endif %}" id="m3u-export-urls">
+        <label class="block text-sm font-medium mb-2">Player URLs</label>
+        <div class="text-xs font-mono bg-gray-900 rounded p-3 space-y-1 break-all">
+          <div><span class="text-gray-500">Playlist:</span> {{ external_base_url }}/get.php?username=USER&amp;password=PASS</div>
+          <div><span class="text-gray-500">EPG:</span> {{ external_base_url }}/xmltv.php?username=USER&amp;password=PASS</div>
+        </div>
+        <p class="text-xs text-gray-400 mt-1">Replace USER/PASS with the neTV account credentials.</p>
+      </div>
+    </div>
+  </div>
+
   <!-- Data Cache -->
   <div id="data-cache" class="mb-8 p-4 bg-gray-800 rounded">
     <h3 class="text-xl font-semibold mb-4">Data Cache</h3>
