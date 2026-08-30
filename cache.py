@@ -15,6 +15,8 @@ import threading
 import time
 import urllib.parse
 
+from util import atomic_write_json
+
 
 log = logging.getLogger(__name__)
 
@@ -511,7 +513,7 @@ def load_server_settings() -> dict[str, Any]:
 
 def save_server_settings(settings: dict[str, Any]) -> None:
     """Save server-wide settings."""
-    SERVER_SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+    atomic_write_json(SERVER_SETTINGS_FILE, settings)
 
 
 USER_AGENT_PRESETS = {
@@ -616,5 +618,6 @@ def update_source_epg_url(source_id: str, epg_url: str) -> None:
         if s["id"] == source_id and not s.get("epg_url"):
             s["epg_url"] = epg_url
             save_server_settings(settings)
-            log.info("Saved EPG URL for source %s: %s", source_id, epg_url)
+            host = urllib.parse.urlparse(epg_url).hostname or "unknown host"
+            log.info("Saved EPG URL for source %s (%s)", source_id, host)
             break

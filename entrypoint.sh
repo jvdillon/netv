@@ -61,5 +61,8 @@ if [ -e /dev/dri/renderD128 ]; then
     fi
 fi
 
-# Drop to netv user and run the app
+# Drop to netv user and run the selected app
+if [ "${NETV_MODE:-web}" = "gateway" ]; then
+    exec gosu netv python3 gateway.py --port "${NETV_GATEWAY_PORT:-8100}"
+fi
 exec gosu netv python3 main.py --port "${NETV_PORT:-8000}" ${NETV_HTTPS:+--https}
