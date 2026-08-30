@@ -210,6 +210,22 @@ class TestUpdateSourceEpgUrl:
         loaded = cache_module.load_server_settings()
         assert "epg_url" not in loaded["sources"][0]
 
+    def test_update_source_epg_url_does_not_log_credentials(self, cache_module, caplog):
+        caplog.set_level("INFO", logger=cache_module.log.name)
+        settings = {
+            "sources": [{"id": "s1", "name": "S1", "type": "xtream", "url": "http://x"}]
+        }
+        cache_module.save_server_settings(settings)
+
+        cache_module.update_source_epg_url(
+            "s1",
+            "https://provider.example/xmltv.php?username=private-user&password=private-secret",
+        )
+
+        assert "private-user" not in caplog.text
+        assert "private-secret" not in caplog.text
+        assert "provider.example" in caplog.text
+
 
 class TestEncoderDetection:
     """Tests for encoder detection functions."""

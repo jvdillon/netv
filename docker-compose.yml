@@ -44,6 +44,36 @@ services:
     devices:
       - /dev/dri:/dev/dri
 
+  # Xtream-compatible endpoint for native IPTV players.
+  netv-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    image: netv-gateway
+    container_name: netv-gateway
+    ports:
+      - "${NETV_GATEWAY_PORT:-8100}:8100"
+    environment:
+      - NETV_MODE=gateway
+      - NETV_GATEWAY_PORT=8100
+      - NETV_GATEWAY_PUBLIC_URL=${NETV_GATEWAY_PUBLIC_URL:-}
+      - NETV_GATEWAY_TRUSTED_PROXIES=${NETV_GATEWAY_TRUSTED_PROXIES:-127.0.0.1}
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./cache:/app/cache
+      - /etc/localtime:/etc/localtime:ro
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; r=urllib.request.urlopen('http://localhost:8100/healthz', timeout=5); exit(0 if r.status==200 else 1)"
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+
   # NVIDIA GPU: docker compose --profile nvidia up -d
   netv-nvidia:
     extends:

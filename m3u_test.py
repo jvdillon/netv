@@ -149,6 +149,32 @@ class TestMakeClientUserAgent:
         assert mock_open.call_args.kwargs["user_agent"] == cache.USER_AGENT_PRESETS["vlc"]
 
 
+class TestFetchSourceLiveData:
+    def test_can_skip_epg_url_persistence(self, m3u_module):
+        source = SimpleNamespace(
+            id="source-a",
+            name="Provider",
+            type="xtream",
+            url="https://provider.example",
+            username="remote-user",
+            password="remote-password",
+            epg_enabled=True,
+            epg_timeout=120,
+        )
+        client = MagicMock()
+        client.get_live_categories.return_value = []
+        client.get_live_streams.return_value = []
+        client.epg_url = "https://provider.example/xmltv.php?credentials=private"
+
+        with (
+            patch.object(m3u_module, "_make_client", return_value=client),
+            patch.object(m3u_module, "update_source_epg_url") as update_epg_url,
+        ):
+            m3u_module.fetch_source_live_data(source, persist_epg_url=False)
+
+        update_epg_url.assert_not_called()
+
+
 if __name__ == "__main__":
     from testing import run_tests
 

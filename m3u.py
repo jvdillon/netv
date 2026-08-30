@@ -156,7 +156,10 @@ def _fetch_all_live_data() -> tuple[list[dict], list[dict], list[tuple[str, int,
     return all_categories, all_streams, epg_urls
 
 
-def fetch_source_live_data(source: Any) -> tuple[list[dict], list[dict], str | None, int]:
+def fetch_source_live_data(
+    source: Any,
+    persist_epg_url: bool = True,
+) -> tuple[list[dict], list[dict], str | None, int]:
     """Fetch live data for a single source. Returns (cats, streams, epg_url, epg_timeout)."""
     cats: list[dict] = []
     streams: list[dict] = []
@@ -178,11 +181,13 @@ def fetch_source_live_data(source: Any) -> tuple[list[dict], list[dict], str | N
             orig_cats = s.get("category_ids") or [s.get("category_id")]
             s["category_ids"] = [f"{source.id}_{c}" for c in orig_cats if c]
         detected_epg = client.epg_url
-        update_source_epg_url(source.id, detected_epg)
+        if persist_epg_url:
+            update_source_epg_url(source.id, detected_epg)
         epg_url = detected_epg if source.epg_enabled else None
     elif source.type == "m3u":
         cats, streams, detected_epg = fetch_m3u(source.url, source.id)
-        update_source_epg_url(source.id, detected_epg)
+        if persist_epg_url:
+            update_source_epg_url(source.id, detected_epg)
         epg_url = detected_epg if source.epg_enabled else None
     elif source.type == "epg":
         epg_url = source.url

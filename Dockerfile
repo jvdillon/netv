@@ -55,15 +55,17 @@ RUN if python3 -m pip install --help 2>&1 | grep -q -- '--break-system-packages'
     fi
 
 # Runtime config
-EXPOSE 8000
+EXPOSE 8000 8100
 
 # Environment variables (see README for details)
 ENV NETV_PORT=8000
+ENV NETV_GATEWAY_PORT=8100
 ENV NETV_HTTPS=""
 ENV LOG_LEVEL=INFO
 
-# Create non-root user (entrypoint handles permissions and group membership)
-RUN useradd -m netv
+# Match the gateway image so both services can safely share the cache volume.
+RUN groupadd --gid 10001 netv && \
+    useradd --uid 10001 --gid 10001 --create-home netv
 
 # Copy entrypoint and set permissions with validation
 COPY entrypoint.sh /app/
@@ -73,6 +75,6 @@ RUN chmod +x /app/entrypoint.sh && \
 # Healthcheck with improved error handling
 # Note: start-period allows time for application startup
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD python3 -c "import urllib.request; r=urllib.request.urlopen('http://localhost:8000/', timeout=5); exit(0 if r.status==200 else 1)" 2>/dev/null || exit 1
+    CMD python3 -c "import os, urllib.request; gateway=os.environ.get('NETV_MODE') == 'gateway'; port=os.environ.get('NETV_GATEWAY_PORT', '8100') if gateway else os.environ.get('NETV_PORT', '8000'); path='/healthz' if gateway else '/'; r=urllib.request.urlopen(f'http://localhost:{port}{path}', timeout=5); exit(0 if r.status==200 else 1)" 2>/dev/null || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]

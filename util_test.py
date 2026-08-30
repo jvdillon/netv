@@ -4,11 +4,25 @@ from __future__ import annotations
 
 from typing import Any
 
+import json
+import pathlib
 import urllib.error
 
 import pytest
 
 import util
+
+
+def test_atomic_write_json_replaces_file_and_preserves_permissions(tmp_path: pathlib.Path):
+    path = tmp_path / "settings.json"
+    path.write_text('{"old": true}')
+    path.chmod(0o640)
+
+    util.atomic_write_json(path, {"new": True})
+
+    assert json.loads(path.read_text()) == {"new": True}
+    assert path.stat().st_mode & 0o777 == 0o640
+    assert list(tmp_path.iterdir()) == [path]
 
 
 def _fake_request(url: str) -> Any:

@@ -36,6 +36,7 @@ through their IPTV providers.
 ## Features
 
 - **Live TV** with EPG grid guide
+- **Native player gateway** - Use the configured live channels from Xtream-compatible players
 - **Movies & Series** with metadata, seasons, episodes
 - **AI Upscale** - Real-time 4x upscaling via TensorRT (720p → 4K @ 85fps)
 - **Chromecast** support (HTTPS required)
@@ -150,6 +151,17 @@ services:
     devices:
       - /dev/dri:/dev/dri  # for hardware transcoding (remove if no GPU)
     restart: unless-stopped
+
+  netv-gateway:
+    image: ghcr.io/jvdillon/netv:latest
+    ports:
+      - "8100:8100"
+    environment:
+      - NETV_MODE=gateway
+      - NETV_GATEWAY_PORT=8100
+    volumes:
+      - ./cache:/app/cache
+    restart: unless-stopped
 ```
 
 Then run:
@@ -159,6 +171,50 @@ docker compose up -d
 ```
 
 Open http://localhost:8000. To update: `docker compose pull && docker compose up -d`
+
+#### Native player gateway
+
+The gateway exposes the live sources configured in the neTV web UI through a
+separate Xtream-compatible endpoint. Configure sources and users at
+`http://localhost:8000`, then enter the following details in a native IPTV
+player:
+
+```text
+Server:   http://<netv-host>:8100
+Username: <your neTV username>
+Password: <your neTV password>
+```
+
+The gateway currently supports live categories, live streams, MPEG-TS M3U
+playlists, short EPG lookups, user-filtered XMLTV, and live passthrough
+playback. VOD, series, and standalone upscaling will be added in later phases.
+Remote provider credentials and playback URLs are not returned to the player.
+
+The gateway currently does not enforce the per-user `max_streams_per_source`
+setting or coordinate per-source connection counts with the web process. Use a
+provider account with sufficient connections and avoid aggressive multi-channel
+preview features in native players.
+
+Use a dedicated non-admin neTV account for native players because Xtream
+clients include their local credentials in stream URLs.
+
+When running from a source checkout, the gateway has an architecture-neutral
+image and can be started independently:
+
+```bash
+docker compose up -d --build netv-gateway
+```
+
+If neTV is behind a reverse proxy or the address seen by the container is not
+reachable by the player, set `NETV_GATEWAY_PUBLIC_URL` to the externally
+reachable gateway URL, such as `http://192.168.1.20:8100`.
+Use only a scheme, host, and optional port; path prefixes are not supported.
+Forwarded client addresses are trusted only from localhost by default. If a
+reverse proxy runs elsewhere, set `NETV_GATEWAY_TRUSTED_PROXIES` to its IP
+address or a comma-separated list of proxy IP addresses.
+
+For restricted users, the gateway hides uncategorized streams because they
+cannot be proven to belong to an allowed category.
 
 The `latest` image is published on tagged releases, on application changes
 merged to `main`, and when a maintainer triggers a rebuild manually. Scheduled
@@ -298,6 +354,7 @@ Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/):
 git clone https://github.com/jvdillon/netv.git
 cd netv
 uv run ./main.py --port 8000  # --https
+uv run ./gateway.py --port 8100
 ```
 
 Or with pip:

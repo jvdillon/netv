@@ -1,0 +1,33 @@
+# Architecture-neutral image for the native-player gateway.
+FROM python:3.11-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gosu && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY *.py ./
+
+RUN python3 -m pip install --no-cache-dir . && \
+    groupadd --gid 10001 netv && \
+    useradd --uid 10001 --gid 10001 --create-home netv && \
+    mkdir -p /app/cache && \
+    chown -R netv:netv /app/cache
+
+COPY entrypoint.sh /app/
+RUN chmod +x /app/entrypoint.sh
+
+ENV NETV_MODE=gateway
+ENV NETV_GATEWAY_PORT=8100
+ENV LOG_LEVEL=INFO
+
+EXPOSE 8100
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD python3 -c "import urllib.request; r=urllib.request.urlopen('http://localhost:8100/healthz', timeout=5); exit(0 if r.status==200 else 1)" 2>/dev/null || exit 1
+
+ENTRYPOINT ["/app/entrypoint.sh"]

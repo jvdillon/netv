@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+import json
+import os
+import pathlib
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +32,29 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 _DEFAULT_USER_AGENT = "VLC/3.0.20 LibVLC/3.0.20"
+
+
+def atomic_write_json(path: pathlib.Path, value: Any) -> None:
+    """Atomically replace a JSON file while preserving existing permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: pathlib.Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as temp:
+            json.dump(value, temp, indent=2)
+            temp.flush()
+            if path.exists():
+                os.fchmod(temp.fileno(), path.stat().st_mode & 0o777)
+            os.fsync(temp.fileno())
+            temp_path = pathlib.Path(temp.name)
+        temp_path.replace(path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def safe_urlopen(url: str, timeout: int = 30, user_agent: str | None = None) -> Any:

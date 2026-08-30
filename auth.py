@@ -11,6 +11,8 @@ import pathlib
 import secrets
 import time
 
+from util import atomic_write_json
+
 
 APP_DIR = pathlib.Path(__file__).parent
 # Use old "cache" if it exists (backwards compat), otherwise ".cache"
@@ -34,7 +36,7 @@ def _get_secret_key() -> str:
         settings = json.loads(settings_file.read_text())
     if "secret_key" not in settings:
         settings["secret_key"] = secrets.token_hex(32)
-        settings_file.write_text(json.dumps(settings, indent=2))
+        atomic_write_json(settings_file, settings)
     return settings["secret_key"]
 
 
@@ -88,7 +90,7 @@ def create_user(username: str, password: str, admin: bool = False) -> None:
         admin = True
     users[username] = {"password": _hash_password(password), "admin": admin}
     settings["users"] = users
-    settings_file.write_text(json.dumps(settings, indent=2))
+    atomic_write_json(settings_file, settings)
     # Create user directory for per-user settings
     user_dir = USERS_DIR / username
     user_dir.mkdir(parents=True, exist_ok=True)
@@ -113,7 +115,7 @@ def delete_user(username: str) -> bool:
     del users[username]
     _ensure_one_admin(users)
     settings["users"] = users
-    settings_file.write_text(json.dumps(settings, indent=2))
+    atomic_write_json(settings_file, settings)
     return True
 
 
@@ -137,7 +139,7 @@ def change_password(username: str, new_password: str) -> bool:
         return False
     users[username]["password"] = _hash_password(new_password)
     settings["users"] = users
-    settings_file.write_text(json.dumps(settings, indent=2))
+    atomic_write_json(settings_file, settings)
     return True
 
 
@@ -160,7 +162,7 @@ def set_admin(username: str, admin: bool) -> bool:
     users[username]["admin"] = admin
     _ensure_one_admin(users)
     settings["users"] = users
-    settings_file.write_text(json.dumps(settings, indent=2))
+    atomic_write_json(settings_file, settings)
     return True
 
 
@@ -206,7 +208,7 @@ def set_user_limits(
     if unavailable_groups is not None:
         users[username]["unavailable_groups"] = unavailable_groups
     settings["users"] = users
-    settings_file.write_text(json.dumps(settings, indent=2))
+    atomic_write_json(settings_file, settings)
     return True
 
 

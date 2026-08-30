@@ -89,7 +89,8 @@ ENV LOG_LEVEL=INFO
 ENV SR_ENGINE_DIR=/models
 
 # Create non-root user
-RUN useradd -m netv
+RUN groupadd --gid 10001 netv && \
+    useradd --uid 10001 --gid 10001 --create-home netv
 
 # Copy entrypoint and set permissions with validation
 COPY entrypoint-ai_upscale.sh /app/entrypoint.sh
