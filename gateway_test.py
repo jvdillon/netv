@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from gateway_catalog import CatalogSnapshot, GatewayCatalog, GatewayStream, StreamIdRegistry
+from gateway_media import GatewayMediaItem, MediaCatalogSnapshot
 
 import auth
 import cache
@@ -29,6 +30,66 @@ class _FakeCatalog:
         return self.snapshot
 
 
+class _FakeMediaCatalog:
+    def __init__(
+        self,
+        kind: str,
+        snapshot: MediaCatalogSnapshot,
+        resolved: tuple[str, str] | None = None,
+    ) -> None:
+        self.kind = kind
+        self.snapshot = snapshot
+        self.resolved = resolved
+
+    @property
+    def id_field(self) -> str:
+        return "stream_id" if self.kind == "movie" else "series_id"
+
+    def get(self) -> MediaCatalogSnapshot:
+        return self.snapshot
+
+    def remap_info(
+        self,
+        item: GatewayMediaItem,
+        raw_info: dict,
+    ) -> dict:
+        return {**raw_info, "local_id": item.local_id}
+
+    def resolve_registered_id(
+        self,
+        _local_id: int,
+        _item_kind: str | None = None,
+    ) -> tuple[str, str] | None:
+        return self.resolved
+
+
+def _media_snapshot(kind: str) -> MediaCatalogSnapshot:
+    id_field = "stream_id" if kind == "movie" else "series_id"
+    item = GatewayMediaItem(
+        local_id=501,
+        source_id="source-media",
+        upstream_id="77",
+        public={
+            id_field: 501,
+            "name": "A Movie" if kind == "movie" else "A Show",
+            "category_id": "401",
+            "category_ids": ["401"],
+        },
+    )
+    return MediaCatalogSnapshot(
+        categories=[
+            {
+                "category_id": "401",
+                "category_name": "Movies" if kind == "movie" else "Series",
+                "parent_id": 0,
+            }
+        ],
+        category_source_ids={"401": "source-media"},
+        items=[item],
+        items_by_id={501: item},
+    )
+
+
 @pytest.fixture
 def gateway_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     settings_file = tmp_path / "server_settings.json"
@@ -42,6 +103,7 @@ def gateway_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(cache, "USERS_DIR", users_dir)
     auth.create_user("player", "local-pass")
     monkeypatch.setattr(gateway, "authenticator", gateway.GatewayAuthenticator())
+    monkeypatch.setattr(gateway, "_has_media_access", lambda _username, _kind: True)
 
     public = {
         "num": 1,
@@ -214,6 +276,176 @@ def test_player_api_exposes_local_live_catalog(gateway_client):
             "tv_archive_duration": 0,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("kind", "categories_action", "items_action", "restriction", "catalog_name"),
+    [
+        (
+            "movie",
+            "get_vod_categories",
+            "get_vod_streams",
+            "movies:source-media",
+            "vod_catalog",
+        ),
+        (
+            "series",
+            "get_series_categories",
+            "get_series",
+            "series:source-media",
+            "series_catalog",
+        ),
+    ],
+)
+def test_player_api_exposes_and_restricts_on_demand_catalogs(
+    gateway_client,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    categories_action: str,
+    items_action: str,
+    restriction: str,
+    catalog_name: str,
+):
+    client, _ = gateway_client
+    snapshot = _media_snapshot(kind)
+    monkeypatch.setattr(
+        gateway,
+        catalog_name,
+        _FakeMediaCatalog(kind, snapshot, ("source-media", "77")),
+    )
+    auth_params = {"username": "player", "password": "local-pass"}
+
+    categories = client.get(
+        "/player_api.php",
+        params={**auth_params, "action": categories_action},
+    )
+    items = client.get(
+        "/player_api.php",
+        params={**auth_params, "action": items_action},
+    )
+
+    assert categories.json() == snapshot.categories
+    assert items.json() == [snapshot.items[0].public]
+
+    assert auth.set_user_limits("player", unavailable_groups=[restriction])
+    assert client.get(
+        "/player_api.php",
+        params={**auth_params, "action": categories_action},
+    ).json() == []
+    assert client.get(
+        "/player_api.php",
+        params={**auth_params, "action": items_action},
+    ).json() == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "action", "id_param", "catalog_name", "client_method"),
+    [
+        ("movie", "get_vod_info", "vod_id", "vod_catalog", "get_vod_info"),
+        (
+            "series",
+            "get_series_info",
+            "series_id",
+            "series_catalog",
+            "get_series_info",
+        ),
+    ],
+)
+def test_player_api_returns_on_demand_details(
+    gateway_client,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    action: str,
+    id_param: str,
+    catalog_name: str,
+    client_method: str,
+):
+    client, _ = gateway_client
+    snapshot = _media_snapshot(kind)
+    monkeypatch.setattr(
+        gateway,
+        catalog_name,
+        _FakeMediaCatalog(kind, snapshot, ("source-media", "77")),
+    )
+    upstream_client = MagicMock()
+    getattr(upstream_client, client_method).return_value = {"info": {"name": "Detail"}}
+    monkeypatch.setattr(
+        gateway,
+        "get_xtream_client_by_source",
+        lambda _source_id: upstream_client,
+    )
+    monkeypatch.setattr(
+        cache,
+        "get_cached_info",
+        lambda _key, fetch: fetch(),
+    )
+
+    response = client.get(
+        "/player_api.php",
+        params={
+            "username": "player",
+            "password": "local-pass",
+            "action": action,
+            id_param: 501,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["local_id"] == 501
+    getattr(upstream_client, client_method).assert_called_once_with(77)
+
+
+@pytest.mark.parametrize(
+    ("kind", "action", "id_param", "catalog_name", "restriction"),
+    [
+        (
+            "movie",
+            "get_vod_info",
+            "vod_id",
+            "vod_catalog",
+            "movies:source-media",
+        ),
+        (
+            "series",
+            "get_series_info",
+            "series_id",
+            "series_catalog",
+            "series:source-media",
+        ),
+    ],
+)
+def test_player_api_hides_restricted_on_demand_details(
+    gateway_client,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    action: str,
+    id_param: str,
+    catalog_name: str,
+    restriction: str,
+):
+    client, _ = gateway_client
+    monkeypatch.setattr(
+        gateway,
+        catalog_name,
+        _FakeMediaCatalog(
+            kind,
+            _media_snapshot(kind),
+            ("source-media", "77"),
+        ),
+    )
+    assert auth.set_user_limits("player", unavailable_groups=[restriction])
+
+    response = client.get(
+        "/player_api.php",
+        params={
+            "username": "player",
+            "password": "local-pass",
+            "action": action,
+            id_param: 501,
+        },
+    )
+
+    assert response.status_code == 404
 
 
 def test_playlist_contains_only_local_playback_urls(gateway_client):
@@ -592,3 +824,111 @@ def test_live_stream_password_may_contain_slash(
 
     assert response.status_code == 200
     assert response.content == b"video-data"
+
+
+@pytest.mark.parametrize(
+    ("kind", "path", "catalog_name", "resolved", "stream_type"),
+    [
+        (
+            "movie",
+            "/movie/player/local-pass/501.mkv",
+            "vod_catalog",
+            ("source-media", "77"),
+            "movie",
+        ),
+        (
+            "series",
+            "/series/player/local-pass/501.mp4",
+            "series_catalog",
+            ("source-media", "88"),
+            "series",
+        ),
+    ],
+)
+def test_on_demand_streams_proxy_ranges(
+    gateway_client,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    path: str,
+    catalog_name: str,
+    resolved: tuple[str, str],
+    stream_type: str,
+):
+    client, _ = gateway_client
+    monkeypatch.setattr(
+        gateway,
+        catalog_name,
+        _FakeMediaCatalog(kind, _media_snapshot(kind), resolved),
+    )
+    upstream_client = MagicMock()
+    upstream_client.build_stream_url.return_value = "https://provider.example/media"
+    monkeypatch.setattr(
+        gateway,
+        "get_xtream_client_by_source",
+        lambda _source_id: upstream_client,
+    )
+    upstream = MagicMock()
+    upstream.status = 206
+    upstream.headers = {
+        "Content-Type": "video/mp4",
+        "Content-Length": "4",
+        "Content-Range": "bytes 10-13/100",
+        "Accept-Ranges": "bytes",
+    }
+    upstream.read.side_effect = [b"data", b""]
+    urlopen = MagicMock(return_value=upstream)
+    monkeypatch.setattr(gateway, "safe_urlopen", urlopen)
+
+    response = client.get(path, headers={"Range": "bytes=10-13"})
+
+    assert response.status_code == 206
+    assert response.content == b"data"
+    assert response.headers["content-range"] == "bytes 10-13/100"
+    upstream_client.build_stream_url.assert_called_once_with(
+        stream_type,
+        int(resolved[1]),
+        path.rsplit(".", 1)[1],
+    )
+    assert urlopen.call_args.args[3] == {"Range": "bytes=10-13"}
+
+
+@pytest.mark.parametrize(
+    ("kind", "path", "catalog_name", "restriction"),
+    [
+        (
+            "movie",
+            "/movie/player/local-pass/501.mkv",
+            "vod_catalog",
+            "movies:source-media",
+        ),
+        (
+            "series",
+            "/series/player/local-pass/501.mp4",
+            "series_catalog",
+            "series:source-media",
+        ),
+    ],
+)
+def test_on_demand_playback_hides_restricted_sources(
+    gateway_client,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    path: str,
+    catalog_name: str,
+    restriction: str,
+):
+    client, _ = gateway_client
+    monkeypatch.setattr(
+        gateway,
+        catalog_name,
+        _FakeMediaCatalog(
+            kind,
+            _media_snapshot(kind),
+            ("source-media", "77"),
+        ),
+    )
+    assert auth.set_user_limits("player", unavailable_groups=[restriction])
+
+    response = client.get(path)
+
+    assert response.status_code == 404

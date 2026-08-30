@@ -60,6 +60,7 @@ class StreamIdRegistry:
         self._lock = threading.Lock()
         self._loaded = False
         self._ids: dict[str, int] = {}
+        self._keys_by_id: dict[int, str] = {}
         self._next_id = 1
 
     @property
@@ -81,6 +82,9 @@ class StreamIdRegistry:
             }
             if len(self._ids) != len(ids) or len(set(self._ids.values())) != len(self._ids):
                 raise ValueError("registry contains invalid or duplicate IDs")
+            self._keys_by_id = {
+                local_id: key for key, local_id in self._ids.items()
+            }
             self._next_id = max(self._ids.values(), default=0) + 1
         except FileNotFoundError:
             pass
@@ -90,7 +94,11 @@ class StreamIdRegistry:
         self._loaded = True
 
     def _save(self) -> None:
-        atomic_write_json(self.path, {"ids": dict(sorted(self._ids.items()))})
+        atomic_write_json(
+            self.path,
+            {"ids": dict(sorted(self._ids.items()))},
+            indent=None,
+        )
 
     def get_or_create(self, key: str) -> int:
         return self.get_or_create_many([key])[key]
@@ -103,11 +111,17 @@ class StreamIdRegistry:
                 if key in self._ids:
                     continue
                 self._ids[key] = self._next_id
+                self._keys_by_id[self._next_id] = key
                 self._next_id += 1
                 changed = True
             if changed:
                 self._save()
             return {key: self._ids[key] for key in keys}
+
+    def key_for_id(self, local_id: int) -> str | None:
+        with self._lock:
+            self._load()
+            return self._keys_by_id.get(local_id)
 
 
 class GatewayCatalog:

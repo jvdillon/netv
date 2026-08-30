@@ -159,7 +159,11 @@ def load_file_cache(name: str, use_process: bool = False) -> tuple[Any, float] |
 def save_file_cache(name: str, data: Any) -> None:
     """Save data to cache file with current timestamp."""
     path = CACHE_DIR / f"{name}.json"
-    path.write_text(json.dumps({"data": data, "timestamp": time.time()}))
+    atomic_write_json(
+        path,
+        {"data": data, "timestamp": time.time()},
+        indent=None,
+    )
 
 
 def clear_all_caches() -> None:

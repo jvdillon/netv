@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -20,8 +21,18 @@ import urllib.parse
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from gateway_catalog import CatalogSnapshot, GatewayCatalog, GatewayStream
+from gateway_catalog import (
+    CatalogSnapshot,
+    GatewayCatalog,
+    GatewayStream,
+    StreamIdRegistry,
+)
 from gateway_epg import EpgUnavailableError, build_filtered_xmltv
+from gateway_media import (
+    GatewayMediaCatalog,
+    GatewayMediaItem,
+    MediaCatalogSnapshot,
+)
 from m3u import get_xtream_client_by_source
 from util import safe_urlopen
 
@@ -31,13 +42,10 @@ import cache
 
 log = logging.getLogger(__name__)
 app = FastAPI(title="neTV Native Player Gateway", docs_url=None, redoc_url=None)
-catalog = GatewayCatalog()
-_PASSTHROUGH_ACTIONS = {
-    "get_vod_categories",
-    "get_vod_streams",
-    "get_series_categories",
-    "get_series",
-}
+registry = StreamIdRegistry()
+catalog = GatewayCatalog(registry=registry)
+vod_catalog = GatewayMediaCatalog("movie", registry)
+series_catalog = GatewayMediaCatalog("series", registry)
 _AUTH_CACHE_SECONDS = 30
 _LOGIN_WINDOW_SECONDS = 300
 _MAX_LOGIN_FAILURES = 10
@@ -201,6 +209,125 @@ async def _get_catalog() -> CatalogSnapshot:
     return await asyncio.to_thread(catalog.get)
 
 
+async def _get_media_catalog(
+    media_catalog: GatewayMediaCatalog,
+) -> MediaCatalogSnapshot:
+    return await asyncio.to_thread(media_catalog.get)
+
+
+async def _json_response(value: Any) -> Response:
+    content = await asyncio.to_thread(
+        lambda: json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode(),
+    )
+    return Response(content, media_type="application/json")
+
+
+def _visible_media(
+    username: str,
+    snapshot: MediaCatalogSnapshot,
+    kind: str,
+    category_id: str | None = None,
+) -> list[GatewayMediaItem]:
+    unavailable = set(auth.get_user_limits(username).get("unavailable_groups", []))
+    restriction = "movies" if kind == "movie" else "series"
+    items = [
+        item
+        for item in snapshot.items
+        if f"{restriction}:{item.source_id}" not in unavailable
+    ]
+    if category_id is not None:
+        items = [
+            item
+            for item in items
+            if category_id in item.public.get("category_ids", [])
+        ]
+    return items
+
+
+def _visible_media_categories(
+    username: str,
+    snapshot: MediaCatalogSnapshot,
+    kind: str,
+) -> list[dict[str, Any]]:
+    unavailable = set(auth.get_user_limits(username).get("unavailable_groups", []))
+    restriction = "movies" if kind == "movie" else "series"
+    return [
+        category
+        for category in snapshot.categories
+        if f"{restriction}:{snapshot.category_source_ids[str(category['category_id'])]}"
+        not in unavailable
+    ]
+
+
+def _media_source_allowed(username: str, kind: str, source_id: str) -> bool:
+    unavailable = set(auth.get_user_limits(username).get("unavailable_groups", []))
+    restriction = "movies" if kind == "movie" else "series"
+    return f"{restriction}:{source_id}" not in unavailable
+
+
+def _has_media_access(username: str, kind: str) -> bool:
+    return any(
+        source.type == "xtream"
+        and _media_source_allowed(username, kind, source.id)
+        for source in cache.get_sources()
+    )
+
+
+async def _media_info(
+    username: str,
+    media_catalog: GatewayMediaCatalog,
+    local_id: int | None,
+) -> dict[str, Any]:
+    if local_id is None:
+        raise HTTPException(400, f"{media_catalog.id_field} is required")
+    resolved = await asyncio.to_thread(
+        media_catalog.resolve_registered_id,
+        local_id,
+    )
+    if resolved is None:
+        raise HTTPException(404, "Item not found")
+    source_id, _ = resolved
+    if not _media_source_allowed(username, media_catalog.kind, source_id):
+        raise HTTPException(404, "Item not found")
+    snapshot = await _get_media_catalog(media_catalog)
+    item = snapshot.items_by_id.get(local_id)
+    if item is None:
+        raise HTTPException(404, "Item not found")
+    client = get_xtream_client_by_source(item.source_id)
+    if client is None:
+        raise HTTPException(404, "Source is no longer configured")
+
+    def fetch() -> dict[str, Any]:
+        upstream_id = int(item.upstream_id)
+        if media_catalog.kind == "movie":
+            return client.get_vod_info(upstream_id)
+        return client.get_series_info(upstream_id)
+
+    cache_key = (
+        f"gateway_{media_catalog.kind}_info_{item.source_id}_{item.upstream_id}"
+    )
+    try:
+        raw_info = await asyncio.to_thread(
+            cache.get_cached_info,
+            cache_key,
+            fetch,
+        )
+    except (OSError, TypeError, ValueError, urllib.error.URLError) as exc:
+        log.warning(
+            "Gateway %s info lookup failed (%s)",
+            media_catalog.kind,
+            type(exc).__name__,
+        )
+        raise HTTPException(502, "Unable to load upstream item details") from exc
+    if not isinstance(raw_info, dict):
+        raise HTTPException(502, "Upstream returned invalid item details")
+    return await asyncio.to_thread(media_catalog.remap_info, item, raw_info)
+
+
 def _auth_failure() -> JSONResponse:
     return JSONResponse(
         {
@@ -226,6 +353,8 @@ async def player_api(
     action: str | None = None,
     category_id: str | None = None,
     stream_id: int | None = None,
+    vod_id: int | None = None,
+    series_id: int | None = None,
     limit: int = 10,
 ) -> Any:
     authenticated = await authenticator.verify(request, username, password)
@@ -239,20 +368,24 @@ async def player_api(
     if action is None:
         return _server_info(request, username, password)
 
-    snapshot = await _get_catalog()
-    allowed_categories = _allowed_category_ids(username, snapshot)
     if action == "get_live_categories":
+        snapshot = await _get_catalog()
+        allowed_categories = _allowed_category_ids(username, snapshot)
         return [
             category
             for category in snapshot.categories
             if str(category["category_id"]) in allowed_categories
         ]
     if action == "get_live_streams":
-        return [
-            stream.public
-            for stream in _visible_streams(username, snapshot, category_id)
-        ]
+        snapshot = await _get_catalog()
+        return await _json_response(
+            [
+                stream.public
+                for stream in _visible_streams(username, snapshot, category_id)
+            ]
+        )
     if action == "get_short_epg":
+        snapshot = await _get_catalog()
         if stream_id is None:
             raise HTTPException(400, "stream_id is required")
         stream = snapshot.streams_by_id.get(stream_id)
@@ -270,8 +403,44 @@ async def player_api(
         except (OSError, TypeError, ValueError, urllib.error.URLError) as exc:
             log.warning("Gateway EPG lookup failed (%s)", type(exc).__name__)
             raise HTTPException(502, "Unable to load upstream EPG data") from exc
-    if action in _PASSTHROUGH_ACTIONS:
-        return []
+    if action == "get_vod_categories":
+        if not _has_media_access(username, "movie"):
+            return []
+        snapshot = await _get_media_catalog(vod_catalog)
+        return _visible_media_categories(username, snapshot, "movie")
+    if action == "get_vod_streams":
+        if not _has_media_access(username, "movie"):
+            return []
+        snapshot = await _get_media_catalog(vod_catalog)
+        return await _json_response(
+            [
+                item.public
+                for item in _visible_media(username, snapshot, "movie", category_id)
+            ]
+        )
+    if action == "get_vod_info":
+        return await _json_response(
+            await _media_info(username, vod_catalog, vod_id)
+        )
+    if action == "get_series_categories":
+        if not _has_media_access(username, "series"):
+            return []
+        snapshot = await _get_media_catalog(series_catalog)
+        return _visible_media_categories(username, snapshot, "series")
+    if action == "get_series":
+        if not _has_media_access(username, "series"):
+            return []
+        snapshot = await _get_media_catalog(series_catalog)
+        return await _json_response(
+            [
+                item.public
+                for item in _visible_media(username, snapshot, "series", category_id)
+            ]
+        )
+    if action == "get_series_info":
+        return await _json_response(
+            await _media_info(username, series_catalog, series_id)
+        )
     raise HTTPException(400, f"Unsupported action: {action}")
 
 
@@ -338,13 +507,17 @@ def _iter_upstream(upstream: Any) -> Iterator[bytes]:
             yield chunk
 
 
-async def _proxy_url(url: str) -> StreamingResponse:
+async def _proxy_url(url: str, request: Request) -> StreamingResponse:
+    request_headers = {}
+    if range_header := request.headers.get("range"):
+        request_headers["Range"] = range_header
     try:
         upstream = await asyncio.to_thread(
             safe_urlopen,
             url,
             30,
             cache.get_user_agent(),
+            request_headers,
         )
     except (OSError, urllib.error.URLError) as exc:
         log.warning("Gateway upstream connection failed (%s)", type(exc).__name__)
@@ -357,7 +530,18 @@ async def _proxy_url(url: str) -> StreamingResponse:
     content_encoding = upstream.headers.get("Content-Encoding")
     if content_encoding:
         headers["Content-Encoding"] = content_encoding
-    return StreamingResponse(_iter_upstream(upstream), media_type=content_type, headers=headers)
+    for header in ("Content-Range", "Accept-Ranges"):
+        if value := upstream.headers.get(header):
+            headers[header] = value
+    status_code = getattr(upstream, "status", 200)
+    if not isinstance(status_code, int):
+        status_code = 200
+    return StreamingResponse(
+        _iter_upstream(upstream),
+        media_type=content_type,
+        headers=headers,
+        status_code=status_code,
+    )
 
 
 @app.get("/live/{stream_path:path}", name="live_stream")
@@ -377,7 +561,54 @@ async def live_stream(request: Request, stream_path: str) -> StreamingResponse:
     stream = snapshot.streams_by_id.get(stream_id)
     if stream is None or stream not in _visible_streams(username, snapshot):
         raise HTTPException(404, "Stream not found")
-    return await _proxy_url(_resolve_upstream(stream, extension))
+    return await _proxy_url(_resolve_upstream(stream, extension), request)
+
+
+async def _on_demand_stream(
+    request: Request,
+    stream_path: str,
+    media_catalog: GatewayMediaCatalog,
+) -> StreamingResponse:
+    try:
+        username, remainder = stream_path.split("/", 1)
+        password, filename = remainder.rsplit("/", 1)
+        stream_id_text, extension = filename.rsplit(".", 1)
+        stream_id = int(stream_id_text)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, "Invalid stream path") from exc
+    if not extension.isalnum() or len(extension) > 10:
+        raise HTTPException(400, "Invalid stream format")
+    if not await authenticator.verify(request, username, password):
+        raise HTTPException(401, "Invalid username or password")
+    resolved = await asyncio.to_thread(
+        media_catalog.resolve_registered_id,
+        stream_id,
+        "series-episode" if media_catalog.kind == "series" else None,
+    )
+    if resolved is None:
+        raise HTTPException(404, "Stream not found")
+    source_id, upstream_id = resolved
+    if not _media_source_allowed(username, media_catalog.kind, source_id):
+        raise HTTPException(404, "Stream not found")
+    client = get_xtream_client_by_source(source_id)
+    if client is None:
+        raise HTTPException(404, "Source is no longer configured")
+    upstream_url = client.build_stream_url(
+        media_catalog.kind,
+        int(upstream_id),
+        extension,
+    )
+    return await _proxy_url(upstream_url, request)
+
+
+@app.get("/movie/{stream_path:path}", name="movie_stream")
+async def movie_stream(request: Request, stream_path: str) -> StreamingResponse:
+    return await _on_demand_stream(request, stream_path, vod_catalog)
+
+
+@app.get("/series/{stream_path:path}", name="series_stream")
+async def series_stream(request: Request, stream_path: str) -> StreamingResponse:
+    return await _on_demand_stream(request, stream_path, series_catalog)
 
 
 @app.get("/xmltv.php")

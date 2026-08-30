@@ -25,6 +25,14 @@ def test_atomic_write_json_replaces_file_and_preserves_permissions(tmp_path: pat
     assert list(tmp_path.iterdir()) == [path]
 
 
+def test_atomic_write_json_supports_compact_output(tmp_path: pathlib.Path):
+    path = tmp_path / "cache.json"
+
+    util.atomic_write_json(path, {"items": [1, 2]}, indent=None)
+
+    assert path.read_text() == '{"items":[1,2]}'
+
+
 def _fake_request(url: str) -> Any:
     """Create a minimal request object for testing."""
 

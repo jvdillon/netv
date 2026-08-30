@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import json
@@ -34,7 +35,11 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 _DEFAULT_USER_AGENT = "VLC/3.0.20 LibVLC/3.0.20"
 
 
-def atomic_write_json(path: pathlib.Path, value: Any) -> None:
+def atomic_write_json(
+    path: pathlib.Path,
+    value: Any,
+    indent: int | None = 2,
+) -> None:
     """Atomically replace a JSON file while preserving existing permissions."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path: pathlib.Path | None = None
@@ -45,7 +50,12 @@ def atomic_write_json(path: pathlib.Path, value: Any) -> None:
             prefix=f".{path.name}.",
             delete=False,
         ) as temp:
-            json.dump(value, temp, indent=2)
+            json.dump(
+                value,
+                temp,
+                indent=indent,
+                separators=None if indent is not None else (",", ":"),
+            )
             temp.flush()
             if path.exists():
                 os.fchmod(temp.fileno(), path.stat().st_mode & 0o777)
@@ -57,7 +67,12 @@ def atomic_write_json(path: pathlib.Path, value: Any) -> None:
             temp_path.unlink(missing_ok=True)
 
 
-def safe_urlopen(url: str, timeout: int = 30, user_agent: str | None = None) -> Any:
+def safe_urlopen(
+    url: str,
+    timeout: int = 30,
+    user_agent: str | None = None,
+    headers: Mapping[str, str] | None = None,
+) -> Any:
     """Open URL with safe redirect handling.
 
     Args:
@@ -70,6 +85,8 @@ def safe_urlopen(url: str, timeout: int = 30, user_agent: str | None = None) -> 
     if parsed.scheme not in ("http", "https"):
         raise urllib.error.URLError(f"Unsafe URL scheme: {parsed.scheme}")
     ua = user_agent if user_agent else _DEFAULT_USER_AGENT
-    req = urllib.request.Request(url, headers={"User-Agent": ua})
+    request_headers = {"User-Agent": ua}
+    request_headers.update(headers or {})
+    req = urllib.request.Request(url, headers=request_headers)
     opener = urllib.request.build_opener(_SafeRedirectHandler())
     return opener.open(req, timeout=timeout)

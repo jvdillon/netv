@@ -185,10 +185,12 @@ Username: <your neTV username>
 Password: <your neTV password>
 ```
 
-The gateway currently supports live categories, live streams, MPEG-TS M3U
-playlists, short EPG lookups, user-filtered XMLTV, and live passthrough
-playback. VOD, series, and standalone upscaling will be added in later phases.
-Remote provider credentials and playback URLs are not returned to the player.
+The gateway supports live TV, movie and series catalogs, movie and series
+details, MPEG-TS M3U playlists, short EPG lookups, user-filtered XMLTV, and
+passthrough playback. Movie and series catalogs are loaded only when requested,
+so they do not delay the initial live-TV catalog. Standalone upscaling will be
+added in a later phase. Remote provider credentials and playback URLs are not
+returned to the player.
 
 The gateway currently does not enforce the per-user `max_streams_per_source`
 setting or coordinate per-source connection counts with the web process. Use a
