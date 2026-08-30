@@ -45,7 +45,7 @@ def test_movie_catalog_assigns_stable_ids_across_sources(
         "load_vod_data",
         lambda: (deepcopy(categories), deepcopy(movies)),
     )
-    path = tmp_path / "ids.json"
+    path = tmp_path / "ids.db"
 
     first = GatewayMediaCatalog(
         "movie",
@@ -88,7 +88,7 @@ def test_series_info_remaps_episode_ids_and_removes_private_fields(
             ],
         ),
     )
-    registry = StreamIdRegistry(tmp_path / "ids.json")
+    registry = StreamIdRegistry(tmp_path / "ids.db")
     catalog = GatewayMediaCatalog("series", registry, ttl_seconds=60)
     series = catalog.get().items[0]
     raw = {
@@ -150,7 +150,7 @@ def test_catalog_reloads_when_shared_cache_changes(
     )
     catalog = GatewayMediaCatalog(
         "movie",
-        StreamIdRegistry(tmp_path / "ids.json"),
+        StreamIdRegistry(tmp_path / "ids.db"),
         ttl_seconds=3600,
     )
     assert catalog.get().items[0].public["name"] == "Before"
@@ -183,7 +183,7 @@ def test_uncategorized_items_receive_a_public_category(
     )
     catalog = GatewayMediaCatalog(
         "movie",
-        StreamIdRegistry(tmp_path / "ids.json"),
+        StreamIdRegistry(tmp_path / "ids.db"),
         ttl_seconds=60,
     )
 
@@ -194,7 +194,7 @@ def test_uncategorized_items_receive_a_public_category(
 
 
 def test_registered_id_resolution_rejects_other_id_kinds(tmp_path: Path):
-    registry = StreamIdRegistry(tmp_path / "ids.json")
+    registry = StreamIdRegistry(tmp_path / "ids.db")
     ids = registry.get_or_create_many(
         [
             "source-a:live:10",

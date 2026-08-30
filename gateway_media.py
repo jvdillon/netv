@@ -6,11 +6,12 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+import json
 import logging
 import threading
 import time
 
-from gateway_catalog import StreamIdRegistry
+from gateway_catalog import RegistryError, StreamIdRegistry
 from m3u import load_series_data, load_vod_data
 
 import cache
@@ -35,7 +36,13 @@ class GatewayMediaItem:
     local_id: int
     source_id: str
     upstream_id: str
-    public: dict[str, Any]
+    category_ids: tuple[str, ...]
+    payload: bytes
+
+    @property
+    def public(self) -> dict[str, Any]:
+        value = json.loads(self.payload)
+        return value if isinstance(value, dict) else {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,7 +125,7 @@ class GatewayMediaCatalog:
                     load_vod_data() if self.kind == "movie" else load_series_data()
                 )
                 candidate = self._map(categories, items)
-            except (KeyError, OSError, TypeError, ValueError) as exc:
+            except (KeyError, OSError, RegistryError, TypeError, ValueError) as exc:
                 if self._snapshot is None:
                     raise
                 log.warning(
@@ -197,52 +204,57 @@ class GatewayMediaCatalog:
             )
             category_source_ids[public_id] = source_id
 
-        item_entries: list[tuple[dict[str, Any], str, str, str]] = []
-        for item in items:
-            source_id = str(item.get("source_id") or "")
-            upstream_id = str(item.get(self.id_field) or "")
-            if not source_id or not upstream_id:
-                continue
-            key = f"{source_id}:{self.kind}:{upstream_id}"
-            item_entries.append((item, source_id, upstream_id, key))
-        local_ids = self._registry.get_or_create_many(
-            [key for _, _, _, key in item_entries]
-        )
-
         public_items: list[GatewayMediaItem] = []
-        for item, source_id, upstream_id, key in item_entries:
-            public = item
-            for private_field in _PRIVATE_FIELDS:
-                public.pop(private_field, None)
-            local_id = local_ids[key]
-            public[self.id_field] = local_id
-            source_categories = [
-                str(value)
-                for value in item.get("category_ids")
-                or [item.get("category_id")]
-                if value not in (None, "")
-            ]
-            mapped_categories = [
-                category_id_map[(source_id, category_id)]
-                for category_id in source_categories
-                if (source_id, category_id) in category_id_map
-            ]
-            if not mapped_categories:
-                uncategorized_id = category_id_map.get(
-                    (source_id, "__uncategorized__")
-                )
-                if uncategorized_id:
-                    mapped_categories = [uncategorized_id]
-            public["category_ids"] = mapped_categories
-            public["category_id"] = mapped_categories[0] if mapped_categories else ""
-            public_items.append(
-                GatewayMediaItem(
-                    local_id=local_id,
-                    source_id=source_id,
-                    upstream_id=upstream_id,
-                    public=public,
-                )
+        for start in range(0, len(items), 5000):
+            entries: list[tuple[dict[str, Any], str, str, str]] = []
+            for item in items[start : start + 5000]:
+                source_id = str(item.get("source_id") or "")
+                upstream_id = str(item.get(self.id_field) or "")
+                if not source_id or not upstream_id:
+                    continue
+                key = f"{source_id}:{self.kind}:{upstream_id}"
+                entries.append((item, source_id, upstream_id, key))
+            local_ids = self._registry.get_or_create_many(
+                [key for _, _, _, key in entries]
             )
+            for item, source_id, upstream_id, key in entries:
+                public = _public_copy(item)
+                local_id = local_ids[key]
+                public[self.id_field] = local_id
+                source_categories = [
+                    str(value)
+                    for value in item.get("category_ids")
+                    or [item.get("category_id")]
+                    if value not in (None, "")
+                ]
+                mapped_categories = [
+                    category_id_map[(source_id, category_id)]
+                    for category_id in source_categories
+                    if (source_id, category_id) in category_id_map
+                ]
+                if not mapped_categories:
+                    uncategorized_id = category_id_map.get(
+                        (source_id, "__uncategorized__")
+                    )
+                    if uncategorized_id:
+                        mapped_categories = [uncategorized_id]
+                public["category_ids"] = mapped_categories
+                public["category_id"] = (
+                    mapped_categories[0] if mapped_categories else ""
+                )
+                public_items.append(
+                    GatewayMediaItem(
+                        local_id=local_id,
+                        source_id=source_id,
+                        upstream_id=upstream_id,
+                        category_ids=tuple(mapped_categories),
+                        payload=json.dumps(
+                            public,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode(),
+                    )
+                )
 
         return MediaCatalogSnapshot(
             categories=public_categories,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -69,12 +70,15 @@ def _media_snapshot(kind: str) -> MediaCatalogSnapshot:
         local_id=501,
         source_id="source-media",
         upstream_id="77",
-        public={
-            id_field: 501,
-            "name": "A Movie" if kind == "movie" else "A Show",
-            "category_id": "401",
-            "category_ids": ["401"],
-        },
+        category_ids=("401",),
+        payload=json.dumps(
+            {
+                id_field: 501,
+                "name": "A Movie" if kind == "movie" else "A Show",
+                "category_id": "401",
+                "category_ids": ["401"],
+            }
+        ).encode(),
     )
     return MediaCatalogSnapshot(
         categories=[
@@ -326,6 +330,7 @@ def test_player_api_exposes_and_restricts_on_demand_catalogs(
 
     assert categories.json() == snapshot.categories
     assert items.json() == [snapshot.items[0].public]
+    assert int(items.headers["content-length"]) == len(items.content)
 
     assert auth.set_user_limits("player", unavailable_groups=[restriction])
     assert client.get(
@@ -579,7 +584,7 @@ def test_xmltv_enforces_category_restrictions(
 
 
 def test_stream_id_registry_is_stable(tmp_path: Path):
-    path = tmp_path / "stream_ids.json"
+    path = tmp_path / "stream_ids.db"
     first = StreamIdRegistry(path)
     assigned = first.get_or_create_many(["source-a:live:7", "source-b:live:7"])
 
@@ -589,14 +594,62 @@ def test_stream_id_registry_is_stable(tmp_path: Path):
     assert assigned["source-a:live:7"] != assigned["source-b:live:7"]
 
 
+def test_stream_id_registry_migrates_existing_json_ids(tmp_path: Path):
+    legacy_path = tmp_path / "stream_ids.json"
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "ids": {
+                    "source-a:live:7": 41,
+                    "source-a:movie:8": 52,
+                }
+            }
+        )
+    )
+    registry = StreamIdRegistry(tmp_path / "stream_ids.db", legacy_path)
+
+    assert registry.get_or_create("source-a:live:7") == 41
+    assert registry.get_or_create("source-a:movie:8") == 52
+    assert registry.get_or_create("source-a:series:9") == 53
+    assert not legacy_path.exists()
+    assert (tmp_path / "stream_ids.json.migrated").exists()
+
+
+def test_stream_id_registry_serializes_concurrent_migration(tmp_path: Path):
+    legacy_path = tmp_path / "stream_ids.json"
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "ids": {
+                    f"source-a:movie:{index}": index
+                    for index in range(1, 101)
+                }
+            }
+        )
+    )
+    database_path = tmp_path / "stream_ids.db"
+
+    def load_registry() -> int:
+        return StreamIdRegistry(
+            database_path,
+            legacy_path,
+        ).get_or_create("source-a:movie:100")
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(lambda _index: load_registry(), range(4)))
+
+    assert results == [100, 100, 100, 100]
+
+
 def test_stream_id_registry_rejects_invalid_existing_file(tmp_path: Path):
-    path = tmp_path / "stream_ids.json"
-    path.write_text("[]")
+    path = tmp_path / "stream_ids.db"
+    legacy_path = tmp_path / "stream_ids.json"
+    legacy_path.write_text("[]")
 
     with pytest.raises(RuntimeError, match="Invalid gateway stream ID registry"):
-        StreamIdRegistry(path).get_or_create("source-a:live:7")
+        StreamIdRegistry(path, legacy_path).get_or_create("source-a:live:7")
 
-    assert path.read_text() == "[]"
+    assert legacy_path.read_text() == "[]"
 
 
 def test_catalog_removes_upstream_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -630,7 +683,7 @@ def test_catalog_removes_upstream_credentials(tmp_path: Path, monkeypatch: pytes
         ),
     )
     snapshot = GatewayCatalog(
-        registry=StreamIdRegistry(tmp_path / "ids.json"),
+        registry=StreamIdRegistry(tmp_path / "ids.db"),
         ttl_seconds=60,
     ).get()
 
@@ -664,7 +717,7 @@ def test_catalog_assigns_uncategorized_streams_numeric_category(
         ),
     )
     snapshot = GatewayCatalog(
-        registry=StreamIdRegistry(tmp_path / "ids.json"),
+        registry=StreamIdRegistry(tmp_path / "ids.db"),
         ttl_seconds=60,
     ).get()
 
@@ -676,7 +729,7 @@ def test_catalog_assigns_uncategorized_streams_numeric_category(
 
 def test_m3u_registry_key_uses_url_instead_of_playlist_position(tmp_path: Path):
     catalog = GatewayCatalog(
-        registry=StreamIdRegistry(tmp_path / "ids.json"),
+        registry=StreamIdRegistry(tmp_path / "ids.db"),
         ttl_seconds=60,
     )
     first = catalog._stream_registry_key(
@@ -750,7 +803,7 @@ def test_catalog_assigns_distinct_ids_to_colliding_m3u_entries(
     )
 
     snapshot = GatewayCatalog(
-        registry=StreamIdRegistry(tmp_path / "ids.json"),
+        registry=StreamIdRegistry(tmp_path / "ids.db"),
         ttl_seconds=60,
     ).get()
 
@@ -779,7 +832,7 @@ def test_catalog_retains_previous_snapshot_when_refresh_fails(
     fetch = MagicMock(return_value=source_data)
     monkeypatch.setattr(gateway_catalog, "fetch_source_live_data", fetch)
     catalog = GatewayCatalog(
-        registry=StreamIdRegistry(tmp_path / "ids.json"),
+        registry=StreamIdRegistry(tmp_path / "ids.db"),
         ttl_seconds=60,
     )
     original = catalog.get()

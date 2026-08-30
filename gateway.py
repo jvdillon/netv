@@ -243,9 +243,53 @@ def _visible_media(
         items = [
             item
             for item in items
-            if category_id in item.public.get("category_ids", [])
+            if category_id in item.category_ids
         ]
     return items
+
+
+def _iter_media_json(items: list[GatewayMediaItem]) -> Iterator[bytes]:
+    buffer = bytearray(b"[")
+    first = True
+    for item in items:
+        separator_size = 0 if first else 1
+        if len(buffer) > 1 and len(buffer) + separator_size + len(item.payload) > 1024 * 1024:
+            yield bytes(buffer)
+            buffer.clear()
+        if not first:
+            buffer.extend(b",")
+        buffer.extend(item.payload)
+        first = False
+    buffer.extend(b"]")
+    yield bytes(buffer)
+
+
+async def _media_items_response(
+    username: str,
+    snapshot: MediaCatalogSnapshot,
+    kind: str,
+    category_id: str | None,
+) -> StreamingResponse:
+    def select() -> tuple[list[GatewayMediaItem], int]:
+        items = _visible_media(
+            username,
+            snapshot,
+            kind,
+            category_id,
+        )
+        content_length = (
+            sum(len(item.payload) for item in items)
+            + max(0, len(items) - 1)
+            + 2
+        )
+        return items, content_length
+
+    items, content_length = await asyncio.to_thread(select)
+    return StreamingResponse(
+        _iter_media_json(items),
+        media_type="application/json",
+        headers={"Content-Length": str(content_length)},
+    )
 
 
 def _visible_media_categories(
@@ -412,11 +456,11 @@ async def player_api(
         if not _has_media_access(username, "movie"):
             return []
         snapshot = await _get_media_catalog(vod_catalog)
-        return await _json_response(
-            [
-                item.public
-                for item in _visible_media(username, snapshot, "movie", category_id)
-            ]
+        return await _media_items_response(
+            username,
+            snapshot,
+            "movie",
+            category_id,
         )
     if action == "get_vod_info":
         return await _json_response(
@@ -431,11 +475,11 @@ async def player_api(
         if not _has_media_access(username, "series"):
             return []
         snapshot = await _get_media_catalog(series_catalog)
-        return await _json_response(
-            [
-                item.public
-                for item in _visible_media(username, snapshot, "series", category_id)
-            ]
+        return await _media_items_response(
+            username,
+            snapshot,
+            "series",
+            category_id,
         )
     if action == "get_series_info":
         return await _json_response(

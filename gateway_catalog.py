@@ -9,19 +9,23 @@ import hashlib
 import json
 import logging
 import pathlib
+import sqlite3
 import threading
 import time
 import urllib.error
 import urllib.parse
 
 from m3u import fetch_source_live_data
-from util import atomic_write_json
 
 import cache
 
 
 log = logging.getLogger(__name__)
 _FAILED_LOAD_RETRY_SECONDS = 60
+
+
+class RegistryError(RuntimeError):
+    """Raised when stable gateway IDs cannot be read or updated."""
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -53,75 +57,172 @@ class CatalogSnapshot:
 
 
 class StreamIdRegistry:
-    """Persist stable integer IDs for source-specific upstream stream IDs."""
+    """Persist stable integer IDs in a transactional SQLite registry."""
 
-    def __init__(self, path: pathlib.Path | None = None) -> None:
+    def __init__(
+        self,
+        path: pathlib.Path | None = None,
+        legacy_path: pathlib.Path | None = None,
+    ) -> None:
         self._path = path
+        self._legacy_path = legacy_path
         self._lock = threading.Lock()
-        self._loaded = False
-        self._ids: dict[str, int] = {}
-        self._keys_by_id: dict[int, str] = {}
-        self._next_id = 1
+        self._initialized = False
 
     @property
     def path(self) -> pathlib.Path:
-        return self._path or cache.CACHE_DIR / "gateway_stream_ids.json"
+        return self._path or cache.CACHE_DIR / "gateway_stream_ids.db"
 
-    def _load(self) -> None:
-        if self._loaded:
+    @property
+    def legacy_path(self) -> pathlib.Path:
+        if self._legacy_path is not None:
+            return self._legacy_path
+        if self._path is None:
+            return cache.CACHE_DIR / "gateway_stream_ids.json"
+        return self.path.with_suffix(".json")
+
+    @property
+    def migrated_legacy_path(self) -> pathlib.Path:
+        return self.legacy_path.with_name(f"{self.legacy_path.name}.migrated")
+
+    def _connect(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.path, timeout=30)
+        connection.execute("PRAGMA busy_timeout=30000")
+        return connection
+
+    def _initialize(self) -> None:
+        if self._initialized:
             return
+        should_mark_legacy = False
         try:
-            raw = json.loads(self.path.read_text())
-            if not isinstance(raw, dict) or not isinstance(raw.get("ids"), dict):
-                raise ValueError("registry must contain an object-valued 'ids' field")
-            ids = raw["ids"]
-            self._ids = {
-                str(key): int(value)
-                for key, value in ids.items()
-                if isinstance(value, int) and value > 0
-            }
-            if len(self._ids) != len(ids) or len(set(self._ids.values())) != len(self._ids):
-                raise ValueError("registry contains invalid or duplicate IDs")
-            self._keys_by_id = {
-                local_id: key for key, local_id in self._ids.items()
-            }
-            self._next_id = max(self._ids.values(), default=0) + 1
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ids (
+                        id INTEGER PRIMARY KEY,
+                        key TEXT NOT NULL UNIQUE
+                    )
+                    """
+                )
+                connection.execute("BEGIN IMMEDIATE")
+                has_ids_row = connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM ids LIMIT 1)"
+                ).fetchone()
+                has_ids = bool(has_ids_row and has_ids_row[0])
+                if not has_ids and self.legacy_path.exists():
+                    raw = json.loads(self.legacy_path.read_text())
+                    if not isinstance(raw, dict) or not isinstance(raw.get("ids"), dict):
+                        raise ValueError(
+                            "registry must contain an object-valued 'ids' field"
+                        )
+                    ids = raw["ids"]
+                    entries = [
+                        (int(local_id), str(key))
+                        for key, local_id in ids.items()
+                        if isinstance(local_id, int)
+                        and not isinstance(local_id, bool)
+                        and local_id > 0
+                    ]
+                    if (
+                        len(entries) != len(ids)
+                        or len({local_id for local_id, _ in entries}) != len(entries)
+                    ):
+                        raise ValueError("registry contains invalid or duplicate IDs")
+                    connection.executemany(
+                        "INSERT INTO ids (id, key) VALUES (?, ?)",
+                        entries,
+                    )
+                    log.info(
+                        "Migrated %d stable gateway IDs to SQLite",
+                        len(entries),
+                    )
+                    should_mark_legacy = True
+                elif not has_ids and self.migrated_legacy_path.exists():
+                    raise ValueError(
+                        "SQLite registry is empty after legacy migration"
+                    )
+                elif has_ids and self.legacy_path.exists():
+                    should_mark_legacy = True
+        except (OSError, sqlite3.Error, ValueError, TypeError, json.JSONDecodeError) as exc:
             log.error("Invalid gateway stream ID registry: %s", exc)
-            raise RuntimeError("Invalid gateway stream ID registry") from exc
-        self._loaded = True
-
-    def _save(self) -> None:
-        atomic_write_json(
-            self.path,
-            {"ids": dict(sorted(self._ids.items()))},
-            indent=None,
-        )
+            raise RegistryError("Invalid gateway stream ID registry") from exc
+        if should_mark_legacy:
+            try:
+                self.legacy_path.replace(self.migrated_legacy_path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.warning("Could not mark legacy gateway ID registry migrated: %s", exc)
+        self._initialized = True
 
     def get_or_create(self, key: str) -> int:
         return self.get_or_create_many([key])[key]
 
     def get_or_create_many(self, keys: list[str]) -> dict[str, int]:
+        unique_keys = list(dict.fromkeys(keys))
+        if not unique_keys:
+            return {}
         with self._lock:
-            self._load()
-            changed = False
-            for key in keys:
-                if key in self._ids:
-                    continue
-                self._ids[key] = self._next_id
-                self._keys_by_id[self._next_id] = key
-                self._next_id += 1
-                changed = True
-            if changed:
-                self._save()
-            return {key: self._ids[key] for key in keys}
+            self._initialize()
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = self._connect()
+                connection.execute("BEGIN IMMEDIATE")
+                existing: dict[str, int] = {}
+                for index in range(0, len(unique_keys), 400):
+                    chunk = unique_keys[index : index + 400]
+                    placeholders = ",".join("?" for _ in chunk)
+                    existing.update(
+                        {
+                            key: local_id
+                            for key, local_id in connection.execute(
+                                f"SELECT key, id FROM ids WHERE key IN ({placeholders})",
+                                chunk,
+                            )
+                        }
+                    )
+                missing = [key for key in unique_keys if key not in existing]
+                if missing:
+                    next_id_row = connection.execute(
+                        "SELECT COALESCE(MAX(id), 0) + 1 FROM ids"
+                    ).fetchone()
+                    if next_id_row is None:
+                        raise RegistryError("Unable to allocate gateway ID")
+                    next_id = int(next_id_row[0])
+                    new_entries = [
+                        (next_id + offset, key)
+                        for offset, key in enumerate(missing)
+                    ]
+                    connection.executemany(
+                        "INSERT INTO ids (id, key) VALUES (?, ?)",
+                        new_entries,
+                    )
+                    existing.update(
+                        {key: local_id for local_id, key in new_entries}
+                    )
+                connection.commit()
+                return {key: existing[key] for key in keys}
+            except sqlite3.Error as exc:
+                if connection is not None:
+                    connection.rollback()
+                raise RegistryError("Unable to update gateway ID registry") from exc
+            finally:
+                if connection is not None:
+                    connection.close()
 
     def key_for_id(self, local_id: int) -> str | None:
         with self._lock:
-            self._load()
-            return self._keys_by_id.get(local_id)
+            self._initialize()
+            try:
+                with self._connect() as connection:
+                    row = connection.execute(
+                        "SELECT key FROM ids WHERE id = ?",
+                        (local_id,),
+                    ).fetchone()
+            except sqlite3.Error as exc:
+                raise RegistryError("Unable to read gateway ID registry") from exc
+            return str(row[0]) if row is not None else None
 
 
 class GatewayCatalog:
