@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from typing import Any
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, ParamSpec, TypeVar
 
 import argparse
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -52,6 +54,21 @@ _MAX_LOGIN_FAILURES = 10
 _MAX_GLOBAL_LOGIN_FAILURES = 100
 _MAX_AUTH_CACHE_ENTRIES = 1024
 _MAX_FAILURE_CLIENTS = 1024
+_MEDIA_EXECUTOR = ThreadPoolExecutor(
+    max_workers=8,
+    thread_name_prefix="netv-gateway-media",
+)
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+async def _run_media(
+    function: Callable[_P, _T],
+    *args: _P.args,
+    **kwargs: _P.kwargs,
+) -> _T:
+    call = functools.partial(function, *args, **kwargs)
+    return await asyncio.get_running_loop().run_in_executor(_MEDIA_EXECUTOR, call)
 
 
 class GatewayAuthenticator:
@@ -212,7 +229,7 @@ async def _get_catalog() -> CatalogSnapshot:
 async def _get_media_catalog(
     media_catalog: GatewayMediaCatalog,
 ) -> MediaCatalogSnapshot:
-    return await asyncio.to_thread(media_catalog.get)
+    return await _run_media(media_catalog.get)
 
 
 async def _json_response(value: Any) -> Response:
@@ -284,7 +301,7 @@ async def _media_items_response(
         )
         return items, content_length
 
-    items, content_length = await asyncio.to_thread(select)
+    items, content_length = await _run_media(select)
     return StreamingResponse(
         _iter_media_json(items),
         media_type="application/json",
@@ -328,7 +345,7 @@ async def _media_info(
 ) -> dict[str, Any]:
     if local_id is None:
         raise HTTPException(400, f"{media_catalog.id_field} is required")
-    resolved = await asyncio.to_thread(
+    resolved = await _run_media(
         media_catalog.resolve_registered_id,
         local_id,
     )
@@ -355,7 +372,7 @@ async def _media_info(
         f"gateway_{media_catalog.kind}_info_{item.source_id}_{item.upstream_id}"
     )
     try:
-        raw_info = await asyncio.to_thread(
+        raw_info = await _run_media(
             cache.get_cached_info,
             cache_key,
             fetch,
@@ -369,7 +386,7 @@ async def _media_info(
         raise HTTPException(502, "Unable to load upstream item details") from exc
     if not isinstance(raw_info, dict):
         raise HTTPException(502, "Upstream returned invalid item details")
-    return await asyncio.to_thread(media_catalog.remap_info, item, raw_info)
+    return await _run_media(media_catalog.remap_info, item, raw_info)
 
 
 def _auth_failure() -> JSONResponse:
@@ -624,7 +641,7 @@ async def _on_demand_stream(
         raise HTTPException(400, "Invalid stream format")
     if not await authenticator.verify(request, username, password):
         raise HTTPException(401, "Invalid username or password")
-    resolved = await asyncio.to_thread(
+    resolved = await _run_media(
         media_catalog.resolve_registered_id,
         stream_id,
         "series-episode" if media_catalog.kind == "series" else None,

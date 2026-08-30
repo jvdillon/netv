@@ -7,7 +7,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import asyncio
 import json
+import threading
 import urllib.error
 
 from fastapi.testclient import TestClient
@@ -280,6 +282,38 @@ def test_player_api_exposes_local_live_catalog(gateway_client):
             "tv_archive_duration": 0,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_media_catalog_does_not_block_default_executor(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    snapshot = _media_snapshot("movie")
+    started = threading.Event()
+    release = threading.Event()
+
+    def load_catalog() -> MediaCatalogSnapshot:
+        started.set()
+        assert release.wait(timeout=2)
+        return snapshot
+
+    monkeypatch.setattr(gateway.vod_catalog, "get", load_catalog)
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    media_task = asyncio.create_task(gateway._get_media_catalog(gateway.vod_catalog))
+    try:
+        while not started.is_set():
+            await asyncio.sleep(0)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(lambda: "live-work"),
+            timeout=1,
+        )
+        assert result == "live-work"
+    finally:
+        release.set()
+        await media_task
+
+    assert media_task.result() is snapshot
 
 
 @pytest.mark.parametrize(
