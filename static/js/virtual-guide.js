@@ -555,7 +555,7 @@ class VirtualGuide {
 
         <!-- Desktop Channel Info -->
         <div class="desktop-only w-36 lg:w-48 flex-shrink-0 p-1 items-center gap-1 bg-gray-800 sticky left-0 z-10 border-r border-gray-700">
-          ${iconUrl ? `<img src="${iconUrl}" alt="" class="w-10 h-10 object-contain" onerror="this.style.display='none'">` : ''}
+          ${iconUrl ? `<img src="${iconUrl}" alt="" class="w-10 h-10 object-contain" loading="lazy" onerror="this.style.display='none'">` : ''}
           <a href="/play/live/${ch.stream_id}"
              class="text-sm line-clamp-3 hover:text-blue-400 focus:text-blue-400 focus:outline focus:outline-2 focus:outline-blue-500 focusable"
              tabindex="0" data-nav="epg" data-row="${index}" data-col="-1"

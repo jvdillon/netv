@@ -238,7 +238,7 @@
       <!-- Desktop Channel Info -->
       <div class="desktop-only w-36 lg:w-48 flex-shrink-0 p-1 items-center gap-1 bg-gray-800 sticky left-0 z-10 border-r border-gray-700">
         {% if row.channel.icon %}
-        <img src="{{ row.channel.icon | logo_url }}" alt="" class="w-10 h-10 object-contain"
+        <img src="{{ row.channel.icon | logo_url }}" alt="" class="w-10 h-10 object-contain" loading="lazy"
              onerror="this.style.display='none'">
         {% endif %}
         <a href="/play/live/{{ row.channel.stream_id }}"

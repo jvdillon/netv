@@ -269,6 +269,28 @@ class TestGuide:
             resp = auth_client.get("/guide?cats=1")
             assert resp.status_code == 200
 
+    def test_guide_limits_initial_virtual_rows(self, auth_client):
+        cache_module.get_cache()["live_categories"] = [
+            {"category_id": "1", "category_name": "News"}
+        ]
+        cache_module.get_cache()["live_streams"] = [
+            {
+                "stream_id": stream_id,
+                "name": f"Channel {stream_id}",
+                "category_ids": ["1"],
+                "epg_channel_id": "",
+                "stream_icon": f"https://example.com/{stream_id}.png",
+            }
+            for stream_id in range(60)
+        ]
+
+        with patch("main.epg.has_programs", return_value=True):
+            resp = auth_client.get("/guide?cats=1")
+
+        assert resp.status_code == 200
+        assert resp.text.count('class="guide-row') == 50
+        assert resp.text.count('loading="lazy"') == 50
+
     def test_guide_uses_saved_filter(self, auth_client, tmp_path):
         user_dir = tmp_path / "users" / "testuser"
         user_dir.mkdir(parents=True, exist_ok=True)

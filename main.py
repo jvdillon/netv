@@ -697,7 +697,7 @@ async def guide_page(
     # Virtual scrolling: only render first batch, JS fetches rest on scroll
     # When disabled, render all rows server-side
     virtual_scroll_enabled = user_settings.get("virtual_scroll", True)
-    initial_batch_size = 500 if virtual_scroll_enabled else total_count
+    initial_batch_size = 50 if virtual_scroll_enabled else total_count
     grid_data = _build_guide_rows(streams, 0, initial_batch_size, window_start, window_end)
 
     # Time markers (every 30 min) - convert to local time for display
@@ -2591,7 +2591,7 @@ async def save_user_prefs(
     return {"ok": True}
 
 
-def _fetch_logo(url: str, timeout: int = 10) -> tuple[bytes, str]:
+def _fetch_logo(url: str, timeout: int = 3) -> tuple[bytes, str]:
     """Fetch logo synchronously. Returns (data, content_type)."""
     from util import safe_urlopen
 
