@@ -29,3 +29,6 @@ tools/.zap2xml/
 
 # macOS
 .DS_Store
+
+# Local App Store source material
+/apple/AppStoreScreenshots/**/*.pdf

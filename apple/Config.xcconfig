@@ -1,1 +1,3 @@
 #include? ".env"
+
+CODE_SIGN_STYLE = Automatic

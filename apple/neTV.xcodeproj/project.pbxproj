@@ -241,12 +241,15 @@
 				TargetAttributes = {
 					52F388A2F260A00469CA3815 = {
 						DevelopmentTeam = "$(NETV_DEVELOPMENT_TEAM)";
+						ProvisioningStyle = Automatic;
 					};
 					9BCA086C4DB8D2ED267C0D2A = {
 						DevelopmentTeam = "$(NETV_DEVELOPMENT_TEAM)";
+						ProvisioningStyle = Automatic;
 					};
 					A0156F88536F20FD21290F82 = {
 						DevelopmentTeam = "$(NETV_DEVELOPMENT_TEAM)";
+						ProvisioningStyle = Automatic;
 					};
 				};
 			};

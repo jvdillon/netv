@@ -112,14 +112,9 @@ private struct GuideMainView: View {
             .background(GuideTheme.background)
             .onExitCommand { isSearchPresented = false }
         }
-        .onExitCommand {
-            if model.isPlayerExpanded {
-                model.isPlayerExpanded = false
-            } else {
-                destination = .live
-                focusedControl = GuideDestination.live.rawValue
-            }
-        }
+        // With no in-app destination to dismiss, leave Back unhandled so
+        // tvOS can return to the Apple TV Home screen.
+        .onExitCommand(perform: canHandleExitCommand ? handleExitCommand : nil)
         .onPlayPauseCommand {
             if destination == .live {
                 model.playPauseRequest = UUID()
@@ -175,5 +170,20 @@ private struct GuideMainView: View {
         .accessibilityLabel(title)
         .accessibilityValue(isSelected ? "Selected" : "")
     }
+
+    #if os(tvOS)
+    private var canHandleExitCommand: Bool {
+        model.isPlayerExpanded || destination != .live
+    }
+
+    private func handleExitCommand() {
+        if model.isPlayerExpanded {
+            model.isPlayerExpanded = false
+        } else {
+            destination = .live
+            focusedControl = GuideDestination.live.rawValue
+        }
+    }
+    #endif
 }
 #endif

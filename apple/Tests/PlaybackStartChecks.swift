@@ -25,6 +25,7 @@ final class APIClient {
     static var guideResponses: [Int: String] = [:]
     static var guideDelays: [Int: UInt64] = [:]
     static var failingGuideOffset: Int?
+    static var loginError: URLError?
     func playbackConfiguration(
         server: String, channelID: String, bandwidthSaver: Bool, catchupStart: Double?
     ) async throws -> PlaybackConfiguration {
@@ -49,7 +50,10 @@ final class APIClient {
     }
     func keepArchiveAlive(server: String, sessionID: String) async throws {}
     func validateSession(server: String) async throws -> Bool { false }
-    func login(server: String, username: String, password: String) async throws -> Bool { true }
+    func login(server: String, username: String, password: String) async throws -> Bool {
+        if let error = Self.loginError { throw error }
+        return true
+    }
     func logout(server: String) async {}
     func guide(server: String, offset: Int = 0) async throws -> GuideResponse {
         Self.guideOffsets.append(offset)
@@ -155,6 +159,15 @@ struct PlaybackStartChecks {
         precondition(archived.transcodeSessionID != live.transcodeSessionID)
         await model.stopPlayback(sessionID: live.transcodeSessionID!)
         try await checkGuideNavigation(model)
+        for code in [URLError.Code.notConnectedToInternet, .timedOut] {
+            APIClient.loginError = URLError(code)
+            model.isAuthenticated = false
+            await model.signIn(username: "test", password: "test")
+            precondition(model.errorMessage?.contains("Local Network") == true)
+            precondition(model.errorMessage?.contains("VPN") == true)
+            precondition(!model.isLoading && !model.isAuthenticated)
+        }
+        APIClient.loginError = nil
         print("Playback startup checks passed: cancellation, rapid tuning, failed release, recovery, catchup")
     }
 

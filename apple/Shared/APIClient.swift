@@ -38,15 +38,17 @@ final class APIClient {
     )
 
     init(session: URLSession? = nil) {
-        if let session {
-            self.session = session
-            return
-        }
+        self.session = session ?? URLSession(configuration: Self.sessionConfiguration())
+    }
+
+    static func sessionConfiguration() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.default
         configuration.httpCookieStorage = .shared
         configuration.httpShouldSetCookies = true
         configuration.timeoutIntervalForRequest = 60
-        self.session = URLSession(configuration: configuration)
+        configuration.waitsForConnectivity = false
+        configuration.timeoutIntervalForResource = 60
+        return configuration
     }
 
     func login(server: String, username: String, password: String) async throws -> URL {
@@ -315,8 +317,9 @@ final class APIClient {
             return (data, response)
         } catch {
             let elapsed = Date().timeIntervalSince(startedAt)
+            let networkError = error as NSError
             logger.error(
-                "\(operation, privacy: .public) failed after \(elapsed, format: .fixed(precision: 2))s: \(endpoint, privacy: .public), \(error.localizedDescription, privacy: .public)"
+                "\(operation, privacy: .public) failed after \(elapsed, format: .fixed(precision: 2))s: \(endpoint, privacy: .public), \(error.localizedDescription, privacy: .public) [\(networkError.domain, privacy: .public) \(networkError.code)]"
             )
             throw error
         }

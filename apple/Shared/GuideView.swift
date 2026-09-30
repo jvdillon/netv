@@ -18,33 +18,67 @@ struct GuideView: View {
 
 private struct GuideTimeNavigation: View {
     @EnvironmentObject private var model: AppModel
+    #if os(tvOS)
+    @FocusState private var focusedButton: String?
+    #endif
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
-                Button("Earlier", systemImage: "chevron.left") {
+                navigationButton(
+                    "Earlier", systemImage: "chevron.left",
+                    isDisabled: model.requestedGuideOffset <= -168
+                ) {
                     Task { await model.loadGuide(offset: model.requestedGuideOffset - 3) }
                 }
-                .disabled(model.requestedGuideOffset <= -168)
-                Button("Now") {
+                navigationButton("Now") {
                     Task { await model.loadGuide(offset: 0) }
                 }
-                Button("Later", systemImage: "chevron.right") {
+                navigationButton(
+                    "Later", systemImage: "chevron.right",
+                    isDisabled: model.requestedGuideOffset >= 168
+                ) {
                     Task { await model.loadGuide(offset: model.requestedGuideOffset + 3) }
                 }
-                .disabled(model.requestedGuideOffset >= 168)
                 if model.isLoading {
                     ProgressView().controlSize(.small)
                 }
                 Spacer(minLength: 0)
             }
-            .buttonStyle(.bordered)
             .labelStyle(.titleAndIcon)
             Text(windowLabel)
                 .font(.caption)
                 .foregroundStyle(Theme.secondaryText)
                 .accessibilityLabel("Guide window: \(windowLabel)")
         }
+    }
+
+    private func navigationButton(
+        _ title: String, systemImage: String? = nil,
+        isDisabled: Bool = false, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Group {
+                if let systemImage {
+                    Label(title, systemImage: systemImage)
+                } else {
+                    Text(title)
+                }
+            }
+            #if os(tvOS)
+            .font(.system(size: GuideMetrics.fontSize(12), weight: .semibold))
+            .padding(.horizontal, 14)
+            .frame(minHeight: GuideMetrics.scaled(32))
+            #endif
+        }
+        #if os(tvOS)
+        .buttonStyle(GuideButtonStyle(isFocused: focusedButton == title))
+        .focused($focusedButton, equals: title)
+        .opacity(isDisabled ? 0.45 : 1)
+        #else
+        .buttonStyle(.bordered)
+        #endif
+        .disabled(isDisabled)
     }
 
     private var windowLabel: String {
@@ -195,10 +229,15 @@ struct GuideSidebar: View {
     }
 }
 
+private struct GuideProgramFocus: Hashable {
+    let rowID: String
+    let index: Int
+}
+
 struct ChannelGuideView: View {
     @EnvironmentObject private var model: AppModel
     var selectedCategoryID: String? = nil
-    @FocusState private var focusedChannelID: String?
+    @FocusState private var focusedProgram: GuideProgramFocus?
     @State private var catchupChannel: Channel?
 
     private var rowHeight: CGFloat { GuideMetrics.scaled(74) }
@@ -283,9 +322,9 @@ struct ChannelGuideView: View {
                                     rowHeight: rowHeight,
                                     nowPosition: nowPosition(at: date),
                                     isPlaying: model.selection?.channel.id == row.id,
-                                    focusedChannel: $focusedChannelID
+                                    focusedProgram: $focusedProgram,
+                                    browseCatchup: { catchupChannel = row.channel }
                                 )
-                                .catchupMenu(row: row, browse: { catchupChannel = row.channel })
                                 .id(row.id)
                             }
                         }
@@ -298,17 +337,33 @@ struct ChannelGuideView: View {
                     .task(id: model.isPlayerExpanded) {
                         guard !model.isPlayerExpanded,
                               let id = model.selection?.channel.id,
-                              rows.contains(where: { $0.id == id }) else { return }
+                              let row = rows.first(where: { $0.id == id }),
+                              let target = focusTarget(in: row) else { return }
                         scrollProxy.scrollTo(id, anchor: .center)
                         // Let the guide become enabled and its lazy row mount before focusing it.
                         await Task.yield()
                         guard !Task.isCancelled else { return }
-                        focusedChannelID = id
+                        focusedProgram = target
                     }
                     #endif
                 }
             }
         }
+    }
+
+    private func focusTarget(in row: ChannelRow) -> GuideProgramFocus? {
+        if row.programs.isEmpty {
+            return GuideProgramFocus(rowID: row.id, index: 0)
+        }
+        let available = row.programs.indices.filter {
+            let program = row.programs[$0]
+            return model.canPlayProgram(program, in: row)
+                && program.guideRange.upperBound > program.guideRange.lowerBound
+        }
+        guard let index = available.first(where: {
+            model.isPlayingProgram(row.programs[$0], in: row)
+        }) ?? available.first else { return nil }
+        return GuideProgramFocus(rowID: row.id, index: index)
     }
 
     private func nowPosition(at date: Date) -> Double {
@@ -349,47 +404,42 @@ struct ChannelGuideView: View {
 }
 
 private struct GuideChannelRow: View {
-    @EnvironmentObject private var model: AppModel
     let row: ChannelRow
     let channelWidth: CGFloat
     let rowHeight: CGFloat
     let nowPosition: Double
     let isPlaying: Bool
-    let focusedChannel: FocusState<String?>.Binding
+    let focusedProgram: FocusState<GuideProgramFocus?>.Binding
+    let browseCatchup: () -> Void
 
     var body: some View {
         HStack(spacing: 0) {
-            Button {
-                #if os(tvOS)
-                if isPlaying && model.selection?.isCatchup == false {
-                    model.isPlayerExpanded = true
-                } else {
-                    model.play(row)
-                }
-                #else
-                model.play(row)
-                #endif
-            } label: {
-                streamLabel
-            }
-            .buttonStyle(GuideButtonStyle(
-                isSelected: isPlaying, isFocused: focusedChannel.wrappedValue == row.id
-            ))
-            .focused(focusedChannel, equals: row.id)
-            .accessibilityLabel("Watch \(row.channel.name) live")
+            streamLabel
+                .foregroundStyle(.white)
+                .background(
+                    isPlaying ? GuideTheme.selection : GuideTheme.surface,
+                    in: RoundedRectangle(cornerRadius: 8)
+                )
+                .allowsHitTesting(false)
+                .accessibilityElement(children: .combine)
 
             GeometryReader { timeline in
                 ZStack(alignment: .leading) {
                     Color.clear
                     if row.programs.isEmpty {
-                        Text("Program information unavailable")
-                            .font(.callout)
-                            .foregroundStyle(Theme.secondaryText)
-                            .padding(.leading, 16)
+                        GuideProgramButton(
+                            row: row, program: nil, index: 0, focusedProgram: focusedProgram
+                        )
+                        .catchupMenu(row: row, browse: browseCatchup)
+                        .padding(.horizontal, 2)
+                        .frame(height: rowHeight - 12)
                     }
-                    ForEach(Array(row.programs.enumerated()), id: \.offset) { _, program in
+                    ForEach(Array(row.programs.enumerated()), id: \.offset) { index, program in
                         let range = program.guideRange
-                        GuideProgramButton(row: row, program: program)
+                        GuideProgramButton(
+                            row: row, program: program, index: index, focusedProgram: focusedProgram
+                        )
+                            .catchupMenu(row: row, browse: browseCatchup)
                             .frame(
                                 width: max(timeline.size.width * (range.upperBound - range.lowerBound) - 4, 0),
                                 height: rowHeight - 12
@@ -432,60 +482,67 @@ private struct GuideChannelRow: View {
 private struct GuideProgramButton: View {
     @EnvironmentObject private var model: AppModel
     let row: ChannelRow
-    let program: Program
-    @FocusState private var focused: Bool
+    let program: Program?
+    let index: Int
+    let focusedProgram: FocusState<GuideProgramFocus?>.Binding
 
     var body: some View {
-        let available = model.canPlayProgram(program, in: row)
-        let playing = model.isPlayingProgram(program, in: row)
+        let available = program.map { model.canPlayProgram($0, in: row) } ?? true
+        let playing = program.map { model.isPlayingProgram($0, in: row) }
+            ?? (model.selection?.channel.id == row.id && model.selection?.isCatchup == false)
+        let focus = GuideProgramFocus(rowID: row.id, index: index)
         Button {
             #if os(tvOS)
             if playing {
                 model.isPlayerExpanded = true
-            } else {
-                model.playProgram(program, in: row)
+                return
             }
-            #else
-            model.playProgram(program, in: row)
             #endif
+            if let program {
+                model.playProgram(program, in: row)
+            } else {
+                model.play(row)
+            }
         } label: {
             GuideProgramCell(program: program)
         }
-        .buttonStyle(GuideButtonStyle(isSelected: playing, isFocused: focused))
-        .focused($focused)
+        .buttonStyle(GuideButtonStyle(
+            isSelected: playing, isFocused: focusedProgram.wrappedValue == focus
+        ))
+        .focused(focusedProgram, equals: focus)
         .disabled(!available)
         .opacity(available ? 1 : 0.45)
-        .accessibilityLabel("\(program.title), \(program.timeRange)")
+        .accessibilityLabel("\(row.channel.name), \(program?.title ?? "Watch live"), \(program?.timeRange ?? "Program information unavailable")")
         .accessibilityValue(available ? (playing ? "Playing" : "Available") : "Unavailable")
         #if os(macOS)
-        .help(available ? program.title : "This program is not available to play")
+        .help(available ? (program?.title ?? "Watch live") : "This program is not available to play")
         #endif
     }
 }
 
 private struct GuideProgramCell: View {
-    let program: Program
+    let program: Program?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 4) {
-                if program.catchup { Image(systemName: "clock.arrow.circlepath") }
-                Text(program.title).lineLimit(1)
+                if program?.catchup == true { Image(systemName: "clock.arrow.circlepath") }
+                Text(program?.title ?? "Watch live").lineLimit(1)
             }
             .font(.system(size: GuideMetrics.fontSize(12), weight: .semibold))
-            Text(program.timeRange)
+            Text(program?.timeRange ?? "Program information unavailable")
                 .font(.system(size: GuideMetrics.fontSize(10)))
                 .foregroundStyle(Theme.secondaryText)
                 .lineLimit(1)
         }
         .padding(.horizontal, 10)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-        .background(program.isCurrent ? GuideTheme.program.opacity(0.32) : .white.opacity(0.035))
+        .background(program?.isCurrent == true ? GuideTheme.program.opacity(0.32) : .white.opacity(0.035))
         .clipShape(RoundedRectangle(cornerRadius: 7))
         .overlay {
             RoundedRectangle(cornerRadius: 7)
                 .stroke(
-                    program.isCurrent ? GuideTheme.program.opacity(0.8) : .white.opacity(0.1),
+                    program?.isCurrent == true ? GuideTheme.program.opacity(0.8) : .white.opacity(0.1),
                     lineWidth: 1
                 )
         }
@@ -549,15 +606,17 @@ private struct PhoneGuideView: View {
                     }
                     ForEach(model.filteredChannels) { row in
                         VStack(spacing: 4) {
-                            Button {
-                                model.play(row)
-                            } label: {
-                                PhoneChannelCard(row: row)
+                            PhoneChannelCard(
+                                row: row, isPlaying: model.selection?.channel.id == row.id
+                            )
+                            .allowsHitTesting(false)
+                            if row.programs.isEmpty {
+                                programButton(nil, row: row)
+                                    .catchupMenu(row: row, browse: { catchupChannel = row.channel })
                             }
-                            .buttonStyle(.plain)
-                            .catchupMenu(row: row, browse: { catchupChannel = row.channel })
                             ForEach(Array(row.programs.enumerated()), id: \.offset) { _, program in
                                 programButton(program, row: row)
+                                    .catchupMenu(row: row, browse: { catchupChannel = row.channel })
                             }
                         }
                         .disabled(model.isLoading)
@@ -586,21 +645,25 @@ private struct PhoneGuideView: View {
         }
     }
 
-    private func programButton(_ program: Program, row: ChannelRow) -> some View {
-        let available = model.canPlayProgram(program, in: row)
+    private func programButton(_ program: Program?, row: ChannelRow) -> some View {
+        let available = program.map { model.canPlayProgram($0, in: row) } ?? true
         return Button {
-            model.playProgram(program, in: row)
+            if let program {
+                model.playProgram(program, in: row)
+            } else {
+                model.play(row)
+            }
         } label: {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(program.title).font(.subheadline.weight(.semibold))
-                    Text(program.timeRange)
+                    Text(program?.title ?? "Watch live").font(.subheadline.weight(.semibold))
+                    Text(program?.timeRange ?? "Program information unavailable")
                         .font(.caption)
                         .foregroundStyle(Theme.secondaryText)
                 }
                 Spacer()
                 Image(systemName: available
-                    ? (program.catchup ? "clock.arrow.circlepath" : "play.circle")
+                    ? (program?.catchup == true ? "clock.arrow.circlepath" : "play.circle")
                     : "clock")
             }
             .padding(12)
@@ -610,51 +673,31 @@ private struct PhoneGuideView: View {
         .buttonStyle(.plain)
         .disabled(!available)
         .opacity(available ? 1 : 0.45)
-        .accessibilityLabel("\(program.title), \(program.timeRange)")
+        .accessibilityLabel("\(row.channel.name), \(program?.title ?? "Watch live"), \(program?.timeRange ?? "Program information unavailable")")
         .accessibilityValue(available ? "Available" : "Unavailable")
     }
 }
 
 private struct PhoneChannelCard: View {
     let row: ChannelRow
+    let isPlaying: Bool
 
     var body: some View {
         HStack(spacing: 14) {
             ChannelLogo(channel: row.channel, size: 58)
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text(row.channel.name)
-                        .font(.headline)
-                        .lineLimit(1)
-                    Spacer()
-                    LiveBadge()
-                }
-                if let program = row.currentProgram {
-                    Text(program.title)
-                        .font(.subheadline.weight(.medium))
-                        .lineLimit(1)
-                    HStack {
-                        Text(program.timeRange)
-                        Spacer()
-                        Text("\(Int(program.progress * 100))%")
-                    }
+            Text(row.channel.name)
+                .font(.headline)
+                .lineLimit(2)
+            Spacer()
+            if isPlaying {
+                Label("Playing", systemImage: "speaker.wave.2.fill")
                     .font(.caption)
                     .foregroundStyle(Theme.secondaryText)
-                    ProgressView(value: program.progress)
-                        .tint(Theme.accent)
-                } else {
-                    Text("Watch live")
-                        .font(.subheadline)
-                        .foregroundStyle(Theme.secondaryText)
-                }
             }
-            Image(systemName: "play.circle.fill")
-                .font(.title2)
-                .foregroundStyle(Theme.accent)
         }
         .padding(14)
         .glassCard()
-        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
     }
 }
 #endif

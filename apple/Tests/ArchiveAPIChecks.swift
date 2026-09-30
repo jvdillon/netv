@@ -46,6 +46,10 @@ private final class ArchiveTransport: URLProtocol {
 @main
 struct ArchiveAPIChecks {
     static func main() async throws {
+        let defaults = APIClient.sessionConfiguration()
+        precondition(!defaults.waitsForConnectivity, "Unavailable network access must not hold the startup screen")
+        precondition(defaults.timeoutIntervalForResource == 60, "Requests must have a bounded overall timeout")
+        precondition(defaults.timeoutIntervalForRequest == 60 && defaults.httpShouldSetCookies)
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ArchiveTransport.self]
         let client = APIClient(session: URLSession(configuration: configuration))

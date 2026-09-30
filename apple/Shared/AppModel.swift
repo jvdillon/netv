@@ -295,13 +295,13 @@ final class AppModel: ObservableObject {
         }
         switch urlError.code {
         case .timedOut:
-            return "The server timed out. Check that the address is reachable from this device."
+            return "The connection timed out. Check the server address, network or VPN connection, and Local Network access for neTV in Settings."
         case .cannotFindHost:
             return "The server name could not be resolved. Check the server address and DNS."
         case .cannotConnectToHost:
             return "The server refused the connection. Check that neTV is running and the port is correct."
         case .notConnectedToInternet:
-            return "This device is not connected to the network."
+            return "neTV cannot access the network. Check your Wi-Fi or VPN connection and allow Local Network access for neTV in Settings."
         case .secureConnectionFailed, .serverCertificateUntrusted,
              .serverCertificateHasBadDate, .serverCertificateHasUnknownRoot:
             return "A secure connection could not be established. Check the server certificate."

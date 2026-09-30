@@ -1,0 +1,48 @@
+neTV App Store screenshot content credits
+
+Include the following credits in the App Store description when publishing
+these screenshots. The channel thumbnails also contain imagery from these films.
+
+Big Buck Bunny: Copyright 2008, Blender Foundation / www.bigbuckbunny.org.
+Licensed under Creative Commons Attribution 3.0:
+https://creativecommons.org/licenses/by/3.0/
+Original rights statement: https://peach.blender.org/about/
+
+Sintel: Copyright Blender Foundation / www.sintel.org.
+Licensed under Creative Commons Attribution 3.0:
+https://creativecommons.org/licenses/by/3.0/
+Original rights statement: https://durian.blender.org/sharing/
+
+Elephants Dream: Copyright 2006, Blender Foundation / Netherlands Media Art
+Institute / www.elephantsdream.org.
+Licensed under Creative Commons Attribution 2.5:
+https://creativecommons.org/licenses/by/2.5/
+Original rights statement:
+https://orange.blender.org/blog/creative-commons-license-2/
+
+Film frames and thumbnails appear within neTV's interface, scaled and/or
+letterboxed for playback. No affiliation with or endorsement by the creators
+is implied. These demonstration films do not represent an included commercial
+television subscription.
+
+Public demo credits: https://demo.tulane.casa/static/demo/licenses.html
+
+Screenshot sets
+
+iPhone: 1320 x 2868 portrait; 2868 x 1320 full-screen landscape.
+iPhone-6.5-inch: 1284 x 2778 portrait; 2778 x 1284 landscape, for the
+App Store Connect upload field that accepts these dimensions. These copies
+preserve the originals' aspect ratio with minimal edge padding; no UI is cropped.
+iPad: 2752 x 2064 landscape.
+Mac: 1280 x 800 app-window captures, excluding the desktop.
+Apple TV: 3840 x 2160 landscape.
+
+Each set contains:
+01-live-guide.png: Big Buck Bunny playing alongside the guide.
+02-channel-browsing.png: Sintel selected in the guide.
+03-full-screen.png: Big Buck Bunny in the expanded player.
+
+The PNGs are opaque RGB images at Apple-supported upload dimensions.
+The Apple TV interface capture is 4K; demo playback remains 720p and is not
+AI-upscaled. Do not describe these captures as demonstrating 4K AI playback.
+contact-sheet.jpg is an overview for selection, not an App Store upload image.

@@ -47,12 +47,16 @@ Use the guide's **Earlier**, **Now**, and **Later** buttons on every Apple platf
 to browse three-hour windows, up to seven days in either direction. The date and
 times use your device's time zone. Browsing does not interrupt playback.
 Select an available past program directly to play its upstream archive; unavailable
-past programs and upcoming programs are dimmed and cannot be selected. Selecting
-the stream name still opens live playback. **Now** returns the guide to the current
-window without changing what is playing.
+past programs and upcoming programs are dimmed and cannot be selected.
+Stream names and logos are noninteractive labels; choose a program to play.
+When no listings are available, a **Watch live** tile in the guide keeps live
+playback accessible. **Now** returns the guide to the current window without
+changing what is playing.
 
 On Apple TV, focus a program and press Select to play it; select the playing program
-again to expand it. The context menu remains available for **Start Over** and
+again to expand it. Moving left out of the program grid skips the stream labels
+and returns to categories. Leaving fullscreen restores focus to an available
+program rather than the stream label. Program context menus remain available for **Start Over** and
 **Catch Up…**, but is no longer required to browse earlier programs.
 On iPhone, iPad, and Mac, drag the archive timeline
 to preview a position and release to seek, or use the ten-second skip buttons.
@@ -90,7 +94,39 @@ Apple TV audio to AirPlay speakers, use the system Control Center.
 4. Select **neTV-iOS**, **neTV-tvOS**, or **neTV-macOS**, choose a destination, and run.
 5. Sign in with the same neTV server address and account used by the web UI.
 
+Signing is managed automatically for all three targets through `Config.xcconfig`.
+For TestFlight or App Store distribution, sign in to Xcode with an Apple ID that
+can access the team configured in `.env`.
+
+To create a tvOS TestFlight archive from the repository root, run:
+
+```bash
+./apple/archive-testflight.sh
+```
+
+The script assigns a unique UTC build number in `YYMM.DDHH.MMSS` format, creates
+a signed Release archive, and opens it in Xcode Organizer. Use Organizer's
+**Distribute App** workflow to upload it. Set `NETV_BUILD_NUMBER` to override the
+generated build number or `NETV_ARCHIVE_PATH` to choose another archive path.
+Automatic signing still requires account access and valid distribution signing
+credentials; it does not replace them.
+
 The development default is `http://localhost:8000`. HTTP transport is enabled because neTV commonly runs on a trusted local network; production deployments should use HTTPS.
+
+### Local network access on iPhone and iPad
+
+Allow neTV to access the local network when iOS asks. API requests do not wait
+for connectivity, so unavailable network access is reported promptly rather
+than holding the startup screen. Retry sign-in after granting permission.
+Requests still have a 60-second overall timeout.
+
+If sign-in reports no network access, check **Settings > Privacy & Security >
+Local Network > neTV**, and make sure your Wi-Fi or VPN can reach the server.
+Safari opening the same address does not prove that neTV has permission:
+[Safari is exempt from local-network privacy checks](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
+If neTV is missing from that list and no prompt appears, restart the device,
+reopen the current app build, and retry sign-in with the app in the foreground.
+The app cannot grant or reset this system permission itself.
 
 ## Shared adaptive live playback
 
