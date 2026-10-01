@@ -47,7 +47,7 @@ through their IPTV providers.
 
 - **Live TV** with EPG grid guide
 - **Catchup playback** - Browse **Earlier / Now / Later**, select an available past program, or **Start over** on supported live content. Replay and seek through upstream archives on the web and across the Apple apps. [How it works](#catchup-playback).
-- **Mac app** on the [Mac App Store](https://apps.apple.com/us/app/netv-personal-tv-player/id6814189386?mt=12); Apple TV and iPhone apps are coming soon
+- **Mac, Apple TV, and iPhone apps** on the [App Store](https://apps.apple.com/us/app/netv-personal-tv-player/id6814189386)
 - **Native player gateway** - Bring your neTV channels and settings to Apple TV and other Xtream-compatible players
 - **Movies & Series** with metadata, seasons, episodes
 - **Real-time 4K AI Upscale** - 1080p → 4K at 70+ FPS through TensorRT on an RTX 5090
@@ -112,7 +112,9 @@ separate Mac client for a neTV server running somewhere else in your house, such
 as a media PC, NAS, or home server. Install it, enter your server's address (for
 example `http://192.168.1.10:8000`), and sign in with your neTV account.
 
-**Apple TV and iPhone:** coming soon to the App Store.
+**Apple TV:** [neTV Personal TV Player](https://apps.apple.com/us/app/netv-personal-tv-player/id6814189386) is available on the App Store.
+
+**iPhone:** [neTV Personal TV Player](https://apps.apple.com/us/app/netv-personal-tv-player/id6814189386) is available on the App Store.
 
 The native SwiftUI source for all three apps is in [`apple/`](apple/). To build
 them yourself:
