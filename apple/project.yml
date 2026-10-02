@@ -40,6 +40,15 @@ targets:
           NSAllowsArbitraryLoads: true
         NSLocalNetworkUsageDescription: neTV connects to your television server on the local network.
         UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
     settings:
       base:
         DEVELOPMENT_TEAM: $(NETV_DEVELOPMENT_TEAM)
@@ -89,6 +98,7 @@ targets:
         CFBundleDisplayName: neTV
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.entertainment
         CFBundleURLTypes:
           - CFBundleURLName: $(PRODUCT_BUNDLE_IDENTIFIER)
             CFBundleURLSchemes:
@@ -99,6 +109,7 @@ targets:
     settings:
       base:
         CODE_SIGN_ENTITLEMENTS: macOS/neTV.entitlements
+        CURRENT_PROJECT_VERSION: 2
         DEVELOPMENT_TEAM: $(NETV_DEVELOPMENT_TEAM)
         PRODUCT_BUNDLE_IDENTIFIER: $(NETV_BUNDLE_IDENTIFIER)
         PRODUCT_NAME: neTV
