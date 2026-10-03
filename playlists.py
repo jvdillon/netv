@@ -220,9 +220,10 @@ def resolve_channel(entry: dict, streams: list[dict]) -> dict | None:
 
 
 def with_entry_epg(entry: dict, stream: dict) -> dict:
-    """Use the entry's EPG id when the stream has none, so the guide can show listings."""
+    """The entry's EPG id overrides the stream's, so a curated playlist can
+    repair guide data when the provider's tvg-id doesn't match the EPG feed."""
     epg_id = entry.get("epg_channel_id") or ""
-    if epg_id and not stream.get("epg_channel_id"):
+    if epg_id:
         return {**stream, "epg_channel_id": epg_id}
     return stream
 
