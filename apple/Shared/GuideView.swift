@@ -331,11 +331,11 @@ struct ChannelGuideView: View {
                         .padding(.horizontal, 16)
                         .padding(.vertical, 8)
                     }
-                    .disabled(model.isLoading)
+                    .disabled(model.isGuideInteractionBlocked)
                     .id([selectedCategoryID ?? "", model.query])
                     #if os(tvOS)
-                    .task(id: model.isPlayerExpanded) {
-                        guard !model.isPlayerExpanded,
+                    .task(id: [model.isPlayerExpanded, model.isLoading]) {
+                        guard !model.isPlayerExpanded, !model.isGuideInteractionBlocked,
                               let id = model.selection?.channel.id,
                               let row = rows.first(where: { $0.id == id }),
                               let target = focusTarget(in: row) else { return }
@@ -619,7 +619,7 @@ private struct PhoneGuideView: View {
                                     .catchupMenu(row: row, browse: { catchupChannel = row.channel })
                             }
                         }
-                        .disabled(model.isLoading)
+                        .disabled(model.isGuideInteractionBlocked)
                     }
                 }
                 .padding(.horizontal, 16)

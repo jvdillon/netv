@@ -5,6 +5,7 @@ import AppKit
 
 struct WatchView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.scenePhase) private var scenePhase
     #if os(macOS) || os(tvOS)
     @State private var selectedCategoryID: String?
     #endif
@@ -16,15 +17,34 @@ struct WatchView: View {
     #endif
 
     var body: some View {
-        #if os(macOS) || os(tvOS)
-        largeScreenLayout
-        #elseif os(iOS)
-        standardLayout
-            .fullScreenCover(isPresented: $model.isPlayerExpanded) {
-                iOSFullScreenPlayer
-            }
-        #else
-        standardLayout
+        Group {
+            #if os(macOS) || os(tvOS)
+            largeScreenLayout
+            #elseif os(iOS)
+            standardLayout
+                .fullScreenCover(isPresented: $model.isPlayerExpanded) {
+                    iOSFullScreenPlayer
+                }
+            #else
+            standardLayout
+            #endif
+        }
+        .task { await refreshGuideIfVisible() }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            Task { await refreshGuideIfVisible() }
+        }
+        .onChange(of: model.isPlayerExpanded) { _, expanded in
+            #if os(tvOS)
+            isPlayerFocused = expanded
+            #endif
+            guard !expanded else { return }
+            Task { await refreshGuideIfVisible() }
+        }
+        #if os(macOS)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await refreshGuideIfVisible() }
+        }
         #endif
     }
 
@@ -103,11 +123,12 @@ struct WatchView: View {
                 model.isPlayerExpanded = false
             }
         }
-        #else
-        .onChange(of: model.isPlayerExpanded) { _, expanded in
-            isPlayerFocused = expanded
-        }
         #endif
+    }
+
+    private func refreshGuideIfVisible() async {
+        guard !model.isPlayerExpanded else { return }
+        await model.refreshGuideOnReturn()
     }
 
     private var currentSelection: PlayerSelection? {

@@ -233,6 +233,7 @@ struct PlaybackStartChecks {
         let count = APIClient.guideOffsets.count
         let olderRequest = Task { await model.loadGuide(offset: -3) }
         while APIClient.guideOffsets.count == count { await Task.yield() }
+        precondition(model.isGuideInteractionBlocked, "Manual guide navigation must block stale rows")
         await model.loadGuide(offset: 3)
         await olderRequest.value
         precondition(model.guideOffset == 3 && !model.isLoading, "A late response must not overwrite the latest window")
@@ -244,6 +245,26 @@ struct PlaybackStartChecks {
         await model.loadGuide(offset: 0)
         precondition(model.guideOffset == 168 && model.requestedGuideOffset == 168 && model.errorMessage != nil)
         APIClient.failingGuideOffset = nil
+        APIClient.guideDelays[0] = 100_000_000
+        let refreshRequestCount = APIClient.guideOffsets.count
+        let refreshRequest = Task { await model.refreshGuideOnReturn() }
+        while APIClient.guideOffsets.count == refreshRequestCount { await Task.yield() }
+        precondition(
+            model.isLoading && !model.isGuideInteractionBlocked,
+            "Returning to the guide must keep existing rows interactive"
+        )
+        await refreshRequest.value
+        APIClient.guideDelays[0] = nil
+        precondition(
+            model.guideOffset == 0 && model.requestedGuideOffset == 0,
+            "Returning to the guide must re-anchor it to the current window"
+        )
+        precondition(APIClient.guideOffsets.last == 0)
+        model.isAuthenticated = false
+        let guideRequestCount = APIClient.guideOffsets.count
+        await model.refreshGuideOnReturn()
+        precondition(APIClient.guideOffsets.count == guideRequestCount, "Signed-out guide returns must not load")
+        model.isAuthenticated = true
         APIClient.guideDelays = [:]
     }
 

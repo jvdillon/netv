@@ -7,6 +7,7 @@ final class AppModel: ObservableObject {
     @Published var isAuthenticated = false
     @Published var isCheckingSession = true
     @Published var isLoading = false
+    @Published private(set) var isGuideInteractionBlocked = false
     @Published var channels: [ChannelRow] = []
     @Published var guideCategories: [GuideCategory] = []
     @Published var guideWindowStart = Date(
@@ -40,6 +41,7 @@ final class AppModel: ObservableObject {
     private var playbackStartTask: Task<PlaybackConfiguration, Error>?
     private var playbackSessionToRelease: (server: String, id: String)?
     private var playbackStartGeneration = 0
+    private var isReturnRefreshInProgress = false
     private let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.netv",
         category: "App"
@@ -86,16 +88,22 @@ final class AppModel: ObservableObject {
     }
 
     func loadGuide(offset: Int? = nil) async {
+        await loadGuide(offset: offset, blocksGuideInteraction: true)
+    }
+
+    private func loadGuide(offset: Int?, blocksGuideInteraction: Bool) async {
         guard isAuthenticated else { return }
         let target = min(max(offset ?? requestedGuideOffset, -168), 168)
         requestedGuideOffset = target
         guideLoadGeneration += 1
         let generation = guideLoadGeneration
         isLoading = true
+        isGuideInteractionBlocked = blocksGuideInteraction
         errorMessage = nil
         defer {
             if generation == guideLoadGeneration {
                 isLoading = false
+                isGuideInteractionBlocked = false
                 requestedGuideOffset = guideOffset
             }
         }
@@ -122,6 +130,15 @@ final class AppModel: ObservableObject {
             guard generation == guideLoadGeneration, !Task.isCancelled else { return }
             errorMessage = error.localizedDescription
         }
+    }
+
+    /// Reloads the current guide window without disabling rows already on screen.
+    func refreshGuideOnReturn() async {
+        guard isAuthenticated, !isCheckingSession, !isReturnRefreshInProgress,
+              !isLoading || !channels.isEmpty else { return }
+        isReturnRefreshInProgress = true
+        defer { isReturnRefreshInProgress = false }
+        await loadGuide(offset: 0, blocksGuideInteraction: false)
     }
 
     func canPlayProgram(_ program: Program, in row: ChannelRow) -> Bool {

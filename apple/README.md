@@ -38,8 +38,11 @@ button. App volume carries across channel changes and adaptive quality switches.
 Category names and ordering follow the web settings. Use the updated neTV server
 for category metadata and device-local program times; older servers remain
 playable through All Channels. The Apple client loads every guide page rather
-than stopping at the first 500 channels. Use the refresh button to reload
-channels and the three-hour schedule.
+than stopping at the first 500 channels. Use the refresh button to reload the
+guide data and three-hour schedule. The guide also reloads and re-anchors to
+the current window whenever it comes back into view, including after Settings,
+fullscreen playback, or returning to the app. Existing rows remain interactive
+while this refresh runs so remote navigation is not interrupted.
 
 ## Catchup and archive seeking
 
