@@ -19,8 +19,7 @@ neTV server, and sign in with your existing neTV account:
 The native SwiftUI source for all three apps is in [`apple/`](apple/). See
 [Apple Apps](#apple-apps) for details and build instructions.
 
-> **Live TV, upgraded to 4K.** neTV can AI-upscale 1080p streams to 4K at
-> **70+ FPS** on an RTX 5090, with GPU decoding, TensorRT inference, and NVENC
+> **Live TV, upgraded to 4K.** neTV can AI-upscale 1080p streams to 4K with GPU decoding, TensorRT inference, and NVENC
 > encoding in one real-time playback pipeline.
 
 > **Missed the start? Go back and press play.** Browse earlier guide listings
