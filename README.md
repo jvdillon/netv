@@ -3,6 +3,22 @@
 A fast, self-hosted IPTV experience for the web, Apple TV, iPhone, macOS,
 Chromecast, and Xtream-compatible players.
 
+**What it does:** neTV plays your own Xtream Codes or M3U IPTV subscription
+with a clean, minimal interface — live TV with an EPG grid guide, catchup
+playback, movies & series, favorites and playlists, Chromecast and AirPlay,
+and optional real-time 4K AI upscaling — on desktop, tablet, mobile, and TV.
+
+## Companion Apps
+
+neTV now comes with native companion apps. Install them, point them at your
+neTV server, and sign in with your existing neTV account:
+
+- **iPhone, iPad, and Apple TV:** [neTV Personal TV Player](https://apps.apple.com/us/app/netv-personal-tv-player/id6814189386) on the App Store
+- **Mac:** [neTV Personal TV Player](https://apps.apple.com/us/app/netv-personal-tv-player/id6814189386?mt=12) on the Mac App Store
+
+The native SwiftUI source for all three apps is in [`apple/`](apple/). See
+[Apple Apps](#apple-apps) for details and build instructions.
+
 > **Live TV, upgraded to 4K.** neTV can AI-upscale 1080p streams to 4K at
 > **70+ FPS** on an RTX 5090, with GPU decoding, TensorRT inference, and NVENC
 > encoding in one real-time playback pipeline.
@@ -107,14 +123,11 @@ for native playback details.
 
 ### Apple Apps
 
-**Mac:** [neTV Personal TV Player](https://apps.apple.com/us/app/netv-personal-tv-player/id6814189386?mt=12) is on the Mac App Store. It's a
-separate Mac client for a neTV server running somewhere else in your house, such
-as a media PC, NAS, or home server. Install it, enter your server's address (for
-example `http://192.168.1.10:8000`), and sign in with your neTV account.
-
-**Apple TV:** [neTV Personal TV Player](https://apps.apple.com/us/app/netv-personal-tv-player/id6814189386) is available on the App Store.
-
-**iPhone:** [neTV Personal TV Player](https://apps.apple.com/us/app/netv-personal-tv-player/id6814189386) is available on the App Store.
+The [App Store links are at the top of this README](#companion-apps). The Mac
+app is a separate client for a neTV server running somewhere else in your
+house, such as a media PC, NAS, or home server. Install it, enter your
+server's address (for example `http://192.168.1.10:8000`), and sign in with
+your neTV account.
 
 The native SwiftUI source for all three apps is in [`apple/`](apple/). To build
 them yourself:
