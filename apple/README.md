@@ -32,13 +32,13 @@ guide timestamps are unavailable, it falls back to the retained-window timeline.
 The server retains everything watched in the current session, up to the configured
 two-hour limit, without replacing the live session.
 
-Mac shows a slim neTV control bar (play/pause, LIVE, volume, and AirPlay) along
-the bottom of the video on hover; it stays visible while paused. AVKit's own
-inline controls are not used because they crashed with live streams.
-TV does not use AVKit's native transport controls either. TV has no
-fullscreen button or percentage/volume panel; use the Siri Remote's hardware
-volume keys to control the connected TV/receiver. Mac retains its fullscreen
-button. App volume carries across channel changes and adaptive quality switches.
+The scheduled-program timeline and 15-second live seek controls are shared by
+Apple TV, Mac, iPhone, and iPad. Mac shows its control bar on hover and keeps it
+visible while paused; iPhone and iPad use touch controls below the same timeline.
+AVKit's native transport controls are not used. TV has no fullscreen button or
+percentage/volume panel; use the Siri Remote's hardware volume keys to control
+the connected display or receiver. Mac retains its fullscreen button. App volume
+carries across playback changes and adaptive quality switches.
 
 Category names and ordering follow the web settings. Use the updated neTV server
 for category metadata and device-local program times; older servers remain

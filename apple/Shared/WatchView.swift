@@ -125,11 +125,6 @@ struct WatchView: View {
         #endif
     }
 
-    private func refreshGuideIfVisible() async {
-        guard !model.isPlayerExpanded else { return }
-        await model.refreshGuideOnReturn()
-    }
-
     private var currentSelection: PlayerSelection? {
         guard let selection = model.selection else { return nil }
         // Archived playback keeps the program it was started for.
@@ -141,6 +136,11 @@ struct WatchView: View {
         return PlayerSelection(channel: row.channel, program: program)
     }
     #endif
+
+    private func refreshGuideIfVisible() async {
+        guard !model.isPlayerExpanded else { return }
+        await model.refreshGuideOnReturn()
+    }
 
     private var standardLayout: some View {
         GeometryReader { proxy in
