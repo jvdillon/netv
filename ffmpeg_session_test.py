@@ -104,6 +104,7 @@ async def test_archive_bypasses_upscale_without_changing_live_or_movies(archive_
     assert build.call_args.args[6] == "4k"
     assert build.call_args.args[7] == "high"
     session = get_session(result["session_id"])
+    assert session is not None
     assert session["is_archive"] is (not upscale)
     assert (pathlib.Path(session["dir"]) / "session.json").exists() is (content_type == "movie" and upscale)
 
@@ -113,7 +114,9 @@ async def test_archive_stop_releases_recent_session_without_caching(archive_runt
     process, _, _ = archive_runtime
     with patch("ffmpeg_session._wait_for_playlist", new=AsyncMock(return_value=True)):
         result = await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie")
-    directory = pathlib.Path(get_session(result["session_id"])["dir"])
+    session = get_session(result["session_id"])
+    assert session is not None
+    directory = pathlib.Path(session["dir"])
     stop_session(result["session_id"])
     assert process.returncode is not None
     assert get_session(result["session_id"]) is None
@@ -177,6 +180,7 @@ async def test_dead_archive_is_not_resumed_using_byte_seeking(archive_runtime):
     with patch("ffmpeg_session._wait_for_playlist", new=AsyncMock(return_value=True)):
         result = await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie")
     session = get_session(result["session_id"])
+    assert session is not None
     (pathlib.Path(session["dir"]) / "seg000.ts").write_bytes(b"x" * 2000)
     process.returncode = 0
     build.reset_mock()
