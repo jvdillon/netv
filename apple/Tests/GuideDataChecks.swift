@@ -134,6 +134,40 @@ struct GuideDataChecks {
         precondition(
             LiveTimeline(seekable: [], position: 0, maximumDuration: 7200) == nil
         )
-        print("Guide checks passed: guide data, archive and live timelines")
+
+        let scheduled = try program(
+            left: 0, width: 100, start: base, end: base + 3600
+        )
+        let programTimeline = LiveProgramTimeline(
+            program: scheduled,
+            playbackTimestamp: base + 900,
+            liveTimestamp: base + 1800
+        )!
+        precondition(programTimeline.duration == 3600)
+        precondition(programTimeline.playbackProgress == 0.25)
+        precondition(programTimeline.liveProgress == 0.5)
+        precondition(programTimeline.behindLive == 900)
+        let clippedProgramTimeline = LiveProgramTimeline(
+            program: scheduled,
+            playbackTimestamp: base - 300,
+            liveTimestamp: base + 600
+        )!
+        precondition(clippedProgramTimeline.playback == base)
+        precondition(
+            LiveProgramTimeline(
+                program: scheduled,
+                playbackTimestamp: base + 3600,
+                liveTimestamp: base + 3601
+            ) == nil,
+            "A stale guide program must not label the live bar"
+        )
+        precondition(
+            LiveProgramTimeline(
+                program: nil,
+                playbackTimestamp: base,
+                liveTimestamp: base
+            ) == nil
+        )
+        print("Guide checks passed: guide data, archive, live and program timelines")
     }
 }

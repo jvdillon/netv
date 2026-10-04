@@ -37,6 +37,15 @@ struct PlayerView: View {
         ArchiveTimeline(selection: selection, streamStart: archiveStreamStart)
     }
 
+    private var liveProgram: Program? {
+        guard !selection.isCatchup else { return nil }
+        if let row = model.channels.first(where: { $0.id == selection.channel.id }),
+           let program = row.currentProgram {
+            return program
+        }
+        return selection.program?.isCurrent == true ? selection.program : nil
+    }
+
     var body: some View {
         ZStack {
             Color.black
@@ -176,7 +185,8 @@ struct PlayerView: View {
                     timeline: archiveTimeline,
                     archiveSeekPosition: tvSeekPosition,
                     liveSeekPosition: tvLiveSeekPosition,
-                    liveBufferDuration: liveBufferDuration
+                    liveBufferDuration: liveBufferDuration,
+                    liveProgram: liveProgram
                 )
             }
         }
@@ -359,6 +369,7 @@ struct PlayerView: View {
             #if os(iOS)
             try configureAudioSession()
             #endif
+            var nextLiveGuideRefresh = Date.distantPast
             while !Task.isCancelled {
                 let bandwidthSaver = model.bandwidthSaver
                 var configuration = try await model.playerConfiguration(for: selection)
@@ -409,6 +420,11 @@ struct PlayerView: View {
                     quality = qualityLabel(for: item.presentationSize)
                     if item.status == .failed {
                         throw item.error ?? APIError.server("The stream could not be played.")
+                    }
+                    if model.isPlayerExpanded, !selection.isCatchup, liveProgram == nil,
+                       Date() >= nextLiveGuideRefresh {
+                        nextLiveGuideRefresh = Date().addingTimeInterval(30)
+                        await model.refreshGuideOnReturn()
                     }
                     if selection.isCatchup, let sessionID = activeSessionID {
                         do {
@@ -828,6 +844,7 @@ private struct TVControlBar: View {
     let archiveSeekPosition: Double?
     let liveSeekPosition: Double?
     let liveBufferDuration: Double
+    let liveProgram: Program?
 
     @State private var isPlaying = true
 
@@ -838,6 +855,14 @@ private struct TVControlBar: View {
                 position: liveSeekPosition,
                 maximumDuration: liveBufferDuration
             )
+            let programTimeline = liveTimeline.flatMap {
+                makeLiveProgramTimeline(
+                    player: player,
+                    program: liveProgram,
+                    liveTimeline: $0,
+                    fallbackLiveDate: context.date
+                )
+            }
             let visible = archiveSeekPosition != nil || liveSeekPosition != nil
                 || !isPlaying || context.date.timeIntervalSince(lastActivity) < 4
             VStack(spacing: 12) {
@@ -864,20 +889,36 @@ private struct TVControlBar: View {
                     .padding(.horizontal, expanded ? 60 : 16)
                 } else if let liveTimeline {
                     VStack(spacing: 8) {
-                        ProgressView(value: liveTimeline.elapsed, total: liveTimeline.duration)
-                            .tint(.white)
-                        HStack {
-                            Text("-" + archiveTime(liveTimeline.duration))
-                            Spacer()
-                            Text(liveStatus(liveTimeline))
-                            Spacer()
-                            HStack(spacing: 5) {
-                                Circle().fill(.red).frame(width: 6, height: 6)
-                                Text("LIVE")
+                        if let programTimeline {
+                            LiveProgramProgressBar(timeline: programTimeline)
+                            HStack {
+                                Text(programTime(programTimeline.start))
+                                Spacer()
+                                Text(
+                                    "\(programTime(programTimeline.playback))  •  "
+                                        + liveStatus(liveTimeline)
+                                )
+                                Spacer()
+                                Text(programTime(programTimeline.end))
                             }
+                            .font(expanded ? .caption : .caption2)
+                            .monospacedDigit()
+                        } else {
+                            ProgressView(value: liveTimeline.elapsed, total: liveTimeline.duration)
+                                .tint(.white)
+                            HStack {
+                                Text("-" + archiveTime(liveTimeline.duration))
+                                Spacer()
+                                Text(liveStatus(liveTimeline))
+                                Spacer()
+                                HStack(spacing: 5) {
+                                    Circle().fill(.red).frame(width: 6, height: 6)
+                                    Text("LIVE")
+                                }
+                            }
+                            .font(expanded ? .caption : .caption2)
+                            .monospacedDigit()
                         }
-                        .font(expanded ? .caption : .caption2)
-                        .monospacedDigit()
                     }
                     .foregroundStyle(.white)
                     .padding(.horizontal, expanded ? 60 : 16)
@@ -928,7 +969,7 @@ private struct TVControlBar: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(selection.channel.name)
                         .font(.headline)
-                    if let program = selection.program {
+                    if let program = selection.isCatchup ? selection.program : liveProgram {
                         Text("\(program.title)  \(program.start) – \(program.end)")
                             .font(.subheadline)
                             .foregroundStyle(.white.opacity(0.7))
@@ -949,6 +990,63 @@ private struct TVControlBar: View {
     }
 }
 
+private struct LiveProgramProgressBar: View {
+    let timeline: LiveProgramTimeline
+
+    var body: some View {
+        GeometryReader { proxy in
+            let width = proxy.size.width
+            let playbackWidth = width * CGFloat(timeline.playbackProgress)
+            let liveWidth = width * CGFloat(timeline.liveProgress)
+            let markerRadius: CGFloat = 7
+            let markerMaximum = max(markerRadius, width - markerRadius)
+            let playbackX = min(max(playbackWidth, markerRadius), markerMaximum)
+            let liveX = min(max(liveWidth, markerRadius), markerMaximum)
+            let labelMargin: CGFloat = 18
+            let labelMaximum = max(labelMargin, width - labelMargin)
+            let liveLabelX = min(max(liveWidth, labelMargin), labelMaximum)
+
+            ZStack(alignment: .leading) {
+                ZStack(alignment: .leading) {
+                    Capsule().fill(.white.opacity(0.16))
+                    Rectangle()
+                        .fill(.white.opacity(0.38))
+                        .frame(width: liveWidth)
+                    Rectangle()
+                        .fill(.white.opacity(0.9))
+                        .frame(width: playbackWidth)
+                }
+                .frame(width: width, height: 8)
+                .clipShape(Capsule())
+                .position(x: width / 2, y: 20)
+
+                Circle()
+                    .fill(.black.opacity(0.5))
+                    .overlay(Circle().stroke(.white, lineWidth: 3))
+                    .frame(width: markerRadius * 2, height: markerRadius * 2)
+                    .position(x: playbackX, y: 20)
+
+                Capsule()
+                    .fill(.red)
+                    .frame(width: 3, height: 18)
+                    .position(x: liveX, y: 20)
+
+                Text("LIVE")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.red)
+                    .position(x: liveLabelX, y: 5)
+            }
+        }
+        .frame(height: 30)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "Program \(programTime(timeline.start)) to \(programTime(timeline.end)), "
+                + "playback at \(programTime(timeline.playback)), "
+                + "live at \(programTime(timeline.live))"
+        )
+    }
+}
+
 #endif
 
 private func archiveTime(_ seconds: Double) -> String {
@@ -956,6 +1054,10 @@ private func archiveTime(_ seconds: Double) -> String {
     return value >= 3600
         ? String(format: "%d:%02d:%02d", value / 3600, value / 60 % 60, value % 60)
         : String(format: "%d:%02d", value / 60, value % 60)
+}
+
+private func programTime(_ timestamp: Double) -> String {
+    Date(timeIntervalSince1970: timestamp).formatted(date: .omitted, time: .shortened)
 }
 
 private func seekableRanges(in item: AVPlayerItem?) -> [ClosedRange<Double>] {
@@ -974,6 +1076,27 @@ private func makeLiveTimeline(
         seekable: seekableRanges(in: player.currentItem),
         position: position ?? player.currentTime().seconds,
         maximumDuration: maximumDuration
+    )
+}
+
+private func makeLiveProgramTimeline(
+    player: AVPlayer,
+    program: Program?,
+    liveTimeline: LiveTimeline,
+    fallbackLiveDate: Date
+) -> LiveProgramTimeline? {
+    let currentPosition = player.currentTime().seconds
+    let playbackTimestamp: Double
+    if currentPosition.isFinite, let currentDate = player.currentItem?.currentDate() {
+        playbackTimestamp = currentDate.timeIntervalSince1970
+            + liveTimeline.position - currentPosition
+    } else {
+        playbackTimestamp = fallbackLiveDate.timeIntervalSince1970 - liveTimeline.behindLive
+    }
+    return LiveProgramTimeline(
+        program: program,
+        playbackTimestamp: playbackTimestamp,
+        liveTimestamp: playbackTimestamp + liveTimeline.behindLive
     )
 }
 

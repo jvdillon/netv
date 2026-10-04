@@ -351,3 +351,28 @@ struct LiveTimeline {
         return min(max(position + seconds, start + margin), end - margin)
     }
 }
+
+struct LiveProgramTimeline {
+    let start: Double
+    let end: Double
+    let playback: Double
+    let live: Double
+
+    init?(
+        program: Program?, playbackTimestamp: Double, liveTimestamp: Double
+    ) {
+        guard let start = program?.startTimestamp, start.isFinite,
+              let end = program?.endTimestamp, end.isFinite, end > start,
+              playbackTimestamp.isFinite, liveTimestamp.isFinite,
+              liveTimestamp >= start, liveTimestamp <= end else { return nil }
+        self.start = start
+        self.end = end
+        self.live = min(max(liveTimestamp, start), end)
+        self.playback = min(max(playbackTimestamp, start), self.live)
+    }
+
+    var duration: Double { end - start }
+    var playbackProgress: Double { (playback - start) / duration }
+    var liveProgress: Double { (live - start) / duration }
+    var behindLive: Double { live - playback }
+}

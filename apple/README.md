@@ -25,9 +25,12 @@ pressing Select again returns to fullscreen without restarting playback. Video
 retains its original aspect ratio. In fullscreen, the remote's Play/Pause button
 or a click on the touchpad pauses and resumes. Left and Right seek through the
 retained live window in 15-second steps without requiring a pause. The status bar
-shows the available history, current position, distance behind the live edge, and
-stays visible while paused. The server retains everything watched in the current
-session, up to the configured two-hour limit, without replacing the live session.
+spans the scheduled program from start to end. A white marker shows the playback
+position, a red marker shows the live edge, and the differently shaded gap between
+them shows how far playback is behind. The bar stays visible while paused. When
+guide timestamps are unavailable, it falls back to the retained-window timeline.
+The server retains everything watched in the current session, up to the configured
+two-hour limit, without replacing the live session.
 
 Mac shows a slim neTV control bar (play/pause, LIVE, volume, and AirPlay) along
 the bottom of the video on hover; it stays visible while paused. AVKit's own
