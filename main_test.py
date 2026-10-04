@@ -236,7 +236,7 @@ def test_live_dvr_routes_auto_mode_through_server(auth_client):
         response = auth_client.get("/play/live/test")
     assert response.status_code == 200
     assert 'transcodeMode: "always"' in response.text
-    assert 'liveDvrMins: 60' in response.text
+    assert 'liveDvrMins: 120' in response.text
 
 
 def test_live_dvr_disabled_keeps_direct_auto_mode(auth_client):
@@ -1171,6 +1171,18 @@ class TestSettings:
         )
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
+
+    def test_settings_transcode_caps_live_dvr_at_two_hours(self, auth_client):
+        resp = auth_client.post(
+            "/settings/transcode",
+            data={
+                "transcode_mode": "auto",
+                "transcode_hw": "nvidia",
+                "live_dvr_mins": 999,
+            },
+        )
+        assert resp.status_code == 200
+        assert cache_module.load_server_settings()["live_dvr_mins"] == 120
 
 
 class TestAddSource:

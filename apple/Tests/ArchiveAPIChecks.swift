@@ -14,7 +14,7 @@ private final class ArchiveTransport: URLProtocol {
             body = """
                 rawUrl: "https://upstream.test/timeshift/user/pass/60/2026-09-28:10-00/1.ts",
                 transcodeMode: "always", sourceId: "test", deinterlaceFallback: false,
-                catchupStart: 1700000580.0, catchupSeek: 45.0
+                catchupStart: 1700000580.0, catchupSeek: 45.0, liveDvrMins: 999
                 """
         } else if url.path == "/api/user-prefs" {
             body = #"{"guide_filter":["group","pl:test"]}"#
@@ -70,6 +70,17 @@ struct ArchiveAPIChecks {
         try await client.releaseTranscode(server: "http://netv.test", sessionID: "archive")
         precondition(ArchiveTransport.requests.last?.httpMethod == "DELETE")
         precondition(ArchiveTransport.requests.last?.url?.query == "force=true")
+        ArchiveTransport.requests = []
+        let live = try await client.playbackConfiguration(
+            server: "http://netv.test", channelID: "1"
+        )
+        precondition(live.liveBufferDuration == 7200)
+        let liveStart = ArchiveTransport.requests.first { $0.url?.path == "/transcode/start" }!
+        let liveQuery = URLComponents(
+            url: liveStart.url!, resolvingAgainstBaseURL: false
+        )!.queryItems!
+        precondition(liveQuery.contains(URLQueryItem(name: "content_type", value: "live")))
+        precondition(liveQuery.contains(URLQueryItem(name: "fast_start", value: "true")))
         for offset in [-6, 0, 3] {
             ArchiveTransport.requests = []
             let guide = try await client.guide(server: "http://netv.test", offset: offset)

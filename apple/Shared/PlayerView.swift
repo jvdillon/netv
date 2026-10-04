@@ -20,9 +20,12 @@ struct PlayerView: View {
     @State private var seekError: String?
     @State private var seekTask: Task<Void, Never>?
     @State private var isPreparingArchive = false
+    @State private var liveBufferDuration = 0.0
     #if os(tvOS)
     @State private var tvActivity = Date()
     @State private var tvSeekPosition: Double?
+    @State private var tvLiveSeekPosition: Double?
+    @State private var tvLiveResumeAfterSeek = false
     @State private var tvResumeAfterCancel = false
     #endif
     private let logger = Logger(
@@ -170,7 +173,10 @@ struct PlayerView: View {
                     selection: selection,
                     expanded: model.isPlayerExpanded,
                     lastActivity: tvActivity,
-                    timeline: archiveTimeline, seekPosition: tvSeekPosition
+                    timeline: archiveTimeline,
+                    archiveSeekPosition: tvSeekPosition,
+                    liveSeekPosition: tvLiveSeekPosition,
+                    liveBufferDuration: liveBufferDuration
                 )
             }
         }
@@ -179,9 +185,20 @@ struct PlayerView: View {
             if let position = tvSeekPosition {
                 tvSeekPosition = nil
                 seekArchive(position, true)
+            } else if tvLiveSeekPosition != nil {
+                let wasPlaying = tvLiveResumeAfterSeek
+                seekTask?.cancel()
+                player?.currentItem?.cancelPendingSeeks()
+                tvLiveSeekPosition = nil
+                tvLiveResumeAfterSeek = false
+                if wasPlaying { player?.pause() } else { resumeTVPlayback() }
             } else if player?.timeControlStatus == .paused {
-                player?.play()
+                resumeTVPlayback()
             } else {
+                seekTask?.cancel()
+                player?.currentItem?.cancelPendingSeeks()
+                tvLiveSeekPosition = nil
+                tvLiveResumeAfterSeek = false
                 player?.pause()
             }
             tvActivity = Date()
@@ -189,13 +206,15 @@ struct PlayerView: View {
         .onChange(of: model.playerActivity) { _, _ in
             tvActivity = Date()
         }
-        .onChange(of: model.seekBackwardRequest) { _, _ in previewTVSeek(by: -10) }
-        .onChange(of: model.seekForwardRequest) { _, _ in previewTVSeek(by: 10) }
+        .onChange(of: model.seekBackwardRequest) { _, _ in handleTVSeek(direction: -1) }
+        .onChange(of: model.seekForwardRequest) { _, _ in handleTVSeek(direction: 1) }
         .onChange(of: model.isPlayerExpanded) { _, expanded in
             if expanded { tvActivity = Date() }
             else {
                 if tvSeekPosition != nil && tvResumeAfterCancel { player?.play() }
                 tvSeekPosition = nil
+                tvLiveSeekPosition = nil
+                tvLiveResumeAfterSeek = false
             }
         }
         #endif
@@ -216,6 +235,14 @@ struct PlayerView: View {
     }
 
     #if os(tvOS)
+    private func handleTVSeek(direction: Double) {
+        if selection.isCatchup {
+            previewTVSeek(by: direction * 10)
+        } else {
+            seekLive(by: direction * 15)
+        }
+    }
+
     private func previewTVSeek(by seconds: Double) {
         guard model.isPlayerExpanded, !isPreparingArchive,
               let player, let timeline = archiveTimeline else { return }
@@ -225,18 +252,71 @@ struct PlayerView: View {
         player.pause()
         tvActivity = Date()
     }
+
+    private func seekLive(by seconds: Double) {
+        guard model.isPlayerExpanded, !isPreparingArchive, let player else { return }
+        let base = tvLiveSeekPosition ?? player.currentTime().seconds
+        guard let timeline = makeLiveTimeline(
+            player: player, position: base, maximumDuration: liveBufferDuration
+        ) else { return }
+        if tvLiveSeekPosition == nil {
+            tvLiveResumeAfterSeek = player.timeControlStatus != .paused
+        }
+        seekLive(
+            player, to: timeline.seekTarget(offsetBy: seconds),
+            resume: tvLiveResumeAfterSeek
+        )
+    }
+
+    private func resumeTVPlayback() {
+        guard let player else { return }
+        guard !selection.isCatchup,
+              let timeline = makeLiveTimeline(
+                player: player, maximumDuration: liveBufferDuration
+              ),
+              player.currentTime().seconds < timeline.start else {
+            player.play()
+            return
+        }
+        seekLive(player, to: timeline.seekTarget(offsetBy: 0), resume: true)
+    }
+
+    private func seekLive(_ player: AVPlayer, to position: Double, resume: Bool) {
+        seekTask?.cancel()
+        player.currentItem?.cancelPendingSeeks()
+        tvLiveSeekPosition = position
+        tvLiveResumeAfterSeek = resume
+        tvActivity = Date()
+        seekTask = Task { @MainActor in
+            let tolerance = CMTime(seconds: 1, preferredTimescale: 600)
+            let sought = await player.seek(
+                to: CMTime(seconds: position, preferredTimescale: 600),
+                toleranceBefore: tolerance,
+                toleranceAfter: tolerance
+            )
+            guard !Task.isCancelled else { return }
+            guard sought else {
+                if tvLiveSeekPosition == position {
+                    tvLiveSeekPosition = nil
+                    tvLiveResumeAfterSeek = false
+                }
+                seekError = "The retained live position could not be loaded."
+                return
+            }
+            if resume { player.play() } else { player.pause() }
+            if tvLiveSeekPosition == position {
+                tvLiveSeekPosition = nil
+                tvLiveResumeAfterSeek = false
+            }
+        }
+    }
     #endif
 
     @MainActor
     private func seekArchive(_ elapsed: Double, _ resume: Bool) {
         guard !isPreparingArchive, let player, let timeline = archiveTimeline, elapsed.isFinite else { return }
         seekTask?.cancel()
-        let ranges = player.currentItem?.seekableTimeRanges.compactMap { value -> ClosedRange<Double>? in
-            let range = value.timeRangeValue
-            let start = range.start.seconds
-            let end = CMTimeRangeGetEnd(range).seconds
-            return start.isFinite && end.isFinite && end > start ? start...end : nil
-        } ?? []
+        let ranges = seekableRanges(in: player.currentItem)
         let position = timeline.localPosition(elapsed: elapsed, seekable: ranges)
         player.pause()
         seekTask = Task { @MainActor in
@@ -270,6 +350,7 @@ struct PlayerView: View {
             quality = nil
             airPlayActive = false
             isPreparingArchive = false
+            liveBufferDuration = 0
             if let sessionID = activeSessionID {
                 Task { await model.stopPlayback(sessionID: sessionID) }
             }
@@ -282,6 +363,7 @@ struct PlayerView: View {
                 let bandwidthSaver = model.bandwidthSaver
                 var configuration = try await model.playerConfiguration(for: selection)
                 activeSessionID = configuration.transcodeSessionID
+                liveBufferDuration = selection.isCatchup ? 0 : configuration.liveBufferDuration
                 try Task.checkCancellation()
                 var options: [String: Any] = [:]
                 if let cookie = configuration.cookieHeader {
@@ -294,6 +376,9 @@ struct PlayerView: View {
                 try Task.checkCancellation()
                 var item = AVPlayerItem(asset: asset)
                 item.preferredForwardBufferDuration = 12
+                if !selection.isCatchup {
+                    item.automaticallyPreservesTimeOffsetFromLive = true
+                }
                 var currentPlayer = AVPlayer(playerItem: item)
                 currentPlayer.isMuted = false
                 #if os(iOS)
@@ -318,6 +403,7 @@ struct PlayerView: View {
                 if !selection.startPaused { currentPlayer.play() }
                 var sampler = PlaybackHealthSampler()
                 var shouldRetune = false
+                var deferredSaverDecision: Bool?
                 while !Task.isCancelled {
                     try await Task.sleep(for: .seconds(2))
                     quality = qualityLabel(for: item.presentationSize)
@@ -366,14 +452,24 @@ struct PlayerView: View {
                             if !wasPaused { replacement.play() }
                             configuration = PlaybackConfiguration(
                                 url: url, cookieHeader: configuration.cookieHeader,
-                                transcodeSessionID: sessionID
+                                transcodeSessionID: sessionID,
+                                liveBufferDuration: configuration.liveBufferDuration
                             )
                             sampler = PlaybackHealthSampler()
                             continue
                         }
                         if feedback.playlist == nil && feedback.bandwidthSaver != bandwidthSaver {
-                            shouldRetune = true
-                            break
+                            if configuration.liveBufferDuration > 0 {
+                                if deferredSaverDecision != feedback.bandwidthSaver {
+                                    logger.info(
+                                        "Keeping the current live session to preserve its retained playback window"
+                                    )
+                                    deferredSaverDecision = feedback.bandwidthSaver
+                                }
+                            } else {
+                                shouldRetune = true
+                                break
+                            }
                         }
                     } catch {
                         if Task.isCancelled { throw CancellationError() }
@@ -435,6 +531,7 @@ struct PlayerView: View {
     ) async throws -> AVPlayer {
         let item = AVPlayerItem(asset: AVURLAsset(url: url, options: options))
         item.preferredForwardBufferDuration = 12
+        item.automaticallyPreservesTimeOffsetFromLive = true
         let candidate = AVPlayer(playerItem: item)
         let deadline = Date().addingTimeInterval(8)
         while item.status == .unknown && Date() < deadline {
@@ -728,23 +825,35 @@ private struct TVControlBar: View {
     let expanded: Bool
     let lastActivity: Date
     let timeline: ArchiveTimeline?
-    let seekPosition: Double?
+    let archiveSeekPosition: Double?
+    let liveSeekPosition: Double?
+    let liveBufferDuration: Double
 
     @State private var isPlaying = true
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
-            let visible = seekPosition != nil || !isPlaying || context.date.timeIntervalSince(lastActivity) < 4
+            let liveTimeline = selection.isCatchup ? nil : makeLiveTimeline(
+                player: player,
+                position: liveSeekPosition,
+                maximumDuration: liveBufferDuration
+            )
+            let visible = archiveSeekPosition != nil || liveSeekPosition != nil
+                || !isPlaying || context.date.timeIntervalSince(lastActivity) < 4
             VStack(spacing: 12) {
                 if let timeline {
-                    let elapsed = seekPosition ?? timeline.elapsed(mediaTime: player.currentTime().seconds)
+                    let elapsed = archiveSeekPosition
+                        ?? timeline.elapsed(mediaTime: player.currentTime().seconds)
                     VStack(spacing: 8) {
                         ProgressView(value: elapsed, total: timeline.duration)
                             .tint(.white)
                         HStack {
                             Text(archiveTime(elapsed))
                             Spacer()
-                            Text(seekPosition == nil ? "Left/Right to seek" : "Select or Play to seek")
+                            Text(
+                                archiveSeekPosition == nil
+                                    ? "Left/Right to seek" : "Select or Play to seek"
+                            )
                             Spacer()
                             Text("-" + archiveTime(timeline.duration - elapsed))
                         }
@@ -753,8 +862,27 @@ private struct TVControlBar: View {
                     }
                     .foregroundStyle(.white)
                     .padding(.horizontal, expanded ? 60 : 16)
+                } else if let liveTimeline {
+                    VStack(spacing: 8) {
+                        ProgressView(value: liveTimeline.elapsed, total: liveTimeline.duration)
+                            .tint(.white)
+                        HStack {
+                            Text("-" + archiveTime(liveTimeline.duration))
+                            Spacer()
+                            Text(liveStatus(liveTimeline))
+                            Spacer()
+                            HStack(spacing: 5) {
+                                Circle().fill(.red).frame(width: 6, height: 6)
+                                Text("LIVE")
+                            }
+                        }
+                        .font(expanded ? .caption : .caption2)
+                        .monospacedDigit()
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, expanded ? 60 : 16)
                 }
-                bar
+                bar(liveTimeline: liveTimeline)
             }
                 .opacity(visible ? 1 : 0)
                 .animation(.easeInOut(duration: 0.3), value: visible)
@@ -765,7 +893,13 @@ private struct TVControlBar: View {
         }
     }
 
-    private var bar: some View {
+    private func liveStatus(_ timeline: LiveTimeline) -> String {
+        let position = timeline.isAtLiveEdge
+            ? "At live edge" : "\(archiveTime(timeline.behindLive)) behind"
+        return expanded ? "\(position)  •  Left/Right 15s" : position
+    }
+
+    private func bar(liveTimeline: LiveTimeline?) -> some View {
         HStack(spacing: expanded ? 24 : 12) {
             Image(systemName: isPlaying ? "pause.fill" : "play.fill")
                 .font(.system(size: expanded ? 30 : 18, weight: .semibold))
@@ -774,6 +908,14 @@ private struct TVControlBar: View {
 
             if selection.isCatchup {
                 CatchupBadge()
+            } else if let liveTimeline, !liveTimeline.isAtLiveEdge {
+                HStack(spacing: 6) {
+                    Image(systemName: "clock.arrow.circlepath")
+                    Text("-\(archiveTime(liveTimeline.behindLive)) LIVE")
+                        .font((expanded ? Font.callout : .caption2).weight(.bold))
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("\(archiveTime(liveTimeline.behindLive)) behind live")
             } else {
                 HStack(spacing: 6) {
                     Circle().fill(.red).frame(width: expanded ? 10 : 7, height: expanded ? 10 : 7)
@@ -814,6 +956,25 @@ private func archiveTime(_ seconds: Double) -> String {
     return value >= 3600
         ? String(format: "%d:%02d:%02d", value / 3600, value / 60 % 60, value % 60)
         : String(format: "%d:%02d", value / 60, value % 60)
+}
+
+private func seekableRanges(in item: AVPlayerItem?) -> [ClosedRange<Double>] {
+    item?.seekableTimeRanges.compactMap { value in
+        let range = value.timeRangeValue
+        let start = range.start.seconds
+        let end = CMTimeRangeGetEnd(range).seconds
+        return start.isFinite && end.isFinite && end > start ? start...end : nil
+    } ?? []
+}
+
+private func makeLiveTimeline(
+    player: AVPlayer, position: Double? = nil, maximumDuration: Double
+) -> LiveTimeline? {
+    LiveTimeline(
+        seekable: seekableRanges(in: player.currentItem),
+        position: position ?? player.currentTime().seconds,
+        maximumDuration: maximumDuration
+    )
 }
 
 #if !os(tvOS)

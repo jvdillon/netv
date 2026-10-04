@@ -17,7 +17,7 @@ import threading
 import time
 
 # Import VAAPI auto-detection results (avoid circular import by importing constants only)
-from cache import AVAILABLE_ENCODERS, VAAPI_DEVICE, get_user_agent
+from cache import AVAILABLE_ENCODERS, VAAPI_DEVICE, clamp_live_dvr_mins, get_user_agent
 
 
 log = logging.getLogger(__name__)
@@ -1225,7 +1225,7 @@ def get_live_hls_list_size(
     segment_duration: float = _HLS_SEGMENT_DURATION_SEC,
 ) -> int:
     """Get hls_list_size for live streams based on DVR setting."""
-    dvr_mins = _load_settings().get("live_dvr_mins", 0)
+    dvr_mins = clamp_live_dvr_mins(_load_settings().get("live_dvr_mins", 0))
     if dvr_mins <= 0:
         # Default buffer when DVR disabled
         return int(DEFAULT_LIVE_BUFFER_SECS / segment_duration)

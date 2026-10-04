@@ -824,6 +824,10 @@ class TestHlsListSize:
             # 5 min = 300 sec / 3 sec per segment = 100 segments
             assert get_live_hls_list_size() == 100
 
+    def test_dvr_list_size_is_capped_at_two_hours(self):
+        with patch("ffmpeg_command._load_settings", return_value={"live_dvr_mins": 999}):
+            assert get_live_hls_list_size() == 2400
+
 
 # =============================================================================
 # Probe Media Tests

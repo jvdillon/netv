@@ -96,7 +96,6 @@ struct WatchView: View {
                         .onTapGesture { model.playPauseRequest = UUID() }
                         .onMoveCommand { direction in
                             model.playerActivity = UUID()
-                            guard model.selection?.isCatchup == true else { return }
                             if direction == .left { model.seekBackwardRequest = UUID() }
                             if direction == .right { model.seekForwardRequest = UUID() }
                         }

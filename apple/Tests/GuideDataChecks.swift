@@ -111,6 +111,29 @@ struct GuideDataChecks {
         precondition(ArchiveTimeline(selection: live) == nil)
         let adjusted = ArchiveTimeline(selection: sought, streamStart: base + 590)!
         precondition(adjusted.elapsed(mediaTime: 35) == 625, "Use the server's actual archive start")
-        print("Guide checks passed: timestamps, clipping, distinct categories, catchup and legacy responses")
+
+        let liveTimeline = LiveTimeline(
+            seekable: [100...460], position: 430, maximumDuration: 7200
+        )!
+        precondition(liveTimeline.duration == 360 && liveTimeline.elapsed == 330)
+        precondition(liveTimeline.behindLive == 30 && !liveTimeline.isAtLiveEdge)
+        precondition(liveTimeline.seekTarget(offsetBy: -15) == 415)
+        precondition(liveTimeline.seekTarget(offsetBy: 15) == 445)
+        precondition(
+            LiveTimeline(seekable: [100...460], position: 450, maximumDuration: 7200)!
+                .isAtLiveEdge
+        )
+        let cappedTimeline = LiveTimeline(
+            seekable: [0...10_000], position: 100, maximumDuration: 99_999
+        )!
+        precondition(cappedTimeline.start == 2800 && cappedTimeline.duration == 7200)
+        precondition(
+            cappedTimeline.seekTarget(offsetBy: -15) == 2800.1,
+            "Seeking must stay inside the retained live window"
+        )
+        precondition(
+            LiveTimeline(seekable: [], position: 0, maximumDuration: 7200) == nil
+        )
+        print("Guide checks passed: guide data, archive and live timelines")
     }
 }

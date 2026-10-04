@@ -106,6 +106,7 @@ class TestSettings:
             "software",
         )
         assert settings["probe_movies"] is True
+        assert settings["live_dvr_mins"] == 120
 
     def test_save_and_load_settings(self, cache_module):
         settings = {"sources": [{"id": "s1", "name": "Test"}], "custom": True}
@@ -113,6 +114,10 @@ class TestSettings:
         loaded = cache_module.load_server_settings()
         assert loaded["sources"] == [{"id": "s1", "name": "Test"}]
         assert loaded["custom"] is True
+
+    def test_live_dvr_window_is_bounded(self, cache_module):
+        cache_module.save_server_settings({"live_dvr_mins": 999})
+        assert cache_module.load_server_settings()["live_dvr_mins"] == 120
 
 
 class TestUserSettings:

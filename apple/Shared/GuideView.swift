@@ -253,7 +253,6 @@ struct ChannelGuideView: View {
         }
         .background(GuideTheme.background)
         .refreshable { await model.loadGuide() }
-        .focusSection()
         .sheet(item: $catchupChannel) { channel in
             CatchupSheet(channel: channel)
         }
@@ -286,6 +285,7 @@ struct ChannelGuideView: View {
             GuideTimeNavigation()
                 .padding(.horizontal, 20)
                 .padding(.bottom, 12)
+                .focusSection()
 
             if let error = model.errorMessage {
                 ErrorBanner(message: error)
@@ -333,6 +333,7 @@ struct ChannelGuideView: View {
                     }
                     .disabled(model.isGuideInteractionBlocked)
                     .id([selectedCategoryID ?? "", model.query])
+                    .focusSection()
                     #if os(tvOS)
                     .task(id: [model.isPlayerExpanded, model.isLoading]) {
                         guard !model.isPlayerExpanded, !model.isGuideInteractionBlocked,

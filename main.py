@@ -55,9 +55,11 @@ from auth import create_token, verify_password, verify_token
 from cache import (
     AVAILABLE_ENCODERS,
     CACHE_DIR,
+    DEFAULT_LIVE_DVR_MINS,
     LOGO_BROWSER_TTL,
     LOGO_MAX_SIZE,
     Source,
+    clamp_live_dvr_mins,
     clear_all_caches,
     clear_all_file_caches,
     get_cache,
@@ -2538,7 +2540,7 @@ async def settings_page(request: Request, user: Annotated[dict, Depends(require_
             "quality": server_settings.get("quality", "high"),
             "vod_transcode_cache_mins": server_settings.get("vod_transcode_cache_mins", 60),
             "live_transcode_cache_secs": server_settings.get("live_transcode_cache_secs", 60),
-            "live_dvr_mins": server_settings.get("live_dvr_mins", 60),
+            "live_dvr_mins": server_settings.get("live_dvr_mins", DEFAULT_LIVE_DVR_MINS),
             "transcode_dir": server_settings.get("transcode_dir", ""),
             "probe_live": server_settings.get("probe_live", True),
             "probe_movies": server_settings.get("probe_movies", True),
@@ -3331,7 +3333,7 @@ async def settings_transcode(
     quality: Annotated[str, Form()] = "high",
     vod_transcode_cache_mins: Annotated[int, Form()] = 60,
     live_transcode_cache_secs: Annotated[int, Form()] = 0,
-    live_dvr_mins: Annotated[int, Form()] = 60,
+    live_dvr_mins: Annotated[int, Form()] = DEFAULT_LIVE_DVR_MINS,
     transcode_dir: Annotated[str, Form()] = "",
     probe_live: Annotated[str | None, Form()] = None,
     probe_movies: Annotated[str | None, Form()] = None,
@@ -3348,7 +3350,7 @@ async def settings_transcode(
     settings["quality"] = quality if quality in ("high", "medium", "low") else "high"
     settings["vod_transcode_cache_mins"] = max(0, vod_transcode_cache_mins)
     settings["live_transcode_cache_secs"] = max(0, live_transcode_cache_secs)
-    settings["live_dvr_mins"] = max(0, live_dvr_mins)
+    settings["live_dvr_mins"] = clamp_live_dvr_mins(live_dvr_mins)
     if transcode_dir:
         settings["transcode_dir"] = transcode_dir
     elif "transcode_dir" in settings:

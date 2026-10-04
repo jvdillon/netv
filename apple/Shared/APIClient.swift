@@ -27,6 +27,7 @@ struct PlaybackConfiguration {
     let transcodeSessionID: String?
     var archiveStart: Double?
     var archiveSeek: Double?
+    var liveBufferDuration: Double = 0
 }
 
 final class APIClient {
@@ -179,6 +180,9 @@ final class APIClient {
         if catchupStart != nil {
             configuration.archiveStart = playerConfigNumber("catchupStart", in: html)
             configuration.archiveSeek = playerConfigNumber("catchupSeek", in: html)
+        } else {
+            let minutes = min(max(playerConfigNumber("liveDvrMins", in: html) ?? 0, 0), 120)
+            configuration.liveBufferDuration = minutes * 60
         }
         return configuration
     }

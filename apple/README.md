@@ -23,9 +23,11 @@ once to play it in the preview, then select the same channel again to fill the
 display. Back/Menu returns to the guide and focuses the playing channel, so
 pressing Select again returns to fullscreen without restarting playback. Video
 retains its original aspect ratio. In fullscreen, the remote's Play/Pause button
-or a click on the touchpad pauses and resumes; swiping during live playback just shows the bar. A slim
-status bar (play/pause, LIVE, channel and program) appears for a few seconds on
-remote activity and stays visible while paused.
+or a click on the touchpad pauses and resumes. Left and Right seek through the
+retained live window in 15-second steps without requiring a pause. The status bar
+shows the available history, current position, distance behind the live edge, and
+stays visible while paused. The server retains everything watched in the current
+session, up to the configured two-hour limit, without replacing the live session.
 
 Mac shows a slim neTV control bar (play/pause, LIVE, volume, and AirPlay) along
 the bottom of the video on hover; it stays visible while paused. AVKit's own
@@ -58,9 +60,11 @@ changing what is playing.
 
 On Apple TV, focus a program and press Select to play it; select the playing program
 again to expand it. Moving left out of the program grid skips the stream labels
-and returns to categories. Leaving fullscreen restores focus to an available
-program rather than the stream label. Program context menus remain available for **Start Over** and
-**Catch Up…**, but is no longer required to browse earlier programs.
+and returns to categories. The time controls and program grid form one vertical
+focus path, so Up and Down move between them from any control. Leaving fullscreen
+restores focus to an available program rather than the stream label. Program context
+menus remain available for **Start Over** and **Catch Up…**, but is no longer required
+to browse earlier programs.
 On iPhone, iPad, and Mac, drag the archive timeline
 to preview a position and release to seek, or use the ten-second skip buttons.
 The timeline covers the full program, including portions not yet buffered.

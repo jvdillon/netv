@@ -320,3 +320,34 @@ struct ArchiveTimeline {
         return position
     }
 }
+
+struct LiveTimeline {
+    let start: Double
+    let end: Double
+    let position: Double
+
+    init?(
+        seekable: [ClosedRange<Double>], position: Double, maximumDuration: Double
+    ) {
+        guard position.isFinite, maximumDuration.isFinite, maximumDuration > 0,
+              let latest = seekable.last(where: {
+                $0.lowerBound.isFinite && $0.upperBound.isFinite
+                    && $0.upperBound > $0.lowerBound
+              }) else { return nil }
+        let duration = min(maximumDuration, 2 * 60 * 60)
+        start = max(latest.lowerBound, latest.upperBound - duration)
+        end = latest.upperBound
+        guard end > start else { return nil }
+        self.position = min(max(position, start), end)
+    }
+
+    var duration: Double { end - start }
+    var elapsed: Double { position - start }
+    var behindLive: Double { end - position }
+    var isAtLiveEdge: Bool { behindLive <= 15 }
+
+    func seekTarget(offsetBy seconds: Double) -> Double {
+        let margin = min(0.1, duration / 2)
+        return min(max(position + seconds, start + margin), end - margin)
+    }
+}

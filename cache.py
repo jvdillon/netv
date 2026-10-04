@@ -20,6 +20,13 @@ from util import atomic_write_json
 
 log = logging.getLogger(__name__)
 
+DEFAULT_LIVE_DVR_MINS = 120
+MAX_LIVE_DVR_MINS = 120
+
+
+def clamp_live_dvr_mins(value: int) -> int:
+    return min(max(value, 0), MAX_LIVE_DVR_MINS)
+
 
 # ===========================================================================
 # VAAPI Auto-Detection
@@ -504,7 +511,8 @@ def load_server_settings() -> dict[str, Any]:
     data.setdefault("vod_transcode_cache_mins", 60)
     # 0 = no caching (dead sessions cleaned immediately)
     data.setdefault("live_transcode_cache_secs", 0)
-    data.setdefault("live_dvr_mins", 60)  # Minutes of live history retained for pause/rewind (0 = ~30s buffer)
+    data.setdefault("live_dvr_mins", DEFAULT_LIVE_DVR_MINS)
+    data["live_dvr_mins"] = clamp_live_dvr_mins(data["live_dvr_mins"])
     data.setdefault("transcode_dir", "")  # Empty = system temp dir
     data.setdefault("probe_live", True)
     data.setdefault("probe_movies", True)
