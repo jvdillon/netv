@@ -35,10 +35,11 @@ two-hour limit, without replacing the live session.
 The scheduled-program timeline and 15-second live seek controls are shared by
 Apple TV, Mac, iPhone, and iPad. Mac shows its control bar on hover and keeps it
 visible while paused; iPhone and iPad use touch controls below the same timeline.
-AVKit's native transport controls are not used. TV has no fullscreen button or
-percentage/volume panel; use the Siri Remote's hardware volume keys to control
-the connected display or receiver. Mac retains its fullscreen button. App volume
-carries across playback changes and adaptive quality switches.
+The resolution badge appears only with these controls, including while paused or
+seeking. AVKit's native transport controls are not used. TV has no fullscreen
+button or percentage/volume panel; use the Siri Remote's hardware volume keys to
+control the connected display or receiver. Mac retains its fullscreen button.
+App volume carries across playback changes and adaptive quality switches.
 
 Category names and ordering follow the web settings. Use the updated neTV server
 for category metadata and device-local program times; older servers remain

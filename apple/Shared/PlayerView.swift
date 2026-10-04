@@ -23,6 +23,9 @@ struct PlayerView: View {
     @State private var liveBufferDuration = 0.0
     @State private var liveSeekPosition: Double?
     @State private var liveResumeAfterSeek = false
+    #if os(iOS)
+    @State private var iosActivity = Date()
+    #endif
     #if os(tvOS)
     @State private var tvActivity = Date()
     @State private var tvSeekPosition: Double?
@@ -69,72 +72,88 @@ struct PlayerView: View {
             }
 
             #if os(iOS)
-            VStack {
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(selection.channel.name)
-                            .font(.headline)
-                        if let program = selection.isCatchup ? selection.program : liveProgram {
-                            Text(program.title)
-                                .font(.subheadline)
-                                .foregroundStyle(.white.opacity(0.7))
-                        }
-                    }
-                    Spacer()
-                    if let startOver = model.startOverForSelection {
-                        Button(action: startOver) {
-                            Image(systemName: "backward.end.fill")
+            if let player {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture { iosActivity = Date() }
+
+                TimelineView(.periodic(from: .now, by: 0.5)) { context in
+                    let controlsVisible = isScrubbing || liveSeekPosition != nil
+                        || player.timeControlStatus == .paused
+                        || context.date.timeIntervalSince(iosActivity) < 4
+                    VStack {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(selection.channel.name)
+                                    .font(.headline)
+                                if let program = selection.isCatchup
+                                    ? selection.program : liveProgram {
+                                    Text(program.title)
+                                        .font(.subheadline)
+                                        .foregroundStyle(.white.opacity(0.7))
+                                }
+                            }
+                            Spacer()
+                            if let startOver = model.startOverForSelection {
+                                Button(action: startOver) {
+                                    Image(systemName: "backward.end.fill")
+                                        .frame(width: 36, height: 36)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Start over")
+                            }
+                            if selection.isCatchup {
+                                Button("Live") { model.play(selection.channel) }
+                                    .font(.caption.weight(.bold))
+                                    .buttonStyle(.bordered)
+                                    .tint(.white)
+                                    .accessibilityLabel("Return to live")
+                            }
+                            if let quality {
+                                QualityBadge(quality: quality)
+                            }
+                            AirPlayButton(player: player)
                                 .frame(width: 36, height: 36)
+                                .accessibilityLabel("AirPlay")
                         }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Start over")
+                        .padding()
+                        .background(
+                            LinearGradient(
+                                colors: [.black.opacity(0.75), .clear],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                        Spacer()
+                        IOSControlBar(
+                            player: player,
+                            isCatchup: selection.isCatchup,
+                            archiveTimeline: archiveTimeline,
+                            liveBufferDuration: liveBufferDuration,
+                            liveProgram: liveProgram,
+                            liveSeekPosition: liveSeekPosition,
+                            isScrubbing: $isScrubbing,
+                            seekArchive: { elapsed, resume in
+                                iosActivity = Date()
+                                seekArchive(elapsed, resume)
+                            },
+                            seekLive: { seconds in
+                                iosActivity = Date()
+                                requestLiveSeek(by: seconds)
+                            },
+                            togglePlayback: {
+                                iosActivity = Date()
+                                togglePlayback()
+                            }
+                        )
+                        .disabled(isPreparingArchive)
                     }
-                    if selection.isCatchup {
-                        Button("Live") { model.play(selection.channel) }
-                            .font(.caption.weight(.bold))
-                            .buttonStyle(.bordered)
-                            .tint(.white)
-                            .accessibilityLabel("Return to live")
-                    }
-                    if let quality {
-                        Text(quality)
-                            .font(.caption.weight(.semibold))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(.white.opacity(0.18), in: Capsule())
-                    }
-                    if let player {
-                        AirPlayButton(player: player)
-                            .frame(width: 36, height: 36)
-                            .accessibilityLabel("AirPlay")
-                    }
-                }
-                .padding()
-                .background(
-                    LinearGradient(
-                        colors: [.black.opacity(0.75), .clear],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
-                Spacer()
-                if let player {
-                    IOSControlBar(
-                        player: player,
-                        isCatchup: selection.isCatchup,
-                        archiveTimeline: archiveTimeline,
-                        liveBufferDuration: liveBufferDuration,
-                        liveProgram: liveProgram,
-                        liveSeekPosition: liveSeekPosition,
-                        isScrubbing: $isScrubbing,
-                        seekArchive: seekArchive,
-                        seekLive: requestLiveSeek,
-                        togglePlayback: togglePlayback
-                    )
-                    .disabled(isPreparingArchive)
+                    .foregroundStyle(.white)
+                    .opacity(controlsVisible ? 1 : 0)
+                    .allowsHitTesting(controlsVisible)
+                    .animation(.easeInOut(duration: 0.2), value: controlsVisible)
                 }
             }
-            .foregroundStyle(.white)
             #endif
         }
         #if os(macOS) || os(tvOS)
@@ -152,7 +171,8 @@ struct PlayerView: View {
                     isScrubbing: $isScrubbing,
                     seekArchive: seekArchive,
                     seekLive: requestLiveSeek,
-                    togglePlayback: togglePlayback
+                    togglePlayback: togglePlayback,
+                    quality: quality
                 )
                 .disabled(isPreparingArchive)
             }
@@ -164,22 +184,6 @@ struct PlayerView: View {
             }
         }
         #endif
-        .overlay(alignment: .topLeading) {
-            if let quality {
-                Text(quality)
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .foregroundStyle(.white)
-                    .background(.black.opacity(0.65), in: Capsule())
-                    #if os(tvOS)
-                    .padding(model.isPlayerExpanded ? 48 : 18)
-                    #else
-                    .padding(12)
-                    #endif
-                    .allowsHitTesting(false)
-            }
-        }
         .onChange(of: model.playbackVolume) { _, volume in
             player?.volume = Float(volume)
         }
@@ -196,7 +200,8 @@ struct PlayerView: View {
                     archiveSeekPosition: tvSeekPosition,
                     liveSeekPosition: liveSeekPosition,
                     liveBufferDuration: liveBufferDuration,
-                    liveProgram: liveProgram
+                    liveProgram: liveProgram,
+                    quality: quality
                 )
             }
         }
@@ -423,6 +428,9 @@ struct PlayerView: View {
                 #endif
                 isPreparingArchive = selection.isCatchup
                 player = currentPlayer
+                #if os(iOS)
+                iosActivity = Date()
+                #endif
                 if let requested = selection.catchupStart {
                     archiveStreamStart = configuration.archiveStart ?? floor(requested / 60) * 60
                     let offset = configuration.archiveSeek ?? max(0, requested - (archiveStreamStart ?? requested))
@@ -644,6 +652,7 @@ private struct MacControlBar: View {
     let seekArchive: (Double, Bool) -> Void
     let seekLive: (Double) -> Void
     let togglePlayback: () -> Void
+    let quality: String?
 
     @State private var isPlaying = true
     @State private var isHovering = false
@@ -665,31 +674,42 @@ private struct MacControlBar: View {
                 )
             }
             let visible = isScrubbing || !isPlaying || (isHovering && context.date.timeIntervalSince(lastActivity) < 3)
-            VStack(spacing: 8) {
-                if let archiveTimeline {
-                    ArchiveSeekBar(
-                        player: player,
-                        timeline: archiveTimeline,
-                        isScrubbing: $isScrubbing,
-                        seek: seekArchive
-                    )
+            ZStack(alignment: .bottom) {
+                if let quality {
+                    QualityBadge(quality: quality)
+                        .frame(
+                            maxWidth: .infinity,
+                            maxHeight: .infinity,
+                            alignment: .topLeading
+                        )
+                        .padding(12)
+                }
+                VStack(spacing: 8) {
+                    if let archiveTimeline {
+                        ArchiveSeekBar(
+                            player: player,
+                            timeline: archiveTimeline,
+                            isScrubbing: $isScrubbing,
+                            seek: seekArchive
+                        )
                         .padding(.horizontal, 12)
                         .padding(.top, 12)
                         .background(.black.opacity(0.7))
-                } else if let liveTimeline {
-                    LiveTimelineDisplay(
-                        timeline: liveTimeline,
-                        programTimeline: programTimeline,
-                        font: .caption2
-                    )
-                    .padding(.horizontal, 12)
-                    .padding(.top, 12)
-                    .background(.black.opacity(0.7))
+                    } else if let liveTimeline {
+                        LiveTimelineDisplay(
+                            timeline: liveTimeline,
+                            programTimeline: programTimeline,
+                            font: .caption2
+                        )
+                        .padding(.horizontal, 12)
+                        .padding(.top, 12)
+                        .background(.black.opacity(0.7))
+                    }
+                    bar(liveTimeline: liveTimeline)
                 }
-                bar(liveTimeline: liveTimeline)
             }
-                .opacity(visible ? 1 : 0)
-                .animation(.easeInOut(duration: 0.2), value: visible)
+            .opacity(visible ? 1 : 0)
+            .animation(.easeInOut(duration: 0.2), value: visible)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .contentShape(Rectangle())
@@ -1021,6 +1041,7 @@ private struct TVControlBar: View {
     let liveSeekPosition: Double?
     let liveBufferDuration: Double
     let liveProgram: Program?
+    let quality: String?
 
     @State private var isPlaying = true
 
@@ -1041,41 +1062,53 @@ private struct TVControlBar: View {
             }
             let visible = archiveSeekPosition != nil || liveSeekPosition != nil
                 || !isPlaying || context.date.timeIntervalSince(lastActivity) < 4
-            VStack(spacing: 12) {
-                if let timeline {
-                    let elapsed = archiveSeekPosition
-                        ?? timeline.elapsed(mediaTime: player.currentTime().seconds)
-                    VStack(spacing: 8) {
-                        ProgressView(value: elapsed, total: timeline.duration)
-                            .tint(.white)
-                        HStack {
-                            Text(archiveTime(elapsed))
-                            Spacer()
-                            Text(
-                                archiveSeekPosition == nil
-                                    ? "Left/Right to seek" : "Select or Play to seek"
-                            )
-                            Spacer()
-                            Text("-" + archiveTime(timeline.duration - elapsed))
-                        }
-                        .font(expanded ? .caption : .caption2)
-                        .monospacedDigit()
-                    }
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, expanded ? 60 : 16)
-                } else if let liveTimeline {
-                    LiveTimelineDisplay(
-                        timeline: liveTimeline,
-                        programTimeline: programTimeline,
-                        font: expanded ? .caption : .caption2,
-                        seekHint: expanded ? "Left/Right 15s" : nil
-                    )
-                    .padding(.horizontal, expanded ? 60 : 16)
+            ZStack(alignment: .bottom) {
+                if let quality {
+                    QualityBadge(quality: quality)
+                        .frame(
+                            maxWidth: .infinity,
+                            maxHeight: .infinity,
+                            alignment: .topLeading
+                        )
+                        .padding(expanded ? 48 : 18)
                 }
-                bar(liveTimeline: liveTimeline)
+                VStack(spacing: 12) {
+                    if let timeline {
+                        let elapsed = archiveSeekPosition
+                            ?? timeline.elapsed(mediaTime: player.currentTime().seconds)
+                        VStack(spacing: 8) {
+                            ProgressView(value: elapsed, total: timeline.duration)
+                                .tint(.white)
+                            HStack {
+                                Text(archiveTime(elapsed))
+                                Spacer()
+                                Text(
+                                    archiveSeekPosition == nil
+                                        ? "Left/Right to seek" : "Select or Play to seek"
+                                )
+                                Spacer()
+                                Text("-" + archiveTime(timeline.duration - elapsed))
+                            }
+                            .font(expanded ? .caption : .caption2)
+                            .monospacedDigit()
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, expanded ? 60 : 16)
+                    } else if let liveTimeline {
+                        LiveTimelineDisplay(
+                            timeline: liveTimeline,
+                            programTimeline: programTimeline,
+                            font: expanded ? .caption : .caption2,
+                            seekHint: expanded ? "Left/Right 15s" : nil
+                        )
+                        .padding(.horizontal, expanded ? 60 : 16)
+                    }
+                    bar(liveTimeline: liveTimeline)
+                }
             }
-                .opacity(visible ? 1 : 0)
-                .animation(.easeInOut(duration: 0.3), value: visible)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .opacity(visible ? 1 : 0)
+            .animation(.easeInOut(duration: 0.3), value: visible)
         }
         .allowsHitTesting(false)
         .onReceive(player.publisher(for: \.timeControlStatus)) { status in
@@ -1134,6 +1167,20 @@ private struct TVControlBar: View {
 }
 
 #endif
+
+private struct QualityBadge: View {
+    let quality: String
+
+    var body: some View {
+        Text(quality)
+            .font(.caption.weight(.semibold))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .foregroundStyle(.white)
+            .background(.black.opacity(0.65), in: Capsule())
+            .allowsHitTesting(false)
+    }
+}
 
 private struct LiveTimelineDisplay: View {
     let timeline: LiveTimeline
