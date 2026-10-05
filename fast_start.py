@@ -18,13 +18,22 @@ from ffmpeg_command import (
 )
 
 
-def ingest_command(url: str, directory: str, user_agent: str | None) -> list[str]:
-    # Remux only. No probe subprocess and no encoder may open the provider URL.
+_PLAYLIST_ENTRIES = re.compile(r"#EXTINF:([\d.]+),[^\n]*\n(?:#[^\n]*\n)*([^#\n]+)")
+
+
+def ingest_command(
+    url: str,
+    directory: str,
+    user_agent: str | None,
+    *,
+    restarting: bool = False,
+) -> list[str]:
+    # Remux only. No probe subprocess and no encoder may open the upstream URL.
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
     cmd += http_reconnect_args(url, max_delay=5)
     if user_agent:
         cmd += ["-user_agent", user_agent]
-    return cmd + [
+    output = [
         "-probesize",
         "5000000",
         "-analyzeduration",
@@ -44,11 +53,16 @@ def ingest_command(url: str, directory: str, user_agent: str | None) -> list[str
         "-hls_list_size",
         "120",
         "-hls_flags",
-        "delete_segments+temp_file",
+        "delete_segments+temp_file" + ("+discont_start" if restarting else ""),
+    ]
+    if restarting:
+        output += ["-hls_start_number_source", "epoch_us"]
+    output += [
         "-hls_segment_filename",
         f"{directory}/input_%06d.ts",
         f"{directory}/input.m3u8",
     ]
+    return cmd + output
 
 
 def encoder_command(
@@ -61,6 +75,7 @@ def encoder_command(
     *,
     audio: MediaInfo | None = None,
     audio_passthrough: bool = False,
+    restarting: bool = False,
 ) -> list[str]:
     cmd = build_hls_ffmpeg_cmd(
         f"{directory}/input.m3u8",
@@ -78,14 +93,17 @@ def encoder_command(
         audio_passthrough=audio_passthrough,
     )
     index = cmd.index("-i")
-    cmd[index:index] = ["-live_start_index", "0"]
+    cmd[index:index] = ["-live_start_index", "-3" if restarting else "0"]
     cmd[cmd.index("-probesize") + 1] = "500000"
     cmd[cmd.index("-analyzeduration") + 1] = "500000"
     # Preserve the shared source timeline through both independent encoders.
     cmd[1:1] = ["-copyts"]
     prefix = "high" if high else "low"
     cmd[cmd.index("-hls_segment_filename") + 1] = f"{directory}/{prefix}_%06d.ts"
-    cmd[cmd.index("-hls_flags") + 1] = "delete_segments+temp_file"
+    flags = "delete_segments+temp_file"
+    if restarting:
+        flags += "+append_list+discont_start"
+    cmd[cmd.index("-hls_flags") + 1] = flags
     duration = "2"
     cmd[cmd.index("-hls_time") + 1] = duration
     cmd[cmd.index("-hls_list_size") + 1] = str(get_live_hls_list_size(float(duration)))
@@ -162,10 +180,29 @@ def dated_playlist(directory: str, content: str, origin_pts: float, origin_time:
     """Map both renditions to the same clock, independent of encoder warm-up."""
     lines = content.splitlines()
     result = []
+    reset_clock = False
+    duration = 0.0
     for line in lines:
+        if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+            continue
+        if line.startswith("#EXT-X-DISCONTINUITY"):
+            reset_clock = True
+        elif match := re.match(r"#EXTINF:([\d.]+)", line):
+            duration = float(match.group(1))
         if line and not line.startswith("#") and pathlib.Path(line).name == line:
-            pts = segment_pts(pathlib.Path(directory) / line)
+            segment = pathlib.Path(directory) / line
+            pts = segment_pts(segment)
             if pts is not None:
+                if reset_clock:
+                    try:
+                        segment_time = segment.stat().st_mtime - duration
+                        elapsed = (pts - origin_pts) % ((1 << 33) / 90000)
+                        if abs(origin_time + elapsed - segment_time) > 60:
+                            origin_time = segment_time
+                            origin_pts = pts
+                    except OSError:
+                        pass
+                    reset_clock = False
                 elapsed = (pts - origin_pts) % ((1 << 33) / 90000)
                 date = datetime.fromtimestamp(origin_time + elapsed, UTC)
                 result.append("#EXT-X-PROGRAM-DATE-TIME:" + date.isoformat(timespec="milliseconds"))
@@ -179,7 +216,7 @@ def aligned(directory: str) -> bool:
         ends = []
         for name in ("low.m3u8", "high.m3u8"):
             content = (pathlib.Path(directory) / name).read_text()
-            entries = re.findall(r"#EXTINF:([\d.]+),[^\n]*\n([^#\n]+)", content)
+            entries = _PLAYLIST_ENTRIES.findall(content)
             duration, filename = entries[-1]
             pts = segment_pts(pathlib.Path(directory) / filename)
             if pts is None:
@@ -190,13 +227,19 @@ def aligned(directory: str) -> bool:
         return False
 
 
-def ready_bitrate(directory: str, name: str, *, minimum_segments: int = 2) -> float:
+def ready_bitrate(
+    directory: str,
+    name: str,
+    *,
+    minimum_segments: int = 2,
+    max_age: float = 10,
+) -> float:
     """Require complete, fresh segments; use the largest recent segment bitrate."""
     path = pathlib.Path(directory) / name
     try:
-        if time.time() - path.stat().st_mtime > 10:
+        if time.time() - path.stat().st_mtime > max_age:
             return 0
-        entries = re.findall(r"#EXTINF:([\d.]+),[^\n]*\n([^#\n]+)", path.read_text())
+        entries = _PLAYLIST_ENTRIES.findall(path.read_text())
         if len(entries) < minimum_segments:
             return 0
         rates = []
