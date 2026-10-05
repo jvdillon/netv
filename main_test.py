@@ -1445,6 +1445,27 @@ class TestTranscodeRoutes:
             dates.assert_called_once_with(str(tmp_path), content, 10, 0)
             assert "#dated" in response.text
 
+    def test_segmented_webvtt_is_mapped_to_the_video_clock(self, auth_client, tmp_path):
+        filename = "sub0_000001.vtt"
+        (tmp_path / filename).write_text(
+            "WEBVTT\n\n00:01.000 --> 00:03.000\nCaption\n"
+        )
+        session = {"dir": str(tmp_path)}
+        with (
+            patch("main.ffmpeg_session.get_session", return_value=session),
+            patch(
+                "main.ffmpeg_session.get_caption_timestamp_origin",
+                return_value=10.08,
+            ),
+        ):
+            response = auth_client.get(f"/transcode/session/{filename}")
+
+        assert response.status_code == 200
+        assert (
+            "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:907200"
+            in response.text
+        )
+
 
 class TestSubtitleRoutes:
     """Tests for subtitle routes."""

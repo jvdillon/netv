@@ -2304,6 +2304,11 @@ async def transcode_file(
         )
     if filename.endswith(".vtt"):
         content = file_path.read_text()
+        if re.fullmatch(r"sub\d+_\d+\.vtt", filename):
+            content = ffmpeg_session.add_webvtt_timestamp_map(
+                content,
+                ffmpeg_session.get_caption_timestamp_origin(session_id),
+            )
         return Response(content=content, media_type="text/vtt", headers=cors)
     return FileResponse(file_path, media_type="video/mp2t", headers=cors)
 

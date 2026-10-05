@@ -20,6 +20,9 @@ final class AppModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var selection: PlayerSelection?
     @Published var isPlayerExpanded = false
+    @Published private(set) var captionChoices: [PlaybackCaptionChoice] = []
+    @Published private(set) var selectedCaptionChoiceID: String?
+    @Published private(set) var captionSelectionRequest: PlaybackCaptionSelectionRequest?
     #if os(macOS) || os(tvOS)
     @Published var playbackVolume: Double = 1
     #endif
@@ -42,6 +45,8 @@ final class AppModel: ObservableObject {
     private var playbackSessionToRelease: (server: String, id: String)?
     private var playbackStartGeneration = 0
     private var isReturnRefreshInProgress = false
+    private static let captionPreferenceKey = "preferredPlaybackCaption"
+    private static let captionsOffValue = "__off__"
     private let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.netv",
         category: "App"
@@ -58,6 +63,24 @@ final class AppModel: ObservableObject {
             $0.channel.name.localizedCaseInsensitiveContains(query)
                 || $0.programs.contains { $0.title.localizedCaseInsensitiveContains(query) }
         }
+    }
+
+    var preferredCaptionChoiceID: String? {
+        let value = UserDefaults.standard.string(forKey: Self.captionPreferenceKey)
+        return value == Self.captionsOffValue ? nil : value
+    }
+
+    func requestCaptionSelection(_ choiceID: String?) {
+        UserDefaults.standard.set(
+            choiceID ?? Self.captionsOffValue,
+            forKey: Self.captionPreferenceKey
+        )
+        captionSelectionRequest = PlaybackCaptionSelectionRequest(choiceID: choiceID)
+    }
+
+    func updateCaptionChoices(_ choices: [PlaybackCaptionChoice], selectedID: String?) {
+        captionChoices = choices
+        selectedCaptionChoiceID = selectedID
     }
 
     func filteredChannels(in categoryID: String?) -> [ChannelRow] {

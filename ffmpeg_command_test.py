@@ -601,6 +601,33 @@ class TestBuildHlsFfmpegCmd:
         assert "0:3" in cmd
         assert "/tmp/out/sub0.vtt" in cmd
         assert "/tmp/out/sub1.vtt" in cmd
+        assert "/tmp/out/sub0.m3u8" in cmd
+        assert "/tmp/out/sub1.m3u8" in cmd
+        assert "/tmp/out/sub0_%06d.vtt" in cmd
+        assert "/tmp/out/sub1_%06d.vtt" in cmd
+        assert cmd.count("-segment_format") == 2
+
+    def test_live_subtitle_renditions_use_bounded_playlists(self):
+        subs = [SubtitleStream(index=2, lang="eng", name="English")]
+        cmd = build_hls_ffmpeg_cmd(
+            "http://test", "software", "/tmp/out", is_vod=False, subtitles=subs
+        )
+        segment_output = cmd[
+            cmd.index("/tmp/out/sub0.vtt") + 1 : cmd.index("/tmp/out/sub0_%06d.vtt")
+        ]
+        assert segment_output[segment_output.index("-segment_list_size") + 1] == "10"
+        assert segment_output[segment_output.index("-segment_list_flags") + 1] == "+live"
+
+    def test_vod_subtitle_renditions_keep_the_full_playlist(self):
+        subs = [SubtitleStream(index=2, lang="eng", name="English")]
+        cmd = build_hls_ffmpeg_cmd(
+            "http://test", "software", "/tmp/out", is_vod=True, subtitles=subs
+        )
+        segment_output = cmd[
+            cmd.index("/tmp/out/sub0.vtt") + 1 : cmd.index("/tmp/out/sub0_%06d.vtt")
+        ]
+        assert segment_output[segment_output.index("-segment_list_size") + 1] == "0"
+        assert "-segment_list_flags" not in segment_output
 
 
 @pytest.mark.parametrize("url", ["http://test/live.ts", "https://test/live.m3u8"])

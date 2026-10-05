@@ -13,7 +13,11 @@ struct WatchView: View {
     @FocusState private var isExpandButtonFocused: Bool
     #endif
     #if os(tvOS)
-    @FocusState private var isPlayerFocused: Bool
+    private enum PlayerFocus: Hashable {
+        case surface
+        case captions
+    }
+    @FocusState private var playerFocus: PlayerFocus?
     #endif
 
     var body: some View {
@@ -36,7 +40,7 @@ struct WatchView: View {
         }
         .onChange(of: model.isPlayerExpanded) { _, expanded in
             #if os(tvOS)
-            isPlayerFocused = expanded
+            playerFocus = expanded ? .surface : nil
             #endif
             guard !expanded else { return }
             Task { await refreshGuideIfVisible() }
@@ -92,13 +96,29 @@ struct WatchView: View {
                     Color.clear
                         .contentShape(Rectangle())
                         .focusable(model.isPlayerExpanded)
-                        .focused($isPlayerFocused)
+                        .focused($playerFocus, equals: .surface)
                         .onTapGesture { model.playPauseRequest = UUID() }
                         .onMoveCommand { direction in
                             model.playerActivity = UUID()
                             if direction == .left { model.seekBackwardRequest = UUID() }
                             if direction == .right { model.seekForwardRequest = UUID() }
+                            if direction == .up, !model.captionChoices.isEmpty {
+                                playerFocus = .captions
+                            }
                         }
+                    if model.isPlayerExpanded, !model.captionChoices.isEmpty {
+                        PlaybackCaptionMenu()
+                            .font(.title2)
+                            .padding(18)
+                            .background(.black.opacity(0.7), in: Circle())
+                            .padding(40)
+                            .focused($playerFocus, equals: .captions)
+                            .onMoveCommand { direction in
+                                if direction == .down {
+                                    playerFocus = .surface
+                                }
+                            }
+                    }
                     #endif
                     #if os(macOS)
                     expandButton

@@ -23,6 +23,9 @@ struct PlayerView: View {
     @State private var liveBufferDuration = 0.0
     @State private var liveSeekPosition: Double?
     @State private var liveResumeAfterSeek = false
+    @State private var captionTracks: [CaptionTrack] = []
+    @State private var captionGroup: AVMediaSelectionGroup?
+    @State private var captionTask: Task<Void, Never>?
     #if os(iOS)
     @State private var iosActivity = Date()
     #endif
@@ -108,6 +111,11 @@ struct PlayerView: View {
                                     .buttonStyle(.bordered)
                                     .tint(.white)
                                     .accessibilityLabel("Return to live")
+                            }
+                            if !model.captionChoices.isEmpty {
+                                PlaybackCaptionMenu()
+                                    .frame(width: 36, height: 36)
+                                    .buttonStyle(.plain)
                             }
                             if let quality {
                                 QualityBadge(quality: quality)
@@ -230,11 +238,16 @@ struct PlayerView: View {
             }
         }
         #endif
+        .onChange(of: model.captionSelectionRequest) { _, request in
+            guard let request else { return }
+            selectCaption(choiceID: request.choiceID)
+        }
         .task {
             await runPlayback()
         }
         .onDisappear {
             seekTask?.cancel()
+            captionTask?.cancel()
             player?.pause()
         }
         .alert("Unable to Seek", isPresented: Binding(
@@ -348,6 +361,101 @@ struct PlayerView: View {
     }
 
     @MainActor
+    private func refreshCaptions(for item: AVPlayerItem, player: AVPlayer) {
+        captionTask?.cancel()
+        player.appliesMediaSelectionCriteriaAutomatically = false
+        captionTask = Task { @MainActor in
+            do {
+                var loadedGroup: AVMediaSelectionGroup?
+                for attempt in 0..<10 {
+                    loadedGroup = try await item.asset.loadMediaSelectionGroup(for: .legible)
+                    try Task.checkCancellation()
+                    guard self.player === player, player.currentItem === item else { return }
+                    if loadedGroup?.options.contains(where: isSourceProvidedCaption) == true {
+                        break
+                    }
+                    if item.status == .failed { break }
+                    if attempt < 9 {
+                        try await Task.sleep(for: .milliseconds(500))
+                    }
+                }
+                guard let group = loadedGroup, !group.options.isEmpty else {
+                    captionTracks = []
+                    captionGroup = nil
+                    model.updateCaptionChoices([], selectedID: nil)
+                    return
+                }
+                var identifierCounts: [String: Int] = [:]
+                let tracks = group.options.filter(isSourceProvidedCaption).map { option in
+                    let baseID = captionIdentifier(for: option)
+                    let occurrence = identifierCounts[baseID, default: 0]
+                    identifierCounts[baseID] = occurrence + 1
+                    let identifier = occurrence == 0 ? baseID : "\(baseID)|\(occurrence)"
+                    return CaptionTrack(
+                        id: identifier,
+                        title: option.displayName,
+                        option: option
+                    )
+                }
+                let selected = tracks.first { $0.id == model.preferredCaptionChoiceID }
+                item.select(selected?.option, in: group)
+                captionTracks = tracks
+                captionGroup = group
+                model.updateCaptionChoices(
+                    tracks.map { PlaybackCaptionChoice(id: $0.id, title: $0.title) },
+                    selectedID: selected?.id
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.player === player, player.currentItem === item else { return }
+                captionTracks = []
+                captionGroup = nil
+                model.updateCaptionChoices([], selectedID: nil)
+                logger.debug(
+                    "Caption discovery unavailable: \(error.localizedDescription, privacy: .public)"
+                )
+            }
+        }
+    }
+
+    @MainActor
+    private func selectCaption(choiceID: String?) {
+        guard let item = player?.currentItem, let group = captionGroup else { return }
+        if let choiceID {
+            guard let track = captionTracks.first(where: { $0.id == choiceID }) else { return }
+            item.select(track.option, in: group)
+            model.updateCaptionChoices(
+                captionTracks.map { PlaybackCaptionChoice(id: $0.id, title: $0.title) },
+                selectedID: track.id
+            )
+        } else {
+            item.select(nil, in: group)
+            model.updateCaptionChoices(
+                captionTracks.map { PlaybackCaptionChoice(id: $0.id, title: $0.title) },
+                selectedID: nil
+            )
+        }
+    }
+
+    private func captionIdentifier(for option: AVMediaSelectionOption) -> String {
+        let language = option.extendedLanguageTag ?? option.locale?.identifier ?? "und"
+        let name = option.displayName.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        return "\(language.lowercased())|\(name)"
+    }
+
+    private func isSourceProvidedCaption(_ option: AVMediaSelectionOption) -> Bool {
+        let generatedCharacteristics = [
+            AVMediaCharacteristic(rawValue: "public.machine-generated"),
+            AVMediaCharacteristic(rawValue: "com.apple.machine-generated"),
+        ]
+        return !generatedCharacteristics.contains(where: option.hasMediaCharacteristic)
+    }
+
+    @MainActor
     private func seekArchive(_ elapsed: Double, _ resume: Bool) {
         guard !isPreparingArchive, let player, let timeline = archiveTimeline, elapsed.isFinite else { return }
         seekTask?.cancel()
@@ -380,6 +488,10 @@ struct PlayerView: View {
     private func runPlayback() async {
         var activeSessionID: String?
         defer {
+            captionTask?.cancel()
+            captionTracks = []
+            captionGroup = nil
+            model.updateCaptionChoices([], selectedID: nil)
             player?.pause()
             player = nil
             quality = nil
@@ -417,6 +529,7 @@ struct PlayerView: View {
                 }
                 var currentPlayer = AVPlayer(playerItem: item)
                 currentPlayer.isMuted = false
+                currentPlayer.appliesMediaSelectionCriteriaAutomatically = false
                 #if os(iOS)
                 currentPlayer.usesExternalPlaybackWhileExternalScreenIsActive = true
                 #endif
@@ -428,6 +541,7 @@ struct PlayerView: View {
                 #endif
                 isPreparingArchive = selection.isCatchup
                 player = currentPlayer
+                refreshCaptions(for: item, player: currentPlayer)
                 #if os(iOS)
                 iosActivity = Date()
                 #endif
@@ -493,6 +607,7 @@ struct PlayerView: View {
                             currentPlayer = replacement
                             item = replacement.currentItem!
                             player = replacement
+                            refreshCaptions(for: item, player: replacement)
                             if !wasPaused { replacement.play() }
                             configuration = PlaybackConfiguration(
                                 url: url, cookieHeader: configuration.cookieHeader,
@@ -577,6 +692,7 @@ struct PlayerView: View {
         item.preferredForwardBufferDuration = 12
         item.automaticallyPreservesTimeOffsetFromLive = true
         let candidate = AVPlayer(playerItem: item)
+        candidate.appliesMediaSelectionCriteriaAutomatically = false
         let deadline = Date().addingTimeInterval(8)
         while item.status == .unknown && Date() < deadline {
             try await Task.sleep(for: .milliseconds(100))
@@ -615,6 +731,55 @@ struct PlayerView: View {
     #endif
 }
 
+private struct CaptionTrack {
+    let id: String
+    let title: String
+    let option: AVMediaSelectionOption
+}
+
+struct PlaybackCaptionMenu: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        Menu {
+            Button {
+                model.requestCaptionSelection(nil)
+            } label: {
+                captionLabel("Off", selected: model.selectedCaptionChoiceID == nil)
+            }
+            ForEach(model.captionChoices) { choice in
+                Button {
+                    model.requestCaptionSelection(choice.id)
+                } label: {
+                    captionLabel(
+                        choice.title,
+                        selected: model.selectedCaptionChoiceID == choice.id
+                    )
+                }
+            }
+        } label: {
+            Image(systemName: model.selectedCaptionChoiceID == nil
+                ? "captions.bubble" : "captions.bubble.fill")
+        }
+        .accessibilityLabel("Closed Captions")
+        .accessibilityValue(selectedCaptionTitle)
+    }
+
+    @ViewBuilder
+    private func captionLabel(_ title: String, selected: Bool) -> some View {
+        if selected {
+            Label(title, systemImage: "checkmark")
+        } else {
+            Text(title)
+        }
+    }
+
+    private var selectedCaptionTitle: String {
+        guard let selectedID = model.selectedCaptionChoiceID else { return "Off" }
+        return model.captionChoices.first(where: { $0.id == selectedID })?.title ?? "Off"
+    }
+}
+
 #if os(macOS)
 private struct PlayerController: NSViewRepresentable {
     let player: AVPlayer
@@ -638,6 +803,8 @@ private struct PlayerController: NSViewRepresentable {
 /// A slim bar of our own: AVKit's inline controls crashed with neTV's live streams.
 /// It appears on hover and stays visible while paused.
 private struct MacControlBar: View {
+    @EnvironmentObject private var model: AppModel
+
     let player: AVPlayer
     @Binding var volume: Double
     let airPlayActive: Bool
@@ -818,6 +985,13 @@ private struct MacControlBar: View {
             .frame(width: 70)
             .accessibilityLabel("Volume")
             .accessibilityValue("\(Int(volume * 100)) percent")
+
+            if !model.captionChoices.isEmpty {
+                PlaybackCaptionMenu()
+                    .frame(width: 22, height: 22)
+                    .buttonStyle(.plain)
+                    .help("Closed Captions")
+            }
 
             AirPlayButton(player: player, active: airPlayActive)
                 .frame(width: 22, height: 22)

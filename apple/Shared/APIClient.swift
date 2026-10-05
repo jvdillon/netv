@@ -288,7 +288,10 @@ final class APIClient {
         ]
         guard let url = components?.url else { throw APIError.invalidServer }
         let response: TranscodeResponse = try await get(url: url)
-        guard let playlistURL = URL(string: response.playlist, relativeTo: baseURL)?.absoluteURL else {
+        guard let playlistURL = URL(
+            string: response.captionPlaylist ?? response.playlist,
+            relativeTo: baseURL
+        )?.absoluteURL else {
             throw APIError.invalidResponse
         }
         return PlaybackConfiguration(
@@ -392,10 +395,12 @@ private struct ServerError: Decodable {
 private struct TranscodeResponse: Decodable {
     let sessionID: String
     let playlist: String
+    let captionPlaylist: String?
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
         case playlist
+        case captionPlaylist = "caption_playlist"
     }
 }
 

@@ -70,7 +70,7 @@ through their IPTV providers.
 - **Playback resolution badge** - Web and Apple players show the actual video resolution, including 720p, 1080p, and 4K
 - **Chromecast** support over your LAN, including HTTP (server-side discovery and controls)
 - **AirPlay** from Safari on Mac, iPhone, and iPad to Apple TV and AirPlay 2 TVs
-- **Closed captions** with style customization
+- **Closed captions** from upstream content, with native track selection in every Apple app and style customization on the web
 - **Search** across all content (supports regex)
 - **Favorites** with drag-and-drop ordering
 - **Playlists** - Put your favorite content in playlists and organize them your way. Set them up on the web and they show up everywhere
@@ -142,6 +142,14 @@ open neTV.xcodeproj
 In Xcode, select the iOS, tvOS, or macOS scheme, run it, then sign in with your
 existing neTV server URL and account. XcodeGen and Xcode 15 or later are
 required.
+
+When upstream content includes a supported text or in-band caption track, neTV
+offers it as a selectable native track on Mac, Apple TV, iPhone, and iPad.
+Choose **Off** or a named track from the caption button; the choice persists
+across playback and quality changes. On Apple TV, press Up from full-screen
+playback to focus the caption button and Down to return to playback controls.
+The button stays hidden when no source-provided track is available, and
+machine-generated transcription is not offered.
 
 ### Transcoding
 

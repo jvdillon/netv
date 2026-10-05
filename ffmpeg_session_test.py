@@ -14,6 +14,8 @@ from ffmpeg_session import (
     _HEARTBEAT_TIMEOUT_SEC,
     _build_subtitle_tracks,
     _calc_hls_duration,
+    _caption_master_playlist,
+    _caption_timestamp_origin,
     _DeadProcess,
     _is_process_alive,
     _kill_process,
@@ -23,6 +25,7 @@ from ffmpeg_session import (
     _transcode_sessions,
     _update_session_process,
     _url_to_session,
+    add_webvtt_timestamp_map,
     cleanup_and_recover_sessions,
     cleanup_expired_sessions,
     clear_url_session,
@@ -172,6 +175,39 @@ async def test_archive_rejects_file_offset_seek_without_interrupting_playback(ar
         await ffmpeg_session.seek_transcode(result["session_id"], 600)
     assert error.value.status_code == 400
     assert process.returncode is None
+
+
+@pytest.mark.asyncio
+async def test_transcode_response_includes_native_caption_playlist(archive_runtime):
+    media = ffmpeg_session.MediaInfo(
+        video_codec="h264",
+        audio_codec="aac",
+        pix_fmt="yuv420p",
+        height=1080,
+    )
+    subtitles = [ffmpeg_session.SubtitleStream(index=2, lang="eng", name="English")]
+    settings = {
+        "transcode_hw": "software",
+        "max_resolution": "1080p",
+        "quality": "high",
+        "probe_movies": True,
+    }
+    with (
+        patch("ffmpeg_session.get_settings", return_value=settings),
+        patch("ffmpeg_session.probe_media", return_value=(media, subtitles)),
+        patch("ffmpeg_session._wait_for_playlist", new=AsyncMock(return_value=True)),
+    ):
+        result = await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie")
+
+    assert result["caption_playlist"].endswith("/captions.m3u8")
+    session = get_session(result["session_id"])
+    assert session is not None
+    master = (pathlib.Path(session["dir"]) / "captions.m3u8").read_text()
+    assert "TYPE=SUBTITLES" in master
+    assert 'URI="sub0.m3u8"' in master
+    placeholder = (pathlib.Path(session["dir"]) / "sub0.m3u8").read_text()
+    assert "#EXT-X-TARGETDURATION:" in placeholder
+    assert "#EXTINF" not in placeholder
 
 
 @pytest.mark.asyncio
@@ -890,6 +926,65 @@ class TestBuildSubtitleTracks:
     def test_non_dict_sub_info(self):
         """Returns empty list for old format (indices only)."""
         assert _build_subtitle_tracks("s", [2, 3]) == []  # type: ignore[arg-type]
+
+
+class TestCaptionMasterPlaylist:
+    def test_links_native_hls_subtitle_renditions(self):
+        playlist = _caption_master_playlist(
+            [
+                {"index": 2, "lang": "eng", "name": "English"},
+                {"index": 3, "lang": "spa", "name": 'Español "CC"'},
+            ],
+            "1080p",
+        )
+
+        assert 'NAME="English",LANGUAGE="eng"' in playlist
+        assert 'NAME="Español \'CC\'",LANGUAGE="spa"' in playlist
+        assert 'URI="sub0.m3u8"' in playlist
+        assert 'URI="sub1.m3u8"' in playlist
+        assert 'SUBTITLES="captions"' in playlist
+        assert playlist.endswith("stream.m3u8\n")
+
+    def test_disambiguates_duplicate_track_names(self):
+        playlist = _caption_master_playlist(
+            [
+                {"index": 2, "lang": "eng", "name": "English"},
+                {"index": 3, "lang": "eng", "name": "English"},
+            ],
+            "720p",
+        )
+
+        assert 'NAME="English"' in playlist
+        assert 'NAME="English 2"' in playlist
+
+
+class TestWebvttTimestampMap:
+    def test_derives_the_clock_origin_from_a_later_video_segment(self, tmp_path):
+        (tmp_path / "stream.m3u8").write_text(
+            "#EXTM3U\n#EXTINF:4.0,\nseg000.ts\n#EXTINF:4.0,\nseg001.ts\n"
+        )
+        (tmp_path / "seg000.ts").touch()
+        (tmp_path / "seg001.ts").touch()
+
+        with patch("ffmpeg_session.segment_pts", side_effect=[None, 14.08]):
+            origin = _caption_timestamp_origin(str(tmp_path))
+
+        assert origin == pytest.approx(10.08)
+
+    def test_maps_webvtt_to_the_mpeg_ts_clock(self):
+        content = "WEBVTT\n\n00:01.000 --> 00:03.000\nCaption\n"
+
+        mapped = add_webvtt_timestamp_map(content, 10.08)
+
+        assert "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:907200\n" in mapped
+        assert mapped.endswith("00:01.000 --> 00:03.000\nCaption\n")
+
+    def test_preserves_existing_mapping_and_non_webvtt_content(self):
+        mapped = "WEBVTT\r\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:90000\r\n"
+
+        assert add_webvtt_timestamp_map(mapped, 10.08) == mapped
+        assert add_webvtt_timestamp_map("not WebVTT", 10.08) == "not WebVTT"
+        assert add_webvtt_timestamp_map("WEBVTT\n", None) == "WEBVTT\n"
 
 
 class TestRegeneratePlaylist:

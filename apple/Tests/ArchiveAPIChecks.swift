@@ -27,7 +27,17 @@ private final class ArchiveTransport: URLProtocol {
                  "total":2,"window_start_timestamp":\(1700000000 + offset * 3600)}
                 """
         } else if url.path == "/transcode/start" {
-            body = #"{"session_id":"archive","playlist":"/transcode/archive/stream.m3u8"}"#
+            let contentType = URLComponents(
+                url: url, resolvingAgainstBaseURL: false
+            )?.queryItems?.first(where: { $0.name == "content_type" })?.value
+            if contentType == "movie" {
+                body = """
+                    {"session_id":"archive","playlist":"/transcode/archive/stream.m3u8",
+                     "caption_playlist":"/transcode/archive/captions.m3u8"}
+                    """
+            } else {
+                body = #"{"session_id":"live","playlist":"/transcode/live/stream.m3u8"}"#
+            }
         } else if url.path.hasPrefix("/transcode/progress/") {
             body = #"{"duration":120,"segment_count":60}"#
         } else {
@@ -60,6 +70,7 @@ struct ArchiveAPIChecks {
         precondition(playback.archiveStart == 1_700_000_580)
         precondition(playback.archiveSeek == 45)
         precondition(playback.transcodeSessionID == "archive")
+        precondition(playback.url.path == "/transcode/archive/captions.m3u8")
         let start = ArchiveTransport.requests.first { $0.url?.path == "/transcode/start" }!
         let query = URLComponents(url: start.url!, resolvingAgainstBaseURL: false)!.queryItems!
         precondition(query.contains(URLQueryItem(name: "content_type", value: "movie")))

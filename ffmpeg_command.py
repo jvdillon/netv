@@ -1405,7 +1405,8 @@ def build_hls_ffmpeg_cmd(
         cmd.extend(["-f", "hls", "-extension_picky", "0"])
     cmd.extend(["-i", input_url])
 
-    # Subtitle extraction
+    # Keep the growing VTT files for web playback and package the same tracks
+    # as HLS subtitle renditions for native players.
     for i, sub in enumerate(subtitles or []):
         cmd.extend(
             [
@@ -1416,8 +1417,27 @@ def build_hls_ffmpeg_cmd(
                 "-flush_packets",
                 "1",
                 f"{output_dir}/sub{i}.vtt",
+                "-map",
+                f"0:{sub.index}",
+                "-c:s",
+                "webvtt",
+                "-f",
+                "segment",
+                "-segment_time",
+                str(int(segment_duration)),
+                "-segment_list",
+                f"{output_dir}/sub{i}.m3u8",
+                "-segment_list_type",
+                "m3u8",
+                "-segment_list_size",
+                "0" if is_vod else str(get_live_hls_list_size(segment_duration)),
+                "-segment_format",
+                "webvtt",
             ]
         )
+        if not is_vod:
+            cmd.extend(["-segment_list_flags", "+live"])
+        cmd.append(f"{output_dir}/sub{i}_%06d.vtt")
 
     # Stream mapping + video + audio
     cmd.extend(["-map", "0:v:0", "-map", "0:a:0"])

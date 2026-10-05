@@ -84,6 +84,20 @@ session to stop first. The player accounts for the archive's minute-aligned star
 and keeps the session alive while paused. Catchup uses source resolution (up to
 the server's configured limit), without AI upscaling; live playback is unchanged.
 
+## Closed captions
+
+Supported text and in-band caption tracks from upstream content appear in a
+native caption menu. Select **Off** or a named track; the preference survives
+quality switches and recovery-driven player replacement. The menu is hidden
+when no source-provided track is available, and machine-generated transcription
+is excluded.
+
+The caption button is in the iPhone/iPad top controls and the Mac hover bar. On
+Apple TV, press Up from the full-screen playback surface to focus the caption
+button, then press Down to return to playback controls. The backend packages
+detected text tracks as standard HLS WebVTT renditions while retaining the
+existing web caption output.
+
 ## AirPlay
 
 On iPhone, iPad, and Mac, the player has an **AirPlay** button (top right on

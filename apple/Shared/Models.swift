@@ -271,6 +271,16 @@ struct CatchupListing: Decodable {
     let programs: [Program]
 }
 
+struct PlaybackCaptionChoice: Identifiable, Equatable {
+    let id: String
+    let title: String
+}
+
+struct PlaybackCaptionSelectionRequest: Equatable {
+    let token = UUID()
+    let choiceID: String?
+}
+
 struct PlayerSelection: Identifiable, Hashable {
     let channel: Channel
     let program: Program?

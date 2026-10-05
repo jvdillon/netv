@@ -589,6 +589,134 @@ def _build_subtitle_tracks(
     ]
 
 
+def _caption_master_playlist(
+    sub_info: list[dict[str, Any]],
+    max_resolution: str,
+) -> str:
+    def attribute(value: Any, fallback: str) -> str:
+        cleaned = " ".join(str(value or fallback).split())
+        return cleaned.replace('"', "'")
+
+    _, maximum_bitrate = live_video_bitrates(max_resolution)
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
+    used_names: dict[str, int] = {}
+    for i, subtitle in enumerate(sub_info):
+        base_name = attribute(subtitle.get("name"), f"Captions {i + 1}")
+        occurrence = used_names.get(base_name, 0)
+        used_names[base_name] = occurrence + 1
+        name = base_name if occurrence == 0 else f"{base_name} {occurrence + 1}"
+        language = attribute(subtitle.get("lang"), "und")
+        lines.append(
+            '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="captions",'
+            f'NAME="{name}",LANGUAGE="{language}",DEFAULT=NO,AUTOSELECT=YES,'
+            f'FORCED=NO,URI="sub{i}.m3u8"'
+        )
+    bandwidth = int(maximum_bitrate * 1.1) + 640_000
+    lines += [
+        f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},SUBTITLES="captions"',
+        "stream.m3u8",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _write_caption_master(
+    output_dir: str,
+    sub_info: list[dict[str, Any]],
+    max_resolution: str,
+) -> pathlib.Path | None:
+    if not sub_info:
+        return None
+    path = pathlib.Path(output_dir) / "captions.m3u8"
+    temporary = path.with_name(".captions.m3u8.tmp")
+    temporary.write_text(_caption_master_playlist(sub_info, max_resolution))
+    temporary.replace(path)
+    _write_empty_caption_playlists(output_dir, len(sub_info))
+    return path
+
+
+def _write_empty_caption_playlists(output_dir: str, count: int) -> None:
+    target_duration = max(1, int(get_hls_segment_duration() + 0.999))
+    content = "\n".join(
+        [
+            "#EXTM3U",
+            "#EXT-X-VERSION:3",
+            f"#EXT-X-TARGETDURATION:{target_duration}",
+            "#EXT-X-MEDIA-SEQUENCE:0",
+            "",
+        ]
+    )
+    for index in range(count):
+        (pathlib.Path(output_dir) / f"sub{index}.m3u8").write_text(content)
+
+
+def _caption_playlist_url(
+    session_id: str,
+    output_dir: str,
+    sub_info: list[dict[str, Any]],
+) -> str | None:
+    if sub_info and (pathlib.Path(output_dir) / "captions.m3u8").exists():
+        return f"/transcode/{session_id}/captions.m3u8"
+    return None
+
+
+def _caption_timestamp_origin(output_dir: str) -> float | None:
+    playlist_path = pathlib.Path(output_dir) / "stream.m3u8"
+    try:
+        lines = playlist_path.read_text().splitlines()
+    except OSError:
+        return None
+
+    elapsed = 0.0
+    duration = 0.0
+    for line in lines:
+        value = line.strip()
+        if value.startswith("#EXTINF:"):
+            with contextlib.suppress(ValueError):
+                duration = float(value.removeprefix("#EXTINF:").split(",", 1)[0])
+            continue
+        if not value or value.startswith("#") or pathlib.Path(value).name != value:
+            continue
+        pts = segment_pts(pathlib.Path(output_dir) / value)
+        if pts is not None:
+            return pts - elapsed
+        elapsed += duration
+        duration = 0.0
+    return None
+
+
+def get_caption_timestamp_origin(session_id: str) -> float | None:
+    with _transcode_lock:
+        session = _transcode_sessions.get(session_id)
+        if not session:
+            return None
+        existing = session.get("caption_timestamp_origin")
+        if existing is not None:
+            return float(existing)
+        output_dir = session["dir"]
+
+    origin = _caption_timestamp_origin(output_dir)
+    if origin is None:
+        return None
+    with _transcode_lock:
+        session = _transcode_sessions.get(session_id)
+        if not session:
+            return None
+        session.setdefault("caption_timestamp_origin", origin)
+        return float(session["caption_timestamp_origin"])
+
+
+def add_webvtt_timestamp_map(content: str, origin_pts: float | None) -> str:
+    if origin_pts is None or "X-TIMESTAMP-MAP=" in content:
+        return content
+    line_ending = "\r\n" if content.startswith("WEBVTT\r\n") else "\n"
+    header = f"WEBVTT{line_ending}"
+    if not content.startswith(header):
+        return content
+    timestamp = round(origin_pts * 90_000) % (1 << 33)
+    mapping = f"X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:{timestamp}{line_ending}"
+    return content.replace(header, header + mapping, 1)
+
+
 def _regenerate_playlist(output_dir: pathlib.Path, start_segment: int) -> None:
     """Regenerate HLS playlist starting from a specific segment (for smart seek)."""
     playlist_path = output_dir / "stream.m3u8"
@@ -673,6 +801,7 @@ def _update_session_process(
         session["process"] = process
         if seek_time is not None:
             session["seek_offset"] = seek_time
+            session.pop("caption_timestamp_origin", None)
         if url:
             _url_to_session[url] = session_id
         return True
@@ -685,7 +814,7 @@ def _build_session_response(
 ) -> dict[str, Any]:
     """Build response dict for existing session, recalculating duration."""
     segments = list(playlist_path.parent.glob(f"{SEG_PREFIX}*.ts"))
-    return {
+    response = {
         "session_id": session_id,
         "playlist": f"/transcode/{session_id}/stream.m3u8",
         "subtitles": _build_subtitle_tracks(session_id, snap.subtitles),
@@ -693,6 +822,10 @@ def _build_session_response(
         "seek_offset": snap.seek_offset,
         "transcoded_duration": _calc_hls_duration(playlist_path, len(segments)),
     }
+    caption_playlist = _caption_playlist_url(session_id, snap.output_dir, snap.subtitles)
+    if caption_playlist:
+        response["caption_playlist"] = caption_playlist
+    return response
 
 
 # ===========================================================================
@@ -973,6 +1106,14 @@ async def _do_start_transcode(
         cmd.insert(i_idx, "-ss")
         log.info("Applying seek_offset=%.1f from previous session", old_seek_offset)
 
+    sub_info = [{"index": s.index, "lang": s.lang, "name": s.name} for s in subtitles]
+    total_duration = media_info.duration if media_info else 0.0
+    try:
+        caption_master = _write_caption_master(output_dir, sub_info, max_resolution)
+    except OSError as error:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise HTTPException(500, "Could not prepare captions") from error
+
     log.info(
         "Starting transcode session %s (vod=%s): %s",
         session_id,
@@ -984,9 +1125,6 @@ async def _do_start_transcode(
 
     stderr_lines: list[str] = []
     _spawn_background_task(_monitor_ffmpeg_stderr(process, session_id, stderr_lines))
-
-    sub_info = [{"index": s.index, "lang": s.lang, "name": s.name} for s in subtitles]
-    total_duration = media_info.duration if media_info else 0.0
 
     with _transcode_lock:
         _transcode_sessions[session_id] = {
@@ -1069,13 +1207,19 @@ async def _do_start_transcode(
         stop_session(session_id, force=True)
         raise HTTPException(500, "Transcode failed - check server logs for details")
 
-    return {
+    if sub_info:
+        get_caption_timestamp_origin(session_id)
+
+    response = {
         "session_id": session_id,
         "playlist": f"/transcode/{session_id}/stream.m3u8",
         "subtitles": _build_subtitle_tracks(session_id, sub_info),
         "duration": total_duration,
         "seek_offset": old_seek_offset,
     }
+    if caption_master:
+        response["caption_playlist"] = f"/transcode/{session_id}/captions.m3u8"
+    return response
 
 
 async def start_transcode(
@@ -1353,8 +1497,8 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
                 seg_file.unlink(missing_ok=True)
         except ValueError:
             pass
-    for vtt_file in output_path.glob("sub*.vtt"):
-        vtt_file.unlink(missing_ok=True)
+    for subtitle_file in (*output_path.glob("sub*.vtt"), *output_path.glob("sub*.m3u8")):
+        subtitle_file.unlink(missing_ok=True)
 
     # Resolve HLS master playlist to highest bandwidth variant
     url = await asyncio.to_thread(resolve_hls_master_playlist, info.url)
@@ -1385,6 +1529,11 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
                 )
             )
 
+    try:
+        _write_empty_caption_playlists(info.output_dir, len(subtitles))
+    except OSError as error:
+        raise HTTPException(500, "Could not prepare captions after seeking") from error
+
     cmd = build_hls_ffmpeg_cmd(
         url,
         hw,
@@ -1401,10 +1550,10 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
     i_idx = cmd.index("-i")
     cmd.insert(i_idx, str(seek_time))
     cmd.insert(i_idx, "-ss")
-    # Shift output timestamps so subtitles start at 0 after seek
-    f_idx = cmd.index("-f")
-    cmd.insert(f_idx, str(-seek_time))
-    cmd.insert(f_idx, "-output_ts_offset")
+    # Keep the main HLS timeline aligned with the requested input position.
+    main_output_idx = cmd.index("-max_delay")
+    cmd.insert(main_output_idx, str(-seek_time))
+    cmd.insert(main_output_idx, "-output_ts_offset")
     cmd.extend(["-start_number", str(segment_num)])
 
     log.info(
@@ -1441,6 +1590,8 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
     ):
         raise HTTPException(500, "Seek transcode timed out waiting for playlist")
 
+    if subtitles:
+        get_caption_timestamp_origin(session_id)
     log.info("Seek ready: %s", playlist_file)
 
     return {
