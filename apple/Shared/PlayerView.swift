@@ -758,8 +758,7 @@ struct PlaybackCaptionMenu: View {
                 }
             }
         } label: {
-            Image(systemName: model.selectedCaptionChoiceID == nil
-                ? "captions.bubble" : "captions.bubble.fill")
+            Image(systemName: "captions.bubble")
         }
         .accessibilityLabel("Closed Captions")
         .accessibilityValue(selectedCaptionTitle)
