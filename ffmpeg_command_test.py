@@ -608,10 +608,13 @@ def test_http_reconnect_options_shared_by_live_and_vod(url):
     for is_vod in (False, True):
         cmd = build_hls_ffmpeg_cmd(url, "software", "/tmp", is_vod=is_vod)
         expected = http_reconnect_args(url)
-        start = cmd.index("-reconnect")
-        assert cmd[start : start + len(expected)] == expected
-        assert start + len(expected) <= cmd.index("-i")
+        timeout_start = cmd.index("-rw_timeout")
+        assert cmd[timeout_start : timeout_start + len(expected)] == expected
+        assert timeout_start + len(expected) <= cmd.index("-i")
+        assert cmd[timeout_start + 1] == "30000000"
     assert http_reconnect_args(url, max_delay=5)[-1] == "5"
+    custom = http_reconnect_args(url, read_timeout=12)
+    assert custom[custom.index("-rw_timeout") + 1] == "12000000"
 
 
 @pytest.mark.parametrize("url", ["/tmp/input.m3u8", "file:/tmp/input.ts", "udp://test:1234"])

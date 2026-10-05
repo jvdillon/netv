@@ -130,3 +130,70 @@ class UpgradePolicy:
             self.reason = "ready"
             return True
         return False
+
+
+_LIVE_STALL_CONFIRM_SECONDS = 2
+_LIVE_HIGH_WARMUP_SECONDS = 30
+_LIVE_RESTART_WINDOW_SECONDS = 300
+_LIVE_RESTART_LIMIT = 3
+
+
+@dataclass
+class LiveRecoveryPolicy:
+    """Confirm media stalls and bound stage restarts independently of playback pressure."""
+
+    high_started: float
+    failures: dict[str, float] = field(default_factory=dict)
+    attempts: dict[str, list[float]] = field(default_factory=dict)
+    pending: set[str] = field(default_factory=set)
+
+    def stalled(
+        self,
+        stage: str,
+        process_alive: bool,
+        output_ready: bool,
+        now: float,
+    ) -> bool:
+        if process_alive and output_ready:
+            self.failures.pop(stage, None)
+            return False
+        if (
+            stage == "high"
+            and process_alive
+            and now - self.high_started < _LIVE_HIGH_WARMUP_SECONDS
+        ):
+            self.failures.pop(stage, None)
+            return False
+        since = self.failures.setdefault(stage, now)
+        return now - since >= _LIVE_STALL_CONFIRM_SECONDS
+
+    def permit_restart(self, action: str, now: float) -> bool:
+        if action in self.pending:
+            return False
+        attempts = [
+            attempt
+            for attempt in self.attempts.get(action, [])
+            if now - attempt < _LIVE_RESTART_WINDOW_SECONDS
+        ]
+        self.attempts[action] = attempts
+        if len(attempts) >= _LIVE_RESTART_LIMIT:
+            return False
+        if attempts:
+            cooldown = 30 if action == "high" else (5 if len(attempts) == 1 else 15)
+            if now - attempts[-1] < cooldown:
+                return False
+        attempts.append(now)
+        self.pending.add(action)
+        return True
+
+    def finish_restart(self, action: str) -> None:
+        self.pending.discard(action)
+
+    def mark_stage_started(self, stage: str, now: float) -> None:
+        self.failures.pop(stage, None)
+        if stage == "high":
+            self.high_started = now
+
+    def reset_pipeline(self, now: float) -> None:
+        self.failures.clear()
+        self.high_started = now

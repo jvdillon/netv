@@ -157,14 +157,23 @@ Extensively optimized for minimal latency and CPU usage:
 - **HTTPS passthrough** - Auto-proxies HTTP streams when behind HTTPS
 
 Apple and web clients share the adaptive live transcoder for configured outputs
-above 720p: one provider ingest, a 720p startup rendition, and a separately warmed
+above 720p: one upstream ingest, a 720p startup rendition, and a separately warmed
 high-quality rendition. Both use the same backend buffer/throughput policy for
 upgrades, fallback, and recovery after sustained bandwidth improvement. The high
-encoder stays warm during bandwidth saver so recovery reuses the same provider
+encoder stays warm during bandwidth saver so recovery reuses the same upstream
 ingest. The web player switches Hls.js levels within one media
 element using matching playlist dates, and targets 12 seconds behind the live edge
 when enough media is available. Native browser HLS without Hls.js telemetry stays
 at the safe initial quality.
+
+A server-owned watchdog also checks process state and completed segment publication.
+An isolated high-quality failure keeps low playback and the upstream ingest running
+while only that encoder restarts. A stalled ingest or low output restarts the
+dependency chain only after the old upstream reader exits. Restarted outputs append
+to the retained playlists with an HLS discontinuity, preserving the available DVR
+window under the same session ID. Recovery attempts have cooldowns and a limit of
+three per five-minute window. HTTP inputs use a 30-second read timeout so an open
+but unresponsive connection becomes recoverable.
 
 Live bitrate targets/maximum settings are 4/6 Mbps for 720p, 6/8 Mbps for 1080p,
 10/14 Mbps for 1440p, and 16/20 Mbps for 4K, plus audio and transport overhead.

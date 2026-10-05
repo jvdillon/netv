@@ -53,8 +53,10 @@ def test_timeline_and_readiness(tmp_path):
     assert "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.000+00:00" in dated
     playlist(tmp_path, "high", start=0)
     assert not fast_start.aligned(str(tmp_path))
-    os.utime(tmp_path / "high.m3u8", (0, 0))
-    assert fast_start.ready_bitrate(str(tmp_path), "high.m3u8") == 0
+    os.utime(tmp_path / "high.m3u8", (80, 80))
+    with patch("fast_start.time.time", return_value=100):
+        assert fast_start.ready_bitrate(str(tmp_path), "high.m3u8") == 0
+        assert fast_start.ready_bitrate(str(tmp_path), "high.m3u8", max_age=30) == 7520
     (tmp_path / "low_2.ts").unlink()
     assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8") == 0
 
@@ -63,6 +65,7 @@ def test_commands_only_ingest_opens_provider(tmp_path):
     url = "https://provider.example/live.ts"
     ingest = fast_start.ingest_command(url, str(tmp_path), "neTV")
     assert ingest[ingest.index("-i") + 1] == url
+    assert ingest[ingest.index("-rw_timeout") + 1] == "30000000"
     assert ingest[ingest.index("-reconnect_on_network_error") + 1] == "1"
     assert ingest[ingest.index("-analyzeduration") + 1] == "1000000"
     assert ingest[ingest.index("-probesize") + 1] == "5000000"
@@ -81,6 +84,65 @@ def test_commands_only_ingest_opens_provider(tmp_path):
         assert duration * int(cmd[cmd.index("-hls_list_size") + 1]) >= 30
 
 
+def test_restart_commands_use_unique_sequences_and_discontinuities(tmp_path):
+    ingest = fast_start.ingest_command(
+        "https://upstream.example/live.m3u8",
+        str(tmp_path),
+        None,
+        restarting=True,
+    )
+    assert ingest[ingest.index("-hls_start_number_source") + 1] == "epoch_us"
+    assert "discont_start" in ingest[ingest.index("-hls_flags") + 1]
+
+    encoder = fast_start.encoder_command(
+        str(tmp_path),
+        "software",
+        "1080p",
+        "high",
+        False,
+        True,
+        restarting=True,
+    )
+    assert encoder[encoder.index("-live_start_index") + 1] == "-3"
+    assert "-hls_start_number_source" not in encoder
+    flags = encoder[encoder.index("-hls_flags") + 1]
+    assert "append_list" in flags
+    assert "discont_start" in flags
+    assert encoder[encoder.index("-i") + 1] == f"{tmp_path}/input.m3u8"
+
+
+def test_dated_playlist_replaces_encoder_dates_after_discontinuity(tmp_path):
+    playlist(tmp_path, "high")
+    content = (
+        (tmp_path / "high.m3u8")
+        .read_text()
+        .replace(
+            "#EXTINF:2,\n",
+            "#EXTINF:2,\n#EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:2030-01-01T00:00:00Z\n",
+        )
+    )
+    dated = fast_start.dated_playlist(str(tmp_path), content, 10, 0)
+    assert dated.count("#EXT-X-PROGRAM-DATE-TIME:") == 3
+    assert "2030-" not in dated
+    assert fast_start.dated_playlist(str(tmp_path), dated, 10, 0) == dated
+    (tmp_path / "high.m3u8").write_text(content)
+    assert fast_start.ready_bitrate(str(tmp_path), "high.m3u8") == 7520
+
+
+def test_discontinuity_keeps_shared_clock_when_pts_remain_continuous(tmp_path):
+    playlist(tmp_path, "high")
+    content = (
+        (tmp_path / "high.m3u8")
+        .read_text()
+        .replace(
+            "#EXTINF:2,\nhigh_1.ts",
+            "#EXTINF:2,\n#EXT-X-DISCONTINUITY\nhigh_1.ts",
+        )
+    )
+    os.utime(tmp_path / "high_1.ts", (32, 32))
+    dated = fast_start.dated_playlist(str(tmp_path), content, 10, 0)
+    assert "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:02.000+00:00" in dated
+
 
 @pytest.mark.parametrize("high", [False, True])
 def test_encoders_keep_surround_audio(tmp_path, high):
@@ -96,6 +158,7 @@ def test_encoders_keep_surround_audio(tmp_path, high):
     dolby = fast_start.encoder_command(*args, audio=audio, audio_passthrough=True)
     assert dolby[dolby.index("-c:a") + 1] == "copy"
     assert dolby[dolby.index("-c:v") + 1] != "copy"
+
 
 def test_ingest_can_warm_encoders_before_playback_is_ready(tmp_path):
     segment = tmp_path / "input_0.ts"
@@ -133,7 +196,6 @@ def test_upgrade_uses_bounded_bitrate(tmp_path, hardware: HwAccel, resolution, t
     assert not set(low) & {"-qp", "-qp_i", "-qp_p", "-global_quality", "-crf", "constqp"}
 
 
-
 def test_master_playlist_reserves_surround_audio_bandwidth():
     from ffmpeg_command import MediaInfo
 
@@ -147,6 +209,7 @@ def test_master_playlist_reserves_surround_audio_bandwidth():
     assert fast_start.surround_audio_bitrate(audio("eac3", 6), True) == 640_000
     content = fast_start.master_playlist("4k", include_high=False, audio_bitrate=640_000)
     assert "BANDWIDTH=7240000\nlow.m3u8" in content
+
 
 def test_master_playlist_only_exposes_local_renditions():
     content = fast_start.master_playlist("4k", include_high=True)
@@ -272,6 +335,7 @@ async def test_shared_session_cleanup(tmp_path, fail_high, source_duration, band
         session = ffmpeg_session.get_session(result["session_id"])
         assert session is not None
         assert session["playback_policy"].bandwidth_saver is bandwidth_saver
+        assert session["watchdog_stale_after"] == max(10, 2 * source_duration + 2)
         master = pathlib.Path(session["dir"]) / "master.m3u8"
         assert ("high.m3u8" in master.read_text()) is not fail_high
         reused = await ffmpeg_session.start_transcode("https://provider/live", fast_start=True)
@@ -305,7 +369,9 @@ async def test_disconnected_startup_stops_waiting_and_cleans_ingest(tmp_path):
     with (
         patch("ffmpeg_session.get_settings", return_value={"max_resolution": "4k"}),
         patch("ffmpeg_session.get_transcode_dir", return_value=tmp_path),
-        patch("ffmpeg_session.asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as launch,
+        patch(
+            "ffmpeg_session.asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+        ) as launch,
         patch("ffmpeg_session._spawn_background_task", side_effect=lambda coro: coro.close()),
     ):
         with pytest.raises(ffmpeg_session.HTTPException) as error:
@@ -494,6 +560,27 @@ def test_real_local_encoders_share_timestamps(tmp_path):
         assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8") > 0
         assert fast_start.ready_bitrate(str(tmp_path), "high.m3u8") > 0
         assert fast_start.aligned(str(tmp_path))
+
+        low_playlist = tmp_path / "low.m3u8"
+        previous_segments = {
+            line for line in low_playlist.read_text().splitlines() if line.endswith(".ts")
+        }
+        subprocess.run(
+            fast_start.encoder_command(
+                str(tmp_path),
+                "software",
+                "720p",
+                "low",
+                False,
+                False,
+                restarting=True,
+            ),
+            check=True,
+        )
+        restarted = low_playlist.read_text()
+        restarted_segments = {line for line in restarted.splitlines() if line.endswith(".ts")}
+        assert previous_segments < restarted_segments
+        assert "#EXT-X-DISCONTINUITY" in restarted
     finally:
         for process in processes:
             if process.poll() is None:
@@ -506,11 +593,19 @@ def test_saver_does_not_recover_when_high_encoder_has_failed(tmp_path):
     playlist(tmp_path, "high")
     high = FakeProcess()
     high.returncode = 1
-    session = dict(dir=str(tmp_path), username="u", fast_start=True,
-        high_process=high, playback_policy=PlaybackPolicy(bandwidth_saver=True),
-        recovery_bitrate=7520)
+    session = dict(
+        dir=str(tmp_path),
+        username="u",
+        fast_start=True,
+        high_process=high,
+        playback_policy=PlaybackPolicy(bandwidth_saver=True),
+        recovery_bitrate=7520,
+    )
     good = PlaybackHealth(buffer_seconds=12, waiting=False, observed_bitrate=100000)
-    with patch.dict(ffmpeg_session._transcode_sessions, {"failed": session}), patch("ffmpeg_session.time.monotonic") as clock:
+    with (
+        patch.dict(ffmpeg_session._transcode_sessions, {"failed": session}),
+        patch("ffmpeg_session.time.monotonic") as clock,
+    ):
         for now in range(0, 120, 2):
             clock.return_value = now
             result = ffmpeg_session.report_playback_health("failed", "u", good)

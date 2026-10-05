@@ -4,7 +4,7 @@ from pydantic import ValidationError
 
 import pytest
 
-from playback_policy import PlaybackHealth, PlaybackPolicy, UpgradePolicy
+from playback_policy import LiveRecoveryPolicy, PlaybackHealth, PlaybackPolicy, UpgradePolicy
 
 
 def health(*, buffer=0, waiting=True, observed=0, required=0):
@@ -175,3 +175,44 @@ def test_recovery_needs_known_target():
     policy = PlaybackPolicy(bandwidth_saver=True)
     for now in range(0, 100, 2):
         assert policy.observe(health(buffer=10, waiting=False, observed=100_000_000), now)
+
+
+def test_live_recovery_confirms_stalls_and_allows_high_warmup():
+    policy = LiveRecoveryPolicy(high_started=0)
+    assert not policy.stalled("input", True, False, 100)
+    assert not policy.stalled("input", True, True, 101)
+    assert not policy.stalled("input", True, False, 102)
+    assert policy.stalled("input", True, False, 104)
+
+    assert not policy.stalled("high", True, False, 10)
+    assert not policy.stalled("high", True, False, 29)
+    assert not policy.stalled("high", True, False, 30)
+    assert policy.stalled("high", True, False, 32)
+
+
+def test_dead_high_bypasses_warmup_but_still_requires_confirmation():
+    policy = LiveRecoveryPolicy(high_started=100)
+    assert not policy.stalled("high", False, False, 101)
+    assert policy.stalled("high", False, False, 103)
+
+
+def test_live_restarts_have_cooldowns_and_sliding_budget():
+    policy = LiveRecoveryPolicy(high_started=0)
+    assert policy.permit_restart("high", 0)
+    assert not policy.permit_restart("high", 100)
+    policy.finish_restart("high")
+    assert not policy.permit_restart("high", 29)
+    assert policy.permit_restart("high", 30)
+    policy.finish_restart("high")
+    assert policy.permit_restart("high", 60)
+    policy.finish_restart("high")
+    assert not policy.permit_restart("high", 299)
+    assert policy.permit_restart("high", 301)
+
+    assert policy.permit_restart("pipeline", 0)
+    policy.finish_restart("pipeline")
+    assert not policy.permit_restart("pipeline", 4)
+    assert policy.permit_restart("pipeline", 5)
+    policy.finish_restart("pipeline")
+    assert not policy.permit_restart("pipeline", 19)
+    assert policy.permit_restart("pipeline", 20)
