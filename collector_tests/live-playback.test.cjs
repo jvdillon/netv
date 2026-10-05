@@ -189,6 +189,24 @@ test('backend health controls upgrades and downgrades within one Hls instance', 
   assert.equal(env.timers.size, 0);
 });
 
+test('recovery generations reuse the existing Hls rendition levels', async () => {
+  let generation = 1;
+  const env = runtime(async () => ok({
+    playlist: `/transcode/shared/low.m3u8?generation=${generation}`,
+  }));
+  const engine = hls();
+  const playback = new env.AdaptiveLivePlayback({
+    video: video(), hls: engine, sessionId: 'shared',
+    playlist: '/transcode/shared/low.m3u8', onPlaylist: () => {},
+  });
+  await flush();
+  assert.deepEqual(engine.switches, [0]);
+  generation = 2;
+  await env.tick();
+  assert.deepEqual(engine.switches, [0, 0]);
+  playback.destroy();
+});
+
 test('pauses, stale transfers, and gaps do not create false throughput samples', async () => {
   const env = runtime(async () => ok({}));
   const media = video();

@@ -133,7 +133,10 @@
           !['low.m3u8', 'high.m3u8'].some(name => url.pathname === prefix + name)) {
         throw new Error('Server returned an invalid live rendition');
       }
-      const index = this.hls.levels.findIndex(level => this.levelUrl(level).href === url.href);
+      const index = this.hls.levels.findIndex(level => {
+        const levelUrl = this.levelUrl(level);
+        return levelUrl.origin === url.origin && levelUrl.pathname === url.pathname;
+      });
       if (index < 0) throw new Error('Requested live rendition is missing from the master playlist');
       if (this.requestedPlaylist === url.href) return;
       // Hls.js aligns the two renditions using their shared program dates and

@@ -9,7 +9,7 @@ import pytest
 
 from fast_start_test import playlist, video_packet
 from ffmpeg_session_test import FakeProcess
-from playback_policy import LiveRecoveryPolicy, PlaybackPolicy, UpgradePolicy
+from playback_policy import LiveRecoveryPolicy, PlaybackHealth, PlaybackPolicy, UpgradePolicy
 
 import ffmpeg_session
 
@@ -50,6 +50,7 @@ def recovery_session(tmp_path):
         "high_restart_command": ["ffmpeg", "high"],
         "master_resolution": "1080p",
         "master_audio_bitrate": 0,
+        "playlist_generation": 0,
     }
     with patch.dict(ffmpeg_session._transcode_sessions, {"recover": session}, clear=True):
         yield session
@@ -208,6 +209,7 @@ async def test_high_restart_preserves_ingest_and_low(recovery_session):
     assert recovery_session["high_process"] is replacement
     assert recovery_session["extra_processes"] == [old_ingest, replacement]
     assert recovery_session["upgrade_policy"].samples == []
+    assert recovery_session["playlist_generation"] == 0
     master = pathlib.Path(recovery_session["dir"]) / "master.m3u8"
     assert "high.m3u8" in master.read_text()
 
@@ -258,6 +260,102 @@ async def test_pipeline_restart_replaces_dependencies_without_second_upstream_re
     assert recovery_session["high_process"] is None
     assert recovery_session["extra_processes"] == [new_ingest]
     assert recovery_session["upgrade_policy"].samples == []
+    assert recovery_session["playlist_generation"] == 1
+
+
+@pytest.mark.asyncio
+async def test_repeated_pipeline_recovery_advances_generation(recovery_session):
+    recovery_session["playlist_generation"] = 7
+    recovery_session["live_recovery"].permit_restart("pipeline", 100)
+    new_ingest, new_low = process(), process()
+
+    with (
+        patch(
+            "ffmpeg_session._launch_recovery_ffmpeg",
+            new=AsyncMock(side_effect=[new_ingest, new_low]),
+        ),
+        patch(
+            "ffmpeg_session._wait_for_fresh_fast_playlist",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "ffmpeg_session._terminate_fast_process",
+            new=AsyncMock(),
+        ),
+        patch(
+            "ffmpeg_session._spawn_background_task",
+            side_effect=lambda coroutine: coroutine.close(),
+        ),
+    ):
+        await ffmpeg_session._restart_fast_pipeline(
+            "recover",
+            recovery_session,
+            "low",
+        )
+
+    assert recovery_session["playlist_generation"] == 8
+
+
+@pytest.mark.asyncio
+async def test_failed_pipeline_recovery_keeps_generation(recovery_session):
+    recovery_session["playlist_generation"] = 5
+    recovery_session["live_recovery"].permit_restart("pipeline", 100)
+    new_ingest, new_low = process(), process()
+
+    with (
+        patch(
+            "ffmpeg_session._launch_recovery_ffmpeg",
+            new=AsyncMock(side_effect=[new_ingest, new_low]),
+        ),
+        patch(
+            "ffmpeg_session._wait_for_fresh_fast_playlist",
+            new=AsyncMock(side_effect=[True, False]),
+        ),
+        patch(
+            "ffmpeg_session._terminate_fast_process",
+            new=AsyncMock(),
+        ),
+        patch(
+            "ffmpeg_session._spawn_background_task",
+            side_effect=lambda coroutine: coroutine.close(),
+        ),
+    ):
+        await ffmpeg_session._restart_fast_pipeline(
+            "recover",
+            recovery_session,
+            "input",
+        )
+
+    assert recovery_session["playlist_generation"] == 5
+
+
+def test_health_reports_current_recovery_generation(recovery_session):
+    recovery_session["playlist_generation"] = 3
+    with patch("ffmpeg_session.ready_bitrate", return_value=4_000_000):
+        result = ffmpeg_session.report_playback_health(
+            "recover",
+            "viewer",
+            PlaybackHealth(
+                buffer_seconds=10,
+                waiting=False,
+                observed_bitrate=10_000_000,
+                required_bitrate=4_000_000,
+            ),
+        )
+
+    assert result["playlist"] == "/transcode/recover/high.m3u8?generation=3"
+
+
+def test_reused_session_response_includes_current_generation(recovery_session):
+    assert (
+        ffmpeg_session._adaptive_session_response("recover")["playlist"]
+        == "/transcode/recover/low.m3u8"
+    )
+    recovery_session["playlist_generation"] = 4
+    response = ffmpeg_session._adaptive_session_response("recover")
+
+    assert response["playlist"] == "/transcode/recover/low.m3u8?generation=4"
+    assert response["master_playlist"] == "/transcode/recover/master.m3u8"
 
 
 def test_stopping_session_cancels_recovery_tasks(recovery_session):

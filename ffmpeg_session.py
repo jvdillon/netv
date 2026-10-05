@@ -698,10 +698,18 @@ def _build_session_response(
 # ===========================================================================
 
 
+def _fast_playlist_url(session_id: str, name: str, generation: int) -> str:
+    url = f"/transcode/{session_id}/{name}"
+    return f"{url}?generation={generation}" if generation > 0 else url
+
+
 def _adaptive_session_response(session_id: str) -> dict[str, Any]:
+    with _transcode_lock:
+        session = _transcode_sessions.get(session_id)
+        generation = int(session.get("playlist_generation", 0)) if session else 0
     return {
         "session_id": session_id,
-        "playlist": f"/transcode/{session_id}/low.m3u8",
+        "playlist": _fast_playlist_url(session_id, "low.m3u8", generation),
         "master_playlist": f"/transcode/{session_id}/master.m3u8",
         "subtitles": [],
         "duration": 0,
@@ -1746,11 +1754,18 @@ async def _restart_fast_pipeline(
         ):
             raise TimeoutError("low output did not become ready")
 
+        with _transcode_lock:
+            if _transcode_sessions.get(session_id) is not session:
+                raise asyncio.CancelledError
+            session["playlist_generation"] = (
+                int(session.get("playlist_generation", 0)) + 1
+            )
         recovery.reset_pipeline(time.monotonic())
         success = True
         log.warning(
-            "Live watchdog %s recovered the pipeline after %s stalled",
+            "Live watchdog %s recovered pipeline generation %d after %s stalled",
             session_id,
+            session["playlist_generation"],
             stalled_stage,
         )
     except asyncio.CancelledError:
@@ -1926,7 +1941,11 @@ def report_playback_health(
                     len(upgrade.samples),
                 )
                 session["upgrade_log_at"] = now
-            result["playlist"] = f"/transcode/{session_id}/{name}"
+            result["playlist"] = _fast_playlist_url(
+                session_id,
+                name,
+                int(session.get("playlist_generation", 0)),
+            )
         return result
 
 
@@ -2000,6 +2019,7 @@ async def _start_fast_live(
                 "playback_policy": PlaybackPolicy(bandwidth_saver=bandwidth_saver),
                 "live_recovery": LiveRecoveryPolicy(high_started=time.monotonic()),
                 "fast_start": True,
+                "playlist_generation": 0,
                 "ingest_restart_command": ingest_command(
                     url,
                     directory,

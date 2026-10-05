@@ -51,7 +51,7 @@ async function player({
   airplay = false,
   catchup = false, catchupDays = catchup ? 2 : 0, catchupStart = programStart, catchupSeek = 0,
   transcodedDuration = 0,
-  stopReady = null, stopFailure = false, startReady = null,
+  stopReady = null, stopFailure = false, startReady = null, startGeneration = 0,
 } = {}) {
   isVod = isVod || catchup;
   const elements = new Map();
@@ -162,7 +162,9 @@ async function player({
         data = {
           session_id: id, duration: isVod ? 3600 : 0, subtitles: [],
           seek_offset: seekOffset,
-          playlist: `/transcode/${id}/${isVod ? 'stream' : 'low'}.m3u8`,
+          playlist: `/transcode/${id}/${isVod ? 'stream' : 'low'}.m3u8${
+            !isVod && startGeneration ? `?generation=${startGeneration}` : ''
+          }`,
           ...(!isVod ? { master_playlist: `/transcode/${id}/master.m3u8` } : {}),
         };
       } else if (options.method === 'DELETE') {
@@ -171,7 +173,11 @@ async function player({
       } else if (url.startsWith('/transcode/progress/')) {
         data = { duration: transcodedDuration };
       } else if (url.endsWith('/health')) {
-        data = { playlist: `/transcode/session${sessionNumber}/${rendition}.m3u8` };
+        data = {
+          playlist: `/transcode/session${sessionNumber}/${rendition}.m3u8${
+            startGeneration ? `?generation=${startGeneration}` : ''
+          }`,
+        };
       } else if (url.startsWith('/api/live/program/')) {
         data = nextProgram || { title: '', desc: '', start: 0, end: 0 };
       } else if (url === '/api/cast/status') {
@@ -357,6 +363,13 @@ test('native HLS stays on low while maintaining the shared live session', async 
   const p = await player({ native: true });
   assert.equal(p.engines.length, 0);
   assert.equal(p.video.src, '/transcode/session1/low.m3u8');
+  assert.equal(p.calls.some(call => call.url.endsWith('/health')), true);
+  assert.deepEqual(p.errors, []);
+});
+
+test('native HLS recognizes a recovered fast-start session', async () => {
+  const p = await player({ native: true, startGeneration: 3 });
+  assert.equal(p.video.src, '/transcode/session1/low.m3u8?generation=3');
   assert.equal(p.calls.some(call => call.url.endsWith('/health')), true);
   assert.deepEqual(p.errors, []);
 });

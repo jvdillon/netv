@@ -584,7 +584,7 @@ struct PlayerView: View {
         guard item.status == .readyToPlay else {
             throw APIError.server("The new quality is not ready yet.")
         }
-        // Both playlists expose dates derived from the same provider timestamps.
+        // Both playlists expose dates derived from the same upstream timestamps.
         // Refuse an upgrade without a shared timeline rather than jumping live.
         guard let date = currentItem.currentDate() else {
             throw APIError.server("Waiting for the shared playback timeline.")

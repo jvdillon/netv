@@ -877,7 +877,8 @@
       if (!data) return;
       transcodeSessionId = data.session_id;
       transcodePlaylist = data.playlist;
-      adaptiveSession = !cfg.isVod && data.playlist.endsWith('/low.m3u8') ? data : null;
+      const playlistPath = new URL(data.playlist, window.location.href).pathname;
+      adaptiveSession = !cfg.isVod && playlistPath.endsWith('/low.m3u8') ? data : null;
       isTranscoding = true;
       updateTranscodeCheck();
       totalDuration = data.duration || 0;

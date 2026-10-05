@@ -174,6 +174,9 @@ to the retained playlists with an HLS discontinuity, preserving the available DV
 window under the same session ID. Recovery attempts have cooldowns and a limit of
 three per five-minute window. HTTP inputs use a 30-second read timeout so an open
 but unresponsive connection becomes recoverable.
+After a full pipeline recovery, health feedback advances a generation counter so
+Apple clients reload the recovered playlist in the same session while preserving
+their playback date and pause state when possible.
 
 Live bitrate targets/maximum settings are 4/6 Mbps for 720p, 6/8 Mbps for 1080p,
 10/14 Mbps for 1440p, and 16/20 Mbps for 4K, plus audio and transport overhead.

@@ -225,6 +225,8 @@ observed before fallback. Their reduced mode disables AI upscaling and uses a 72
 maximum (480p if already configured) and the low encoder quality preset. Global
 server settings are unchanged. LTE and dropped-frame counts alone do not trigger
 fallback. Direct/passthrough streams do not use this backend feedback mechanism.
+After a full fast-start pipeline recovery, the app reloads the new generation in
+the same session and preserves its playback date and pause state when possible.
 
 An upstream advertising `m3u8` supports HLS, but not necessarily adaptive bitrate.
 Confirm multiple `#EXT-X-STREAM-INF` variants in a channel's master playlist before
