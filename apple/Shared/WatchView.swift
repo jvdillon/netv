@@ -41,10 +41,22 @@ struct WatchView: View {
         .onChange(of: model.isPlayerExpanded) { _, expanded in
             #if os(tvOS)
             playerFocus = expanded ? .surface : nil
+            model.tvCaptionControlFocused = false
+            if !expanded { model.tvPlaybackControlsVisible = false }
             #endif
             guard !expanded else { return }
             Task { await refreshGuideIfVisible() }
         }
+        #if os(tvOS)
+        .onChange(of: playerFocus) { _, focus in
+            model.tvCaptionControlFocused = focus == .captions
+        }
+        .onChange(of: model.captionChoices.isEmpty) { _, captionsAreEmpty in
+            if captionsAreEmpty, playerFocus == .captions {
+                playerFocus = .surface
+            }
+        }
+        #endif
         #if os(macOS)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await refreshGuideIfVisible() }
@@ -102,22 +114,37 @@ struct WatchView: View {
                             model.playerActivity = UUID()
                             if direction == .left { model.seekBackwardRequest = UUID() }
                             if direction == .right { model.seekForwardRequest = UUID() }
-                            if direction == .up, !model.captionChoices.isEmpty {
+                            if direction == .down, !model.captionChoices.isEmpty {
+                                model.tvCaptionControlFocused = true
                                 playerFocus = .captions
                             }
                         }
-                    if model.isPlayerExpanded, !model.captionChoices.isEmpty {
-                        PlaybackCaptionMenu()
-                            .font(.title2)
-                            .padding(18)
-                            .background(.black.opacity(0.7), in: Circle())
-                            .padding(40)
-                            .focused($playerFocus, equals: .captions)
-                            .onMoveCommand { direction in
-                                if direction == .down {
-                                    playerFocus = .surface
-                                }
+                    if model.isPlayerExpanded,
+                       model.tvPlaybackControlsVisible || model.tvCaptionControlFocused,
+                       !model.captionChoices.isEmpty {
+                        PlaybackCaptionMenu {
+                            model.playerActivity = UUID()
+                            playerFocus = .surface
+                        }
+                        .font(.system(size: 30, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .tint(.white)
+                        .frame(width: 44, height: 44)
+                        .buttonStyle(.plain)
+                        .focused($playerFocus, equals: .captions)
+                        .onMoveCommand { direction in
+                            model.playerActivity = UUID()
+                            if direction == .up {
+                                playerFocus = .surface
                             }
+                        }
+                        .frame(
+                            maxWidth: .infinity,
+                            maxHeight: .infinity,
+                            alignment: .bottomTrailing
+                        )
+                        .padding(.trailing, 60)
+                        .padding(.bottom, 43)
                     }
                     #endif
                     #if os(macOS)

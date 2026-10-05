@@ -31,6 +31,8 @@ final class AppModel: ObservableObject {
     @Published var playerActivity: UUID?
     @Published var seekBackwardRequest: UUID?
     @Published var seekForwardRequest: UUID?
+    @Published var tvPlaybackControlsVisible = false
+    @Published var tvCaptionControlFocused = false
     #endif
 
     // Carry the server's current quality decision across channel changes.

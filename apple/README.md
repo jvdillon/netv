@@ -93,10 +93,10 @@ when no source-provided track is available, and machine-generated transcription
 is excluded.
 
 The caption button is in the iPhone/iPad top controls and the Mac hover bar. On
-Apple TV, press Up from the full-screen playback surface to focus the caption
-button, then press Down to return to playback controls. The backend packages
-detected text tracks as standard HLS WebVTT renditions while retaining the
-existing web caption output.
+Apple TV, it appears with the bottom transport controls; press Down from the
+full-screen playback surface to focus it and Up to return to playback. The
+backend packages detected text tracks as standard HLS WebVTT renditions while
+retaining the existing web caption output.
 
 ## AirPlay
 

@@ -739,17 +739,24 @@ private struct CaptionTrack {
 
 struct PlaybackCaptionMenu: View {
     @EnvironmentObject private var model: AppModel
+    let onSelection: () -> Void
+
+    init(onSelection: @escaping () -> Void = {}) {
+        self.onSelection = onSelection
+    }
 
     var body: some View {
         Menu {
             Button {
                 model.requestCaptionSelection(nil)
+                onSelection()
             } label: {
                 captionLabel("Off", selected: model.selectedCaptionChoiceID == nil)
             }
             ForEach(model.captionChoices) { choice in
                 Button {
                     model.requestCaptionSelection(choice.id)
+                    onSelection()
                 } label: {
                     captionLabel(
                         choice.title,
@@ -1205,6 +1212,7 @@ private struct PlayerController: UIViewControllerRepresentable {
 /// Status-only bar: the Siri Remote drives playback, so nothing here takes focus.
 /// It appears on remote activity and stays visible while paused.
 private struct TVControlBar: View {
+    @EnvironmentObject private var model: AppModel
     let player: AVPlayer
     let selection: PlayerSelection
     let expanded: Bool
@@ -1234,7 +1242,8 @@ private struct TVControlBar: View {
                 )
             }
             let visible = archiveSeekPosition != nil || liveSeekPosition != nil
-                || !isPlaying || context.date.timeIntervalSince(lastActivity) < 4
+                || !isPlaying || model.tvCaptionControlFocused
+                || context.date.timeIntervalSince(lastActivity) < 4
             ZStack(alignment: .bottom) {
                 if let quality {
                     QualityBadge(quality: quality)
@@ -1282,8 +1291,13 @@ private struct TVControlBar: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .opacity(visible ? 1 : 0)
             .animation(.easeInOut(duration: 0.3), value: visible)
+            .onAppear { model.tvPlaybackControlsVisible = visible }
+            .onChange(of: visible) { _, isVisible in
+                model.tvPlaybackControlsVisible = isVisible
+            }
         }
         .allowsHitTesting(false)
+        .onDisappear { model.tvPlaybackControlsVisible = false }
         .onReceive(player.publisher(for: \.timeControlStatus)) { status in
             isPlaying = status != .paused
         }

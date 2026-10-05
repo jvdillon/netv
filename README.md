@@ -146,8 +146,9 @@ required.
 When upstream content includes a supported text or in-band caption track, neTV
 offers it as a selectable native track on Mac, Apple TV, iPhone, and iPad.
 Choose **Off** or a named track from the caption button; the choice persists
-across playback and quality changes. On Apple TV, press Up from full-screen
-playback to focus the caption button and Down to return to playback controls.
+across playback and quality changes. On Apple TV, the caption button appears
+with the bottom transport controls; press Down from full-screen playback to
+focus it and Up to return to playback.
 The button stays hidden when no source-provided track is available, and
 machine-generated transcription is not offered.
 
