@@ -592,7 +592,7 @@ struct PlayerView: View {
                             sessionID: sessionID, health: health
                         )
                         try Task.checkCancellation()
-                        if let playlist = feedback.playlist,
+                        if let playlist = feedback.captionPlaylist ?? feedback.playlist,
                            let url = URL(string: playlist, relativeTo: configuration.url)?.absoluteURL,
                            url != configuration.url {
                             // Prepare locally while the current rendition keeps playing.

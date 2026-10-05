@@ -1301,6 +1301,35 @@ def probe_audio(path: str) -> MediaInfo | None:
         return None
 
 
+def probe_closed_captions(path: str) -> bool:
+    """Whether a local video segment carries embedded closed-caption data."""
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+2",
+        "-show_frames", "-show_entries", "frame=side_data_list", "-of", "json", path,
+    ]  # fmt: skip
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
+        if result.returncode != 0:
+            detail = result.stderr.strip()[-500:] or f"ffprobe exited {result.returncode}"
+            log.warning("Could not inspect embedded captions in %s: %s", pathlib.Path(path).name, detail)
+            return False
+        frames = json.loads(result.stdout).get("frames", [])
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError) as error:
+        log.warning(
+            "Could not inspect embedded captions in %s: %s",
+            pathlib.Path(path).name,
+            error,
+        )
+        return False
+    return any(
+        "closed caption" in str(side_data.get("side_data_type", "")).lower()
+        for frame in frames
+        if isinstance(frame, dict)
+        for side_data in frame.get("side_data_list", [])
+        if isinstance(side_data, dict)
+    )
+
+
 def build_hls_ffmpeg_cmd(
     input_url: str,
     hw: HwAccel,

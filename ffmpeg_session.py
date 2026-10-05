@@ -23,6 +23,7 @@ from fastapi import HTTPException
 
 from fast_start import (
     aligned,
+    closed_caption_master_playlist,
     encoder_command,
     ingest_command,
     master_playlist,
@@ -45,6 +46,7 @@ from ffmpeg_command import (
     invalidate_series_probe_cache,
     live_video_bitrates,
     probe_audio,
+    probe_closed_captions,
     probe_media,
     resolve_hls_master_playlist,
     restore_probe_cache_entry,
@@ -842,7 +844,8 @@ def _adaptive_session_response(session_id: str) -> dict[str, Any]:
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
         generation = int(session.get("playlist_generation", 0)) if session else 0
-    return {
+        closed_captions = bool(session and session.get("closed_captions"))
+    response = {
         "session_id": session_id,
         "playlist": _fast_playlist_url(session_id, "low.m3u8", generation),
         "master_playlist": f"/transcode/{session_id}/master.m3u8",
@@ -850,6 +853,13 @@ def _adaptive_session_response(session_id: str) -> dict[str, Any]:
         "duration": 0,
         "seek_offset": 0,
     }
+    if closed_captions:
+        response["caption_playlist"] = _fast_playlist_url(
+            session_id,
+            "low-captions.m3u8",
+            generation,
+        )
+    return response
 
 
 def _get_existing_session(url: str) -> tuple[str | None, bool, float]:
@@ -1745,6 +1755,24 @@ def _publish_fast_master(session: dict[str, Any], *, include_high: bool) -> None
         )
     )
     temporary.replace(path)
+    caption_renditions = [
+        ("low", "720p", True),
+        ("high", session["master_resolution"], include_high),
+    ]
+    for name, resolution, available in caption_renditions:
+        caption_path = pathlib.Path(session["dir"]) / f"{name}-captions.m3u8"
+        if session.get("closed_captions") and available:
+            caption_temporary = caption_path.with_name(f".{name}-captions.m3u8.tmp")
+            caption_temporary.write_text(
+                closed_caption_master_playlist(
+                    name,
+                    resolution,
+                    audio_bitrate=session["master_audio_bitrate"],
+                )
+            )
+            caption_temporary.replace(caption_path)
+        else:
+            caption_path.unlink(missing_ok=True)
 
 
 async def _cancel_high_recovery(session_id: str, session: dict[str, Any]) -> None:
@@ -2099,6 +2127,12 @@ def report_playback_health(
                 name,
                 int(session.get("playlist_generation", 0)),
             )
+            if session.get("closed_captions"):
+                result["caption_playlist"] = _fast_playlist_url(
+                    session_id,
+                    f"{name.removesuffix('.m3u8')}-captions.m3u8",
+                    int(session.get("playlist_generation", 0)),
+                )
         return result
 
 
@@ -2173,6 +2207,7 @@ async def _start_fast_live(
                 "live_recovery": LiveRecoveryPolicy(high_started=time.monotonic()),
                 "fast_start": True,
                 "playlist_generation": 0,
+                "closed_captions": False,
                 "ingest_restart_command": ingest_command(
                     url,
                     directory,
@@ -2197,8 +2232,11 @@ async def _start_fast_live(
         )
         first_input = min(pathlib.Path(directory).glob("input_*.ts"))
         origin_pts = segment_pts(first_input)
-        # The local segment reveals the audio layout without re-reading upstream.
-        audio = await asyncio.to_thread(probe_audio, str(first_input))
+        # The local segment reveals audio and caption metadata without re-reading upstream.
+        audio, closed_captions = await asyncio.gather(
+            asyncio.to_thread(probe_audio, str(first_input)),
+            asyncio.to_thread(probe_closed_captions, str(first_input)),
+        )
         use_audio_passthrough = uses_audio_passthrough(audio, audio_passthrough)
         with _transcode_lock:
             _transcode_sessions[session_id].update(
@@ -2206,7 +2244,10 @@ async def _start_fast_live(
                 origin_time=time.time(),
                 audio_info=audio,
                 audio_passthrough=use_audio_passthrough,
+                closed_captions=closed_captions,
             )
+        if closed_captions:
+            log.info("Fast-start session %s detected embedded captions", session_id)
         hw = settings.get("transcode_hw", "software")
         low_restart_command = encoder_command(
             directory,

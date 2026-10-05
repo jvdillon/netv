@@ -36,8 +36,16 @@ private final class ArchiveTransport: URLProtocol {
                      "caption_playlist":"/transcode/archive/captions.m3u8"}
                     """
             } else {
-                body = #"{"session_id":"live","playlist":"/transcode/live/stream.m3u8"}"#
+                body = """
+                    {"session_id":"live","playlist":"/transcode/live/low.m3u8",
+                     "caption_playlist":"/transcode/live/low-captions.m3u8"}
+                    """
             }
+        } else if url.path == "/transcode/live/health" {
+            body = """
+                {"bandwidth_saver":false,"playlist":"/transcode/live/high.m3u8",
+                 "caption_playlist":"/transcode/live/high-captions.m3u8"}
+                """
         } else if url.path.hasPrefix("/transcode/progress/") {
             body = #"{"duration":120,"segment_count":60}"#
         } else {
@@ -86,12 +94,23 @@ struct ArchiveAPIChecks {
             server: "http://netv.test", channelID: "1"
         )
         precondition(live.liveBufferDuration == 7200)
+        precondition(live.url.path == "/transcode/live/low-captions.m3u8")
         let liveStart = ArchiveTransport.requests.first { $0.url?.path == "/transcode/start" }!
         let liveQuery = URLComponents(
             url: liveStart.url!, resolvingAgainstBaseURL: false
         )!.queryItems!
         precondition(liveQuery.contains(URLQueryItem(name: "content_type", value: "live")))
         precondition(liveQuery.contains(URLQueryItem(name: "fast_start", value: "true")))
+        let health = try await client.reportPlaybackHealth(
+            server: "http://netv.test",
+            sessionID: "live",
+            health: PlaybackHealth(
+                bufferSeconds: 10, waiting: false,
+                observedBitrate: 10_000_000, requiredBitrate: 4_000_000
+            )
+        )
+        precondition(health.playlist == "/transcode/live/high.m3u8")
+        precondition(health.captionPlaylist == "/transcode/live/high-captions.m3u8")
         for offset in [-6, 0, 3] {
             ArchiveTransport.requests = []
             let guide = try await client.guide(server: "http://netv.test", offset: offset)

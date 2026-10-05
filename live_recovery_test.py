@@ -42,6 +42,7 @@ def recovery_session(tmp_path):
         "started": 0,
         "last_access": 0,
         "fast_start": True,
+        "closed_captions": True,
         "high_selected": True,
         "playback_policy": PlaybackPolicy(),
         "upgrade_policy": UpgradePolicy(samples=[(90, 100_000_000)]),
@@ -365,6 +366,10 @@ def test_health_reports_current_recovery_generation(recovery_session):
         )
 
     assert result["playlist"] == "/transcode/recover/high.m3u8?generation=3"
+    assert (
+        result["caption_playlist"]
+        == "/transcode/recover/high-captions.m3u8?generation=3"
+    )
 
 
 def test_reused_session_response_includes_current_generation(recovery_session):
@@ -376,6 +381,10 @@ def test_reused_session_response_includes_current_generation(recovery_session):
     response = ffmpeg_session._adaptive_session_response("recover")
 
     assert response["playlist"] == "/transcode/recover/low.m3u8?generation=4"
+    assert (
+        response["caption_playlist"]
+        == "/transcode/recover/low-captions.m3u8?generation=4"
+    )
     assert response["master_playlist"] == "/transcode/recover/master.m3u8"
 
 

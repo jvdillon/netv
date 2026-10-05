@@ -28,6 +28,7 @@ from ffmpeg_command import (
     invalidate_series_probe_cache,
     limit_live_video_bitrate,
     probe_audio,
+    probe_closed_captions,
     probe_media,
     restore_probe_cache_entry,
 )
@@ -1387,3 +1388,22 @@ def test_probe_audio_reads_local_surround_segment(tmp_path):
     assert info is not None
     assert (info.audio_codec, info.audio_channels, info.audio_sample_rate) == ("ac3", 6, 48000)
     assert probe_audio(str(tmp_path / "missing.ts")) is None
+
+
+@pytest.mark.parametrize("side_data_type, expected", [
+    ("ATSC A53 Part 4 Closed Captions", True),
+    ("H.264 User Data Unregistered SEI message", False),
+])
+def test_probe_closed_captions_reads_video_side_data(side_data_type, expected):
+    result = MagicMock(
+        returncode=0,
+        stdout=json.dumps({
+            "frames": [{"side_data_list": [{"side_data_type": side_data_type}]}],
+        }),
+    )
+    with patch("ffmpeg_command.subprocess.run", return_value=result) as run:
+        assert probe_closed_captions("/tmp/input.ts") is expected
+
+    command = run.call_args.args[0]
+    assert command[command.index("-read_intervals") + 1] == "%+2"
+    assert command[command.index("-show_entries") + 1] == "frame=side_data_list"

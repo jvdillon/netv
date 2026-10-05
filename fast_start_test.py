@@ -221,6 +221,16 @@ def test_master_playlist_only_exposes_local_renditions():
     assert "high.m3u8" not in fast_start.master_playlist("4k", include_high=False)
 
 
+def test_closed_caption_master_declares_instream_cc1():
+    assert fast_start.closed_caption_master_playlist("low", "720p") == (
+        "#EXTM3U\n#EXT-X-VERSION:3\n"
+        '#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID="cc",NAME="CC1",'
+        'DEFAULT=NO,AUTOSELECT=YES,INSTREAM-ID="CC1"\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=6600000,CLOSED-CAPTIONS="cc"\n'
+        "low.m3u8\n"
+    )
+
+
 def test_upgrade_fallback_and_recovery_keep_same_encoder_and_session(tmp_path):
     playlist(tmp_path, "low")
     playlist(tmp_path, "high")
@@ -317,6 +327,7 @@ async def test_shared_session_cleanup(tmp_path, fail_high, source_duration, band
         patch("ffmpeg_session.get_transcode_dir", return_value=tmp_path),
         patch("ffmpeg_session.asyncio.create_subprocess_exec", side_effect=launch),
         patch("ffmpeg_session._spawn_background_task", side_effect=lambda coro: coro.close()),
+        patch("ffmpeg_session.probe_closed_captions", return_value=True),
         patch("ffmpeg_session.ready_bitrate", side_effect=ready),
         # Encoder warm-up must not reduce the playback reserve, including for
         # sources whose long keyframe intervals require more than eight seconds.
@@ -332,12 +343,16 @@ async def test_shared_session_cleanup(tmp_path, fail_high, source_duration, band
         assert len(launched) == (2 if fail_high else 3)
         assert result["playlist"].endswith("/low.m3u8")
         assert result["master_playlist"].endswith("/master.m3u8")
+        assert result["caption_playlist"].endswith("/low-captions.m3u8")
         session = ffmpeg_session.get_session(result["session_id"])
         assert session is not None
         assert session["playback_policy"].bandwidth_saver is bandwidth_saver
         assert session["watchdog_stale_after"] == max(45, 2 * source_duration + 2)
         master = pathlib.Path(session["dir"]) / "master.m3u8"
         assert ("high.m3u8" in master.read_text()) is not fail_high
+        low_captions = pathlib.Path(session["dir"]) / "low-captions.m3u8"
+        assert 'INSTREAM-ID="CC1"' in low_captions.read_text()
+        assert ((pathlib.Path(session["dir"]) / "high-captions.m3u8").exists()) is not fail_high
         reused = await ffmpeg_session.start_transcode("https://provider/live", fast_start=True)
         assert reused == result
         assert sum("https://provider/live" in cmd for cmd, _ in launched) == 1

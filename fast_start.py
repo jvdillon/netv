@@ -133,6 +133,28 @@ def master_playlist(resolution: str, *, include_high: bool, audio_bitrate: int =
     return "\n".join(lines) + "\n"
 
 
+def closed_caption_master_playlist(
+    rendition: str,
+    resolution: str,
+    *,
+    audio_bitrate: int = 0,
+) -> str:
+    """Single-rendition master declaring embedded CEA-608/708 captions."""
+    _, maximum = live_video_bitrates(resolution)
+    bandwidth = int(maximum * 1.1) + audio_bitrate
+    return "\n".join(
+        [
+            "#EXTM3U",
+            "#EXT-X-VERSION:3",
+            '#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID="cc",NAME="CC1",'
+            'DEFAULT=NO,AUTOSELECT=YES,INSTREAM-ID="CC1"',
+            f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CLOSED-CAPTIONS="cc"',
+            f"{rendition}.m3u8",
+            "",
+        ]
+    )
+
+
 def surround_audio_bitrate(audio: MediaInfo | None, passthrough: bool) -> int:
     """Extra bandwidth to advertise for surround output (Dolby copies at up to 640 kbps)."""
     if audio and passthrough and audio.audio_codec in PASSTHROUGH_AUDIO_CODECS:

@@ -425,9 +425,11 @@ struct PlaybackHealth: Encodable {
 struct PlaybackHealthResponse: Decodable {
     let bandwidthSaver: Bool
     let playlist: String?
+    let captionPlaylist: String?
 
     enum CodingKeys: String, CodingKey {
         case bandwidthSaver = "bandwidth_saver"
         case playlist
+        case captionPlaylist = "caption_playlist"
     }
 }
