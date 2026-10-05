@@ -68,6 +68,8 @@ _REUSE_ACTIVE_WAIT_TIMEOUT_SEC = 15.0
 _RESUME_WAIT_TIMEOUT_SEC = 10.0
 _RESUME_SEGMENT_WAIT_TIMEOUT_SEC = 5.0
 _LIVE_WATCHDOG_INTERVAL_SEC = 2.0
+# Publication gaps are not failures; dead processes bypass this age check.
+_LIVE_WATCHDOG_STALE_FLOOR_SEC = 45.0
 
 # Size thresholds
 _MIN_SEGMENT_SIZE_BYTES = 1_000
@@ -2092,7 +2094,7 @@ async def _start_fast_live(
         startup_buffer = max(8.0, 2 * max(input_durations, default=4.0))
         with _transcode_lock:
             _transcode_sessions[session_id]["watchdog_stale_after"] = max(
-                10.0,
+                _LIVE_WATCHDOG_STALE_FLOOR_SEC,
                 startup_buffer + 2,
             )
         await wait_ready("low.m3u8", low, startup_buffer)

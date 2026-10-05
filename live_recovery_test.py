@@ -3,6 +3,7 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncio
+import os
 import pathlib
 
 import pytest
@@ -51,6 +52,7 @@ def recovery_session(tmp_path):
         "master_resolution": "1080p",
         "master_audio_bitrate": 0,
         "playlist_generation": 0,
+        "watchdog_stale_after": 45,
     }
     with patch.dict(ffmpeg_session._transcode_sessions, {"recover": session}, clear=True):
         yield session
@@ -111,6 +113,25 @@ async def test_short_publication_gap_does_not_restart(recovery_session):
         await check(recovery_session, 102, healthy)
         high_restart.assert_not_awaited()
         pipeline_restart.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_running_pipeline_tolerates_thirty_second_publication_gap(
+    recovery_session,
+):
+    for name in ("input", "low", "high"):
+        os.utime(pathlib.Path(recovery_session["dir"]) / f"{name}.m3u8", (70, 70))
+
+    with (
+        patch("fast_start.time.time", return_value=100),
+        patch("ffmpeg_session.time.monotonic", return_value=100),
+        patch("ffmpeg_session._restart_fast_pipeline", new=AsyncMock()) as pipeline_restart,
+        patch("ffmpeg_session._restart_high_encoder", new=AsyncMock()) as high_restart,
+    ):
+        await ffmpeg_session._check_fast_live_session("recover", recovery_session)
+
+    pipeline_restart.assert_not_awaited()
+    high_restart.assert_not_awaited()
 
 
 @pytest.mark.asyncio

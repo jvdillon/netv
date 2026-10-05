@@ -885,18 +885,11 @@ def probe_media(
 # ===========================================================================
 
 
-def http_reconnect_args(
-    url: str,
-    *,
-    max_delay: int = 30,
-    read_timeout: int = 30,
-) -> list[str]:
+def http_reconnect_args(url: str, *, max_delay: int = 30) -> list[str]:
     """HTTP reconnect options must not be passed to local or other protocol inputs."""
     if not url.startswith(("http://", "https://")):
         return []
     return [
-        "-rw_timeout",
-        str(read_timeout * 1_000_000),
         "-reconnect",
         "1",
         "-reconnect_streamed",

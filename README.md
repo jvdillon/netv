@@ -172,8 +172,10 @@ while only that encoder restarts. A stalled ingest or low output restarts the
 dependency chain only after the old upstream reader exits. Restarted outputs append
 to the retained playlists with an HLS discontinuity, preserving the available DVR
 window under the same session ID. Recovery attempts have cooldowns and a limit of
-three per five-minute window. HTTP inputs use a 30-second read timeout so an open
-but unresponsive connection becomes recoverable.
+three per five-minute window. Workers that exit bypass the publication grace; a
+process that remains alive must stop publishing completed media for 45 seconds
+before the watchdog intervenes, so temporary upstream delivery gaps do not trigger
+a restart.
 After a full pipeline recovery, health feedback advances a generation counter so
 Apple clients reload the recovered playlist in the same session while preserving
 their playback date and pause state when possible.

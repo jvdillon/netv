@@ -61,11 +61,11 @@ def test_timeline_and_readiness(tmp_path):
     assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8") == 0
 
 
-def test_commands_only_ingest_opens_provider(tmp_path):
-    url = "https://provider.example/live.ts"
+def test_commands_only_ingest_opens_upstream(tmp_path):
+    url = "https://upstream.example/live.ts"
     ingest = fast_start.ingest_command(url, str(tmp_path), "neTV")
     assert ingest[ingest.index("-i") + 1] == url
-    assert ingest[ingest.index("-rw_timeout") + 1] == "30000000"
+    assert "-rw_timeout" not in ingest
     assert ingest[ingest.index("-reconnect_on_network_error") + 1] == "1"
     assert ingest[ingest.index("-analyzeduration") + 1] == "1000000"
     assert ingest[ingest.index("-probesize") + 1] == "5000000"
@@ -278,7 +278,7 @@ def test_upgrade_fallback_and_recovery_keep_same_encoder_and_session(tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bandwidth_saver", [False, True])
 @pytest.mark.parametrize("fail_high", [False, True])
-@pytest.mark.parametrize("source_duration", [4, 6])
+@pytest.mark.parametrize("source_duration", [4, 6, 30])
 async def test_shared_session_cleanup(tmp_path, fail_high, source_duration, bandwidth_saver):
     launched = []
     startup_ready = False
@@ -335,7 +335,7 @@ async def test_shared_session_cleanup(tmp_path, fail_high, source_duration, band
         session = ffmpeg_session.get_session(result["session_id"])
         assert session is not None
         assert session["playback_policy"].bandwidth_saver is bandwidth_saver
-        assert session["watchdog_stale_after"] == max(10, 2 * source_duration + 2)
+        assert session["watchdog_stale_after"] == max(45, 2 * source_duration + 2)
         master = pathlib.Path(session["dir"]) / "master.m3u8"
         assert ("high.m3u8" in master.read_text()) is not fail_high
         reused = await ffmpeg_session.start_transcode("https://provider/live", fast_start=True)
