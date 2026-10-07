@@ -109,6 +109,14 @@ test('VOD retains cached-stop semantics; live page close forces release', async 
   }
 });
 
+test('playback buffer hints retain compatibility defaults and bounded latency', () => {
+  const env = runtime(async () => ok({}));
+  assert.equal(env.playbackBufferSeconds(undefined), 12);
+  assert.equal(env.playbackBufferSeconds(8), 12);
+  assert.equal(env.playbackBufferSeconds('30'), 30);
+  assert.equal(env.playbackBufferSeconds(90), 60);
+});
+
 test('casting detaches the session from browser stop and page-close cleanup', async () => {
   const calls = [];
   const env = runtime(async (url, options) => {

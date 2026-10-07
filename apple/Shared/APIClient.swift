@@ -28,6 +28,7 @@ struct PlaybackConfiguration {
     var archiveStart: Double?
     var archiveSeek: Double?
     var liveBufferDuration: Double = 0
+    var playbackBufferDuration: Double = 12
 }
 
 final class APIClient {
@@ -297,7 +298,11 @@ final class APIClient {
         return PlaybackConfiguration(
             url: playlistURL,
             cookieHeader: cookieHeader(for: playlistURL),
-            transcodeSessionID: response.sessionID
+            transcodeSessionID: response.sessionID,
+            playbackBufferDuration: min(
+                max(response.playbackBufferSeconds ?? 12, 12),
+                60
+            )
         )
     }
 
@@ -396,11 +401,13 @@ private struct TranscodeResponse: Decodable {
     let sessionID: String
     let playlist: String
     let captionPlaylist: String?
+    let playbackBufferSeconds: Double?
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
         case playlist
         case captionPlaylist = "caption_playlist"
+        case playbackBufferSeconds = "playback_buffer_seconds"
     }
 }
 

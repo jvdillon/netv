@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 
+import math
 import pathlib
 import re
 import time
@@ -19,6 +20,36 @@ from ffmpeg_command import (
 
 
 _PLAYLIST_ENTRIES = re.compile(r"#EXTINF:([\d.]+),[^\n]*\n(?:#[^\n]*\n)*([^#\n]+)")
+DEFAULT_PLAYBACK_BUFFER_SECONDS = 12.0
+MAX_PLAYBACK_BUFFER_SECONDS = 60.0
+
+
+def live_buffer_durations(segment_durations: list[float]) -> tuple[float, float]:
+    """Return startup reserve and client buffer targets for bursty upstream media."""
+    valid = [value for value in segment_durations if math.isfinite(value) and value > 0]
+    upstream_duration = max(valid, default=4.0)
+    startup_buffer = max(8.0, 2 * upstream_duration)
+    playback_buffer = min(
+        MAX_PLAYBACK_BUFFER_SECONDS,
+        max(DEFAULT_PLAYBACK_BUFFER_SECONDS, startup_buffer),
+    )
+    return startup_buffer, playback_buffer
+
+
+def add_live_start_offset(content: str, seconds: float) -> str:
+    """Prefer a safe initial position behind the live edge for native HLS clients."""
+    if not math.isfinite(seconds) or seconds <= 0 or "#EXT-X-START:" in content:
+        return content
+    line_ending = "\r\n" if content.startswith("#EXTM3U\r\n") else "\n"
+    header = f"#EXTM3U{line_ending}"
+    if not content.startswith(header):
+        return content
+    offset = f"{seconds:.3f}".rstrip("0").rstrip(".")
+    return content.replace(
+        header,
+        f"{header}#EXT-X-START:TIME-OFFSET=-{offset},PRECISE=NO{line_ending}",
+        1,
+    )
 
 
 def ingest_command(

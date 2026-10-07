@@ -38,7 +38,8 @@ private final class ArchiveTransport: URLProtocol {
             } else {
                 body = """
                     {"session_id":"live","playlist":"/transcode/live/low.m3u8",
-                     "caption_playlist":"/transcode/live/low-captions.m3u8"}
+                     "caption_playlist":"/transcode/live/low-captions.m3u8",
+                     "playback_buffer_seconds":30}
                     """
             }
         } else if url.path == "/transcode/live/health" {
@@ -79,6 +80,7 @@ struct ArchiveAPIChecks {
         precondition(playback.archiveSeek == 45)
         precondition(playback.transcodeSessionID == "archive")
         precondition(playback.url.path == "/transcode/archive/captions.m3u8")
+        precondition(playback.playbackBufferDuration == 12)
         let start = ArchiveTransport.requests.first { $0.url?.path == "/transcode/start" }!
         let query = URLComponents(url: start.url!, resolvingAgainstBaseURL: false)!.queryItems!
         precondition(query.contains(URLQueryItem(name: "content_type", value: "movie")))
@@ -94,6 +96,7 @@ struct ArchiveAPIChecks {
             server: "http://netv.test", channelID: "1"
         )
         precondition(live.liveBufferDuration == 7200)
+        precondition(live.playbackBufferDuration == 30)
         precondition(live.url.path == "/transcode/live/low-captions.m3u8")
         let liveStart = ArchiveTransport.requests.first { $0.url?.path == "/transcode/start" }!
         let liveQuery = URLComponents(

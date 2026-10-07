@@ -935,9 +935,16 @@
       return;
     }
 
+    const adaptiveBufferSeconds = window.NetvPlayback.playbackBufferSeconds(
+      adaptiveSession?.playback_buffer_seconds
+    );
     const hls = new Hls({
       ...createHlsConfig({isVod: cfg.isVod}),
-      ...(adaptiveSession ? { liveSyncDuration: 12, liveSyncDurationCount: undefined } : {}),
+      ...(adaptiveSession ? {
+        liveSyncDuration: adaptiveBufferSeconds,
+        liveSyncDurationCount: undefined,
+        maxBufferLength: Math.max(30, adaptiveBufferSeconds),
+      } : {}),
     });
     currentHls = hls;
     let recoveryAttempts = 0;

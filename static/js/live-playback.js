@@ -1,6 +1,12 @@
 (function() {
   'use strict';
 
+  function playbackBufferSeconds(value) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return 12;
+    return Math.min(60, Math.max(12, parsed));
+  }
+
   class TranscodeSession {
     constructor(isVod) {
       this.isVod = isVod;
@@ -215,5 +221,9 @@
     }
   }
 
-  window.NetvPlayback = { TranscodeSession, AdaptiveLivePlayback };
+  window.NetvPlayback = {
+    TranscodeSession,
+    AdaptiveLivePlayback,
+    playbackBufferSeconds,
+  };
 })();

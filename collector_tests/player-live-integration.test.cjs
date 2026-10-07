@@ -52,6 +52,7 @@ async function player({
   catchup = false, catchupDays = catchup ? 2 : 0, catchupStart = programStart, catchupSeek = 0,
   transcodedDuration = 0,
   stopReady = null, stopFailure = false, startReady = null, startGeneration = 0,
+  playbackBufferSeconds = 12,
 } = {}) {
   isVod = isVod || catchup;
   const elements = new Map();
@@ -165,7 +166,10 @@ async function player({
           playlist: `/transcode/${id}/${isVod ? 'stream' : 'low'}.m3u8${
             !isVod && startGeneration ? `?generation=${startGeneration}` : ''
           }`,
-          ...(!isVod ? { master_playlist: `/transcode/${id}/master.m3u8` } : {}),
+          ...(!isVod ? {
+            master_playlist: `/transcode/${id}/master.m3u8`,
+            playback_buffer_seconds: playbackBufferSeconds,
+          } : {}),
         };
       } else if (options.method === 'DELETE') {
         if (stopReady) await stopReady;
@@ -231,6 +235,7 @@ test('web live startup and upgrades use one shared adaptive session', async () =
   assert.deepEqual(hls.sources, ['/transcode/session1/master.m3u8']);
   assert.equal(hls.config.startPosition, -1);
   assert.equal(hls.config.liveSyncDuration, 12);
+  assert.equal(hls.config.maxBufferLength, 30);
   assert.equal(hls.nextLevel, 0);
   p.setRendition('high');
   await p.pollHealth();
@@ -240,6 +245,13 @@ test('web live startup and upgrades use one shared adaptive session', async () =
   assert.equal(p.calls.some(call => call.url.includes('/progress/')), false);
   await p.window.emit('pagehide');
   assert.deepEqual(p.beacons, ['/transcode/session1/stop?force=true']);
+  assert.deepEqual(p.errors, []);
+});
+
+test('web live playback honors the measured buffer target', async () => {
+  const p = await player({ playbackBufferSeconds: 40 });
+  assert.equal(p.engines[0].config.liveSyncDuration, 40);
+  assert.equal(p.engines[0].config.maxBufferLength, 40);
   assert.deepEqual(p.errors, []);
 });
 

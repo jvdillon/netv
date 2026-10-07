@@ -22,10 +22,12 @@ import uuid
 from fastapi import HTTPException
 
 from fast_start import (
+    DEFAULT_PLAYBACK_BUFFER_SECONDS,
     aligned,
     closed_caption_master_playlist,
     encoder_command,
     ingest_command,
+    live_buffer_durations,
     master_playlist,
     playlist_duration,
     ready_bitrate,
@@ -845,10 +847,16 @@ def _adaptive_session_response(session_id: str) -> dict[str, Any]:
         session = _transcode_sessions.get(session_id)
         generation = int(session.get("playlist_generation", 0)) if session else 0
         closed_captions = bool(session and session.get("closed_captions"))
+        playback_buffer_seconds = float(
+            session.get("playback_buffer_seconds", DEFAULT_PLAYBACK_BUFFER_SECONDS)
+            if session
+            else DEFAULT_PLAYBACK_BUFFER_SECONDS
+        )
     response = {
         "session_id": session_id,
         "playlist": _fast_playlist_url(session_id, "low.m3u8", generation),
         "master_playlist": f"/transcode/{session_id}/master.m3u8",
+        "playback_buffer_seconds": playback_buffer_seconds,
         "subtitles": [],
         "duration": 0,
         "seek_offset": 0,
@@ -2207,6 +2215,7 @@ async def _start_fast_live(
                 "live_recovery": LiveRecoveryPolicy(high_started=time.monotonic()),
                 "fast_start": True,
                 "playlist_generation": 0,
+                "playback_buffer_seconds": DEFAULT_PLAYBACK_BUFFER_SECONDS,
                 "closed_captions": False,
                 "ingest_restart_command": ingest_command(
                     url,
@@ -2283,18 +2292,22 @@ async def _start_fast_live(
         # of tiny output segments cannot bridge the next upstream delivery gap.
         input_text = (pathlib.Path(directory) / "input.m3u8").read_text()
         input_durations = [float(value) for value in re.findall(r"#EXTINF:([\d.]+)", input_text)]
-        startup_buffer = max(8.0, 2 * max(input_durations, default=4.0))
+        startup_buffer, playback_buffer = live_buffer_durations(input_durations)
         with _transcode_lock:
-            _transcode_sessions[session_id]["watchdog_stale_after"] = max(
+            session = _transcode_sessions[session_id]
+            session["watchdog_stale_after"] = max(
                 _LIVE_WATCHDOG_STALE_FLOOR_SEC,
                 startup_buffer + 2,
             )
+            session["playback_buffer_seconds"] = playback_buffer
         await wait_ready("low.m3u8", low, startup_buffer)
         log.info(
-            "Fast-start session %s ready at 720p after %.2fs with %.1fs startup reserve",
+            "Fast-start session %s ready at 720p after %.2fs with %.1fs startup reserve "
+            "and %.1fs playback buffer",
             session_id,
             time.monotonic() - startup_started,
             startup_buffer,
+            playback_buffer,
         )
         # Keep high-quality initialization off the GPU until the startup
         # rendition has built its reserve. Do not wait for high-quality output.

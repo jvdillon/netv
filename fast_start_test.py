@@ -61,6 +61,21 @@ def test_timeline_and_readiness(tmp_path):
     assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8") == 0
 
 
+def test_live_buffers_follow_upstream_segment_cadence():
+    assert fast_start.live_buffer_durations([4]) == (8, 12)
+    assert fast_start.live_buffer_durations([6]) == (12, 12)
+    assert fast_start.live_buffer_durations([10]) == (20, 20)
+    assert fast_start.live_buffer_durations([30]) == (60, 60)
+    assert fast_start.live_buffer_durations([45]) == (90, 60)
+
+
+def test_live_playlist_prefers_the_measured_buffer_offset():
+    content = "#EXTM3U\n#EXT-X-VERSION:3\n"
+    updated = fast_start.add_live_start_offset(content, 24)
+    assert updated == ("#EXTM3U\n#EXT-X-START:TIME-OFFSET=-24,PRECISE=NO\n#EXT-X-VERSION:3\n")
+    assert fast_start.add_live_start_offset(updated, 30) == updated
+
+
 def test_commands_only_ingest_opens_upstream(tmp_path):
     url = "https://upstream.example/live.ts"
     ingest = fast_start.ingest_command(url, str(tmp_path), "neTV")
@@ -344,10 +359,13 @@ async def test_shared_session_cleanup(tmp_path, fail_high, source_duration, band
         assert result["playlist"].endswith("/low.m3u8")
         assert result["master_playlist"].endswith("/master.m3u8")
         assert result["caption_playlist"].endswith("/low-captions.m3u8")
+        expected_playback_buffer = min(60, max(12, 2 * source_duration))
+        assert result["playback_buffer_seconds"] == expected_playback_buffer
         session = ffmpeg_session.get_session(result["session_id"])
         assert session is not None
         assert session["playback_policy"].bandwidth_saver is bandwidth_saver
         assert session["watchdog_stale_after"] == max(45, 2 * source_duration + 2)
+        assert session["playback_buffer_seconds"] == expected_playback_buffer
         master = pathlib.Path(session["dir"]) / "master.m3u8"
         assert ("high.m3u8" in master.read_text()) is not fail_high
         low_captions = pathlib.Path(session["dir"]) / "low-captions.m3u8"

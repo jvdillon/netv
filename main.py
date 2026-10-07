@@ -83,7 +83,7 @@ from cache import (
     update_source_epg_url,
 )
 from epg import fetch_epg
-from fast_start import dated_playlist
+from fast_start import DEFAULT_PLAYBACK_BUFFER_SECONDS, add_live_start_offset, dated_playlist
 from m3u import (
     fetch_m3u,
     fetch_source_live_data,
@@ -2291,12 +2291,20 @@ async def transcode_file(
     cors = {"Access-Control-Allow-Origin": "*"}
     if filename.endswith(".m3u8"):
         content = file_path.read_text()
-        if (
-            filename in ("low.m3u8", "high.m3u8")
-            and session.get("fast_start")
-            and session.get("origin_pts") is not None
-        ):
-            content = dated_playlist(session["dir"], content, session["origin_pts"], session["origin_time"])
+        if filename in ("low.m3u8", "high.m3u8") and session.get("fast_start"):
+            if session.get("origin_pts") is not None:
+                content = dated_playlist(
+                    session["dir"], content, session["origin_pts"], session["origin_time"]
+                )
+            content = add_live_start_offset(
+                content,
+                float(
+                    session.get(
+                        "playback_buffer_seconds",
+                        DEFAULT_PLAYBACK_BUFFER_SECONDS,
+                    )
+                ),
+            )
         return Response(
             content=content,
             media_type="application/vnd.apple.mpegurl",

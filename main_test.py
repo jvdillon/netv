@@ -1429,21 +1429,32 @@ class TestTranscodeRoutes:
         content = "#EXTM3U\n"
         (tmp_path / filename).write_text(content)
         session = {
-            "dir": str(tmp_path), "fast_start": True, "origin_pts": 10, "origin_time": 0,
+            "dir": str(tmp_path),
+            "fast_start": True,
+            "origin_pts": 10,
+            "origin_time": 0,
+            "playback_buffer_seconds": 24,
         }
         with (
             patch("ffmpeg_session.get_session", return_value=session),
             patch("main.dated_playlist", return_value=content + "#dated\n") as dates,
+            patch(
+                "main.add_live_start_offset",
+                side_effect=lambda value, _seconds: value + "#start\n",
+            ) as start,
         ):
             response = auth_client.get(f"/transcode/shared/{filename}")
         assert response.status_code == 200
         assert response.headers["access-control-allow-origin"] == "*"
         if filename == "master.m3u8":
             dates.assert_not_called()
+            start.assert_not_called()
             assert response.text == content
         else:
             dates.assert_called_once_with(str(tmp_path), content, 10, 0)
+            start.assert_called_once_with(content + "#dated\n", 24)
             assert "#dated" in response.text
+            assert "#start" in response.text
 
     def test_segmented_webvtt_is_mapped_to_the_video_clock(self, auth_client, tmp_path):
         filename = "sub0_000001.vtt"

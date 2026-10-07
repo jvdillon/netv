@@ -523,7 +523,7 @@ struct PlayerView: View {
                 }
                 try Task.checkCancellation()
                 var item = AVPlayerItem(asset: asset)
-                item.preferredForwardBufferDuration = 12
+                item.preferredForwardBufferDuration = configuration.playbackBufferDuration
                 if !selection.isCatchup {
                     item.automaticallyPreservesTimeOffsetFromLive = true
                 }
@@ -597,7 +597,10 @@ struct PlayerView: View {
                            url != configuration.url {
                             // Prepare locally while the current rendition keeps playing.
                             let replacement = try await prepareQualityPlayer(
-                                url: url, options: options, currentItem: item
+                                url: url,
+                                options: options,
+                                currentItem: item,
+                                playbackBufferDuration: configuration.playbackBufferDuration
                             )
                             try Task.checkCancellation()
                             replacement.volume = currentPlayer.volume
@@ -612,7 +615,8 @@ struct PlayerView: View {
                             configuration = PlaybackConfiguration(
                                 url: url, cookieHeader: configuration.cookieHeader,
                                 transcodeSessionID: sessionID,
-                                liveBufferDuration: configuration.liveBufferDuration
+                                liveBufferDuration: configuration.liveBufferDuration,
+                                playbackBufferDuration: configuration.playbackBufferDuration
                             )
                             sampler = PlaybackHealthSampler()
                             continue
@@ -686,10 +690,13 @@ struct PlayerView: View {
 
     @MainActor
     private func prepareQualityPlayer(
-        url: URL, options: [String: Any], currentItem: AVPlayerItem
+        url: URL,
+        options: [String: Any],
+        currentItem: AVPlayerItem,
+        playbackBufferDuration: Double
     ) async throws -> AVPlayer {
         let item = AVPlayerItem(asset: AVURLAsset(url: url, options: options))
-        item.preferredForwardBufferDuration = 12
+        item.preferredForwardBufferDuration = playbackBufferDuration
         item.automaticallyPreservesTimeOffsetFromLive = true
         let candidate = AVPlayer(playerItem: item)
         candidate.appliesMediaSelectionCriteriaAutomatically = false

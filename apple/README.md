@@ -187,20 +187,23 @@ delay the first decodable frame. Logs report elapsed time to input readiness and
 
 Playback still waits for at least eight seconds of 720p media (or two source segment
 durations, whichever is longer) to bridge bursty upstream delivery. Each rendition
-keeps at least the normal 30-second live window. The app requests a 12-second
-forward buffer. Apple channel changes and in-page web restarts wait for any earlier
-startup to return its session ID, then confirm that session has stopped before
-starting the next provider feed. The backend checks for disconnected requests while
-waiting for adaptive startup and cleans up their processes and files.
+keeps at least the normal 30-second live window. The backend derives a bounded
+playback buffer from the measured upstream segment cadence, publishes the same
+offset through `EXT-X-START`, and returns it to web and Apple clients. Both clients
+retain a 12-second compatibility default and cap the adaptive target at 60 seconds.
+Playback changes and in-page web restarts wait for any earlier startup to return its
+session ID, then confirm that session has stopped before opening replacement upstream
+content. The backend checks for disconnected requests while waiting for adaptive
+startup and cleans up their processes and files.
 
 The web player consumes a local master playlist containing the same low/high
 renditions. Hls.js starts pinned to low quality, reports buffer and recent fragment
 download measurements every two seconds, and follows the backend's health decisions
 using in-place level switching. Both playlists carry matching program dates; the
-web player does not reload the source or open another provider stream on upgrades.
-It targets a 12-second live delay when enough media is available, rather than
-treating transcoded live streams as VOD. Native browser HLS without Hls.js telemetry
-stays on the initial rendition and only sends heartbeats.
+web player does not reload the source or open another upstream stream on upgrades.
+It targets the measured playback buffer when enough media is available, rather than
+treating transcoded live streams as VOD. Native browser HLS receives the same start
+offset, stays on the initial rendition, and only sends heartbeats.
 
 An upgrade requires fresh high-quality segments caught up to the low rendition,
 at least six seconds of player buffer, and three download measurements spanning
