@@ -238,6 +238,9 @@ struct ChannelGuideView: View {
     @EnvironmentObject private var model: AppModel
     var selectedCategoryID: String? = nil
     @FocusState private var focusedProgram: GuideProgramFocus?
+    #if os(tvOS)
+    @FocusState private var isSearchFilterFocused: Bool
+    #endif
     @State private var catchupChannel: Channel?
 
     private var rowHeight: CGFloat { GuideMetrics.scaled(74) }
@@ -278,6 +281,31 @@ struct ChannelGuideView: View {
                     .font(.caption)
                     .foregroundStyle(Theme.secondaryText)
                 Spacer(minLength: 0)
+                #if os(tvOS)
+                if !model.query.isEmpty {
+                    Button {
+                        model.query = ""
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "magnifyingglass")
+                            Text("Filtered: \(model.query)")
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .font(.system(size: GuideMetrics.fontSize(12), weight: .semibold))
+                        .padding(.horizontal, 12)
+                        .frame(maxWidth: GuideMetrics.scaled(320))
+                        .frame(minHeight: GuideMetrics.scaled(32))
+                    }
+                    .buttonStyle(GuideButtonStyle(
+                        isSelected: true, isFocused: isSearchFilterFocused
+                    ))
+                    .focused($isSearchFilterFocused)
+                    .accessibilityLabel("Clear search")
+                    .accessibilityValue("Filtering by \(model.query)")
+                }
+                #endif
             }
             .padding(.horizontal, 20)
             .frame(height: GuideMetrics.scaled(54))

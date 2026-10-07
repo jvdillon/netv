@@ -1,26 +1,19 @@
 #!/usr/bin/env python3
-"""Export upscaling models to TensorRT engines for FFmpeg dnn_processing filter.
+"""Export the NomosUni upscaler to TensorRT for FFmpeg dnn_processing.
 
-This script converts AI upscaling models to TensorRT engines (.engine files)
+This script converts the 2x NomosUni model to TensorRT engines (.engine files)
 that can be loaded by FFmpeg's TensorRT DNN backend.
 
-Available models (use --list to see all):
-  2x models (1080p → 4K):
-    - 2x-liveaction-span    Best for live action TV/film
-    - 2x-nomosuni-compact   Fast universal upscaler for degraded sources
-
-  4x models (720p → 4K, 480p → 1080p):
-    - 4x-compact            Fast, good quality (SRVGGNetCompact)
-
 Usage:
-    # List available models
+    # Show the supported model
     python export-tensorrt.py --list
 
-    # Export 2x model for live action
-    python export-tensorrt.py --model 2x-liveaction-span -o model.engine
+    # Export a fixed 1080p engine
+    python export-tensorrt.py --min-height 1080 --opt-height 1080 \\
+        --max-height 1080 -o model.engine
 
     # Export with custom height range
-    python export-tensorrt.py --model 2x-liveaction-span --min-height 720 --max-height 1080
+    python export-tensorrt.py --min-height 720 --max-height 1080
 
 Requirements:
     pip install torch onnx onnxconverter-common safetensors tensorrt
@@ -32,248 +25,46 @@ Example FFmpeg usage after export:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, NotRequired, TypedDict
+from typing import TYPE_CHECKING
+
+import argparse
+import tempfile
+import urllib.request
 
 
 if TYPE_CHECKING:
     import tensorrt as trt
-
-import argparse
-import sys
-import tempfile
-import urllib.request
-
-from onnxconverter_common import float16 as onnx_float16
-from safetensors.torch import load_file as load_safetensors
-
-import onnx
-import tensorrt as trt
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+    import torch
+    import torch.nn as nn
 
 
-class SRVGGNetCompact(nn.Module):
-    """Compact SR network - fast inference, good quality."""
-
-    upscale: int
-    body: nn.ModuleList
-    upsampler: nn.PixelShuffle
-
-    def __init__(
-        self,
-        num_in_ch: int = 3,
-        num_out_ch: int = 3,
-        num_feat: int = 64,
-        num_conv: int = 32,
-        upscale: int = 4,
-    ):
-        super().__init__()
-        self.upscale = upscale
-        self.body = nn.ModuleList()
-        self.body.append(nn.Conv2d(num_in_ch, num_feat, 3, 1, 1))
-        self.body.append(nn.PReLU(num_parameters=num_feat))
-        for _ in range(num_conv - 2):
-            self.body.append(nn.Conv2d(num_feat, num_feat, 3, 1, 1))
-            self.body.append(nn.PReLU(num_parameters=num_feat))
-        self.body.append(nn.Conv2d(num_feat, num_out_ch * upscale * upscale, 3, 1, 1))
-        self.upsampler = nn.PixelShuffle(upscale)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = x
-        for layer in self.body[:-1]:
-            out = layer(out)
-        out = self.body[-1](out)
-        out = self.upsampler(out)
-        return out + F.interpolate(x, scale_factor=self.upscale, mode="nearest")
+MODEL_NAME = "2x-nomosuni-compact"
+MODEL_DESCRIPTION = "Fast universal upscale - compression, noise, and blur handling"
+MODEL_URL = (
+    "https://huggingface.co/Phips/2xNomosUni_compact_otf_medium/"
+    "resolve/3241c877a6e09036f9e466c840822bb066f11c44/"
+    "2xNomosUni_compact_otf_medium.safetensors"
+)
+MODEL_FILENAME = "2xNomosUni_compact_otf_medium.safetensors"
+MODEL_SCALE = 2
 
 
-class ResidualDenseBlock(nn.Module):
-    """Residual Dense Block for RRDBNet."""
-
-    conv1: nn.Conv2d
-    conv2: nn.Conv2d
-    conv3: nn.Conv2d
-    conv4: nn.Conv2d
-    conv5: nn.Conv2d
-    lrelu: nn.LeakyReLU
-
-    def __init__(self, nf: int = 64, gc: int = 32):
-        super().__init__()
-        self.conv1 = nn.Conv2d(nf, gc, 3, 1, 1)
-        self.conv2 = nn.Conv2d(nf + gc, gc, 3, 1, 1)
-        self.conv3 = nn.Conv2d(nf + 2 * gc, gc, 3, 1, 1)
-        self.conv4 = nn.Conv2d(nf + 3 * gc, gc, 3, 1, 1)
-        self.conv5 = nn.Conv2d(nf + 4 * gc, nf, 3, 1, 1)
-        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1 = self.lrelu(self.conv1(x))
-        x2 = self.lrelu(self.conv2(torch.cat((x, x1), 1)))
-        x3 = self.lrelu(self.conv3(torch.cat((x, x1, x2), 1)))
-        x4 = self.lrelu(self.conv4(torch.cat((x, x1, x2, x3), 1)))
-        x5 = self.conv5(torch.cat((x, x1, x2, x3, x4), 1))
-        return x5 * 0.2 + x
-
-
-class RRDB(nn.Module):
-    """Residual in Residual Dense Block."""
-
-    rdb1: ResidualDenseBlock
-    rdb2: ResidualDenseBlock
-    rdb3: ResidualDenseBlock
-
-    def __init__(self, nf: int, gc: int = 32):
-        super().__init__()
-        self.rdb1 = ResidualDenseBlock(nf, gc)
-        self.rdb2 = ResidualDenseBlock(nf, gc)
-        self.rdb3 = ResidualDenseBlock(nf, gc)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.rdb1(x)
-        out = self.rdb2(out)
-        out = self.rdb3(out)
-        return out * 0.2 + x
-
-
-class RRDBNet(nn.Module):
-    """RRDBNet architecture for Real-ESRGAN - highest quality, slower."""
-
-    scale: int
-    conv_first: nn.Conv2d
-    body: nn.Sequential
-    conv_body: nn.Conv2d
-    conv_up1: nn.Conv2d
-    conv_up2: nn.Conv2d
-    conv_hr: nn.Conv2d
-    conv_last: nn.Conv2d
-    lrelu: nn.LeakyReLU
-
-    def __init__(
-        self,
-        num_in_ch: int = 3,
-        num_out_ch: int = 3,
-        num_feat: int = 64,
-        num_block: int = 23,
-        num_grow_ch: int = 32,
-        scale: int = 4,
-    ):
-        super().__init__()
-        self.scale = scale
-        self.conv_first = nn.Conv2d(num_in_ch, num_feat, 3, 1, 1)
-        self.body = nn.Sequential(*[RRDB(num_feat, num_grow_ch) for _ in range(num_block)])
-        self.conv_body = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
-        self.conv_up1 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
-        self.conv_up2 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
-        self.conv_hr = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
-        self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
-        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feat = self.conv_first(x)
-        body_feat = self.conv_body(self.body(feat))
-        feat = feat + body_feat
-        feat = self.lrelu(
-            self.conv_up1(
-                F.interpolate(
-                    feat,
-                    scale_factor=2,
-                    mode="nearest",
-                )
-            )
-        )
-        feat = self.lrelu(
-            self.conv_up2(
-                F.interpolate(
-                    feat,
-                    scale_factor=2,
-                    mode="nearest",
-                )
-            )
-        )
-        out = self.conv_last(self.lrelu(self.conv_hr(feat)))
-        return out
-
-
-class ModelInfo(TypedDict):
-    """Type definition for model registry entries."""
-
-    description: str
-    filename: str
-    scale: int
-    arch: str
-    url: NotRequired[str]
-    onnx_url: NotRequired[str]
-
-
-MODELS: dict[str, ModelInfo] = {
-    # 2x models - high quality, 1080p → 4K
-    "2x-liveaction-span": {
-        "description": "Live action TV/film - handles compression, preserves grain",
-        "onnx_url": "https://github.com/jcj83429/upscaling/raw/f73a3a02874360ec6ced18f8bdd8e43b5d7bba57/2xLiveActionV1_SPAN/2xLiveActionV1_SPAN_490000.onnx",
-        "filename": "2xLiveActionV1_SPAN.onnx",
-        "scale": 2,
-        "arch": "span",
-    },
-    "2x-nomosuni-compact": {
-        "description": "Fast universal upscale - compression, noise, and blur handling",
-        "url": "https://huggingface.co/Phips/2xNomosUni_compact_otf_medium/resolve/3241c877a6e09036f9e466c840822bb066f11c44/2xNomosUni_compact_otf_medium.safetensors",
-        "filename": "2xNomosUni_compact_otf_medium.safetensors",
-        "scale": 2,
-        "arch": "compact",
-    },
-    # 4x models - 720p → 4K or 480p → 1080p
-    "4x-compact": {
-        "description": "Fast 4x upscale - SRVGGNetCompact",
-        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
-        "filename": "realesr-general-x4v3.pth",
-        "scale": 4,
-        "arch": "compact",
-    },
-    # 4x-realesrgan - not recommended (overly smooths faces)
-    "4x-realesrgan": {
-        "description": "RealESRGAN 4x - smooths faces (not recommended)",
-        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
-        "filename": "RealESRGAN_x4plus.pth",
-        "scale": 4,
-        "arch": "rrdbnet",
-    },
-    # NOTE: 4x-rrdbnet was removed because:
-    # - 1080p engine build fails with OOM even on 32GB VRAM (RTX 5090)
-    # - 720p engine causes "Invalid frame dimensions 0x0" errors during playback
-    # - Same weights as 4x-realesrgan but different name
-}
-
-
-def resolve_model(model_name: str) -> tuple[str, ModelInfo]:
-    """Resolve model name."""
-    info = MODELS.get(model_name)
-    if info is None:
-        raise ValueError(f"Unknown model: {model_name}")
-    return model_name, info
-
-
-def download_model(model_name: str, cache_dir: Path) -> Path:
-    """Download model weights (ONNX or PTH)."""
-    model_name, info = resolve_model(model_name)
-    # Use .name to prevent path traversal
-    path = cache_dir / Path(info["filename"]).name
+def download_model(cache_dir: Path) -> Path:
+    """Download the Nomos model weights."""
+    path = cache_dir / MODEL_FILENAME
     if path.exists():
         print(f"Using cached model: {path}")
         return path
 
-    url = info.get("onnx_url") or info.get("url")
-    if url is None:
-        raise ValueError(f"No URL for model: {model_name}")
-    if not url.startswith("https://"):
-        raise ValueError(f"URL must use HTTPS: {url}")
-    print(f"Downloading {info['filename']}...")
+    if not MODEL_URL.startswith("https://"):
+        raise ValueError(f"URL must use HTTPS: {MODEL_URL}")
+    print(f"Downloading {MODEL_FILENAME}...")
 
     # Download to a temp file first, then rename to avoid partial downloads
     temp_path = path.with_suffix(path.suffix + ".tmp")
     try:
         with (
-            urllib.request.urlopen(url, timeout=300) as response,
+            urllib.request.urlopen(MODEL_URL, timeout=300) as response,
             open(temp_path, "wb") as f,
         ):
             f.write(response.read())
@@ -287,98 +78,69 @@ def download_model(model_name: str, cache_dir: Path) -> Path:
         # Clean up partial download
         if temp_path.exists():
             temp_path.unlink()
-        raise RuntimeError(f"Failed to download model from {url}: {e}") from e
+        raise RuntimeError(f"Failed to download model from {MODEL_URL}: {e}") from e
 
     return path
 
 
 def list_models() -> None:
-    """Print available models."""
-    print("\nAvailable models:\n")
-    print("  2x models (1080p → 4K):")
-    for name, info in MODELS.items():
-        if name.startswith("2x-"):
-            rec = " (recommended)" if name == "2x-nomosuni-compact" else ""
-            print(f"    {name:24s} {info['description']}{rec}")
-    print("\n  4x models (720p → 4K):")
-    for name, info in MODELS.items():
-        if name.startswith("4x-"):
-            print(f"    {name:24s} {info['description']}")
-    print()
+    """Print the supported model."""
+    print(f"\nSupported model:\n\n  {MODEL_NAME:24s} {MODEL_DESCRIPTION}\n")
 
 
-def get_model_and_onnx(
-    model_name: str,
-    cache_dir: Path | None = None,
-) -> tuple[
-    nn.Module | None,
-    Path | None,
-    int,
-]:
-    """Load model and return (model_or_none, onnx_path_or_none, scale).
+def build_nomos_model(state_dict: dict[str, torch.Tensor]) -> nn.Module:
+    """Build the Nomos SRVGG network represented by the downloaded weights."""
+    import torch.nn as nn
+    import torch.nn.functional as F
 
-    For ONNX-based models, returns (None, onnx_path, scale).
-    For PTH-based models, returns (model, None, scale).
-    """
+    class NomosSRVGG(nn.Module):
+        def __init__(self, num_conv: int):
+            super().__init__()
+            self.body = nn.ModuleList(
+                [
+                    nn.Conv2d(3, 64, 3, 1, 1),
+                    nn.PReLU(num_parameters=64),
+                ]
+            )
+            for _ in range(num_conv - 2):
+                self.body.append(nn.Conv2d(64, 64, 3, 1, 1))
+                self.body.append(nn.PReLU(num_parameters=64))
+            self.body.append(
+                nn.Conv2d(64, 3 * MODEL_SCALE * MODEL_SCALE, 3, 1, 1)
+            )
+            self.upsampler = nn.PixelShuffle(MODEL_SCALE)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            out = x
+            for layer in self.body[:-1]:
+                out = layer(out)
+            out = self.upsampler(self.body[-1](out))
+            return out + F.interpolate(x, scale_factor=MODEL_SCALE, mode="nearest")
+
+    num_conv_layers = sum(
+        1 for key, value in state_dict.items() if "weight" in key and len(value.shape) == 4
+    )
+    return NomosSRVGG(num_conv_layers)
+
+
+def load_model(cache_dir: Path | None = None) -> nn.Module:
+    """Load the Nomos model."""
+    from safetensors.torch import load_file as load_safetensors
+
     if cache_dir is None:
         cache_dir = Path.home() / ".cache" / "ai_upscale"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    model_name, info = resolve_model(model_name)
-    scale = info["scale"]
-    arch = info["arch"]
-
-    model_path = download_model(model_name, cache_dir)
-
-    # ONNX-based models - no PyTorch loading needed
-    if "onnx_url" in info:
-        print(f"Using ONNX model directly: {model_path}")
-        print(f"  Architecture: {arch}, Scale: {scale}x")
-        return None, model_path, scale
-
-    # PyTorch-based models - load state dict
+    model_path = download_model(cache_dir)
     print(f"Loading PyTorch model from {model_path}")
-    if model_path.suffix == ".safetensors":
-        state_dict = load_safetensors(model_path, device="cpu")
-    else:
-        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-    if "params_ema" in state_dict:
-        state_dict = state_dict["params_ema"]
-    elif "params" in state_dict:
-        state_dict = state_dict["params"]
-
-    # Instantiate model based on explicit architecture
-    if arch == "rrdbnet":
-        model: nn.Module = RRDBNet(
-            num_in_ch=3,
-            num_out_ch=3,
-            num_feat=64,
-            num_block=23,
-            num_grow_ch=32,
-            scale=scale,
-        )
-        arch_name = "RRDBNet"
-    elif arch == "compact":
-        # Count conv layers to determine num_conv for SRVGGNetCompact
-        num_conv_layers = sum(
-            1 for k, v in state_dict.items() if "weight" in k and len(v.shape) == 4
-        )
-        model = SRVGGNetCompact(
-            num_in_ch=3,
-            num_out_ch=3,
-            num_feat=64,
-            num_conv=num_conv_layers,
-            upscale=scale,
-        )
-        arch_name = "SRVGGNetCompact"
-    else:
-        raise ValueError(f"Unknown architecture: {arch}")
+    state_dict = load_safetensors(model_path, device="cpu")
+    model = build_nomos_model(state_dict)
 
     model.load_state_dict(state_dict)
     model.eval()
     params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"  Loaded {arch_name} ({params:.2f}M params), Scale: {scale}x")
-    return model, None, scale
+    print(f"  Loaded SRVGGNetCompact ({params:.2f}M params), Scale: {MODEL_SCALE}x")
+    return model
 
 
 def export_onnx(
@@ -390,6 +152,11 @@ def export_onnx(
     precision: str = "fp32",
 ) -> None:
     """Export model to ONNX format."""
+    from onnxconverter_common import float16 as onnx_float16
+
+    import onnx
+    import torch
+
     opt_w, opt_h = opt_shape
     print(f"Exporting to ONNX: {onnx_path}")
     print(f"  Optimal shape: 1x3x{opt_h}x{opt_w}")
@@ -434,6 +201,8 @@ def export_onnx(
 
 def _get_trt_dtype_map() -> dict[str, trt.DataType]:
     """Get mapping from precision string to TensorRT DataType."""
+    import tensorrt as trt
+
     dtype_map: dict[str, trt.DataType] = {
         "fp32": trt.float32,
         "fp16": trt.float16,
@@ -462,6 +231,8 @@ def build_engine(
     opt_level: int = 3,
 ) -> None:
     """Build TensorRT engine from ONNX model with dynamic shapes."""
+    import tensorrt as trt
+
     min_w, min_h = min_shape
     opt_w, opt_h = opt_shape
     max_w, max_h = max_shape
@@ -582,34 +353,27 @@ def height_to_shape(h: int, aspect: float = 16 / 9) -> tuple[int, int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Export AI upscaling models to TensorRT engines",
+        description="Export NomosUni to a TensorRT engine",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--model",
-        "-m",
-        type=str,
-        default="4x-compact",
-        help="Model name (use --list to see available models)",
-    )
-    parser.add_argument("--list", "-l", action="store_true", help="List available models")
+    parser.add_argument("--list", "-l", action="store_true", help="Show the supported model")
     parser.add_argument(
         "--min-height",
         type=int,
         default=None,
-        help="Minimum input height (default: auto)",
+        help="Minimum input height (default: 720)",
     )
     parser.add_argument(
         "--opt-height",
         type=int,
         default=None,
-        help="Optimal input height (default: auto)",
+        help="Optimal input height (default: 1080)",
     )
     parser.add_argument(
         "--max-height",
         type=int,
         default=None,
-        help="Maximum input height (default: auto)",
+        help="Maximum input height (default: 1080)",
     )
     parser.add_argument(
         "--output",
@@ -650,29 +414,9 @@ def main() -> None:
         list_models()
         return
 
-    # Get model info for defaults
-    try:
-        model_name, info = resolve_model(args.model)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        list_models()
-        sys.exit(1)
-
-    scale = info["scale"]
-
-    # Set height defaults based on scale factor
-    if scale == 2:
-        # 2x: input 1080p -> output 4K
-        default_min, default_opt, default_max = 720, 1080, 1080
-    elif scale == 4:
-        # 4x: input 720p -> output 4K, or 480p -> 1080p
-        default_min, default_opt, default_max = 480, 720, 1080
-    else:
-        raise ValueError(f"Unsupported scale factor: {scale}")
-
-    min_h = args.min_height or default_min
-    opt_h = args.opt_height or default_opt
-    max_h = args.max_height or default_max
+    min_h = args.min_height or 720
+    opt_h = args.opt_height or 1080
+    max_h = args.max_height or 1080
 
     # Validate height constraints
     if min_h > max_h:
@@ -687,7 +431,7 @@ def main() -> None:
     max_shape = height_to_shape(max_h)
 
     if args.output is None:
-        args.output = f"{model_name}_{opt_h}p_{args.precision}.engine"
+        args.output = f"{MODEL_NAME}_{opt_h}p_{args.precision}.engine"
     output_path = Path(args.output)
     if output_path.exists() and output_path.is_dir():
         raise ValueError(
@@ -697,20 +441,15 @@ def main() -> None:
     print("=" * 60)
     print("AI Upscale: TensorRT Engine Export")
     print("=" * 60)
-    print(f"Model: {model_name}")
-    print(f"  {info['description']}")
+    print(f"Model: {MODEL_NAME}")
+    print(f"  {MODEL_DESCRIPTION}")
     print()
 
-    model, existing_onnx, _ = get_model_and_onnx(args.model)
+    model = load_model()
 
-    # Determine ONNX path
-    if existing_onnx:
-        # Model already has ONNX - use it directly
-        onnx_path = existing_onnx
-        cleanup_onnx = False
-    elif args.onnx_only:
+    if args.onnx_only:
         # Save ONNX to current directory with sensible name
-        onnx_path = Path(f"{model_name}_{opt_h}p.onnx")
+        onnx_path = Path(f"{MODEL_NAME}_{opt_h}p.onnx")
         cleanup_onnx = False
     else:
         # Temp file for intermediate ONNX
@@ -719,15 +458,13 @@ def main() -> None:
         cleanup_onnx = True
 
     try:
-        # Export to ONNX if needed (PTH-based models only)
-        if model is not None:
-            export_onnx(
-                model,
-                opt_shape,
-                onnx_path,
-                fixed_shape=min_shape == opt_shape == max_shape,
-                precision=args.precision,
-            )
+        export_onnx(
+            model,
+            opt_shape,
+            onnx_path,
+            fixed_shape=min_shape == opt_shape == max_shape,
+            precision=args.precision,
+        )
 
         if args.onnx_only:
             print(f"\nONNX saved to: {onnx_path}")
@@ -754,7 +491,7 @@ def main() -> None:
     print("Export complete!")
     print("=" * 60)
     print()
-    print(f"Model: {model_name} ({scale}x upscale)")
+    print(f"Model: {MODEL_NAME} ({MODEL_SCALE}x upscale)")
     print(f"Engine accepts input heights from {min_h} to {max_h} (16:9)")
     print()
     print("Usage with FFmpeg:")

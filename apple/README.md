@@ -32,6 +32,10 @@ guide timestamps are unavailable, it falls back to the retained-window timeline.
 The server retains everything watched in the current session, up to the configured
 two-hour limit, without replacing the live session.
 
+Submitting a search from the Apple TV keyboard returns directly to the guide. An
+active filter appears in the guide header with an X so it can be cleared without
+reopening search.
+
 The scheduled-program timeline and 15-second live seek controls are shared by
 Apple TV, Mac, iPhone, and iPad. Mac shows its control bar on hover and keeps it
 visible while paused; iPhone and iPad use touch controls below the same timeline.

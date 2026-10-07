@@ -279,8 +279,9 @@ def test_upscale_setting_controls_gateway_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    engine = tmp_path / "2x-liveaction-span_720p_fp16.engine"
+    engine = tmp_path / "2x-nomosuni-compact_720p_fp16.engine"
     engine.write_bytes(b"engine")
+    (tmp_path / "retired-model_720p_fp16.engine").write_bytes(b"engine")
     monkeypatch.setattr(gateway, "_UPSCALE_ENGINE_DIR", tmp_path)
     settings = {
         "sr_model": "",
@@ -291,10 +292,12 @@ def test_upscale_setting_controls_gateway_mode(
     monkeypatch.setattr(gateway.cache, "load_server_settings", lambda: settings)
 
     assert gateway._upscale_enabled() is False
+    assert gateway._available_upscale_models() == ["2x-nomosuni-compact"]
 
-    settings["sr_model"] = "2x-liveaction-span"
+    settings["sr_model"] = "retired-model"
 
     assert gateway._upscale_enabled() is True
+    assert gateway._upscale_settings()["sr_model"] == "2x-nomosuni-compact"
     assert gateway._upscale_settings()["max_resolution"] == "4k"
 
 

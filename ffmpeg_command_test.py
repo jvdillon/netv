@@ -14,7 +14,9 @@ from ffmpeg_command import (
     MediaInfo,
     SubtitleStream,
     _build_audio_args,
+    _build_sr_filter,
     _build_video_args,
+    _find_sr_engine,
     _get_gpu_nvdec_codecs,
     build_hls_ffmpeg_cmd,
     can_remux_live,
@@ -161,15 +163,17 @@ class TestBuildVideoArgs:
         assert "yadif_cuda=0" in vf
         assert "scale_cuda" in vf
 
-    def test_nvenc_sr_uses_experiment_winner(self, tmp_path):
-        engine = tmp_path / "2x-liveaction-span_720p_fp16.engine"
+    def test_nvenc_sr_uses_nomos(self, tmp_path):
+        engine = tmp_path / "2x-nomosuni-compact_720p_fp16.engine"
         engine.write_bytes(b"engine")
+        retired_engine = tmp_path / "retired-model_720p_fp16.engine"
+        retired_engine.write_bytes(b"engine")
 
         with (
             patch("ffmpeg_command._sr_engine_dir", str(tmp_path)),
             patch(
                 "ffmpeg_command._load_settings",
-                return_value={"sr_model": "2x-liveaction-span"},
+                return_value={"sr_model": "retired-model"},
             ),
         ):
             pre, post = _build_video_args(
@@ -186,7 +190,47 @@ class TestBuildVideoArgs:
         assert post[post.index("-preset") + 1] == "p5"
         assert post[post.index("-bf") + 1] == "0"
         assert "-rc-lookahead" not in post
-        assert "dnn_processing=" in post[post.index("-vf") + 1]
+        video_filter = post[post.index("-vf") + 1]
+        assert f"dnn_processing=dnn_backend=tensorrt:model={engine}" in video_filter
+        assert str(retired_engine) not in video_filter
+
+    @pytest.mark.parametrize(
+        ("source_height", "expected_height"),
+        [(480, 480), (576, 720), (720, 720), (1080, 1080)],
+    )
+    def test_sr_selects_fixed_nomos_engine(
+        self,
+        tmp_path: Path,
+        source_height: int,
+        expected_height: int,
+    ):
+        for height in (480, 720, 1080):
+            (tmp_path / f"2x-nomosuni-compact_{height}p_fp16.engine").write_bytes(b"engine")
+        (tmp_path / "retired-model_576p_fp16.engine").write_bytes(b"engine")
+
+        with patch("ffmpeg_command._sr_engine_dir", str(tmp_path)):
+            result = _find_sr_engine(source_height)
+
+        assert result is not None
+        engine_path, engine_height, _, scale = result
+        assert engine_path.endswith(f"2x-nomosuni-compact_{expected_height}p_fp16.engine")
+        assert engine_height == expected_height
+        assert scale == 2
+
+    def test_sr_maps_enabled_retired_setting_to_nomos(self, tmp_path: Path):
+        engine = tmp_path / "2x-nomosuni-compact_1080p_fp16.engine"
+        engine.write_bytes(b"engine")
+
+        with (
+            patch("ffmpeg_command._sr_engine_dir", str(tmp_path)),
+            patch(
+                "ffmpeg_command._load_settings",
+                return_value={"sr_model": "retired-model"},
+            ),
+        ):
+            video_filter = _build_sr_filter(1080, 2160)
+
+        assert f"model={engine}" in video_filter
 
     def test_vaapi_filters(self):
         """Test VAAPI uses VAAPI filters."""
@@ -246,7 +290,7 @@ class TestBuildVideoArgs:
         assert expected_qp in post
 
     def test_sr_live_hls_uses_two_second_segments(self, tmp_path):
-        engine = tmp_path / "2x-liveaction-span_720p_fp16.engine"
+        engine = tmp_path / "2x-nomosuni-compact_720p_fp16.engine"
         engine.write_bytes(b"engine")
         media_info = MediaInfo(
             video_codec="h264",
@@ -263,7 +307,7 @@ class TestBuildVideoArgs:
             patch(
                 "ffmpeg_command._load_settings",
                 return_value={
-                    "sr_model": "2x-liveaction-span",
+                    "sr_model": "2x-nomosuni-compact",
                     "live_dvr_mins": 0,
                 },
             ),

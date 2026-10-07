@@ -1136,6 +1136,16 @@ class TestSearch:
 class TestSettings:
     """Tests for settings page."""
 
+    def test_only_nomos_engine_is_discovered(self, auth_client, tmp_path: Path):
+        import main
+
+        (tmp_path / "retired-model_720p_fp16.engine").write_bytes(b"engine")
+        with patch("main.SR_ENGINE_DIR", tmp_path):
+            assert main.get_sr_models() == []
+
+            (tmp_path / "2x-nomosuni-compact_720p_fp16.engine").write_bytes(b"engine")
+            assert main.get_sr_models() == ["2x-nomosuni-compact"]
+
     def test_settings_page_renders(self, auth_client):
         cache_module.get_cache()["live_categories"] = []
 
@@ -1143,6 +1153,27 @@ class TestSettings:
             resp = auth_client.get("/settings")
             assert resp.status_code == 200
             assert 'id="sort-live-by-views" checked' in resp.text
+
+    def test_settings_page_maps_enabled_retired_model_to_nomos(self, auth_client):
+        cache_module.get_cache()["live_categories"] = []
+
+        with (
+            patch("main.load_file_cache", return_value=None),
+            patch(
+                "main.load_server_settings",
+                return_value={"sr_model": "retired-model"},
+            ),
+            patch(
+                "main.get_sr_models",
+                return_value=["2x-nomosuni-compact"],
+            ),
+        ):
+            resp = auth_client.get("/settings")
+
+        assert resp.status_code == 200
+        assert resp.text.count('name="sr_model"') == 2
+        assert 'value="2x-nomosuni-compact" checked' in resp.text
+        assert "NomosUni 2x (480p/720p/1080p)" in resp.text
 
     def test_settings_guide_filter(self, auth_client):
         resp = auth_client.post(

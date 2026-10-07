@@ -105,6 +105,8 @@ private struct GuideMainView: View {
                 Text("Search Live TV")
                     .font(.title.bold())
                 TextField("Channels and programs", text: $model.query)
+                    .submitLabel(.search)
+                    .onSubmit { isSearchPresented = false }
                 Button("Done") { isSearchPresented = false }
                     .buttonStyle(.borderedProminent)
             }

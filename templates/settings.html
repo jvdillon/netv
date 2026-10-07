@@ -585,23 +585,11 @@
                    class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
             <span>None</span>
           </label>
-          <label class="flex items-center gap-2 text-sm {% if '4x-compact' not in sr_models %}opacity-40{% endif %}">
-            <input type="radio" name="sr_model" value="4x-compact" {% if sr_model == '4x-compact' %}checked{% endif %}
-                   {% if '4x-compact' not in sr_models %}disabled{% endif %}
+          <label class="flex items-center gap-2 text-sm {% if sr_model_name not in sr_models %}opacity-40{% endif %}">
+            <input type="radio" name="sr_model" value="{{ sr_model_name }}" {% if sr_model == sr_model_name %}checked{% endif %}
+                   {% if sr_model_name not in sr_models %}disabled{% endif %}
                    class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
-            <span>4x-compact (480p/720p)</span>
-          </label>
-          <label class="flex items-center gap-2 text-sm {% if '2x-nomosuni-compact' not in sr_models %}opacity-40{% endif %}">
-            <input type="radio" name="sr_model" value="2x-nomosuni-compact" {% if sr_model == '2x-nomosuni-compact' %}checked{% endif %}
-                   {% if '2x-nomosuni-compact' not in sr_models %}disabled{% endif %}
-                   class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
-            <span>2x-nomosuni-compact (recommended for 1080p)</span>
-          </label>
-          <label class="flex items-center gap-2 text-sm {% if '2x-liveaction-span' not in sr_models %}opacity-40{% endif %}">
-            <input type="radio" name="sr_model" value="2x-liveaction-span" {% if sr_model == '2x-liveaction-span' %}checked{% endif %}
-                   {% if '2x-liveaction-span' not in sr_models %}disabled{% endif %}
-                   class="setting-input w-4 h-4 bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
-            <span>2x-liveaction-span (legacy)</span>
+            <span>NomosUni 2x (480p/720p/1080p)</span>
           </label>
         </div>
         <p class="text-xs text-gray-400 mt-1">{% if sr_available %}AI upscaling via TensorRT (requires NVIDIA GPU). Upscales to max resolution then scales down.{% else %}Not available - run <code class="bg-gray-700 px-1 rounded">tools/install-ai_upscale.sh</code> to install{% endif %}</p>

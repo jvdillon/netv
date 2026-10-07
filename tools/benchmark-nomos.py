@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the fixed 1080p SPAN and NomosUni TensorRT engines."""
+"""Benchmark the fixed 1080p NomosUni TensorRT engine."""
 
 from __future__ import annotations
 
@@ -188,11 +188,8 @@ def main() -> None:
     ffmpeg = find_binary("ffmpeg")
     ffprobe = find_binary("ffprobe")
     source_seconds, source_fps = probe_sample(ffprobe, args.sample)
-    engines = [
-        args.model_dir / "2x-liveaction-span_1080p_fp16.engine",
-        args.model_dir / "2x-nomosuni-compact_1080p_fp16.engine",
-    ]
-    for path in [args.sample, *engines]:
+    engine = args.model_dir / "2x-nomosuni-compact_1080p_fp16.engine"
+    for path in [args.sample, engine]:
         if not path.exists():
             raise FileNotFoundError(path)
 
@@ -203,32 +200,22 @@ def main() -> None:
     print(f"Target: >= {args.target_fps:.3f} FPS end-to-end")
     print()
 
-    results: list[Result] = []
-    for engine in engines:
-        print(f"Warming {engine.stem} for {args.warmup_seconds:.1f}s...")
-        run_once(
-            ffmpeg,
-            args.sample,
-            engine,
-            source_seconds,
-            source_fps,
-            duration=args.warmup_seconds,
-        )
-        print(f"Measuring {engine.stem}...")
-        result = run_once(ffmpeg, args.sample, engine, source_seconds, source_fps)
-        results.append(result)
-        status = "PASS" if result.throughput_fps >= args.target_fps else "FAIL"
-        print(
-            f"  {result.throughput_fps:.2f} FPS ({result.speed:.3f}x), "
-            f"startup {result.startup_seconds:.3f}s: {status}"
-        )
-        print()
-
-    winner = max(results, key=lambda result: result.throughput_fps)
-    baseline = results[0]
-    gain = winner.throughput_fps / baseline.throughput_fps
-    print(f"Winner: {winner.model}")
-    print(f"Throughput gain over SPAN: {gain:.3f}x")
+    print(f"Warming {engine.stem} for {args.warmup_seconds:.1f}s...")
+    run_once(
+        ffmpeg,
+        args.sample,
+        engine,
+        source_seconds,
+        source_fps,
+        duration=args.warmup_seconds,
+    )
+    print(f"Measuring {engine.stem}...")
+    result = run_once(ffmpeg, args.sample, engine, source_seconds, source_fps)
+    status = "PASS" if result.throughput_fps >= args.target_fps else "FAIL"
+    print(
+        f"  {result.throughput_fps:.2f} FPS ({result.speed:.3f}x), "
+        f"startup {result.startup_seconds:.3f}s: {status}"
+    )
 
 
 if __name__ == "__main__":

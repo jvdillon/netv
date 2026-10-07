@@ -10,7 +10,6 @@ from typing import Any, Literal
 import json
 import logging
 import pathlib
-import re
 import subprocess
 import tempfile
 import threading
@@ -39,6 +38,7 @@ def _parse_hw(hw: HwAccel) -> tuple[str, str]:
 _HLS_SEGMENT_DURATION_SEC = 3.0  # Short segments for faster startup/seeking
 _SR_HLS_SEGMENT_DURATION_SEC = 2.0
 _SR_FILTER_THREADS = 4
+SR_MODEL_NAME = "2x-nomosuni-compact"
 _PROBE_CACHE_TTL_SEC = 3_600
 _SERIES_PROBE_CACHE_TTL_SEC = 7 * 24 * 3_600  # 7 days
 _PROBE_TIMEOUT_SEC = 30
@@ -160,8 +160,8 @@ def get_settings() -> dict[str, Any]:
     return _load_settings()
 
 
-def _find_sr_engine(model_name: str, source_height: int) -> tuple[str, int, int, int] | None:
-    """Find the best matching SR engine file for the given model and resolution.
+def _find_sr_engine(source_height: int) -> tuple[str, int, int, int] | None:
+    """Find the best matching Nomos engine file for the given resolution.
 
     Returns (engine_path, input_height, input_width, scale_factor) or None if not found.
     """
@@ -171,12 +171,11 @@ def _find_sr_engine(model_name: str, source_height: int) -> tuple[str, int, int,
     if not engine_dir.exists():
         return None
 
-    # Find all engines for this model
-    # Engine naming: {model}_{height}p_fp16.engine
+    # Engine naming: 2x-nomosuni-compact_{height}p_fp16.engine
     engines: list[tuple[int, pathlib.Path]] = []
-    for engine in engine_dir.glob(f"{model_name}_*p_fp16.engine"):
+    for engine in engine_dir.glob(f"{SR_MODEL_NAME}_*p_fp16.engine"):
         # Extract height from filename
-        name = engine.stem  # e.g., "2x-liveaction-span_1080p_fp16"
+        name = engine.stem
         parts = name.rsplit("_", 2)
         if len(parts) >= 3:
             height_str = parts[1].rstrip("p")
@@ -184,19 +183,6 @@ def _find_sr_engine(model_name: str, source_height: int) -> tuple[str, int, int,
                 engines.append((int(height_str), engine))
 
     if not engines:
-        return None
-
-    # Determine scale factor from model name prefix (e.g., "2x-", "4x-")
-    scale_match = re.match(r"^(\d+)x-", model_name)
-    if scale_match:
-        scale = int(scale_match.group(1))
-    elif model_name == "realesrgan":
-        # Legacy model name - was 4x
-        scale = 4
-    else:
-        log.error(
-            "SR: cannot determine scale from model name: %s (expected Nx- prefix)", model_name
-        )
         return None
 
     # Sort by height ascending
@@ -218,7 +204,7 @@ def _find_sr_engine(model_name: str, source_height: int) -> tuple[str, int, int,
     # Calculate width assuming 16:9 aspect ratio, rounded to multiple of 8
     engine_width = ((engine_height * 16 // 9) + 7) // 8 * 8
 
-    return str(engine_path), engine_height, engine_width, scale
+    return str(engine_path), engine_height, engine_width, 2
 
 
 def _build_sr_filter(source_height: int, target_height: int) -> str:
@@ -230,14 +216,11 @@ def _build_sr_filter(source_height: int, target_height: int) -> str:
     if not _sr_engine_dir:
         return ""
 
-    # Get selected model from settings
-    settings = _load_settings()
-    model_name = settings.get("sr_model", "")
-    if not model_name:
+    if not _load_settings().get("sr_model"):
         return ""  # SR disabled (Off selected)
 
-    # Find engine for this model and resolution
-    engine_info = _find_sr_engine(model_name, source_height)
+    model_name = SR_MODEL_NAME
+    engine_info = _find_sr_engine(source_height)
     if not engine_info:
         log.warning("SR: no engine found for model=%s, source=%dp", model_name, source_height)
         return ""

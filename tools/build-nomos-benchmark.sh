@@ -9,7 +9,6 @@ ENGINE="$MODEL_DIR/2x-nomosuni-compact_1080p_fp16.engine"
 mkdir -p "$MODEL_DIR"
 
 exec "$PYTHON" "$ROOT/tools/export-tensorrt.py" \
-    --model 2x-nomosuni-compact \
     --min-height 1080 \
     --opt-height 1080 \
     --max-height 1080 \

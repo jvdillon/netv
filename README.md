@@ -257,7 +257,7 @@ users who find them overkill and just want a simple IPTV player.
 | **NVENC** | ✅ | ❌ | ✅ | ✅ | ⚠️ Pass |
 | **VAAPI** | ✅ | ❌ | ✅ | ✅ | ⚠️ Pass |
 | **QSV** | ✅ | ❌ | ✅ | ✅ | ⚠️ Pass |
-| **AI Upscale (4x)** | ✅ TensorRT | ❌ | ⚠️ Plugin | ❌ | ❌ |
+| **AI Upscale (Nomos 2x)** | ✅ TensorRT | ❌ | ⚠️ Plugin | ❌ | ❌ |
 | **Software fallback** | ✅ | ❌ Browser | ✅ | ✅ | ✅ |
 | **Legacy GPU** | ✅ Any | ❌ No (browser) | ✅ Any | ✅ Any | ⚠️ Driver 450+ |
 | **ffprobe caching** | ✅ Dynamic | ❌ None | ⚠️ Offline | ⚠️ Offline | ⚠️ Offline |
@@ -396,7 +396,7 @@ Password: <your neTV password>
 
 Changes made under **Settings → Transcoding → AI Upscale** apply to new native
 player streams without changing the gateway address. Check the active setting
-and installed models at `http://<netv-host>:8100/capabilities`.
+and installed Nomos engine at `http://<netv-host>:8100/capabilities`.
 The first container start builds GPU-specific TensorRT engines and can take a
 few minutes.
 
@@ -477,13 +477,13 @@ docker build -f Dockerfile.ai_upscale -t netv-ai-upscale .
 docker run --gpus all -v netv-models:/models -v ./cache:/app/cache -p 8000:8000 netv-ai-upscale
 ```
 
-First start builds TensorRT engines for your GPU (~2-3 min). Engines are cached in the
+First start builds Nomos TensorRT engines for your GPU (~2-3 min). Engines are cached in the
 `netv-models` volume for instant subsequent starts.
 
 <details>
 <summary>AI model attribution</summary>
 
-The recommended 1080p upscaler is based on
+The upscaler is based on
 [`Phips/2xNomosUni_compact_otf_medium`](https://huggingface.co/Phips/2xNomosUni_compact_otf_medium)
 by Philip Hofmann and is used under the CC BY 4.0 license.
 
@@ -605,11 +605,10 @@ uv sync --group ai_upscale
 sudo ./tools/install-netv.sh # default port=8000 or --port 9000
 ```
 
-The default installer builds the recommended engines for both SD/720p and
-1080p sources.
+The default installer builds Nomos engines for SD, 720p, and 1080p input.
 
 After the engine is built, open **Settings → Transcoding**, select
-the recommended 1080p option under **AI Upscale**, choose a 4K maximum
+**NomosUni 2x** under **AI Upscale**, choose a 4K maximum
 resolution, and set transcoding to **Always**. New web and port `8100` streams
 use the setting without restarting the services.
 

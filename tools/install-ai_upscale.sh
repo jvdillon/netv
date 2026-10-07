@@ -4,7 +4,7 @@
 # Prerequisites: uv sync --group ai_upscale
 #   Or: pip install torch onnx onnxconverter-common tensorrt safetensors
 #
-# Models sourced from https://openmodeldb.info/
+# Model sourced from https://openmodeldb.info/
 #
 set -e
 
@@ -15,16 +15,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || {
 }
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 MODEL_DIR="${MODEL_DIR:-$HOME/ffmpeg_build/models}"
-MODEL="${MODEL:-recommended}"
-PRECISION="${PRECISION:-fp16}"
-
-# Recursion guard to prevent fork bombs when calling ourselves
-MAX_RECURSION_DEPTH=10
-RECURSION_DEPTH=${RECURSION_DEPTH:-0}
-if [ "$RECURSION_DEPTH" -ge "$MAX_RECURSION_DEPTH" ]; then
-    echo "ERROR: Maximum recursion depth ($MAX_RECURSION_DEPTH) exceeded" >&2
-    exit 1
-fi
+MODEL="2x-nomosuni-compact"
+PRECISION="fp16"
 
 # Use uv run if in a uv project, otherwise plain python3
 # Note: PYTHON_CMD is an array to handle paths with spaces correctly
@@ -48,60 +40,19 @@ fi
 
 # Show help
 if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
-    echo "Usage: $0 [MODEL]"
+    echo "Usage: $0"
     echo ""
-    echo "Build TensorRT engines for AI Upscale."
-    echo ""
-    echo "Arguments:"
-    echo "  MODEL    Model to build (default: $MODEL)"
-    echo "           'recommended' - 4x-compact, 2x-nomosuni-compact"
-    echo "           'all'         - all models including 4x-realesrgan"
+    echo "Build 2x NomosUni TensorRT engines for AI Upscale."
     echo ""
     echo "Environment:"
     echo "  MODEL_DIR   Output directory (default: \$HOME/ffmpeg_build/models)"
-    echo "  MODEL       Model name (can also be passed as argument)"
-    echo "  PRECISION   Model precision: fp16, bf16, fp32 (default: fp16)"
-    echo ""
-    echo "Available models:"
     run_python "$EXPORT_SCRIPT" --list
     exit 0
 fi
 
-# Allow model to be passed as argument
 if [ -n "$1" ]; then
-    MODEL="$1"
-fi
-
-# Handle "recommended" option - build recommended models
-if [ "$MODEL" = "recommended" ]; then
-    echo "========================================"
-    echo "AI Upscale: Building recommended models"
-    echo "========================================"
-    echo ""
-    for m in 4x-compact 2x-nomosuni-compact; do
-        echo ">>> Building $m..."
-        # Increment recursion depth when calling ourselves
-        RECURSION_DEPTH=$((RECURSION_DEPTH + 1)) MODEL="$m" "$0"
-        echo ""
-    done
-    echo "Done! Recommended models built."
-    exit 0
-fi
-
-# Handle "all" option - build all available models
-if [ "$MODEL" = "all" ]; then
-    echo "========================================"
-    echo "AI Upscale: Building ALL models"
-    echo "========================================"
-    echo ""
-    for m in 4x-compact 2x-liveaction-span 2x-nomosuni-compact 4x-realesrgan; do
-        echo ">>> Building $m..."
-        # Increment recursion depth when calling ourselves
-        RECURSION_DEPTH=$((RECURSION_DEPTH + 1)) MODEL="$m" "$0"
-        echo ""
-    done
-    echo "Done! All models built."
-    exit 0
+    echo "ERROR: NomosUni is the only supported model; no model argument is accepted." >&2
+    exit 2
 fi
 
 echo "========================================"
@@ -140,10 +91,11 @@ fi
 # Input resolutions to build engines for (output can be downscaled as needed)
 RESOLUTIONS="480 720 1080"
 
-# Sanitize model name for safe filename (remove any path separators)
-# Done once before the loop since MODEL doesn't change during iteration
-SAFE_MODEL="${MODEL//\//_}"
-SAFE_MODEL="${SAFE_MODEL//\\/_}"
+SAFE_MODEL="$MODEL"
+
+# Remove engines from model families that are no longer supported.
+find "$MODEL_DIR" -maxdepth 1 -type f -name '*_*p_*.engine' \
+    ! -name "${SAFE_MODEL}_*p_*.engine" -delete
 
 # Build engines for common resolutions (FFmpeg TensorRT backend needs fixed shapes)
 echo "Building TensorRT engines for resolutions: $RESOLUTIONS"
@@ -160,7 +112,6 @@ for res in $RESOLUTIONS; do
         echo "  ${res}p: building..."
         # Capture output to show errors if build fails
         if ! OUTPUT=$(run_python "$EXPORT_SCRIPT" \
-            --model "$MODEL" \
             --precision "$PRECISION" \
             --min-height "$res" --opt-height "$res" --max-height "$res" \
             -o "$engine" 2>&1); then
@@ -193,11 +144,6 @@ find "$MODEL_DIR" -maxdepth 1 -name "${SAFE_MODEL}_*.engine" -type f -exec ls -l
         file=$(echo "$line" | awk '{print $NF}')
         echo "  $(basename "$file") ($size)"
     done
-echo ""
-echo "To use a different model, run:"
-echo "  MODEL=2x-liveaction-span $0"
-echo "  MODEL=2x-nomosuni-compact $0"
-echo "  MODEL=4x-compact $0"
 echo ""
 echo "Test with:"
 echo "  ffmpeg -init_hw_device cuda=cu -filter_hw_device cu \\"

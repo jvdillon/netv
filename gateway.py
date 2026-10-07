@@ -61,25 +61,22 @@ _MAX_FAILURE_CLIENTS = 1024
 def _available_upscale_models() -> list[str]:
     if not _UPSCALE_ENGINE_DIR.exists():
         return []
-    models = {
-        engine.stem.rsplit("_", 2)[0]
-        for engine in _UPSCALE_ENGINE_DIR.glob("*_*p_fp16.engine")
-        if len(engine.stem.rsplit("_", 2)) == 3
-    }
-    return sorted(
-        models,
-        key=lambda model: (
-            model != "2x-nomosuni-compact",
-            model != "4x-compact",
-            model,
-        ),
+    pattern = f"{ffmpeg_command.SR_MODEL_NAME}_*p_fp16.engine"
+    return (
+        [ffmpeg_command.SR_MODEL_NAME]
+        if next(_UPSCALE_ENGINE_DIR.glob(pattern), None)
+        else []
     )
 
 
 def _upscale_settings() -> dict[str, Any]:
     settings = cache.load_server_settings()
     available_models = _available_upscale_models()
-    configured_model = str(settings.get("sr_model") or "").strip()
+    configured_model = (
+        ffmpeg_command.SR_MODEL_NAME
+        if str(settings.get("sr_model") or "").strip()
+        else ""
+    )
     if configured_model and configured_model not in available_models:
         raise RuntimeError(
             f"Configured AI Upscale model {configured_model!r} is not installed; "

@@ -57,30 +57,38 @@ if [ -e /dev/dri/renderD128 ]; then
     fi
 fi
 
-# Build TensorRT engines if missing (first run only)
-# Builds both recommended models: 4x-compact and 2x-nomosuni-compact
-if ! ls /models/4x-compact_*p_fp16.engine >/dev/null 2>&1 ||
-   ! ls /models/2x-nomosuni-compact_*p_fp16.engine >/dev/null 2>&1; then
+# Keep the model volume Nomos-only.
+find /models -maxdepth 1 -type f -name '*_*p_*.engine' \
+    ! -name '2x-nomosuni-compact_*p_*.engine' -delete
+
+# Build fixed-shape Nomos engines if any supported input size is missing.
+NEEDS_MODEL_BUILD=false
+for HEIGHT in 480 720 1080; do
+    if [ ! -f "/models/2x-nomosuni-compact_${HEIGHT}p_fp16.engine" ]; then
+        NEEDS_MODEL_BUILD=true
+    fi
+done
+if [ "$NEEDS_MODEL_BUILD" = "true" ]; then
     echo "========================================"
     echo "AI Upscale: First start detected"
     echo "========================================"
     echo "Building TensorRT engines for your GPU..."
-    echo "Models: 4x-compact (720p), 2x-nomosuni-compact (1080p)"
+    echo "Model: 2x-nomosuni-compact (480p/720p/1080p)"
     echo "This only happens once (cached in /models volume)."
     echo ""
     # Run as netv user so files have correct ownership
-    if ! gosu netv env MODEL_DIR=/models MODEL="recommended" /app/tools/install-ai_upscale.sh; then
+    if ! gosu netv env MODEL_DIR=/models /app/tools/install-ai_upscale.sh; then
         echo "ERROR: Failed to build TensorRT engines"
         echo "Check GPU compatibility and CUDA installation"
         exit 1
     fi
 
-    # Verify engines were created
-    if ! ls /models/4x-compact_*p_fp16.engine >/dev/null 2>&1; then
-        echo "ERROR: TensorRT engines not found after build"
-        echo "Build may have succeeded but produced no output"
-        exit 1
-    fi
+    for HEIGHT in 480 720 1080; do
+        if [ ! -f "/models/2x-nomosuni-compact_${HEIGHT}p_fp16.engine" ]; then
+            echo "ERROR: Nomos ${HEIGHT}p TensorRT engine not found after build"
+            exit 1
+        fi
+    done
 fi
 
 # Drop to netv user and run the selected app

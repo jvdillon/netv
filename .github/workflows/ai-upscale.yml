@@ -8,6 +8,11 @@ on:
     paths:
       - "Dockerfile.ai_upscale"
       - "entrypoint-ai_upscale.sh"
+      - "*.py"
+      - "pyproject.toml"
+      - "templates/**"
+      - "static/**"
+      - "tools/**"
       - ".github/workflows/ai-upscale.yml"
 
 env:
@@ -137,6 +142,12 @@ jobs:
             echo 'OK: install-ai_upscale.sh exists'
             test -f /app/tools/export-tensorrt.py || { echo 'ERROR: export-tensorrt.py not found'; exit 1; }
             echo 'OK: export-tensorrt.py exists'
+            python3 /app/tools/export-tensorrt.py --list | grep -q '2x-nomosuni-compact' || { echo 'ERROR: Nomos model unavailable'; exit 1; }
+            if python3 /app/tools/export-tensorrt.py --help | grep -q -- '--model'; then
+              echo 'ERROR: Legacy model selection is still available'
+              exit 1
+            fi
+            echo 'OK: Nomos is the sole supported model'
 
             echo ''
             echo '=== All verifications passed ==='
