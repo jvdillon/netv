@@ -245,14 +245,6 @@ struct Program: Decodable, Hashable {
     }()
 }
 
-struct UserPreferences: Decodable {
-    let guideFilter: [String]?
-
-    enum CodingKeys: String, CodingKey {
-        case guideFilter = "guide_filter"
-    }
-}
-
 struct FlexibleID: Decodable, Hashable {
     let value: String
 

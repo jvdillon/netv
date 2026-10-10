@@ -3,6 +3,7 @@ import Foundation
 
 private final class ArchiveTransport: URLProtocol {
     static var requests: [URLRequest] = []
+    static var redirectToLogin = false
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
@@ -17,7 +18,7 @@ private final class ArchiveTransport: URLProtocol {
                 catchupStart: 1700000580.0, catchupSeek: 45.0, liveDvrMins: 999
                 """
         } else if url.path == "/api/user-prefs" {
-            body = #"{"guide_filter":["group","pl:test"]}"#
+            body = #"{"guide_filter":[1,{"invalid":true}]}"#
         } else if url.path == "/api/guide/rows" {
             let query = URLComponents(url: url, resolvingAgainstBaseURL: false)!.queryItems!
             let start = query.first { $0.name == "start" }!.value!
@@ -52,8 +53,11 @@ private final class ArchiveTransport: URLProtocol {
         } else {
             body = #"{"status":"stopped"}"#
         }
+        let responseURL = Self.redirectToLogin
+            ? URL(string: "http://netv.test/login")!
+            : url
         client?.urlProtocol(self, didReceive: HTTPURLResponse(
-            url: url, statusCode: 200, httpVersion: nil, headerFields: nil
+            url: responseURL, statusCode: 200, httpVersion: nil, headerFields: nil
         )!, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(body.utf8))
         client?.urlProtocolDidFinishLoading(self)
@@ -72,6 +76,19 @@ struct ArchiveAPIChecks {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ArchiveTransport.self]
         let client = APIClient(session: URLSession(configuration: configuration))
+        ArchiveTransport.redirectToLogin = true
+        let savedSessionIsValid = try await client.validateSession(server: "http://netv.test")
+        precondition(
+            !savedSessionIsValid,
+            "A login redirect must be treated as an expired saved session"
+        )
+        do {
+            _ = try await client.guide(server: "http://netv.test")
+            preconditionFailure("A login redirect must not be decoded as guide JSON")
+        } catch APIError.authenticationFailed {
+        }
+        ArchiveTransport.redirectToLogin = false
+        ArchiveTransport.requests = []
         let playback = try await client.playbackConfiguration(
             server: "http://netv.test", channelID: "1", bandwidthSaver: true,
             catchupStart: 1_700_000_625
@@ -120,10 +137,14 @@ struct ArchiveAPIChecks {
             precondition(guide.rows.count == 2)
             let pages = ArchiveTransport.requests.filter { $0.url?.path == "/api/guide/rows" }
             precondition(pages.count == 2)
+            precondition(
+                !ArchiveTransport.requests.contains { $0.url?.path == "/api/user-prefs" },
+                "Guide loading must rely on the server-side saved filter"
+            )
             for page in pages {
                 let query = URLComponents(url: page.url!, resolvingAgainstBaseURL: false)!.queryItems!
                 precondition(query.contains(URLQueryItem(name: "offset", value: String(offset))))
-                precondition(query.contains(URLQueryItem(name: "cats", value: "group,pl:test")))
+                precondition(query.contains(URLQueryItem(name: "cats", value: "")))
             }
         }
         print("Archive API checks passed: exact position, VOD mode, heartbeat and forced release")

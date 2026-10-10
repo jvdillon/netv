@@ -90,21 +90,19 @@ final class APIClient {
         guard let http = response as? HTTPURLResponse else {
             throw APIError.invalidResponse
         }
-        return http.statusCode == 200
+        return http.statusCode == 200 && http.url?.path == url.path
     }
 
     func guide(server: String, offset: Int = 0) async throws -> GuideResponse {
         guard let baseURL = normalizedServerURL(server) else {
             throw APIError.invalidServer
         }
-        let preferences: UserPreferences = try await get("api/user-prefs", baseURL: baseURL)
-        let categories = preferences.guideFilter?.joined(separator: ",") ?? ""
         var components = URLComponents(url: baseURL.appendingPathComponent("api/guide/rows"), resolvingAgainstBaseURL: false)
         components?.queryItems = [
             URLQueryItem(name: "start", value: "0"),
             URLQueryItem(name: "count", value: "500"),
             URLQueryItem(name: "offset", value: String(offset)),
-            URLQueryItem(name: "cats", value: categories)
+            URLQueryItem(name: "cats", value: "")
         ]
         guard let url = components?.url else { throw APIError.invalidServer }
         var guide: GuideResponse = try await get(url: url)
@@ -114,7 +112,7 @@ final class APIClient {
                 URLQueryItem(name: "start", value: String(guide.rows.count)),
                 URLQueryItem(name: "count", value: "500"),
                 URLQueryItem(name: "offset", value: String(offset)),
-                URLQueryItem(name: "cats", value: categories)
+                URLQueryItem(name: "cats", value: "")
             ]
             guard let pageURL = components?.url else { throw APIError.invalidServer }
             let page: GuideResponse = try await get(url: pageURL)
@@ -146,6 +144,9 @@ final class APIClient {
         let (data, response) = try await data(for: request, operation: "playback configuration")
         guard let http = response as? HTTPURLResponse else {
             throw APIError.invalidResponse
+        }
+        if http.url?.lastPathComponent == "login" {
+            throw APIError.authenticationFailed
         }
         guard http.statusCode == 200 else {
             if http.statusCode == 401 { throw APIError.authenticationFailed }
@@ -255,6 +256,9 @@ final class APIClient {
         let (data, response) = try await data(for: request, operation: "GET")
         guard let http = response as? HTTPURLResponse else {
             throw APIError.invalidResponse
+        }
+        if http.url?.lastPathComponent == "login" {
+            throw APIError.authenticationFailed
         }
         guard http.statusCode == 200 else {
             if http.statusCode == 401 { throw APIError.authenticationFailed }
