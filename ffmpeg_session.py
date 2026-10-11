@@ -1046,11 +1046,15 @@ async def _do_start_transcode(
     bandwidth_saver: bool = False,
     audio_passthrough: bool = False,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
+    resolved_url: str | None = None,
 ) -> dict[str, Any]:
-    """Core transcode logic. Raises HTTPException on failure."""
+    """Core transcode logic. Raises HTTPException on failure.
+
+    resolved_url: the variant ``url`` already resolved to, saving a second fetch.
+    """
     is_archive = _is_archive_url(url)
     # Resolve HLS master playlist to highest bandwidth variant
-    url = await asyncio.to_thread(resolve_hls_master_playlist, url)
+    url = resolved_url or await asyncio.to_thread(resolve_hls_master_playlist, url)
 
     settings = get_settings()
     hw = settings.get("transcode_hw", "software")
@@ -1310,6 +1314,7 @@ async def start_transcode(
         log.info("Cleaning up invalid session %s", existing_id)
         _cleanup_invalid_session(url, existing_id)
 
+    resolved: str | None = None
     if (
         fast_start
         and content_type == "live"
@@ -1363,6 +1368,7 @@ async def start_transcode(
             bandwidth_saver,
             audio_passthrough=audio_passthrough,
             is_disconnected=is_disconnected,
+            resolved_url=resolved,
         )
     except HTTPException:
         if series_id is None:

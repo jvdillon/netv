@@ -113,6 +113,23 @@ async def test_archive_bypasses_upscale_without_changing_live_or_movies(archive_
 
 
 @pytest.mark.asyncio
+async def test_dvr_remux_start_resolves_master_playlist_once(archive_runtime):
+    settings = {"max_resolution": "1080p", "live_dvr_mins": 60, "probe_live": True}
+    master = "https://upstream.test/live/1.m3u8"
+    variant = "https://upstream.test/live/1_hi.m3u8"
+    with (
+        patch("ffmpeg_session.get_settings", return_value=settings),
+        patch("ffmpeg_session.resolve_hls_master_playlist", return_value=variant) as resolve,
+        patch("ffmpeg_session.probe_media", return_value=(None, [])),
+        patch("ffmpeg_session.can_remux_live", return_value=True),
+        patch("ffmpeg_session._wait_for_playlist", new=AsyncMock(return_value=True)),
+    ):
+        result = await ffmpeg_session.start_transcode(master, "live", fast_start=True)
+    resolve.assert_called_once_with(master)
+    assert get_session(result["session_id"])["url"] == variant
+
+
+@pytest.mark.asyncio
 async def test_archive_stop_releases_recent_session_without_caching(archive_runtime):
     process, _, _ = archive_runtime
     with patch("ffmpeg_session._wait_for_playlist", new=AsyncMock(return_value=True)):

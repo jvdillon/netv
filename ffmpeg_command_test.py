@@ -323,6 +323,7 @@ class TestBuildVideoArgs:
 
         assert command[command.index("-hls_time") + 1] == "2"
         assert command[command.index("-hls_list_size") + 1] == "15"
+        assert command[command.index("-hls_init_time") + 1] == "1"
 
     def test_invalid_hw_raises(self):
         """Test invalid hardware raises ValueError."""

@@ -1483,7 +1483,9 @@ def build_hls_ffmpeg_cmd(
             ]
         )
     else:
-        cmd.extend(["-hls_flags", "delete_segments"])
+        # Startup waits for two segments; short first ones (cut at the next
+        # keyframe) let live playback begin without waiting out two full ones.
+        cmd.extend(["-hls_init_time", "1", "-hls_flags", "delete_segments"])
 
     cmd.append(f"{output_dir}/stream.m3u8")
     if sr_applied and not is_vod:
