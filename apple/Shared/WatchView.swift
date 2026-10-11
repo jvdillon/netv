@@ -15,6 +15,7 @@ struct WatchView: View {
     #if os(tvOS)
     private enum PlayerFocus: Hashable {
         case surface
+        case timeshift
         case captions
     }
     @FocusState private var playerFocus: PlayerFocus?
@@ -41,7 +42,7 @@ struct WatchView: View {
         .onChange(of: model.isPlayerExpanded) { _, expanded in
             #if os(tvOS)
             playerFocus = expanded ? .surface : nil
-            model.tvCaptionControlFocused = false
+            model.tvTransportControlFocused = false
             if !expanded { model.tvPlaybackControlsVisible = false }
             #endif
             guard !expanded else { return }
@@ -49,10 +50,15 @@ struct WatchView: View {
         }
         #if os(tvOS)
         .onChange(of: playerFocus) { _, focus in
-            model.tvCaptionControlFocused = focus == .captions
+            model.tvTransportControlFocused = focus == .timeshift || focus == .captions
         }
         .onChange(of: model.captionChoices.isEmpty) { _, captionsAreEmpty in
             if captionsAreEmpty, playerFocus == .captions {
+                playerFocus = .surface
+            }
+        }
+        .onChange(of: timeshiftAction == nil) { _, unavailable in
+            if unavailable, playerFocus == .timeshift {
                 playerFocus = .surface
             }
         }
@@ -114,24 +120,47 @@ struct WatchView: View {
                             model.playerActivity = UUID()
                             if direction == .left { model.seekBackwardRequest = UUID() }
                             if direction == .right { model.seekForwardRequest = UUID() }
-                            if direction == .down, !model.captionChoices.isEmpty {
-                                model.tvCaptionControlFocused = true
-                                playerFocus = .captions
+                            if direction == .down, let focus = firstTransportFocus {
+                                model.tvTransportControlFocused = true
+                                playerFocus = focus
                             }
                         }
                     if model.isPlayerExpanded,
-                       model.tvPlaybackControlsVisible || model.tvCaptionControlFocused,
-                       !model.captionChoices.isEmpty {
-                        PlaybackCaptionMenu {
-                            model.playerActivity = UUID()
-                            playerFocus = .surface
+                       model.tvPlaybackControlsVisible || model.tvTransportControlFocused,
+                       firstTransportFocus != nil {
+                        HStack(spacing: 28) {
+                            if let timeshift = timeshiftAction {
+                                Button {
+                                    timeshift.perform()
+                                    model.playerActivity = UUID()
+                                    playerFocus = .surface
+                                } label: {
+                                    Label(timeshift.title, systemImage: timeshift.systemImage)
+                                        .font(.system(size: 26, weight: .semibold))
+                                        .padding(.horizontal, 18)
+                                        .padding(.vertical, 8)
+                                        .background(
+                                            .white.opacity(playerFocus == .timeshift ? 0.3 : 0),
+                                            in: Capsule()
+                                        )
+                                        .scaleEffect(playerFocus == .timeshift ? 1.08 : 1)
+                                        .animation(.easeOut(duration: 0.15), value: playerFocus)
+                                }
+                                .focused($playerFocus, equals: .timeshift)
+                            }
+                            if !model.captionChoices.isEmpty {
+                                PlaybackCaptionMenu {
+                                    model.playerActivity = UUID()
+                                    playerFocus = .surface
+                                }
+                                .font(.system(size: 30, weight: .semibold))
+                                .frame(width: 44, height: 44)
+                                .focused($playerFocus, equals: .captions)
+                            }
                         }
-                        .font(.system(size: 30, weight: .semibold))
                         .foregroundStyle(.white)
                         .tint(.white)
-                        .frame(width: 44, height: 44)
                         .buttonStyle(.plain)
-                        .focused($playerFocus, equals: .captions)
                         .onMoveCommand { direction in
                             model.playerActivity = UUID()
                             if direction == .up {
@@ -184,6 +213,33 @@ struct WatchView: View {
     }
     #endif
 
+    #if os(tvOS)
+    private struct TimeshiftAction {
+        let title: String
+        let systemImage: String
+        let perform: () -> Void
+    }
+
+    /// Start Over while live (when the archive has the program's start), Go Live in catchup.
+    private var timeshiftAction: TimeshiftAction? {
+        guard let selection = model.selection else { return nil }
+        if selection.isCatchup {
+            return TimeshiftAction(title: "Go Live", systemImage: "dot.radiowaves.left.and.right") {
+                model.play(selection.channel)
+            }
+        }
+        return model.startOverForSelection.map {
+            TimeshiftAction(title: "Start Over", systemImage: "backward.end.fill", perform: $0)
+        }
+    }
+
+    /// Where a swipe down from the picture lands among the transport controls.
+    private var firstTransportFocus: PlayerFocus? {
+        if timeshiftAction != nil { return .timeshift }
+        return model.captionChoices.isEmpty ? nil : .captions
+    }
+    #endif
+
     private func refreshGuideIfVisible() async {
         guard !model.isPlayerExpanded else { return }
         await model.refreshGuideOnReturn()
@@ -231,7 +287,7 @@ struct WatchView: View {
             Color.black
             if let selection = model.selection {
                 PlayerView(selection: selection)
-                    .id(selection.id)
+                    .id(selection.channel.id)
             }
             Button {
                 model.isPlayerExpanded = false
@@ -291,7 +347,7 @@ struct WatchView: View {
     private var playerSurface: some View {
         if let selection = model.selection {
             PlayerView(selection: selection)
-                .id(selection.id)
+                .id(selection.channel.id)
         } else {
             VStack(spacing: 14) {
                 Image(systemName: "play.tv.fill")

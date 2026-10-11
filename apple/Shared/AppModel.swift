@@ -32,7 +32,7 @@ final class AppModel: ObservableObject {
     @Published var seekBackwardRequest: UUID?
     @Published var seekForwardRequest: UUID?
     @Published var tvPlaybackControlsVisible = false
-    @Published var tvCaptionControlFocused = false
+    @Published var tvTransportControlFocused = false
     #endif
 
     // Carry the server's current quality decision across channel changes.
@@ -238,6 +238,60 @@ final class AppModel: ObservableObject {
             channel: playing.channel, program: playing.program,
             catchupStart: target, startPaused: !resume
         )
+    }
+
+    /// Moves live playback back past the retained window into the upstream archive.
+    /// Returns false when the archive can't serve `timestamp`, leaving playback as is.
+    @discardableResult
+    func rewindLive(
+        _ playing: PlayerSelection, to timestamp: Double, resume: Bool,
+        now: Double = Date().timeIntervalSince1970
+    ) -> Bool {
+        guard selection?.id == playing.id, !playing.isCatchup else { return false }
+        return playArchive(playing, at: timestamp, resume: resume, now: now, roundUp: false)
+    }
+
+    /// Keeps the broadcast going when an archived program ends: live once the
+    /// archive has caught up, otherwise the next program the guide knows of.
+    func continueArchive(after playing: PlayerSelection, now: Double = Date().timeIntervalSince1970) {
+        guard selection?.id == playing.id, playing.isCatchup,
+              let end = playing.program?.endTimestamp else { return }
+        if end >= now - 30 {
+            play(playing.channel)
+        } else {
+            playArchive(playing, at: end, resume: true, now: now, roundUp: true)
+        }
+    }
+
+    @discardableResult
+    /// `roundUp` moves forward to the next whole minute, so continuing past a
+    /// program's end never lands back inside it.
+    private func playArchive(
+        _ playing: PlayerSelection, at requested: Double, resume: Bool, now: Double, roundUp: Bool
+    ) -> Bool {
+        // Archives start on whole minutes, so the newest one may not be recorded yet.
+        // Starting on the minute itself plays at once instead of working through
+        // up to a minute of archive to reach the exact second.
+        let minutes = min(requested, now - 60) / 60
+        let timestamp = (roundUp ? ceil(minutes) : floor(minutes)) * 60
+        guard timestamp.isFinite,
+              playing.channel.canCatchUp(from: timestamp, now: Date(timeIntervalSince1970: now)),
+              let program = program(on: playing.channel, at: timestamp, fallback: playing.program)
+        else { return false }
+        selection = PlayerSelection(
+            channel: playing.channel, program: program,
+            catchupStart: floor(timestamp), startPaused: !resume
+        )
+        return true
+    }
+
+    /// The guide program airing on `channel` at `timestamp`.
+    private func program(on channel: Channel, at timestamp: Double, fallback: Program?) -> Program? {
+        let programs = (channels.first { $0.id == channel.id }?.programs ?? []) + [fallback].compactMap { $0 }
+        return programs.first {
+            guard let start = $0.startTimestamp, let end = $0.endTimestamp else { return false }
+            return start <= timestamp && timestamp < end
+        }
     }
 
     func keepArchiveAlive(sessionID: String) async throws {

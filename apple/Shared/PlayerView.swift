@@ -103,10 +103,10 @@ struct PlayerView: View {
                                         .frame(width: 36, height: 36)
                                 }
                                 .buttonStyle(.plain)
-                                .accessibilityLabel("Start over")
+                                .accessibilityLabel("Start Over")
                             }
                             if selection.isCatchup {
-                                Button("Live") { model.play(selection.channel) }
+                                Button("Go Live") { model.play(selection.channel) }
                                     .font(.caption.weight(.bold))
                                     .buttonStyle(.bordered)
                                     .tint(.white)
@@ -133,28 +133,30 @@ struct PlayerView: View {
                             )
                         )
                         Spacer()
-                        IOSControlBar(
-                            player: player,
-                            isCatchup: selection.isCatchup,
-                            archiveTimeline: archiveTimeline,
-                            liveBufferDuration: liveBufferDuration,
-                            liveProgram: liveProgram,
-                            liveSeekPosition: liveSeekPosition,
-                            isScrubbing: $isScrubbing,
-                            seekArchive: { elapsed, resume in
-                                iosActivity = Date()
-                                seekArchive(elapsed, resume)
-                            },
-                            seekLive: { seconds in
-                                iosActivity = Date()
-                                requestLiveSeek(by: seconds)
-                            },
-                            togglePlayback: {
-                                iosActivity = Date()
-                                togglePlayback()
-                            }
-                        )
-                        .disabled(isPreparingArchive)
+                        // The outgoing player's position means nothing to the incoming stream.
+                        if !isPreparingArchive {
+                            IOSControlBar(
+                                player: player,
+                                isCatchup: selection.isCatchup,
+                                archiveTimeline: archiveTimeline,
+                                liveBufferDuration: liveBufferDuration,
+                                liveProgram: liveProgram,
+                                liveSeekPosition: liveSeekPosition,
+                                isScrubbing: $isScrubbing,
+                                seekArchive: { elapsed, resume in
+                                    iosActivity = Date()
+                                    seekArchive(elapsed, resume)
+                                },
+                                seekLive: { seconds in
+                                    iosActivity = Date()
+                                    requestLiveSeek(by: seconds)
+                                },
+                                togglePlayback: {
+                                    iosActivity = Date()
+                                    togglePlayback()
+                                }
+                            )
+                        }
                     }
                     .foregroundStyle(.white)
                     .opacity(controlsVisible ? 1 : 0)
@@ -167,7 +169,7 @@ struct PlayerView: View {
         #if os(macOS) || os(tvOS)
         #if os(macOS)
         .overlay(alignment: .bottom) {
-            if let player {
+            if let player, !isPreparingArchive {
                 MacControlBar(
                     player: player, volume: $model.playbackVolume, airPlayActive: airPlayActive,
                     isCatchup: selection.isCatchup, startOver: model.startOverForSelection,
@@ -198,7 +200,7 @@ struct PlayerView: View {
         #endif
         #if os(tvOS)
         .overlay(alignment: .bottom) {
-            if let player {
+            if let player, !isPreparingArchive {
                 TVControlBar(
                     player: player,
                     selection: selection,
@@ -242,7 +244,9 @@ struct PlayerView: View {
             guard let request else { return }
             selectCaption(choiceID: request.choiceID)
         }
-        .task {
+        // The view lives as long as its channel; moving between live and the
+        // archive restarts playback here while the old picture stays up.
+        .task(id: selection.id) {
             await runPlayback()
         }
         .onDisappear {
@@ -285,9 +289,29 @@ struct PlayerView: View {
         let base = liveSeekPosition ?? player.currentTime().seconds
         guard let timeline = makeLiveTimeline(
             player: player, position: base, maximumDuration: liveBufferDuration
-        ) else { return }
+        ) else {
+            // No retained window on this channel: the archive is the only way back.
+            if seconds < 0, liveBufferDuration <= 0 {
+                let now = player.currentItem?.currentDate() ?? Date()
+                model.rewindLive(
+                    selection, to: now.timeIntervalSince1970 + seconds,
+                    resume: player.timeControlStatus != .paused
+                )
+            }
+            return
+        }
         if liveSeekPosition == nil {
             liveResumeAfterSeek = player.timeControlStatus != .paused
+        }
+        // Past the oldest retained moment, carry on back into the upstream archive.
+        if timeline.position + seconds < timeline.start - 5 {
+            let target = playbackTimestamp(player: player, timeline: timeline, fallbackLiveDate: Date())
+                + seconds
+            if model.rewindLive(selection, to: target, resume: liveResumeAfterSeek) {
+                seekTask?.cancel()
+                player.currentItem?.cancelPendingSeeks()
+                return
+            }
         }
         seekLive(
             player, to: timeline.seekTarget(offsetBy: seconds),
@@ -487,21 +511,44 @@ struct PlayerView: View {
     @MainActor
     private func runPlayback() async {
         var activeSessionID: String?
+        var ownPlayer: AVPlayer?
+        var endObserver: Task<Void, Never>?
+        #if os(tvOS)
+        var displayCriteriaTask: Task<Void, Never>?
+        #endif
         defer {
-            captionTask?.cancel()
-            captionTracks = []
-            captionGroup = nil
-            model.updateCaptionChoices([], selectedID: nil)
-            player?.pause()
-            player = nil
-            quality = nil
-            airPlayActive = false
-            isPreparingArchive = false
-            liveBufferDuration = 0
+            endObserver?.cancel()
+            #if os(tvOS)
+            displayCriteriaTask?.cancel()
+            #endif
+            ownPlayer?.pause()
+            // A cancelled run was replaced or its view is gone; either way the
+            // screen now belongs to whatever comes next.
+            if !Task.isCancelled {
+                captionTask?.cancel()
+                captionTracks = []
+                captionGroup = nil
+                model.updateCaptionChoices([], selectedID: nil)
+                player?.pause()
+                player = nil
+                quality = nil
+                airPlayActive = false
+                isPreparingArchive = false
+                liveBufferDuration = 0
+            }
             if let sessionID = activeSessionID {
                 Task { await model.stopPlayback(sessionID: sessionID) }
             }
         }
+        errorMessage = nil
+        liveSeekPosition = nil
+        liveResumeAfterSeek = false
+        #if os(tvOS)
+        tvSeekPosition = nil
+        #endif
+        // Freeze the outgoing picture and its controls as soon as the move starts.
+        player?.pause()
+        isPreparingArchive = player != nil
         do {
             #if os(iOS)
             try configureAudioSession()
@@ -511,7 +558,6 @@ struct PlayerView: View {
                 let bandwidthSaver = model.bandwidthSaver
                 var configuration = try await model.playerConfiguration(for: selection)
                 activeSessionID = configuration.transcodeSessionID
-                liveBufferDuration = selection.isCatchup ? 0 : configuration.liveBufferDuration
                 try Task.checkCancellation()
                 var options: [String: Any] = [:]
                 if let cookie = configuration.cookieHeader {
@@ -528,6 +574,7 @@ struct PlayerView: View {
                     item.automaticallyPreservesTimeOffsetFromLive = true
                 }
                 var currentPlayer = AVPlayer(playerItem: item)
+                ownPlayer = currentPlayer
                 currentPlayer.isMuted = false
                 currentPlayer.appliesMediaSelectionCriteriaAutomatically = false
                 #if os(iOS)
@@ -539,21 +586,41 @@ struct PlayerView: View {
                 #else
                 currentPlayer.volume = 1
                 #endif
-                isPreparingArchive = selection.isCatchup
-                player = currentPlayer
-                refreshCaptions(for: item, player: currentPlayer)
+                // Moving within a channel keeps the previous picture, paused, on
+                // screen until the new stream is positioned.
+                let predecessor = player
+                predecessor?.pause()
+                isPreparingArchive = selection.isCatchup || predecessor != nil
+                if predecessor == nil {
+                    player = currentPlayer
+                    refreshCaptions(for: item, player: currentPlayer)
+                }
                 #if os(iOS)
                 iosActivity = Date()
                 #endif
                 if let requested = selection.catchupStart {
-                    archiveStreamStart = configuration.archiveStart ?? floor(requested / 60) * 60
-                    let offset = configuration.archiveSeek ?? max(0, requested - (archiveStreamStart ?? requested))
+                    let streamStart = configuration.archiveStart ?? floor(requested / 60) * 60
+                    let offset = configuration.archiveSeek ?? max(0, requested - streamStart)
                     try await prepareArchivePosition(
                         player: currentPlayer, offset: offset, sessionID: activeSessionID
                     )
+                    archiveStreamStart = streamStart
+                    endObserver?.cancel()
+                    endObserver = observeArchiveEnd(of: item)
+                } else if predecessor != nil {
+                    try await waitUntilReady(item)
                 }
+                if player !== currentPlayer {
+                    player = currentPlayer
+                    refreshCaptions(for: item, player: currentPlayer)
+                }
+                liveBufferDuration = selection.isCatchup ? 0 : configuration.liveBufferDuration
                 isPreparingArchive = false
                 if !selection.startPaused { currentPlayer.play() }
+                #if os(tvOS)
+                displayCriteriaTask?.cancel()
+                displayCriteriaTask = matchDisplay(to: item)
+                #endif
                 var sampler = PlaybackHealthSampler()
                 var shouldRetune = false
                 var deferredSaverDecision: Bool?
@@ -608,6 +675,7 @@ struct PlayerView: View {
                             let wasPaused = currentPlayer.timeControlStatus == .paused
                             currentPlayer.pause()
                             currentPlayer = replacement
+                            ownPlayer = replacement
                             item = replacement.currentItem!
                             player = replacement
                             refreshCaptions(for: item, player: replacement)
@@ -656,6 +724,62 @@ struct PlayerView: View {
                 logger.error("Playback failed: \(error.localizedDescription, privacy: .public)")
                 errorMessage = error.localizedDescription
             }
+        }
+    }
+
+    /// Carries on past the end of an archived program instead of stopping there.
+    @MainActor
+    private func observeArchiveEnd(of item: AVPlayerItem) -> Task<Void, Never> {
+        let playing = selection
+        return Task { @MainActor in
+            let ends = NotificationCenter.default.notifications(
+                named: AVPlayerItem.didPlayToEndTimeNotification, object: item
+            )
+            for await _ in ends {
+                model.continueArchive(after: playing)
+                return
+            }
+        }
+    }
+
+    #if os(tvOS)
+    /// Switches the TV to the video's frame rate and dynamic range once its format is
+    /// known. The mode is never reset here: the guide preview keeps playing the same
+    /// video, and the system restores the menu's mode when the app leaves the screen.
+    @MainActor
+    private func matchDisplay(to item: AVPlayerItem) -> Task<Void, Never> {
+        Task { @MainActor in
+            var criteria: AVDisplayCriteria?
+            for _ in 0..<50 {
+                if let track = item.tracks.first(where: { $0.assetTrack?.mediaType == .video })?.assetTrack,
+                   let (formats, rate) = try? await track.load(.formatDescriptions, .nominalFrameRate),
+                   let format = formats.first, rate > 0 {
+                    criteria = AVDisplayCriteria(refreshRate: rate, formatDescription: format)
+                    break
+                }
+                guard (try? await Task.sleep(for: .milliseconds(200))) != nil else { return }
+            }
+            if criteria == nil {
+                criteria = try? await item.asset.load(.preferredDisplayCriteria)
+            }
+            guard !Task.isCancelled, let criteria,
+                  let manager = keyWindow()?.avDisplayManager,
+                  manager.isDisplayCriteriaMatchingEnabled else { return }
+            if manager.preferredDisplayCriteria != criteria {
+                manager.preferredDisplayCriteria = criteria
+            }
+        }
+    }
+    #endif
+
+    @MainActor
+    private func waitUntilReady(_ item: AVPlayerItem) async throws {
+        let deadline = Date().addingTimeInterval(15)
+        while item.status == .unknown && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        if item.status == .failed {
+            throw item.error ?? APIError.server("The stream could not be played.")
         }
     }
 
@@ -955,8 +1079,8 @@ private struct MacControlBar: View {
                         .frame(width: 20, height: 20)
                 }
                 .buttonStyle(.plain)
-                .help("Start over")
-                .accessibilityLabel("Start over")
+                .help("Start Over")
+                .accessibilityLabel("Start Over")
             }
 
             if isCatchup {
@@ -1205,6 +1329,9 @@ private struct PlayerController: UIViewControllerRepresentable {
         let controller = AVPlayerViewController()
         controller.showsPlaybackControls = false
         controller.videoGravity = .resizeAspect
+        // AVKit would rematch the display each time the player leaves or returns to
+        // full screen, blanking the TV. PlayerView holds the video's mode instead.
+        controller.appliesPreferredDisplayCriteriaAutomatically = false
         controller.player = player
         return controller
     }
@@ -1249,7 +1376,7 @@ private struct TVControlBar: View {
                 )
             }
             let visible = archiveSeekPosition != nil || liveSeekPosition != nil
-                || !isPlaying || model.tvCaptionControlFocused
+                || !isPlaying || model.tvTransportControlFocused
                 || context.date.timeIntervalSince(lastActivity) < 4
             ZStack(alignment: .bottom) {
                 if let quality {
@@ -1518,20 +1645,26 @@ private func makeLiveTimeline(
     )
 }
 
+/// The broadcast moment at the timeline's position, in Unix time.
+private func playbackTimestamp(
+    player: AVPlayer, timeline: LiveTimeline, fallbackLiveDate: Date
+) -> Double {
+    let currentPosition = player.currentTime().seconds
+    if currentPosition.isFinite, let currentDate = player.currentItem?.currentDate() {
+        return currentDate.timeIntervalSince1970 + timeline.position - currentPosition
+    }
+    return fallbackLiveDate.timeIntervalSince1970 - timeline.behindLive
+}
+
 private func makeLiveProgramTimeline(
     player: AVPlayer,
     program: Program?,
     liveTimeline: LiveTimeline,
     fallbackLiveDate: Date
 ) -> LiveProgramTimeline? {
-    let currentPosition = player.currentTime().seconds
-    let playbackTimestamp: Double
-    if currentPosition.isFinite, let currentDate = player.currentItem?.currentDate() {
-        playbackTimestamp = currentDate.timeIntervalSince1970
-            + liveTimeline.position - currentPosition
-    } else {
-        playbackTimestamp = fallbackLiveDate.timeIntervalSince1970 - liveTimeline.behindLive
-    }
+    let playbackTimestamp = playbackTimestamp(
+        player: player, timeline: liveTimeline, fallbackLiveDate: fallbackLiveDate
+    )
     return LiveProgramTimeline(
         program: program,
         playbackTimestamp: playbackTimestamp,
@@ -1597,6 +1730,16 @@ private struct ArchiveSeekBar: View {
     }
 }
 
+#endif
+
+#if os(tvOS)
+@MainActor
+private func keyWindow() -> UIWindow? {
+    UIApplication.shared.connectedScenes
+        .compactMap { $0 as? UIWindowScene }
+        .flatMap(\.windows)
+        .first(where: \.isKeyWindow)
+}
 #endif
 
 private func isLoopback(_ host: String) -> Bool {

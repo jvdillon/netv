@@ -152,6 +152,71 @@ struct PlaybackStartChecks {
         precondition(model.selection == sought, "Ignore seek requests from a replaced player")
         try model.seekCatchup(sought, to: now - 5, resume: true, now: now)
         precondition(model.selection?.isCatchup == false, "Seeking to the live edge should return to live")
+
+        // Rewinding live past the retained window continues into the archive.
+        let airing = PlayerSelection(channel: archiveChannel, program: archiveProgram)
+        model.selection = sought
+        precondition(
+            !model.rewindLive(airing, to: now - 600, resume: true, now: now) && model.selection == sought,
+            "Ignore rewinds from a replaced player"
+        )
+        model.selection = airing
+        precondition(model.rewindLive(airing, to: now - 20, resume: true, now: now))
+        precondition(model.selection?.catchupStart == 1_700_009_940, "Stay clear of the minute still being archived")
+        model.selection = airing
+        precondition(model.rewindLive(airing, to: now - 600.4, resume: true, now: now))
+        let rewound = model.selection!
+        precondition(rewound.catchupStart == 1_700_009_340 && !rewound.startPaused, "Rewinds start on the minute")
+        precondition(rewound.program == archiveProgram, "Rewinding must keep the airing program")
+        precondition(rewound.id != airing.id, "An archive position restarts playback")
+        model.selection = airing
+        precondition(
+            !model.rewindLive(airing, to: 1_700_000_000 - 60, resume: true, now: now),
+            "Without a guide program for the moment, stay live"
+        )
+        precondition(
+            !model.rewindLive(airing, to: now - 3 * 86_400, resume: true, now: now),
+            "Moments older than the archive stay live"
+        )
+        let liveOnly = PlayerSelection(channel: c.channel, program: archiveProgram)
+        model.selection = liveOnly
+        precondition(
+            !model.rewindLive(liveOnly, to: now - 600, resume: true, now: now),
+            "Channels without an archive can't rewind past their buffer"
+        )
+        precondition(model.selection == liveOnly)
+
+        // The end of an archive that has caught up with the broadcast goes live.
+        model.selection = rewound
+        model.continueArchive(after: rewound, now: now)
+        precondition(model.selection?.isCatchup == false, "A caught-up archive returns to live")
+        let earlier = try JSONDecoder().decode(Program.self, from: Data("""
+            {"title":"Earlier","desc":"","start":"09:00","end":"10:00",
+             "left_pct":0,"width_pct":100,"start_timestamp":1699996400,"end_timestamp":1700000000}
+            """.utf8))
+        let finished = PlayerSelection(channel: archiveChannel, program: earlier, catchupStart: 1_699_996_400)
+        model.selection = finished
+        model.continueArchive(after: finished, now: now)
+        precondition(model.selection == finished, "Without a known next program, an old archive just ends")
+        model.channels = [try JSONDecoder().decode(ChannelRow.self, from: Data("""
+            {"channel":{"stream_id":"c","name":"Stream","icon":"","catchup_days":2},
+             "programs":[{"title":"Earlier","desc":"","start":"09:00","end":"10:00",
+                          "left_pct":0,"width_pct":100,"start_timestamp":1699996400,"end_timestamp":1700000000},
+                         {"title":"Recording","desc":"","start":"10:00","end":"11:00",
+                          "left_pct":0,"width_pct":100,"start_timestamp":1700000000,"end_timestamp":1700011000}]}
+            """.utf8))]
+        model.continueArchive(after: finished, now: now)
+        precondition(
+            model.selection?.catchupStart == 1_700_000_040 && model.selection?.program == archiveProgram,
+            "An ended archive continues on the next whole minute of the next program"
+        )
+        model.selection = airing
+        precondition(model.rewindLive(airing, to: 1_699_999_000, resume: false, now: now))
+        precondition(
+            model.selection?.program == earlier && model.selection?.startPaused == true,
+            "Rewinding past the airing program's start lands in the previous one, paused if it was"
+        )
+        model.channels = []
         model.selection = c
         let live = try await model.playerConfiguration(for: c)
         precondition(APIClient.requestedCatchup.last == .some(nil), "Going live must leave the archive")

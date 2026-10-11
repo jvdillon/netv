@@ -459,7 +459,7 @@ private struct GuideChannelRow: View {
                         GuideProgramButton(
                             row: row, program: nil, index: 0, focusedProgram: focusedProgram
                         )
-                        .catchupMenu(row: row, browse: browseCatchup)
+                        .catchupMenu(row: row, program: nil, browse: browseCatchup)
                         .padding(.horizontal, 2)
                         .frame(height: rowHeight - 12)
                     }
@@ -468,7 +468,7 @@ private struct GuideChannelRow: View {
                         GuideProgramButton(
                             row: row, program: program, index: index, focusedProgram: focusedProgram
                         )
-                            .catchupMenu(row: row, browse: browseCatchup)
+                            .catchupMenu(row: row, program: program, browse: browseCatchup)
                             .frame(
                                 width: max(timeline.size.width * (range.upperBound - range.lowerBound) - 4, 0),
                                 height: rowHeight - 12
@@ -641,11 +641,11 @@ private struct PhoneGuideView: View {
                             .allowsHitTesting(false)
                             if row.programs.isEmpty {
                                 programButton(nil, row: row)
-                                    .catchupMenu(row: row, browse: { catchupChannel = row.channel })
+                                    .catchupMenu(row: row, program: nil, browse: { catchupChannel = row.channel })
                             }
                             ForEach(Array(row.programs.enumerated()), id: \.offset) { _, program in
                                 programButton(program, row: row)
-                                    .catchupMenu(row: row, browse: { catchupChannel = row.channel })
+                                    .catchupMenu(row: row, program: program, browse: { catchupChannel = row.channel })
                             }
                         }
                         .disabled(model.isGuideInteractionBlocked)
@@ -788,27 +788,31 @@ struct CatchupBadge: View {
 private struct CatchupMenu: ViewModifier {
     @EnvironmentObject private var model: AppModel
     let row: ChannelRow
+    let program: Program?
     let browse: () -> Void
 
     func body(content: Content) -> some View {
         if row.channel.catchupDays > 0 {
             content.contextMenu {
-                if let program = model.startOverProgram(for: row) {
-                    Button {
-                        model.playCatchup(row.channel, program: program)
-                    } label: {
-                        Label("Start Over", systemImage: "backward.end.fill")
+                // Choices for joining what's on now; other programs keep their tap action.
+                if program?.isCurrent ?? true {
+                    if let program = model.startOverProgram(for: row) {
+                        Button {
+                            model.playCatchup(row.channel, program: program)
+                        } label: {
+                            Label("Start from Beginning", systemImage: "backward.end.fill")
+                        }
+                    }
+                    if !(model.selection?.channel.id == row.id && model.selection?.isCatchup == false) {
+                        Button {
+                            model.play(row)
+                        } label: {
+                            Label("Join Live", systemImage: "dot.radiowaves.left.and.right")
+                        }
                     }
                 }
                 Button(action: browse) {
                     Label("Catch Up…", systemImage: "clock.arrow.circlepath")
-                }
-                if model.selection?.channel.id == row.id, model.selection?.isCatchup == true {
-                    Button {
-                        model.play(row)
-                    } label: {
-                        Label("Watch Live", systemImage: "dot.radiowaves.left.and.right")
-                    }
                 }
             }
         } else {
@@ -818,9 +822,9 @@ private struct CatchupMenu: ViewModifier {
 }
 
 extension View {
-    /// Start Over and Catch Up actions for channels whose upstream keeps an archive.
-    func catchupMenu(row: ChannelRow, browse: @escaping () -> Void) -> some View {
-        modifier(CatchupMenu(row: row, browse: browse))
+    /// Start from Beginning, Join Live and Catch Up for channels whose upstream keeps an archive.
+    func catchupMenu(row: ChannelRow, program: Program?, browse: @escaping () -> Void) -> some View {
+        modifier(CatchupMenu(row: row, program: program, browse: browse))
     }
 }
 
