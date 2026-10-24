@@ -9,9 +9,6 @@ __pycache__/
 **/*.out
 **/*.log
 
-# UV
-uv.lock
-
 # App data
 .cache/
 cache/

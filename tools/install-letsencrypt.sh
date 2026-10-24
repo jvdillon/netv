@@ -36,17 +36,6 @@ echo "=== Setting up ssl-cert group permissions ==="
 sudo chgrp -R ssl-cert /etc/letsencrypt/archive/
 sudo chmod -R g+r /etc/letsencrypt/archive/
 
-echo "=== Installing deploy hook ==="
-cat <<'EOF' | sudo tee /etc/letsencrypt/renewal-hooks/deploy/ssl-cert-perms
-#!/bin/bash
-# Fix cert permissions after renewal for ssl-cert group
-
-chgrp -R ssl-cert /etc/letsencrypt/archive/
-chmod -R g+r /etc/letsencrypt/archive/
-EOF
-
-sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/ssl-cert-perms
-
 echo ""
 echo "=== Done ==="
 echo ""

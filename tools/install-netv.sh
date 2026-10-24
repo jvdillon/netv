@@ -126,7 +126,9 @@ if [ -n "$HTTPS_FLAG" ]; then
     echo "=== Installing certbot deploy hook (restart netv on renewal) ==="
     cat <<'EOF' | sudo tee /etc/letsencrypt/renewal-hooks/deploy/netv
 #!/bin/bash
-# Restart netv after cert renewal
+# Fix cert permissions and restart netv after renewal
+chgrp -R ssl-cert /etc/letsencrypt/archive/
+chmod -R g+r /etc/letsencrypt/archive/
 systemctl restart netv
 EOF
     sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/netv
