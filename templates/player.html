@@ -208,7 +208,7 @@
         <p id="cast-state" class="text-xl mb-4" role="status" aria-live="polite"></p>
         <button id="cast-manage" class="px-4 py-2 bg-blue-600 rounded">Cast controls</button>
         <button id="cast-local" class="px-4 py-2 bg-gray-700 rounded">Stop casting and play here</button>
-        <p class="text-sm text-gray-400 mt-4">You can close this page; playback continues on the TV.</p>
+        <p id="cast-note" class="text-sm text-gray-400 mt-4">You can close this page; playback continues on the TV.</p>
       </div>
     </div>
     <dialog id="cast-dialog" class="bg-gray-800 text-white rounded-lg p-5 w-full max-w-md" aria-labelledby="cast-heading">
@@ -218,7 +218,11 @@
       </div>
       <p id="cast-error" class="hidden text-red-400 mb-3" role="alert"></p>
       <div id="cast-picker">
-        <button id="cast-refresh" class="px-3 py-2 bg-gray-700 rounded mb-3">Find devices</button>
+        <h3 class="font-semibold mb-2">Near this device</h3>
+        <button id="cast-browser" disabled class="px-3 py-2 bg-blue-600 rounded mb-2 disabled:opacity-50">Choose nearby Chromecast</button>
+        <p id="cast-browser-status" class="text-sm text-gray-400 mb-4" role="status">Loading browser casting...</p>
+        <h3 class="font-semibold mb-2">On the server's network</h3>
+        <button id="cast-refresh" class="px-3 py-2 bg-gray-700 rounded mb-3">Find server-LAN devices</button>
         <p id="cast-discovery" class="text-sm text-gray-400 mb-3" role="status"></p>
         <div id="cast-devices" class="flex flex-col gap-2 mb-4"></div>
         <form id="cast-form">

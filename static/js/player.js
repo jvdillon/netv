@@ -833,7 +833,7 @@
   }
 
   function cleanupTranscodeSync() {
-    if (document.pictureInPictureElement === video) return;
+    if (document.pictureInPictureElement === video || castController?.browserActive) return;
     adaptivePlayback?.destroy();
     adaptivePlayback = null;
     stopProgressPolling();
@@ -1672,6 +1672,36 @@
           session_id: transcodeSessionId, title: cfg.mediaTitle,
           current_time: Math.max(0, position - seekOffset),
         };
+      },
+      getBrowserMedia: async () => {
+        const position = video.currentTime + seekOffset;
+        if (!transcodeSessionId) {
+          await startTranscode();
+          if (!transcodeSessionId) throw new Error('Could not prepare an HLS stream for the TV.');
+          if (cfg.isVod && position > 0 && !await handleSeekToPosition(position)) {
+            throw new Error('Could not prepare the current movie position.');
+          }
+        }
+        const playlist = adaptiveSession?.master_playlist || transcodePlaylist;
+        return {
+          url: new URL(playlist, window.location.origin).href,
+          title: cfg.mediaTitle, isVod: cfg.isVod,
+          current_time: Math.max(0, position - seekOffset),
+        };
+      },
+      onBrowserStarted: async () => {
+        video.pause();
+        if (document.pictureInPictureElement === video) {
+          await document.exitPictureInPicture().catch(e => console.warn('[CAST] Could not close picture-in-picture:', e));
+        }
+        adaptivePlayback?.destroy();
+        adaptivePlayback = null;
+        if (currentHls) { currentHls.destroy(); currentHls = null; }
+        stopProgressPolling();
+        video.removeAttribute('src');
+        video.load();
+        hideLoading();
+        error.classList.add('hidden');
       },
       onStarted: async status => {
         video.pause();

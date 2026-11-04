@@ -48,7 +48,7 @@ async function player({
   isVod = false, native = false, direct = false,
   programStart = 0, programEnd = 0, nextProgram = null,
   castFailure = false, initialCast = null, seekOffset = 0, statusReady = null,
-  airplay = false,
+  airplay = false, browserCast = false,
   catchup = false, catchupDays = catchup ? 2 : 0, catchupStart = programStart, catchupSeek = 0,
   transcodedDuration = 0,
   stopReady = null, stopFailure = false, startReady = null, startGeneration = 0,
@@ -142,6 +142,38 @@ async function player({
     location: { href: 'http://netv.test/play/live/1', origin: 'http://netv.test', hostname: 'netv.test' },
     ...(airplay ? { WebKitPlaybackTargetAvailabilityEvent: function() {} } : {}),
   });
+  const browserLoads = [];
+  if (browserCast) {
+    window.isSecureContext = true;
+    window.location.protocol = 'https:';
+    const session = {
+      loadMedia: async request => { browserLoads.push(request); },
+      getCastDevice: () => ({ friendlyName: 'Rivian' }),
+      getMediaSession: () => null,
+      getVolume: () => 0.5,
+    };
+    const castContext = {
+      setOptions() {}, addEventListener() {},
+      getCurrentSession: () => session,
+      requestSession: async () => {},
+    };
+    window.cast = { framework: {
+      CastContext: { getInstance: () => castContext },
+      CastContextEventType: { SESSION_STATE_CHANGED: 'session' },
+      SessionState: {},
+    } };
+    window.chrome = { cast: {
+      AutoJoinPolicy: { ORIGIN_SCOPED: 'origin' },
+      media: {
+        DEFAULT_MEDIA_RECEIVER_APP_ID: 'default',
+        MediaInfo: function(url, type) { this.contentId = url; this.contentType = type; },
+        LoadRequest: function(media) { this.media = media; },
+        GenericMediaMetadata: function() {},
+        StreamType: { LIVE: 'LIVE', BUFFERED: 'BUFFERED' },
+        HlsSegmentFormat: { TS: 'TS' }, HlsVideoSegmentFormat: { MPEG2_TS: 'MPEG2_TS' },
+      },
+    } };
+  }
   const document = Object.assign(element(), {
     getElementById, createElement: element, head: element(),
     querySelectorAll: () => [], visibilityState: 'visible',
@@ -208,7 +240,7 @@ async function player({
   }
   await flush();
   return {
-    video, window, document, elements, engines, calls, beacons, errors, timers, pickerCalls,
+    video, window, document, elements, engines, calls, beacons, errors, timers, pickerCalls, browserLoads,
     setRendition: value => { rendition = value; },
     setWindowStart: value => { windowStart = value; },
     setTranscodedDuration: value => { transcodedDuration = value; },
@@ -269,6 +301,39 @@ test('HTTP player casts a shared session and leaves it running after page close'
   await p.window.emit('pagehide');
   assert.deepEqual(p.beacons, []);
   assert.equal(p.calls.some(call => call.options.method === 'DELETE'), false);
+});
+
+test('nearby browser casting uses the public origin and retains playback after page close', async () => {
+  const p = await player({ browserCast: true });
+  await p.elements.get('cast-browser').emit('click');
+  await flush();
+  assert.equal(p.browserLoads.length, 1);
+  assert.equal(p.browserLoads[0].media.contentId, 'http://netv.test/transcode/session1/master.m3u8');
+  assert.equal(p.browserLoads[0].media.streamType, 'LIVE');
+  assert.equal(p.video.paused, true);
+  assert.equal(p.engines[0].destroyed, true);
+  assert.equal(p.calls.some(call => call.url === '/api/cast/start'), false);
+  await p.window.emit('pagehide');
+  assert.deepEqual(p.beacons, []);
+  assert.equal(p.calls.some(call => call.options.method === 'DELETE'), false);
+});
+
+test('nearby VOD casting sends the HLS-relative position and buffered stream type', async () => {
+  const p = await player({ browserCast: true, isVod: true, seekOffset: 120 });
+  p.video.currentTime = 25;
+  await p.elements.get('cast-browser').emit('click');
+  await flush();
+  assert.equal(p.browserLoads[0].media.contentId, 'http://netv.test/transcode/session1/stream.m3u8');
+  assert.equal(p.browserLoads[0].media.streamType, 'BUFFERED');
+  assert.equal(p.browserLoads[0].currentTime, 25);
+});
+
+test('nearby casting prepares HLS when starting from direct playback', async () => {
+  const p = await player({ browserCast: true, direct: true });
+  await p.elements.get('cast-browser').emit('click');
+  await flush();
+  assert.equal(p.browserLoads[0].media.contentId, 'http://netv.test/transcode/session1/master.m3u8');
+  assert.equal(p.calls.filter(call => call.url.startsWith('/transcode/start?')).length, 1);
 });
 
 test('failed casting keeps local playback and exposes the receiver error', async () => {
