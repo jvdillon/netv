@@ -105,6 +105,27 @@ RUN echo "BUILD_ARGS: NVIDIA=${NVIDIA} FFMPEG_VERSION=${FFMPEG_VERSION} NVCC_GEN
     export CUDA_VERSION && \
     /tmp/install-ffmpeg.sh
 
+# Derive the runtime package list from what the binaries actually link, so the
+# runtime stage works on any Ubuntu release without hand-maintained package names
+# (e.g. librubberband2 on 24.04 vs librubberband3 on 26.04).
+# Skipped: our own libs in /opt (copied below), CUDA/NVIDIA (provided by the
+# container toolkit), and base-image libs (libc6, libgcc-s1, libstdc++6).
+RUN set -e; \
+    : > /opt/runtime-packages.txt; \
+    for lib in $(ldd /opt/bin/ffmpeg /opt/bin/ffprobe /opt/bin/ffplay | awk '/=> \//{print $3}' | sort -u); do \
+        case "$lib" in /opt/*|/usr/local/cuda*|*libcuda*|*libnv*) continue ;; esac; \
+        real=$(readlink -f "$lib"); \
+        pkg=""; \
+        for p in "$lib" "$real" "/usr$lib" "/usr$real" "${lib#/usr}" "${real#/usr}"; do \
+            pkg=$(dpkg -S "$p" 2>/dev/null | head -1 | cut -d: -f1) && [ -n "$pkg" ] && break; \
+        done; \
+        if [ -z "$pkg" ]; then echo "ERROR: no package owns $lib" >&2; exit 1; fi; \
+        echo "$pkg" >> /opt/runtime-packages.txt; \
+    done; \
+    sort -u -o /opt/runtime-packages.txt /opt/runtime-packages.txt; \
+    sed -i -E '/^(libc6|libgcc-s1|libstdc\+\+6)$/d' /opt/runtime-packages.txt; \
+    echo "Runtime packages ($(wc -l < /opt/runtime-packages.txt)):"; cat /opt/runtime-packages.txt
+
 # =============================================================================
 # Runtime stage: minimal image with just FFmpeg binaries
 # =============================================================================
@@ -113,20 +134,9 @@ FROM ${FFMPEG_BASE_IMAGE}
 
 ARG BUILD_DATE
 ARG FFMPEG_VERSION=snapshot
-ARG ENABLE_NVIDIA_CUDA=1
-ARG ENABLE_AMD_AMF=1
 ARG ENABLE_LIBTORCH=0
-ARG BUILD_LIBPLACEBO=1
-ARG BUILD_LIBX265=1
-ARG BUILD_LIBAOM=1
-ARG BUILD_LIBWEBP=1
-ARG BUILD_LIBVPL=1
-ARG BUILD_LIBDAV1D=1
-ARG BUILD_LIBSVTAV1=1
 ARG BUILD_LIBVMAF=1
 ARG BUILD_LIBVA=1
-ARG BUILD_LIBJXL=1
-ARG BUILD_LIBX264=1
 
 LABEL org.opencontainers.image.created="${BUILD_DATE}"
 LABEL org.opencontainers.image.title="netv-ffmpeg"
@@ -167,98 +177,23 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Runtime libraries for FFmpeg
-# Note: x265, libaom, libwebp, libvpl, libdav1d are statically linked when built from source
+# Runtime libraries for FFmpeg: the linked set is derived in the builder stage
+# (/opt/runtime-packages.txt). Listed explicitly below are only components loaded
+# at runtime that ldd cannot see:
+# - NVENC/CUDA: provided by nvidia-container-toolkit from host (no pkg needed)
+# - VAAPI drivers: intel-media-va-driver-non-free (Intel), mesa-va-drivers (AMD)
+# - Intel oneVPL/QSV runtime: libmfx-gen1.2 (dlopen'd by libvpl)
+# - Vulkan loader: libvulkan1 (libplacebo), driver from host
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    . /etc/os-release && \
-    if [ "$VERSION_CODENAME" = "jammy" ]; then \
-        LIBVPX=libvpx7; \
-        LIBSRT=libsrt1.4-openssl; \
-        LIBUNISTRING=libunistring2; \
-        LIBASOUND=libasound2; \
-        LIBSNDIO=libsndio7.0; \
-    else \
-        LIBVPX=libvpx9; \
-        LIBSRT=libsrt1.5-openssl; \
-        LIBUNISTRING=libunistring5; \
-        LIBASOUND=libasound2t64; \
-        LIBSNDIO=libsndio7.0; \
-    fi && \
+    --mount=type=bind,from=builder,source=/opt/runtime-packages.txt,target=/tmp/runtime-packages.txt \
     apt-get update && apt-get install -y --no-install-recommends \
-    # Core codec libs
-    libass9 \
-    libbluray2 \
-    libfdk-aac2 \
-    libmp3lame0 \
-    libopus0 \
-    libvorbis0a \
-    libvorbisenc2 \
-    $LIBVPX \
-    # Text/font rendering
-    libfontconfig1 \
-    libfreetype6 \
-    libfribidi0 \
-    libharfbuzz0b \
-    # Audio/video processing
-    librubberband2 \
-    libsoxr0 \
-    libvidstab1.1 \
-    libzimg2 \
-    libnuma1 \
-    # Network/crypto
-    $LIBSRT \
-    libssl3 \
-    # X11/display
-    libxcb1 \
-    libxcb-shm0 \
-    libxcb-shape0 \
-    libxcb-xfixes0 \
-    libxv1 \
-    libx11-6 \
-    libxext6 \
-    # Hardware accel:
-    # - NVENC/CUDA: provided by nvidia-container-toolkit from host (no pkg needed)
-    # - VAAPI: intel-media-va-driver-non-free (Intel), mesa-va-drivers (AMD), libva from source (below)
-    # - OpenCL: ocl-icd-libopencl1 (ICD loader), backend from host (NVIDIA) or mesa-opencl-icd (AMD)
-    # - Vulkan: libvulkan1 (conditional below), driver from host
-    libvdpau1 \
-    intel-media-va-driver-non-free \
-    mesa-va-drivers \
-    ocl-icd-libopencl1 \
-    # Intel oneVPL/QSV runtime for Intel GPU hardware encoding (modern Intel CPUs)
-    libmfx-gen1.2 \
-    # Other deps
-    zlib1g \
-    $LIBUNISTRING \
-    liblzma5 \
-    liblzo2-2 \
-    $LIBASOUND \
-    libdrm2 \
-    $LIBSNDIO \
-    libsdl2-2.0-0 \
-    libpulse0
-
-# Conditional runtime libs for apt-based packages (when not built from source)
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    . /etc/os-release && \
-    HWY_PKG="libhwy1t64" && \
-    if [ "$VERSION_CODENAME" = "jammy" ]; then HWY_PKG="libhwy0"; fi && \
-    APT_PKGS="" && \
-    [ "$BUILD_LIBX265" != "1" ] && APT_PKGS="$APT_PKGS libx265-199" ; \
-    [ "$BUILD_LIBAOM" != "1" ] && APT_PKGS="$APT_PKGS libaom3" ; \
-    [ "$BUILD_LIBWEBP" != "1" ] && APT_PKGS="$APT_PKGS libwebp7 libwebpmux3" ; \
-    [ "$BUILD_LIBVPL" != "1" ] && APT_PKGS="$APT_PKGS libvpl2" ; \
-    [ "$BUILD_LIBDAV1D" != "1" ] && APT_PKGS="$APT_PKGS libdav1d7" ; \
-    [ "$BUILD_LIBSVTAV1" != "1" ] && APT_PKGS="$APT_PKGS libsvtav1enc1d1" ; \
-    [ "$BUILD_LIBVMAF" != "1" ] && APT_PKGS="$APT_PKGS libvmaf3" ; \
-    [ "$BUILD_LIBPLACEBO" = "1" ] && APT_PKGS="$APT_PKGS libvulkan1" ; \
-    [ "$BUILD_LIBVA" != "1" ] && APT_PKGS="$APT_PKGS libva2 libva-drm2 libva-x11-2" ; \
-    [ "$BUILD_LIBJXL" = "1" ] && APT_PKGS="$APT_PKGS libbrotli1 $HWY_PKG" ; \
-    [ "$BUILD_LIBJXL" != "1" ] && APT_PKGS="$APT_PKGS libjxl0.7" ; \
-    [ "$BUILD_LIBX264" != "1" ] && APT_PKGS="$APT_PKGS libx264-164" ; \
-    if [ -n "$APT_PKGS" ]; then apt-get update && apt-get install -y --no-install-recommends $APT_PKGS; fi
+        $(cat /tmp/runtime-packages.txt) \
+        intel-media-va-driver-non-free \
+        mesa-va-drivers \
+        ocl-icd-libopencl1 \
+        libmfx-gen1.2 \
+        libvulkan1
 
 # Tell libva where to find system drivers and which driver to use
 # Our libva is built with prefix=/opt/ffmpeg_build but drivers are system-installed

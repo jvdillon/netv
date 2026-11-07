@@ -30,15 +30,26 @@ jobs:
       packages: write
     strategy:
       matrix:
+        # default: owns the unsuffixed cudaX.Y tag (newest LTS that has that CUDA)
         include:
           - nvidia: 'cuda:12.4'
             base_image: 'ubuntu:22.04'
+            default: true
           - nvidia: 'cuda:12.6'
             base_image: 'ubuntu:24.04'
+            default: true
           - nvidia: 'cuda:12.8'
             base_image: 'ubuntu:24.04'
+            default: false
+          - nvidia: 'cuda:12.8'
+            base_image: 'ubuntu:26.04'
+            default: true
           - nvidia: 'cuda:13.0'
             base_image: 'ubuntu:24.04'
+            default: false
+          - nvidia: 'cuda:13.0'
+            base_image: 'ubuntu:26.04'
+            default: true
 
     steps:
       - uses: actions/checkout@v4
@@ -60,6 +71,9 @@ jobs:
           CUDA_VER="${{ matrix.nvidia }}"
           CUDA_VER="${CUDA_VER#cuda:}"
           echo "version=$CUDA_VER" >> $GITHUB_OUTPUT
+          # "ubuntu:26.04" -> "ubuntu26.04"
+          OS="${{ matrix.base_image }}"
+          echo "os=${OS/:/}" >> $GITHUB_OUTPUT
 
       - name: Generate build date
         id: date
@@ -84,9 +98,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=cuda${{ steps.cuda.outputs.version }}
-            type=raw,value=latest,enable=${{ steps.cuda.outputs.version == '13.0' }}
-            type=raw,value=${{ steps.date.outputs.date }}-cuda${{ steps.cuda.outputs.version }},enable=${{ steps.version.outputs.version == 'snapshot' }}
+            type=raw,value=cuda${{ steps.cuda.outputs.version }}-${{ steps.cuda.outputs.os }}
+            type=raw,value=cuda${{ steps.cuda.outputs.version }},enable=${{ matrix.default }}
+            type=raw,value=latest,enable=${{ matrix.default && steps.cuda.outputs.version == '13.0' }}
+            type=raw,value=${{ steps.date.outputs.date }}-cuda${{ steps.cuda.outputs.version }}-${{ steps.cuda.outputs.os }},enable=${{ steps.version.outputs.version == 'snapshot' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -105,11 +120,12 @@ jobs:
 
       - name: Verify image
         run: |
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cuda${{ steps.cuda.outputs.version }}
+          IMG=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cuda${{ steps.cuda.outputs.version }}-${{ steps.cuda.outputs.os }}
+          docker pull $IMG
           # Verify ffmpeg build - check binaries and shared library dependencies
           # Note: Static libraries (libx264, libx265, etc.) are compiled into the binary
           # and won't appear in ldd output. If they were missing, the build would have failed.
-          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cuda${{ steps.cuda.outputs.version }} sh -c "
+          docker run --rm $IMG sh -c "
             echo '=== Verifying ffmpeg build ==='
 
             # Verify all binaries exist

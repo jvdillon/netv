@@ -1513,11 +1513,25 @@ if [ "$ENABLE_TENSORRT" = "1" ]; then
     DNN_INTERFACE_H="$FFMPEG_DIR/libavfilter/dnn_interface.h"
     if [ -f "$DNN_INTERFACE_H" ] && ! grep -q "DNN_TRT" "$DNN_INTERFACE_H"; then
         # FFmpeg 7.0 has single-line enum: {DNN_TF = 1, DNN_OV, DNN_TH}
-        # FFmpeg 7.1+/snapshot has multi-line: DNN_TH = 1 << 2
-        if grep -q "DNN_TH = 1 << 2" "$DNN_INTERFACE_H"; then
-            # Multi-line format (7.1+/snapshot)
-            sed -i '/DNN_TH = 1 << 2/s/$/,/' "$DNN_INTERFACE_H"
-            sed -i '/DNN_TH = 1 << 2,$/a\    DNN_TRT = 1 << 3' "$DNN_INTERFACE_H"
+        # FFmpeg 7.1+ has multi-line bit flags (DNN_TH = 1 << 2, later DNN_ONNX = 1 << 3, ...)
+        if grep -qE "^ *DNN_TH = 1 << [0-9]+" "$DNN_INTERFACE_H"; then
+            # Multi-line bit flags: append DNN_TRT as the next free bit after the last member
+            awk '
+                /^typedef enum \{/ { in_enum = 1 }
+                in_enum && /^ *DNN_[A-Z0-9_]+ = 1 << [0-9]+/ {
+                    n = $0; sub(/.*<< */, "", n); sub(/[^0-9].*/, "", n)
+                    if (n + 0 > max) max = n + 0
+                    last = NR
+                }
+                in_enum && /^\} DNNBackendType;/ { close_line = NR; in_enum = 0 }
+                { lines[NR] = $0 }
+                END {
+                    for (i = 1; i <= NR; i++) {
+                        if (i == last && lines[i] !~ /,[[:space:]]*$/) lines[i] = lines[i] ","
+                        if (i == close_line) printf "    DNN_TRT = 1 << %d\n", max + 1
+                        print lines[i]
+                    }
+                }' "$DNN_INTERFACE_H" > "$DNN_INTERFACE_H.tmp" && mv "$DNN_INTERFACE_H.tmp" "$DNN_INTERFACE_H"
         elif grep -q "DNN_TF = 1, DNN_OV, DNN_TH}" "$DNN_INTERFACE_H"; then
             # Single-line format (7.0)
             sed -i 's/DNN_TF = 1, DNN_OV, DNN_TH}/DNN_TF = 1, DNN_OV, DNN_TH, DNN_TRT}/' "$DNN_INTERFACE_H"
