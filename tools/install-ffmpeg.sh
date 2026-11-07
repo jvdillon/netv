@@ -8,8 +8,9 @@
 #   # Default build (TensorRT enabled, requires compute_70+ GPU)
 #   ./install-ffmpeg.sh
 #
-#   # Maxwell GPU (compute_52, e.g. GTX 900/TITAN X) - use LibTorch 2.5 instead of TensorRT
-#   ENABLE_LIBTORCH=1 ENABLE_TENSORRT=0 LIBTORCH_VERSION=2.5.0 LIBTORCH_VARIANT=cu121 ./install-ffmpeg.sh
+#   # Maxwell GPU (compute_52, e.g. GTX 900/TITAN X) - use LibTorch 2.5 instead of TensorRT.
+#   # CUDA 13 dropped Maxwell: pin 12.9 (on 26.04, from NVIDIA's ubuntu2404 repo).
+#   CUDA_VERSION=12.9 NVCC_GENCODE=52 ENABLE_LIBTORCH=1 ENABLE_TENSORRT=0 LIBTORCH_VERSION=2.5.0 LIBTORCH_VARIANT=cu121 ./install-ffmpeg.sh
 #
 #   # CPU-only DNN inference (no GPU required)
 #   ENABLE_LIBTORCH=1 ENABLE_TENSORRT=0 LIBTORCH_VARIANT=cpu ./install-ffmpeg.sh
@@ -22,6 +23,22 @@
 #
 #   # Both LibTorch and TensorRT (for testing/comparison)
 #   ENABLE_LIBTORCH=1 ENABLE_TENSORRT=1 ./install-ffmpeg.sh
+#
+# Reruns are incremental: each library is skipped when its source revision,
+# toolchain, and build settings match the last successful build (stamps in
+# $BUILD_DIR/.stamps). ffmpeg itself is skipped when nothing it links changed.
+#
+#   # Force specific steps to rebuild (space-separated, or "all")
+#   REBUILD="x265 ffmpeg" ./install-ffmpeg.sh
+#
+#   # Start over: wipe $BUILD_DIR and reset source trees (keeps downloads), then build
+#   CLEAN=build ./install-ffmpeg.sh
+#
+#   # Start over from nothing: also delete $SRC_DIR (re-clones, re-downloads LibTorch/Vulkan SDK)
+#   CLEAN=all ./install-ffmpeg.sh
+#
+#   # Clean only, no build
+#   CLEAN=build PHASE=clean ./install-ffmpeg.sh
 #
 set -e
 
@@ -194,7 +211,9 @@ FFMPEG_VERSION=${FFMPEG_VERSION:-snapshot}
 
 # Skip apt dependency installation (use if deps already installed, avoids sudo)
 SKIP_DEPS=${SKIP_DEPS:-0}
-PHASE=${PHASE:-all}
+PHASE=${PHASE:-all}            # all | deps | clean
+CLEAN=${CLEAN:-}               # "" | build | all
+REBUILD=${REBUILD:-}           # step names to force, or "all"
 
 # Noninteractive apt installs (prevents prompts)
 export DEBIAN_FRONTEND="${DEBIAN_FRONTEND:-noninteractive}"
@@ -410,6 +429,43 @@ download_file() {
     return 0
 }
 
+# --- Incremental build stamps ---------------------------------------------
+# A step is skipped when $STAMP_DIR/<step> holds the same key as computed now.
+# Key = source revision + toolchain + step-specific settings. Stamps live in
+# $BUILD_DIR, so deleting it (or CLEAN=build) forces a full rebuild.
+toolchain_id() {
+    local os_ver=""
+    [ -f /etc/os-release ] && os_ver=$(. /etc/os-release && echo "$VERSION_ID")
+    echo "$os_ver|$(gcc -dumpfullversion 2>/dev/null)|$(g++ -dumpfullversion 2>/dev/null)|$(cmake --version 2>/dev/null | head -1)|$(meson --version 2>/dev/null)"
+}
+
+# step_key <src_dir> [extra settings...]
+step_key() {
+    local src="$1"; shift
+    local rev
+    rev=$(git -C "$src" rev-parse HEAD 2>/dev/null || echo "nogit")
+    printf '%s\n' "$rev" "$TOOLCHAIN_ID" "$BUILD_DIR" "$@" | sha256sum | cut -c1-32
+}
+
+# step_done <name> <key> [artifact]: true if already built with this key
+step_done() {
+    local name="$1" key="$2" artifact="${3:-}"
+    if [ "$REBUILD" = "all" ] || [[ " $REBUILD " == *" $name "* ]]; then
+        return 1
+    fi
+    [ -n "$artifact" ] && [ ! -e "$artifact" ] && return 1
+    if [ "$(cat "$STAMP_DIR/$name" 2>/dev/null)" = "$key" ]; then
+        log_info "$name: up to date, skipping (REBUILD=\"$name\" to force)"
+        return 0
+    fi
+    return 1
+}
+
+step_mark() {
+    mkdir -p "$STAMP_DIR"
+    echo "$2" > "$STAMP_DIR/$1"
+}
+
 version_ge() {
     [ "$(printf '%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
 }
@@ -457,6 +513,7 @@ SRC_DIR="${SRC_DIR:-$HOME/ffmpeg_sources}"      # Source code cache (can be dele
 BUILD_DIR="${BUILD_DIR:-$HOME/ffmpeg_build}"    # Build artifacts cache (can be deleted after build)
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"          # Final binary install location
 LIB_DIR="${LIB_DIR:-$HOME/.local/lib}"          # Final shared library install location (for libva)
+STAMP_DIR="$BUILD_DIR/.stamps"
 
 # Get number of processors with fallback and validation
 NPROC=$(nproc 2>/dev/null || echo 4)
@@ -473,6 +530,42 @@ if [ -z "$HOME" ]; then
         exit 1
     fi
     export HOME
+fi
+
+case "$CLEAN" in
+    "") ;;
+    build)
+        echo "CLEAN=build: removing $BUILD_DIR and resetting source trees in $SRC_DIR"
+        safe_rm_rf "$BUILD_DIR" 3
+        if [ -d "$SRC_DIR" ]; then
+            for d in "$SRC_DIR"/*/; do
+                d="${d%/}"
+                if [ -d "$d/.git" ]; then
+                    git -C "$d" reset -q --hard
+                    git -C "$d" clean -q -ffdx
+                    git -C "$d" submodule foreach -q --recursive 'git clean -q -ffdx' 2>/dev/null || true
+                fi
+            done
+            # Extracted ffmpeg tarball trees carry in-place patches; re-extract fresh
+            for d in "$SRC_DIR"/ffmpeg-*/; do
+                [ -d "$d" ] && safe_rm_rf "${d%/}" 3
+            done
+            safe_rm_rf "$SRC_DIR/aom_build" 3
+        fi
+        ;;
+    all)
+        echo "CLEAN=all: removing $BUILD_DIR and $SRC_DIR"
+        safe_rm_rf "$BUILD_DIR" 3
+        safe_rm_rf "$SRC_DIR" 3
+        ;;
+    *)
+        log_error "Invalid CLEAN='$CLEAN' (expected build or all)"
+        exit 1
+        ;;
+esac
+if [ "$PHASE" = "clean" ]; then
+    echo "PHASE=clean set; done."
+    exit 0
 fi
 
 # Create build directories (with validation)
@@ -540,6 +633,10 @@ APT_PACKAGES=(
     # Intel oneVPL/QSV runtime (needed for Intel GPU hardware encoding)
     libmfx-gen1.2
 )
+# Ubuntu 26.04+: libcrypto.pc's static libs reference libjitterentropy.a (needed to link srt/openssl)
+if apt-cache show libjitterentropy3-dev >/dev/null 2>&1; then
+    APT_PACKAGES+=(libjitterentropy3-dev)
+fi
 # Add apt packages for libraries we're not building from source
 [ "$BUILD_LIBX265" != "1" ] && APT_PACKAGES+=(libx265-dev)
 [ "$BUILD_LIBAOM" != "1" ] && APT_PACKAGES+=(libaom-dev)
@@ -582,12 +679,13 @@ if [ "$ENABLE_NVIDIA_CUDA" = "1" ]; then
                 # Detect Ubuntu version for correct CUDA repo (24.04 -> ubuntu2404, 25.04 -> ubuntu2504)
                 UBUNTU_VERSION=$(get_ubuntu_version) || exit 1
                 CUDA_REPO_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${UBUNTU_VERSION}/x86_64/cuda-keyring_1.1-1_all.deb"
-                if ! wget --progress=dot:giga "$CUDA_REPO_URL" -O cuda-keyring.deb; then
+                CUDA_KEYRING_DEB="$(mktemp -d)/cuda-keyring.deb"
+                if ! wget --progress=dot:giga "$CUDA_REPO_URL" -O "$CUDA_KEYRING_DEB"; then
                     log_error "Failed to download CUDA keyring from $CUDA_REPO_URL"
                     exit 1
                 fi
-                sudo dpkg -i cuda-keyring.deb
-                rm cuda-keyring.deb
+                sudo dpkg -i "$CUDA_KEYRING_DEB"
+                rm -rf "$(dirname "$CUDA_KEYRING_DEB")"
                 sudo apt-get update
             fi
 
@@ -599,6 +697,38 @@ if [ "$ENABLE_NVIDIA_CUDA" = "1" ]; then
                     exit 1
                 fi
                 echo "Will install latest CUDA version: $CUDA_VERSION"
+            fi
+        fi
+
+        # NVIDIA's repo for newer Ubuntu may lack older toolkits (ubuntu2604 has only CUDA 13+,
+        # which dropped Maxwell/Pascal/Volta). Fall back to the ubuntu2404 repo for those.
+        cuda_pkg_available() {
+            apt-cache policy "cuda-nvcc-$CUDA_VERSION" 2>/dev/null | awk '/Candidate:/{print $2}' | grep -qv '(none)'
+        }
+        if ! cuda_pkg_available; then
+            echo "cuda-nvcc-$CUDA_VERSION not in this release's CUDA repo; adding NVIDIA ubuntu2404 repo"
+            # ubuntu2404 is signed with a different key than newer repos; install it side by side
+            CUDA2404_KEY=/usr/share/keyrings/cuda-archive-keyring-ubuntu2404.gpg
+            if [ ! -f "$CUDA2404_KEY" ]; then
+                CUDA_KEY_TMP=$(mktemp -d)
+                if ! wget -q -O "$CUDA_KEY_TMP/k.deb" https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb; then
+                    log_error "Failed to download ubuntu2404 CUDA keyring"
+                    exit 1
+                fi
+                dpkg-deb -x "$CUDA_KEY_TMP/k.deb" "$CUDA_KEY_TMP/x"
+                sudo install -m 644 "$CUDA_KEY_TMP/x/usr/share/keyrings/cuda-archive-keyring.gpg" "$CUDA2404_KEY"
+                rm -rf "$CUDA_KEY_TMP"
+            fi
+            sudo tee /etc/apt/sources.list.d/cuda-ubuntu2404-x86_64.sources >/dev/null <<SRCEOF
+Types: deb
+URIs: https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/
+Suites: /
+Signed-By: $CUDA2404_KEY
+SRCEOF
+            sudo apt-get update
+            if ! cuda_pkg_available; then
+                log_error "cuda-nvcc-$CUDA_VERSION not available from NVIDIA's repos"
+                exit 1
             fi
         fi
 
@@ -615,57 +745,66 @@ if [ "$ENABLE_NVIDIA_CUDA" = "1" ]; then
 
     # Detect CUDA installation path
     CUDA_VERSION_DOT=$(echo "$CUDA_VERSION" | tr '-' '.')
-    if [ -d "/usr/local/cuda" ]; then
-        CUDA_PATH="/usr/local/cuda"
-    elif [ -d "/usr/local/cuda-${CUDA_VERSION_DOT}" ]; then
+    if [ -x "/usr/local/cuda-${CUDA_VERSION_DOT}/bin/nvcc" ]; then
         CUDA_PATH="/usr/local/cuda-${CUDA_VERSION_DOT}"
+    elif [ -d "/usr/local/cuda" ]; then
+        CUDA_PATH="/usr/local/cuda"
     else
         echo "Warning: CUDA path not found, using /usr/local/cuda (headers may be missing)" >&2
         CUDA_PATH="/usr/local/cuda"
     fi
     echo "Using CUDA path: $CUDA_PATH"
 
-    # Patch CUDA headers for glibc 2.42+ compatibility (Ubuntu 25.04+)
-    # glibc 2.42 added rsqrt/rsqrtf to mathcalls.h which conflicts with CUDA's definitions
-    # This causes "exception specification is incompatible" errors during nvcc compilation
-    if [ "$SKIP_DEPS" != "1" ]; then
-        CUDA_MATH_HEADER="$CUDA_PATH/targets/x86_64-linux/include/crt/math_functions.h"
-        if [ -f "$CUDA_MATH_HEADER" ]; then
-            GLIBC_VERSION=$(ldd --version | head -1 | grep -oP '\d+\.\d+$')
-            GLIBC_MAJOR=$(echo "$GLIBC_VERSION" | cut -d. -f1)
-            GLIBC_MINOR=$(echo "$GLIBC_VERSION" | cut -d. -f2)
-
-            # Only patch if glibc >= 2.42 and patch not already applied
-            if [ "$GLIBC_MAJOR" -gt 2 ] || ([ "$GLIBC_MAJOR" -eq 2 ] && [ "$GLIBC_MINOR" -ge 42 ]); then
-                # Check for our patch OR NVIDIA's fix (they use __NV_GLIBC_PROVIDES_IEC_60559_FUNCS for similar issues)
-                if grep -q "rsqrt" "$CUDA_MATH_HEADER" && \
-                   ! grep -B2 "double[[:space:]]*rsqrt(double" "$CUDA_MATH_HEADER" | grep -q "GLIBC"; then
-                    echo "Patching CUDA headers for glibc $GLIBC_VERSION compatibility..."
-                    # Backup original if no backup exists
-                    [ ! -f "${CUDA_MATH_HEADER}.bak" ] && sudo cp "$CUDA_MATH_HEADER" "${CUDA_MATH_HEADER}.bak"
-                    # Add guards around rsqrt declaration (prevent conflict with glibc's rsqrt)
-                    sudo sed -i '/extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ double[[:space:]]*rsqrt(double/c\
-#if !(defined(__GLIBC__) \&\& __GLIBC_USE_IEC_60559_FUNCS_EXT_C23)\
-extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ double                 rsqrt(double x);\
-#endif' "$CUDA_MATH_HEADER"
-                    # Add guards around rsqrtf declaration
-                    sudo sed -i '/extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ float[[:space:]]*rsqrtf(float/c\
-#if !(defined(__GLIBC__) \&\& __GLIBC_USE_IEC_60559_FUNCS_EXT_C23)\
-extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ float                  rsqrtf(float x);\
-#endif' "$CUDA_MATH_HEADER"
-                    # Verify patch was applied
-                    if grep -B2 "double[[:space:]]*rsqrt(double" "$CUDA_MATH_HEADER" | grep -q "GLIBC"; then
-                        echo "CUDA header patched successfully"
-                    else
-                        echo "Warning: CUDA header patch may have failed - rsqrt declaration not found" >&2
-                        echo "CUDA version may have different header format. Check $CUDA_MATH_HEADER" >&2
-                    fi
-                else
-                    echo "CUDA headers already patched for glibc compatibility"
+    # Patch CUDA headers for glibc 2.41+ (Ubuntu 25.04+). glibc now declares C23
+    # sinpi/cospi/rsqrt (+f) as noexcept; CUDA 12.x declares them without it, so nvcc
+    # fails with "exception specification is incompatible". Add matching noexcept.
+    CUDA_MATH_HEADER="$CUDA_PATH/targets/x86_64-linux/include/crt/math_functions.h"
+    GLIBC_VERSION=$(ldd --version | head -1 | grep -oP '\d+\.\d+$')
+    if [ -f "$CUDA_MATH_HEADER" ] && version_ge "$GLIBC_VERSION" 2.41; then
+        C23_DECL_RE='^(extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ (double|float) +(sinpif?|cospif?|rsqrtf?)\((double|float) x\));'
+        if grep -qE "$C23_DECL_RE\$" "$CUDA_MATH_HEADER"; then
+            if [ "$SKIP_DEPS" = "1" ]; then
+                log_warn "CUDA headers need a glibc $GLIBC_VERSION patch (requires sudo); rerun without SKIP_DEPS=1"
+            else
+                echo "Patching CUDA headers for glibc $GLIBC_VERSION compatibility..."
+                [ -f "${CUDA_MATH_HEADER}.orig" ] || sudo cp "$CUDA_MATH_HEADER" "${CUDA_MATH_HEADER}.orig"
+                sudo sed -i -E "s/${C23_DECL_RE}\$/\1 noexcept (true);/" "$CUDA_MATH_HEADER"
+                if grep -qE "$C23_DECL_RE\$" "$CUDA_MATH_HEADER"; then
+                    log_error "CUDA header patch failed: $CUDA_MATH_HEADER"
+                    exit 1
                 fi
             fi
         fi
     fi
+
+    # Pick a host compiler nvcc accepts. CUDA 12.x rejects GCC newer than 14
+    # (Ubuntu 26.04 ships 15); fall back to an older g++, installing it if needed.
+    if [ -z "${NVCC_CCBIN:-}" ]; then
+        NVCC_PROBE_DIR=$(mktemp -d)
+        printf '__global__ void k(){}\n' > "$NVCC_PROBE_DIR/p.cu"
+        nvcc_accepts() {
+            if [ -n "$1" ]; then set -- env NVCC_CCBIN="$1"; else set -- env -u NVCC_CCBIN; fi
+            "$@" "$CUDA_PATH/bin/nvcc" -std=c++14 -c -o "$NVCC_PROBE_DIR/p.o" "$NVCC_PROBE_DIR/p.cu" \
+                -Wno-deprecated-gpu-targets >/dev/null 2>&1
+        }
+        if ! nvcc_accepts ""; then
+            for v in 14 13 12; do
+                if ! command -v "g++-$v" >/dev/null && [ "$SKIP_DEPS" != "1" ]; then
+                    sudo apt-get install -y "g++-$v" >/dev/null 2>&1 || continue
+                fi
+                if command -v "g++-$v" >/dev/null && nvcc_accepts "g++-$v"; then
+                    export NVCC_CCBIN="g++-$v"
+                    break
+                fi
+            done
+            if [ -z "${NVCC_CCBIN:-}" ]; then
+                log_error "nvcc ($CUDA_PATH) accepts no available host compiler; set NVCC_CCBIN"
+                exit 1
+            fi
+        fi
+        rm -rf "$NVCC_PROBE_DIR"
+    fi
+    echo "nvcc host compiler: ${NVCC_CCBIN:-default ($(g++ -dumpfullversion))}"
 
     CUDA_FLAGS=(--enable-cuda-nvcc --enable-nvenc --enable-cuvid --enable-nvdec)
 
@@ -749,13 +888,19 @@ fi
 
 # libx264 (H.264/AVC encoder)
 # Build with --bit-depth=all for 8-bit and 10-bit support
+TOOLCHAIN_ID=$(toolchain_id)
+
 if [ "$BUILD_LIBX264" = "1" ]; then
     cd "$SRC_DIR"
     git_update_or_clone "https://code.videolan.org/videolan/x264.git" "x264" 1
-    cd x264
-    PATH="$BIN_DIR:$PATH" ./configure --prefix="$BUILD_DIR" --enable-static --enable-pic --disable-cli --bit-depth=all
-    PATH="$BIN_DIR:$PATH" make -j "$NPROC"
-    make install
+    KEY=$(step_key "$SRC_DIR/x264")
+    if ! step_done x264 "$KEY" "$BUILD_DIR/lib/libx264.a"; then
+        cd x264
+        PATH="$BIN_DIR:$PATH" ./configure --prefix="$BUILD_DIR" --enable-static --enable-pic --disable-cli --bit-depth=all
+        PATH="$BIN_DIR:$PATH" make -j "$NPROC"
+        make install
+        step_mark x264 "$KEY"
+    fi
 fi
 
 
@@ -765,7 +910,10 @@ fi
 if [ "$BUILD_LIBX265" = "1" ]; then
     cd "$SRC_DIR"
     git_update_or_clone "https://bitbucket.org/multicoreware/x265_git.git" "x265_git" 1
-    cd x265_git/build/linux
+    KEY=$(step_key "$SRC_DIR/x265_git")
+fi
+if [ "$BUILD_LIBX265" = "1" ] && ! step_done x265 "$KEY" "$BUILD_DIR/lib/libx265.a"; then
+    cd "$SRC_DIR/x265_git/build/linux"
 
     # Clean previous builds
     rm -rf 8bit 10bit 12bit
@@ -836,28 +984,37 @@ Libs: -L\${libdir} -lx265
 Libs.private: -lstdc++ -lm -lrt -ldl -lnuma -lpthread
 Cflags: -I\${includedir}
 PCEOF
+    step_mark x265 "$KEY"
 fi
 
 # libaom (AV1 reference codec)
 if [ "$BUILD_LIBAOM" = "1" ]; then
     cd "$SRC_DIR"
     git_update_or_clone "https://aomedia.googlesource.com/aom" "aom" 1
-    mkdir -p aom_build
-    cd aom_build
-    PATH="$BIN_DIR:$PATH" cmake -G "Unix Makefiles" -DCMAKE_INSTALL_PREFIX="$BUILD_DIR" -DENABLE_TESTS=OFF -DENABLE_NASM=on -DBUILD_SHARED_LIBS=OFF -DCONFIG_AV1_HIGHBITDEPTH=1 ../aom
-    PATH="$BIN_DIR:$PATH" make -j "$NPROC"
-    make install
+    KEY=$(step_key "$SRC_DIR/aom")
+    if ! step_done aom "$KEY" "$BUILD_DIR/lib/libaom.a"; then
+        mkdir -p aom_build
+        cd aom_build
+        PATH="$BIN_DIR:$PATH" cmake -G "Unix Makefiles" -DCMAKE_INSTALL_PREFIX="$BUILD_DIR" -DENABLE_TESTS=OFF -DENABLE_NASM=on -DBUILD_SHARED_LIBS=OFF -DCONFIG_AV1_HIGHBITDEPTH=1 ../aom
+        PATH="$BIN_DIR:$PATH" make -j "$NPROC"
+        make install
+        step_mark aom "$KEY"
+    fi
 fi
 
 # libwebp (WebP image codec)
 if [ "$BUILD_LIBWEBP" = "1" ]; then
     cd "$SRC_DIR"
     git_update_or_clone "https://chromium.googlesource.com/webm/libwebp" "libwebp" 1
-    cd libwebp
-    ./autogen.sh
-    ./configure --prefix="$BUILD_DIR" --disable-shared --enable-static
-    make -j "$NPROC"
-    make install
+    KEY=$(step_key "$SRC_DIR/libwebp")
+    if ! step_done libwebp "$KEY" "$BUILD_DIR/lib/libwebp.a"; then
+        cd libwebp
+        ./autogen.sh
+        ./configure --prefix="$BUILD_DIR" --disable-shared --enable-static
+        make -j "$NPROC"
+        make install
+        step_mark libwebp "$KEY"
+    fi
 fi
 
 # libjxl (JPEG XL image codec)
@@ -876,41 +1033,53 @@ if [ "$BUILD_LIBJXL" = "1" ]; then
             exit 1
         fi
     fi
-    cd libjxl
-    mkdir -p build
-    cd build
-    cmake -G "Unix Makefiles" -DCMAKE_INSTALL_PREFIX="$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release \
-        -DBUILD_SHARED_LIBS=OFF -DJPEGXL_ENABLE_BENCHMARK=OFF -DJPEGXL_ENABLE_EXAMPLES=OFF \
-        -DJPEGXL_ENABLE_MANPAGES=OFF -DJPEGXL_ENABLE_PLUGINS=OFF -DJPEGXL_ENABLE_VIEWERS=OFF \
-        -DJPEGXL_ENABLE_TOOLS=OFF -DJPEGXL_ENABLE_DOXYGEN=OFF -DJPEGXL_ENABLE_JPEGLI=OFF ..
-    make -j "$NPROC"
-    make install
+    KEY=$(step_key "$SRC_DIR/libjxl" "$(git -C "$SRC_DIR/libjxl" submodule status --recursive 2>/dev/null)")
+    if ! step_done libjxl "$KEY" "$BUILD_DIR/lib/libjxl.a"; then
+        cd libjxl
+        mkdir -p build
+        cd build
+        cmake -G "Unix Makefiles" -DCMAKE_INSTALL_PREFIX="$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF -DJPEGXL_ENABLE_BENCHMARK=OFF -DJPEGXL_ENABLE_EXAMPLES=OFF \
+            -DJPEGXL_ENABLE_MANPAGES=OFF -DJPEGXL_ENABLE_PLUGINS=OFF -DJPEGXL_ENABLE_VIEWERS=OFF \
+            -DJPEGXL_ENABLE_TOOLS=OFF -DJPEGXL_ENABLE_DOXYGEN=OFF -DJPEGXL_ENABLE_JPEGLI=OFF ..
+        make -j "$NPROC"
+        make install
+        step_mark libjxl "$KEY"
+    fi
 fi
 
 # libvpl (Intel Video Processing Library / QuickSync)
 if [ "$BUILD_LIBVPL" = "1" ]; then
     cd "$SRC_DIR"
     git_update_or_clone "https://github.com/intel/libvpl.git" "libvpl" 1
-    mkdir -p libvpl/build
-    cd libvpl/build
-    cmake -G "Unix Makefiles" -DCMAKE_INSTALL_PREFIX="$BUILD_DIR" -DBUILD_SHARED_LIBS=OFF ..
-    make -j "$NPROC"
-    make install
+    KEY=$(step_key "$SRC_DIR/libvpl")
+    if ! step_done libvpl "$KEY" "$BUILD_DIR/lib/libvpl.a"; then
+        mkdir -p libvpl/build
+        cd libvpl/build
+        cmake -G "Unix Makefiles" -DCMAKE_INSTALL_PREFIX="$BUILD_DIR" -DBUILD_SHARED_LIBS=OFF ..
+        make -j "$NPROC"
+        make install
+        step_mark libvpl "$KEY"
+    fi
 fi
 
 # libdav1d (AV1 decoder)
 if [ "$BUILD_LIBDAV1D" = "1" ]; then
     cd "$SRC_DIR"
     git_update_or_clone "https://code.videolan.org/videolan/dav1d.git" "dav1d" 1
-    cd dav1d
-    if [ -f build/build.ninja ]; then
-        meson setup --reconfigure build --buildtype=release --default-library=static --prefix="$BUILD_DIR" --libdir="$BUILD_DIR/lib" || \
-        meson setup --wipe build --buildtype=release --default-library=static --prefix="$BUILD_DIR" --libdir="$BUILD_DIR/lib"
-    else
-        meson setup build --buildtype=release --default-library=static --prefix="$BUILD_DIR" --libdir="$BUILD_DIR/lib"
+    KEY=$(step_key "$SRC_DIR/dav1d")
+    if ! step_done dav1d "$KEY" "$BUILD_DIR/lib/libdav1d.a"; then
+        cd dav1d
+        if [ -f build/build.ninja ]; then
+            meson setup --reconfigure build --buildtype=release --default-library=static --prefix="$BUILD_DIR" --libdir="$BUILD_DIR/lib" || \
+            meson setup --wipe build --buildtype=release --default-library=static --prefix="$BUILD_DIR" --libdir="$BUILD_DIR/lib"
+        else
+            meson setup build --buildtype=release --default-library=static --prefix="$BUILD_DIR" --libdir="$BUILD_DIR/lib"
+        fi
+        ninja -C build
+        ninja -C build install
+        step_mark dav1d "$KEY"
     fi
-    ninja -C build
-    ninja -C build install
 fi
 
 # libsvtav1 (AV1 encoder)
@@ -923,25 +1092,33 @@ if [ "$BUILD_LIBSVTAV1" = "1" ]; then
         git -C .. fetch --depth 1 origin "$SVTAV1_GIT_REF"
         git -C .. checkout -q FETCH_HEAD
     fi
-    PATH="$BIN_DIR:$PATH" cmake -G "Unix Makefiles" -DCMAKE_INSTALL_PREFIX="$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DBUILD_DEC=OFF -DBUILD_SHARED_LIBS=OFF ..
-    PATH="$BIN_DIR:$PATH" make -j "$NPROC"
-    make install
+    KEY=$(step_key "$SRC_DIR/SVT-AV1")
+    if ! step_done svtav1 "$KEY" "$BUILD_DIR/lib/libSvtAv1Enc.a"; then
+        PATH="$BIN_DIR:$PATH" cmake -G "Unix Makefiles" -DCMAKE_INSTALL_PREFIX="$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DBUILD_DEC=OFF -DBUILD_SHARED_LIBS=OFF ..
+        PATH="$BIN_DIR:$PATH" make -j "$NPROC"
+        make install
+        step_mark svtav1 "$KEY"
+    fi
 fi
 
 # libvmaf (video quality metrics)
 if [ "$BUILD_LIBVMAF" = "1" ]; then
     cd "$SRC_DIR"
     git_update_or_clone "https://github.com/Netflix/vmaf" "vmaf" 1
-    mkdir -p vmaf/libvmaf/build
-    cd vmaf/libvmaf/build
-    if [ -f build.ninja ]; then
-        meson setup --reconfigure -Denable_tests=false -Denable_docs=false --buildtype=release --default-library=static '../' --prefix "$BUILD_DIR" --bindir="$BIN_DIR" --libdir="$BUILD_DIR/lib" || \
-        meson setup --wipe -Denable_tests=false -Denable_docs=false --buildtype=release --default-library=static '../' --prefix "$BUILD_DIR" --bindir="$BIN_DIR" --libdir="$BUILD_DIR/lib"
-    else
-        meson setup -Denable_tests=false -Denable_docs=false --buildtype=release --default-library=static '../' --prefix "$BUILD_DIR" --bindir="$BIN_DIR" --libdir="$BUILD_DIR/lib"
+    KEY=$(step_key "$SRC_DIR/vmaf" "$BIN_DIR")
+    if ! step_done vmaf "$KEY" "$BUILD_DIR/lib/libvmaf.a"; then
+        mkdir -p vmaf/libvmaf/build
+        cd vmaf/libvmaf/build
+        if [ -f build.ninja ]; then
+            meson setup --reconfigure -Denable_tests=false -Denable_docs=false --buildtype=release --default-library=static '../' --prefix "$BUILD_DIR" --bindir="$BIN_DIR" --libdir="$BUILD_DIR/lib" || \
+            meson setup --wipe -Denable_tests=false -Denable_docs=false --buildtype=release --default-library=static '../' --prefix "$BUILD_DIR" --bindir="$BIN_DIR" --libdir="$BUILD_DIR/lib"
+        else
+            meson setup -Denable_tests=false -Denable_docs=false --buildtype=release --default-library=static '../' --prefix "$BUILD_DIR" --bindir="$BIN_DIR" --libdir="$BUILD_DIR/lib"
+        fi
+        ninja
+        ninja install
+        step_mark vmaf "$KEY"
     fi
-    ninja
-    ninja install
 fi
 
 # libva (VA-API)
@@ -950,15 +1127,19 @@ fi
 if [ "$BUILD_LIBVA" = "1" ]; then
     cd "$SRC_DIR"
     git_update_or_clone "https://github.com/intel/libva.git" "libva" 1
-    cd libva
-    if [ -f build/build.ninja ]; then
-        meson setup --reconfigure build --buildtype=release --default-library=shared --prefix="$BUILD_DIR" --libdir="$BUILD_DIR/lib" || \
-        meson setup --wipe build --buildtype=release --default-library=shared --prefix="$BUILD_DIR" --libdir="$BUILD_DIR/lib"
-    else
-        meson setup build --buildtype=release --default-library=shared --prefix="$BUILD_DIR" --libdir="$BUILD_DIR/lib"
+    KEY=$(step_key "$SRC_DIR/libva")
+    if ! step_done libva "$KEY" "$BUILD_DIR/lib/libva.so"; then
+        cd libva
+        if [ -f build/build.ninja ]; then
+            meson setup --reconfigure build --buildtype=release --default-library=shared --prefix="$BUILD_DIR" --libdir="$BUILD_DIR/lib" || \
+            meson setup --wipe build --buildtype=release --default-library=shared --prefix="$BUILD_DIR" --libdir="$BUILD_DIR/lib"
+        else
+            meson setup build --buildtype=release --default-library=shared --prefix="$BUILD_DIR" --libdir="$BUILD_DIR/lib"
+        fi
+        ninja -C build
+        ninja -C build install
+        step_mark libva "$KEY"
     fi
-    ninja -C build
-    ninja -C build install
     # Copy shared libs to permanent location (LIB_DIR) for runtime
     cp -a "$BUILD_DIR/lib"/libva*.so* "$LIB_DIR/"
 fi
@@ -1024,9 +1205,13 @@ if [ "$BUILD_LIBPLACEBO" = "1" ]; then
         git fetch --depth 1 origin "$LIBPLACEBO_GIT_REF"
         git checkout -q FETCH_HEAD
     fi
-    build_libplacebo
-    ninja -C build
-    ninja -C build install
+    KEY=$(step_key "$SRC_DIR/libplacebo" "$VULKAN_SDK_VERSION")
+    if ! step_done libplacebo "$KEY" "$BUILD_DIR/lib/libplacebo.a"; then
+        build_libplacebo
+        ninja -C build
+        ninja -C build install
+        step_mark libplacebo "$KEY"
+    fi
 fi
 
 # LibTorch (PyTorch C++ library for DNN backend)
@@ -1154,6 +1339,11 @@ if [ ! -d "$FFMPEG_DIR" ]; then
         tar xJf "ffmpeg-${FFMPEG_VERSION}.tar.xz"
         rm -f "ffmpeg-${FFMPEG_VERSION}.tar.xz"
     fi
+fi
+
+# libstdc++ >= 14 headers fail under nvcc -std=c++11 (variable templates); ffmpeg's configure hardcodes it
+if grep -q 'nvccflags="$nvccflags -std=c++11"' "$FFMPEG_DIR/configure"; then
+    sed -i 's/nvccflags="$nvccflags -std=c++11"/nvccflags="$nvccflags -std=c++14"/' "$FFMPEG_DIR/configure"
 fi
 
 # Patch ffmpeg for SVT-AV1 v4.0.0 API compatibility
@@ -1506,9 +1696,22 @@ fi
 BUILD_PATH="$BIN_DIR:$PATH"
 [ "$ENABLE_NVIDIA_CUDA" = "1" ] && BUILD_PATH="$CUDA_PATH/bin:$BUILD_PATH"
 
-PATH="$BUILD_PATH" PKG_CONFIG_PATH="$BUILD_DIR/lib/pkgconfig:$PKG_CONFIG_PATH" "${CONFIGURE_CMD[@]}"
-PATH="$BUILD_PATH" make -j "$NPROC"
-make install
+# ffmpeg key: everything it links or is patched with. In-place source patches above are
+# idempotent, so the script and patches/ hashes stand in for "what patches were applied".
+FFMPEG_KEY=$(step_key "$SRC_DIR/$FFMPEG_DIR" \
+    "$(cat VERSION RELEASE 2>/dev/null)" \
+    "${CONFIGURE_CMD[*]}" \
+    "$(cd "$STAMP_DIR" 2>/dev/null && for f in $(ls | sort); do [ "$f" = ffmpeg ] || echo "$f=$(cat "$f")"; done)" \
+    "$( [ "$ENABLE_NVIDIA_CUDA" = "1" ] && "$CUDA_PATH/bin/nvcc" --version 2>/dev/null | tail -1)" \
+    "${LIBTORCH_VERSION:-}:${TORCH_VARIANT:-}" \
+    "${NVCC_CCBIN:-}" \
+    "$(sha256sum "$SCRIPT_DIR/install-ffmpeg.sh" "$SCRIPT_DIR"/patches/* 2>/dev/null | cut -c1-64)")
+if ! step_done ffmpeg "$FFMPEG_KEY" "$BIN_DIR/ffmpeg"; then
+    PATH="$BUILD_PATH" PKG_CONFIG_PATH="$BUILD_DIR/lib/pkgconfig:$PKG_CONFIG_PATH" "${CONFIGURE_CMD[@]}"
+    PATH="$BUILD_PATH" make -j "$NPROC"
+    make install
+    step_mark ffmpeg "$FFMPEG_KEY"
+fi
 hash -r
 
 grep -q "$BUILD_DIR/share/man" "$HOME/.manpath" 2>/dev/null || echo "MANPATH_MAP $BIN_DIR $BUILD_DIR/share/man" >> "$HOME/.manpath"
