@@ -225,6 +225,17 @@ def test_upgrade_uses_bounded_bitrate(tmp_path, hardware: HwAccel, resolution, t
     assert not set(low) & {"-qp", "-qp_i", "-qp_p", "-global_quality", "-crf", "constqp"}
 
 
+def test_encoders_decode_on_gpu_when_source_codec_is_known(tmp_path):
+    with patch("ffmpeg_command._get_gpu_nvdec_codecs", return_value={"h264"}):
+        for high in (False, True):
+            args = (str(tmp_path), "nvenc+software", "1080p", "high", False, high)
+            cmd = fast_start.encoder_command(*args, video_codec="h264")
+            assert cmd[cmd.index("-hwaccel") + 1] == "cuda"
+            assert "hwupload_cuda" not in cmd[cmd.index("-vf") + 1]
+            assert "-hwaccel" not in fast_start.encoder_command(*args)
+            assert "-hwaccel" not in fast_start.encoder_command(*args, video_codec="hevc")
+
+
 def test_master_playlist_reserves_surround_audio_bandwidth():
     from ffmpeg_command import MediaInfo
 

@@ -1284,6 +1284,19 @@ def probe_audio(path: str) -> MediaInfo | None:
         return None
 
 
+def probe_video_codec(path: str) -> str:
+    """Video codec of a local file, or "" when it cannot be read."""
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name", "-of", "json", path,
+    ]  # fmt: skip
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
+        return json.loads(result.stdout)["streams"][0].get("codec_name", "").lower()
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError, TypeError):
+        return ""
+
+
 def probe_closed_captions(path: str) -> bool:
     """Whether a local video segment carries embedded closed-caption data."""
     cmd = [
@@ -1327,11 +1340,13 @@ def build_hls_ffmpeg_cmd(
     allow_upscale: bool = True,
     audio_info: MediaInfo | None = None,
     audio_passthrough: bool = False,
+    video_codec: str = "",
 ) -> list[str]:
     """Build ffmpeg command for HLS transcoding.
 
     audio_info describes the audio when media_info is unavailable. audio_passthrough
     lets Dolby (AC-3/E-AC-3) audio through for clients that decode it natively.
+    video_codec, when media_info is unavailable, still selects hardware decoding.
     """
     audio = audio_info or media_info
     # Check if we can copy streams directly (compatible codecs, no processing needed)
@@ -1341,10 +1356,10 @@ def build_hls_ffmpeg_cmd(
     # Full hardware pipeline if GPU supports the codec
     # Parse hw to get encoder type
     enc_type, _ = _parse_hw(hw)
-    codec = media_info.video_codec if media_info else ""
+    codec = media_info.video_codec if media_info else video_codec
     use_hw_pipeline = bool(
         not copy_video
-        and media_info
+        and codec
         and (
             (enc_type == "nvenc" and codec in _get_gpu_nvdec_codecs())
             or (enc_type == "vaapi" and codec in _VAAPI_SAFE_CODECS)

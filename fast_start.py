@@ -117,6 +117,7 @@ def encoder_command(
     audio: MediaInfo | None = None,
     audio_passthrough: bool = False,
     restarting: bool = False,
+    video_codec: str = "",
 ) -> list[str]:
     cmd = build_hls_ffmpeg_cmd(
         f"{directory}/input.m3u8",
@@ -132,6 +133,7 @@ def encoder_command(
         allow_upscale=high,
         audio_info=audio,
         audio_passthrough=audio_passthrough,
+        video_codec=video_codec,
     )
     index = cmd.index("-i")
     cmd[index:index] = ["-live_start_index", "-3" if restarting else "0"]

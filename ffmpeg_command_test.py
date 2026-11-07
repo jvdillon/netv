@@ -30,6 +30,7 @@ from ffmpeg_command import (
     invalidate_series_probe_cache,
     limit_live_video_bitrate,
     probe_audio,
+    probe_video_codec,
     probe_closed_captions,
     probe_media,
     restore_probe_cache_entry,
@@ -1433,6 +1434,20 @@ def test_probe_audio_reads_local_surround_segment(tmp_path):
     assert info is not None
     assert (info.audio_codec, info.audio_channels, info.audio_sample_rate) == ("ac3", 6, 48000)
     assert probe_audio(str(tmp_path / "missing.ts")) is None
+
+
+@pytest.mark.skipif(not __import__("shutil").which("ffmpeg"), reason="ffmpeg not installed")
+def test_probe_video_codec_reads_local_segment(tmp_path):
+    import subprocess
+
+    path = tmp_path / "input.ts"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x64", "-t", "1",
+         "-c:v", "mpeg2video", str(path)],
+        check=True,
+    )  # fmt: skip
+    assert probe_video_codec(str(path)) == "mpeg2video"
+    assert probe_video_codec(str(tmp_path / "missing.ts")) == ""
 
 
 @pytest.mark.parametrize("side_data_type, expected", [

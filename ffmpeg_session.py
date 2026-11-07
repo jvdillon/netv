@@ -48,6 +48,7 @@ from ffmpeg_command import (
     invalidate_series_probe_cache,
     live_video_bitrates,
     probe_audio,
+    probe_video_codec,
     probe_closed_captions,
     probe_media,
     resolve_hls_master_playlist,
@@ -2262,9 +2263,10 @@ async def _start_fast_live(
         first_input = min(pathlib.Path(directory).glob("input_*.ts"))
         origin_pts = segment_pts(first_input)
         # The local segment reveals audio and caption metadata without re-reading upstream.
-        audio, closed_captions = await asyncio.gather(
+        audio, closed_captions, video_codec = await asyncio.gather(
             asyncio.to_thread(probe_audio, str(first_input)),
             asyncio.to_thread(probe_closed_captions, str(first_input)),
+            asyncio.to_thread(probe_video_codec, str(first_input)),
         )
         use_audio_passthrough = uses_audio_passthrough(audio, audio_passthrough)
         with _transcode_lock:
@@ -2288,6 +2290,7 @@ async def _start_fast_live(
             audio=audio,
             audio_passthrough=audio_passthrough,
             restarting=True,
+            video_codec=video_codec,
         )
         low = await launch(
             encoder_command(
@@ -2299,6 +2302,7 @@ async def _start_fast_live(
                 False,
                 audio=audio,
                 audio_passthrough=audio_passthrough,
+                video_codec=video_codec,
             ),
             "720p",
         )
@@ -2344,6 +2348,7 @@ async def _start_fast_live(
             audio=audio,
             audio_passthrough=audio_passthrough,
             restarting=True,
+            video_codec=video_codec,
         )
         with _transcode_lock:
             _transcode_sessions[session_id].update(
@@ -2362,6 +2367,7 @@ async def _start_fast_live(
                     True,
                     audio=audio,
                     audio_passthrough=audio_passthrough,
+                    video_codec=video_codec,
                 ),
                 "high-quality",
             )
