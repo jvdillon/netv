@@ -4,12 +4,14 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import json
+import subprocess
 import tempfile
+import time
 
 import pytest
 
+from cache import get_user_agent
 from ffmpeg_command import (
-    _MAX_RES_HEIGHT,
     HwAccel,
     MediaInfo,
     SubtitleStream,
@@ -25,53 +27,25 @@ from ffmpeg_command import (
     get_live_hls_list_size,
     get_series_probe_cache_stats,
     get_transcode_dir,
-    get_user_agent,
     http_reconnect_args,
     invalidate_series_probe_cache,
     limit_live_video_bitrate,
     probe_audio,
-    probe_video_codec,
     probe_closed_captions,
     probe_media,
+    probe_video_codec,
+    resolve_hls_master_playlist,
     restore_probe_cache_entry,
 )
+
+import ffmpeg_command
 
 
 @pytest.fixture(autouse=True)
 def mock_vaapi_device():
     """Mock VAAPI_DEVICE for all tests to allow VAAPI tests on CI without hardware."""
-    with patch("ffmpeg_command.VAAPI_DEVICE", "/dev/dri/renderD128"):
+    with patch("cache.VAAPI_DEVICE", "/dev/dri/renderD128"):
         yield
-
-
-class FakeMediaInfo:
-    """Fake media info for testing."""
-
-    def __init__(
-        self,
-        video_codec: str = "h264",
-        audio_codec: str = "aac",
-        pix_fmt: str = "yuv420p",
-        audio_channels: int = 2,
-        audio_sample_rate: int = 48000,
-        audio_profile: str = "LC",
-        height: int = 1080,
-        interlaced: bool = False,
-        is_10bit: bool = False,
-        is_hdr: bool = False,
-        is_hls: bool = False,
-    ):
-        self.video_codec = video_codec
-        self.audio_codec = audio_codec
-        self.pix_fmt = pix_fmt
-        self.audio_channels = audio_channels
-        self.audio_sample_rate = audio_sample_rate
-        self.audio_profile = audio_profile
-        self.height = height
-        self.interlaced = interlaced
-        self.is_10bit = is_10bit
-        self.is_hdr = is_hdr
-        self.is_hls = is_hls
 
 
 # =============================================================================
@@ -159,7 +133,7 @@ class TestBuildVideoArgs:
         )
         assert pre == []
         vf = post[post.index("-vf") + 1]
-        # Upload to GPU, then deinterlace (mode=0 for original framerate) and scale on GPU
+        # Upload to GPU, then deinterlace (mode=0 for original framerate) and scale on GPU.
         assert "hwupload_cuda" in vf
         assert "yadif_cuda=0" in vf
         assert "scale_cuda" in vf
@@ -276,7 +250,8 @@ class TestBuildVideoArgs:
         assert "yadif=0" in vf
 
     @pytest.mark.parametrize(
-        "quality,expected_qp", [("high", "20"), ("medium", "28"), ("low", "35")]
+        "quality,expected_qp",
+        [("high", "20"), ("medium", "28"), ("low", "35")],
     )
     def test_quality_presets(self, quality: str, expected_qp: str):
         """Test quality presets map to correct QP values."""
@@ -298,7 +273,7 @@ class TestBuildVideoArgs:
             audio_codec="aac",
             pix_fmt="yuv420p",
             audio_channels=2,
-            audio_sample_rate=48000,
+            audio_sample_rate=48_000,
             audio_profile="LC",
             height=720,
         )
@@ -331,7 +306,7 @@ class TestBuildVideoArgs:
         with pytest.raises(ValueError, match="Unrecognized hardware"):
             _build_video_args(
                 copy_video=False,
-                hw="invalid",  # type: ignore
+                hw="invalid",
                 deinterlace=False,
                 use_hw_pipeline=False,
                 max_resolution="1080p",
@@ -353,7 +328,7 @@ class TestBuildVideoArgs:
         vf = post[post.index("-vf") + 1]
         assert "libplacebo" in vf
         assert "tonemapping=hable" in vf
-        # Should download from CUDA, process, re-upload
+        # Should download from CUDA, process, re-upload.
         assert "hwdownload" in vf
         assert "hwupload_cuda" in vf
 
@@ -387,7 +362,7 @@ class TestBuildVideoArgs:
             is_hdr=True,
         )
         vf = post[post.index("-vf") + 1]
-        # Deinterlace should come before tonemap in hw decode path
+        # Deinterlace should come before tonemap in hw decode path.
         deint_pos = vf.find("yadif_cuda")
         tonemap_pos = vf.find("libplacebo")
         assert deint_pos < tonemap_pos, f"deinterlace should come before tonemap: {vf}"
@@ -405,8 +380,8 @@ class TestBuildVideoArgs:
             is_hdr=True,
         )
         vf = post[post.index("-vf") + 1]
-        # SW decode HDR should use CPU yadif before tonemap
-        assert "yadif=0" in vf  # CPU deinterlace, not yadif_cuda
+        # SW decode HDR should use CPU yadif before tonemap.
+        assert "yadif=0" in vf
         deint_pos = vf.find("yadif=0")
         tonemap_pos = vf.find("libplacebo")
         assert deint_pos < tonemap_pos, f"CPU deinterlace should come before tonemap: {vf}"
@@ -436,15 +411,15 @@ class TestBuildAudioArgs:
 
     def test_copy_audio(self):
         """Test copy_audio returns copy args."""
-        args = _build_audio_args(copy_audio=True, audio_sample_rate=48000)
+        args = _build_audio_args(copy_audio=True, audio_sample_rate=48_000)
         assert args == ["-c:a", "copy"]
 
     @pytest.mark.parametrize(
         "sample_rate,expected",
         [
-            (44100, "44100"),
-            (48000, "48000"),
-            (96000, "48000"),
+            (44_100, "44100"),
+            (48_000, "48000"),
+            (96_000, "48000"),
             (0, "48000"),
         ],
     )
@@ -457,14 +432,22 @@ class TestBuildAudioArgs:
     @pytest.mark.parametrize("channels", [3, 6, 8])
     def test_surround_encodes_5_1(self, channels: int):
         """Surround sources stay surround instead of being downmixed to stereo."""
-        args = _build_audio_args(copy_audio=False, audio_sample_rate=48000, audio_channels=channels)
+        args = _build_audio_args(
+            copy_audio=False,
+            audio_sample_rate=48_000,
+            audio_channels=channels,
+        )
         assert args[args.index("-af") + 1] == "aformat=channel_layouts=5.1"
         assert args[args.index("-b:a") + 1] == "384k"
         assert "-ac" not in args
 
     @pytest.mark.parametrize("channels", [1, 2])
     def test_stereo_stays_stereo(self, channels: int):
-        args = _build_audio_args(copy_audio=False, audio_sample_rate=48000, audio_channels=channels)
+        args = _build_audio_args(
+            copy_audio=False,
+            audio_sample_rate=48_000,
+            audio_channels=channels,
+        )
         assert args[args.index("-ac") + 1] == "2"
         assert args[args.index("-b:a") + 1] == "192k"
         assert "-af" not in args
@@ -532,13 +515,13 @@ class TestBuildHlsFfmpegCmd:
 
     def test_copy_video_with_compatible_media(self):
         """Test copy_video is used for compatible VOD media."""
-        media = FakeMediaInfo(video_codec="h264", pix_fmt="yuv420p", height=1080)
+        media = _media_info(video_codec="h264", pix_fmt="yuv420p", height=1080)
         cmd = build_hls_ffmpeg_cmd(
             "http://test",
             "vaapi",
             "/tmp",
             is_vod=True,
-            media_info=media,  # type: ignore
+            media_info=media,
             max_resolution="1080p",
         )
         assert "-c:v" in cmd
@@ -547,52 +530,52 @@ class TestBuildHlsFfmpegCmd:
 
     def test_no_copy_for_10bit(self):
         """Test 10-bit content is transcoded, not copied."""
-        media = FakeMediaInfo(video_codec="h264", pix_fmt="yuv420p10le", height=1080)
+        media = _media_info(video_codec="h264", pix_fmt="yuv420p10le", height=1080)
         cmd = build_hls_ffmpeg_cmd(
             "http://test",
             "vaapi",
             "/tmp",
             is_vod=True,
-            media_info=media,  # type: ignore
+            media_info=media,
         )
         assert cmd[cmd.index("-c:v") + 1] != "copy"
         assert "-hwaccel" in cmd
 
     def test_no_copy_when_scaling_needed(self):
         """Test scaling requirement prevents copy."""
-        media = FakeMediaInfo(video_codec="h264", pix_fmt="yuv420p", height=2160)
+        media = _media_info(video_codec="h264", pix_fmt="yuv420p", height=2160)
         cmd = build_hls_ffmpeg_cmd(
             "http://test",
             "vaapi",
             "/tmp",
             is_vod=True,
-            media_info=media,  # type: ignore
+            media_info=media,
             max_resolution="1080p",
         )
         assert cmd[cmd.index("-c:v") + 1] != "copy"
 
     def test_can_remux_live_compatible_source(self):
         """Test a browser-compatible progressive H.264/AAC source can remux."""
-        assert can_remux_live(FakeMediaInfo(), "1080p")  # type: ignore[arg-type]
+        assert can_remux_live(_media_info(), "1080p")
 
     def test_can_remux_live_rejects_unplayable_sources(self):
         """Test remux is rejected for missing info or incompatible sources."""
         assert not can_remux_live(None, "1080p")
-        assert not can_remux_live(FakeMediaInfo(video_codec="hevc"), "1080p")  # type: ignore[arg-type]
-        assert not can_remux_live(FakeMediaInfo(interlaced=True), "1080p")  # type: ignore[arg-type]
-        assert not can_remux_live(FakeMediaInfo(height=2160), "1080p")  # type: ignore[arg-type]
-        assert not can_remux_live(FakeMediaInfo(audio_codec="ac3"), "1080p")  # type: ignore[arg-type]
-        assert not can_remux_live(FakeMediaInfo(audio_profile="HE-AAC"), "1080p")  # type: ignore[arg-type]
+        assert not can_remux_live(_media_info(video_codec="hevc"), "1080p")
+        assert not can_remux_live(_media_info(interlaced=True), "1080p")
+        assert not can_remux_live(_media_info(height=2160), "1080p")
+        assert not can_remux_live(_media_info(audio_codec="ac3"), "1080p")
+        assert not can_remux_live(_media_info(audio_profile="HE-AAC"), "1080p")
 
     def test_can_remux_live_surround_audio(self):
         """5.1 AAC copies for every client; Dolby only for passthrough clients."""
-        assert can_remux_live(FakeMediaInfo(audio_channels=6), "1080p")  # type: ignore[arg-type]
-        dolby = FakeMediaInfo(audio_codec="eac3", audio_channels=6)
-        assert not can_remux_live(dolby, "1080p")  # type: ignore[arg-type]
-        assert can_remux_live(dolby, "1080p", audio_passthrough=True)  # type: ignore[arg-type]
+        assert can_remux_live(_media_info(audio_channels=6), "1080p")
+        dolby = _media_info(audio_codec="eac3", audio_channels=6)
+        assert not can_remux_live(dolby, "1080p")
+        assert can_remux_live(dolby, "1080p", audio_passthrough=True)
         for profile in ("Main", "", "he-aac"):
-            aac = FakeMediaInfo(audio_channels=6, audio_profile=profile)
-            assert not can_remux_live(aac, "1080p")  # type: ignore[arg-type]
+            aac = _media_info(audio_channels=6, audio_profile=profile)
+            assert not can_remux_live(aac, "1080p")
 
     @pytest.mark.parametrize(
         "codec,passthrough,expected",
@@ -600,10 +583,19 @@ class TestBuildHlsFfmpegCmd:
     )
     def test_audio_info_without_media_info(self, codec, passthrough, expected):
         """Audio facts alone decide the audio path; video is still transcoded."""
-        audio = MediaInfo(video_codec="", audio_codec=codec, pix_fmt="", audio_channels=6,
-                          audio_sample_rate=48000)  # fmt: skip
+        audio = MediaInfo(
+            video_codec="",
+            audio_codec=codec,
+            pix_fmt="",
+            audio_channels=6,
+            audio_sample_rate=48_000,
+        )
         cmd = build_hls_ffmpeg_cmd(
-            "http://test", "software", "/tmp", audio_info=audio, audio_passthrough=passthrough
+            "http://test",
+            "software",
+            "/tmp",
+            audio_info=audio,
+            audio_passthrough=passthrough,
         )
         assert cmd[cmd.index("-c:v") + 1] != "copy"
         index = cmd.index("-c:a")
@@ -632,8 +624,8 @@ class TestBuildHlsFfmpegCmd:
 
     def test_no_probe_args_with_media_info(self):
         """Test probe args are skipped when media_info provided."""
-        media = FakeMediaInfo()
-        cmd = build_hls_ffmpeg_cmd("http://test", "software", "/tmp", media_info=media)  # type: ignore
+        media = _media_info()
+        cmd = build_hls_ffmpeg_cmd("http://test", "software", "/tmp", media_info=media)
         assert "-probesize" not in cmd
 
     def test_subtitle_extraction(self):
@@ -657,7 +649,11 @@ class TestBuildHlsFfmpegCmd:
     def test_live_subtitle_renditions_use_bounded_playlists(self):
         subs = [SubtitleStream(index=2, lang="eng", name="English")]
         cmd = build_hls_ffmpeg_cmd(
-            "http://test", "software", "/tmp/out", is_vod=False, subtitles=subs
+            "http://test",
+            "software",
+            "/tmp/out",
+            is_vod=False,
+            subtitles=subs,
         )
         segment_output = cmd[
             cmd.index("/tmp/out/sub0.vtt") + 1 : cmd.index("/tmp/out/sub0_%06d.vtt")
@@ -668,7 +664,11 @@ class TestBuildHlsFfmpegCmd:
     def test_vod_subtitle_renditions_keep_the_full_playlist(self):
         subs = [SubtitleStream(index=2, lang="eng", name="English")]
         cmd = build_hls_ffmpeg_cmd(
-            "http://test", "software", "/tmp/out", is_vod=True, subtitles=subs
+            "http://test",
+            "software",
+            "/tmp/out",
+            is_vod=True,
+            subtitles=subs,
         )
         segment_output = cmd[
             cmd.index("/tmp/out/sub0.vtt") + 1 : cmd.index("/tmp/out/sub0_%06d.vtt")
@@ -704,8 +704,11 @@ def test_live_ai_upscale_uses_shared_bitrate_policy(is_vod):
         patch("ffmpeg_command._build_sr_filter", return_value="dnn_processing=model=test"),
     ):
         cmd = build_hls_ffmpeg_cmd(
-            "https://provider.example/live.m3u8", "nvenc+software", "/tmp/output",
-            is_vod=is_vod, max_resolution="4k",
+            "https://provider.example/live.m3u8",
+            "nvenc+software",
+            "/tmp/output",
+            is_vod=is_vod,
+            max_resolution="4k",
         )
     if is_vod:
         assert cmd[cmd.index("-rc") + 1] == "constqp"
@@ -741,18 +744,18 @@ class TestAspectRatioHandling:
     )
     def test_scaling_decisions(self, input_height: int, max_res: str, should_scale: bool):
         """Test correct scaling decisions for various input heights."""
-        media = FakeMediaInfo(height=input_height, pix_fmt="yuv420p10le")
+        media = _media_info(height=input_height, pix_fmt="yuv420p10le")
         cmd = build_hls_ffmpeg_cmd(
             "http://test",
             "vaapi",
             "/tmp",
             is_vod=True,
-            media_info=media,  # type: ignore
+            media_info=media,
             max_resolution=max_res,
         )
         vf = cmd[cmd.index("-vf") + 1]
-        max_h = _MAX_RES_HEIGHT.get(max_res, 9999)
-        # Comma is escaped in FFmpeg filter expressions
+        max_h = {"1080p": 1080, "720p": 720, "4k": 2160}[max_res]
+        # Comma is escaped in FFmpeg filter expressions.
         height_expr = f"min(ih\\,{max_h})"
         assert height_expr in vf, f"Expected {height_expr} in {vf}"
 
@@ -767,9 +770,8 @@ class TestGpuDetection:
 
     def test_nvidia_gpu_detected(self):
         """Test NVIDIA GPU detection parses compute capability."""
-        import ffmpeg_command
 
-        ffmpeg_command._gpu_nvdec_codecs = None  # Reset cache
+        ffmpeg_command._gpu_nvdec_codecs = None  # Reset cache.
 
         mock_result = MagicMock()
         mock_result.returncode = 0
@@ -783,7 +785,6 @@ class TestGpuDetection:
 
     def test_no_nvidia_gpu(self):
         """Test handling when no NVIDIA GPU present."""
-        import ffmpeg_command
 
         ffmpeg_command._gpu_nvdec_codecs = None
 
@@ -796,7 +797,6 @@ class TestGpuDetection:
 
     def test_older_nvidia_gpu(self):
         """Test older GPU with limited NVDEC support."""
-        import ffmpeg_command
 
         ffmpeg_command._gpu_nvdec_codecs = None
 
@@ -873,7 +873,8 @@ class TestTranscodeDir:
         """Test custom directory is used and created."""
         custom_dir = tmp_path / "custom_transcode"
         with patch(
-            "ffmpeg_command._load_settings", return_value={"transcode_dir": str(custom_dir)}
+            "ffmpeg_command._load_settings",
+            return_value={"transcode_dir": str(custom_dir)},
         ):
             path = get_transcode_dir()
             assert path == custom_dir
@@ -896,7 +897,7 @@ class TestHlsListSize:
     def test_dvr_enabled_list_size(self):
         """Test DVR enabled calculates segments from minutes."""
         with patch("ffmpeg_command._load_settings", return_value={"live_dvr_mins": 5}):
-            # 5 min = 300 sec / 3 sec per segment = 100 segments
+            # 5 min = 300 sec / 3 sec per segment = 100 segments.
             assert get_live_hls_list_size() == 100
 
     def test_dvr_list_size_follows_long_windows(self):
@@ -914,7 +915,6 @@ class TestProbeMedia:
 
     def test_probe_success(self):
         """Test successful probe parses media info."""
-        import ffmpeg_command
 
         ffmpeg_command._probe_cache.clear()
 
@@ -956,7 +956,6 @@ class TestProbeMedia:
 
     def test_probe_interlaced_detection(self):
         """Test interlaced content detection."""
-        import ffmpeg_command
 
         ffmpeg_command._probe_cache.clear()
 
@@ -967,7 +966,7 @@ class TestProbeMedia:
                     "codec_name": "mpeg2video",
                     "pix_fmt": "yuv420p",
                     "height": 1080,
-                    "field_order": "tt",  # Top field first = interlaced
+                    "field_order": "tt",  # Top field first = interlaced.
                 },
             ],
             "format": {},
@@ -989,18 +988,17 @@ class TestProbeMedia:
     @pytest.mark.parametrize(
         "pix_fmt,expected",
         [
-            ("yuv420p10le", True),  # 10-bit little endian
-            ("yuv420p10be", True),  # 10-bit big endian
-            ("yuv422p10le", True),  # 10-bit 4:2:2
-            ("p010le", True),  # CUDA/VAAPI 10-bit format
-            ("yuv420p", False),  # 8-bit
+            ("yuv420p10le", True),  # 10-bit little endian.
+            ("yuv420p10be", True),  # 10-bit big endian.
+            ("yuv422p10le", True),  # 10-bit 4:2:2.
+            ("p010le", True),  # CUDA/VAAPI 10-bit format.
+            ("yuv420p", False),  # 8-bit.
             ("yuv410p", False),  # 4:1:0 chroma, NOT 10-bit (was a false positive)
-            ("nv12", False),  # 8-bit NV12
+            ("nv12", False),  # 8-bit NV12.
         ],
     )
     def test_probe_10bit_detection(self, pix_fmt: str, expected: bool):
         """Test 10-bit content detection from pix_fmt."""
-        import ffmpeg_command
 
         ffmpeg_command._probe_cache.clear()
 
@@ -1035,13 +1033,12 @@ class TestProbeMedia:
             ("smpte2084", True),  # PQ (HDR10, HDR10+, Dolby Vision)
             ("arib-std-b67", True),  # HLG
             ("bt709", False),  # SDR
-            ("bt2020-10", False),  # Wide gamut but not HDR transfer
-            ("", False),  # Unknown/missing
+            ("bt2020-10", False),  # Wide gamut but not HDR transfer.
+            ("", False),  # Unknown/missing.
         ],
     )
     def test_probe_hdr_detection(self, color_transfer: str, expected: bool):
         """Test HDR content detection from color_transfer."""
-        import ffmpeg_command
 
         ffmpeg_command._probe_cache.clear()
 
@@ -1075,7 +1072,6 @@ class TestProbeMedia:
 
     def test_probe_failure(self):
         """Test probe failure returns None."""
-        import ffmpeg_command
 
         ffmpeg_command._probe_cache.clear()
 
@@ -1093,9 +1089,6 @@ class TestProbeMedia:
 
     def test_probe_cache_hit(self):
         """Test probe cache returns cached result."""
-        import time
-
-        import ffmpeg_command
 
         ffmpeg_command._probe_cache.clear()
 
@@ -1117,7 +1110,6 @@ class TestProbeMedia:
 
     def test_probe_extracts_subtitles(self):
         """Test subtitle stream extraction."""
-        import ffmpeg_command
 
         ffmpeg_command._probe_cache.clear()
 
@@ -1168,11 +1160,8 @@ class TestProbeCacheManagement:
 
     def test_clear_all_probe_cache(self):
         """Test clearing all probe caches."""
-        import time
 
-        import ffmpeg_command
-
-        # Clear first to ensure known state
+        # Clear first to ensure known state.
         ffmpeg_command._probe_cache.clear()
         ffmpeg_command._series_probe_cache.clear()
 
@@ -1189,7 +1178,6 @@ class TestProbeCacheManagement:
 
     def test_invalidate_series_probe_cache_entire_series(self):
         """Test invalidating entire series cache."""
-        import ffmpeg_command
 
         ffmpeg_command._series_probe_cache[123] = {
             "name": "Test",
@@ -1203,7 +1191,6 @@ class TestProbeCacheManagement:
 
     def test_invalidate_series_probe_cache_single_episode(self):
         """Test invalidating single episode cache."""
-        import ffmpeg_command
 
         ffmpeg_command._series_probe_cache[123] = {
             "name": "Test",
@@ -1219,7 +1206,6 @@ class TestProbeCacheManagement:
 
     def test_clear_series_mru(self):
         """Test clearing series MRU."""
-        import ffmpeg_command
 
         ffmpeg_command._series_probe_cache[123] = {
             "name": "Test",
@@ -1235,7 +1221,6 @@ class TestProbeCacheManagement:
 
     def test_restore_probe_cache_entry(self):
         """Test restoring probe cache entry."""
-        import ffmpeg_command
 
         ffmpeg_command._probe_cache.clear()
         ffmpeg_command._series_probe_cache.clear()
@@ -1251,17 +1236,14 @@ class TestProbeCacheManagement:
 
     def test_get_series_probe_cache_stats(self):
         """Test getting cache stats for UI."""
-        import time
-
-        import ffmpeg_command
 
         ffmpeg_command._series_probe_cache.clear()
         ffmpeg_command._series_probe_cache[123] = {
             "name": "Test Series",
             "mru": 2,
             "episodes": {
-                1: (time.time(), MediaInfo("h264", "aac", "yuv420p"), []),
-                2: (time.time(), MediaInfo("h264", "aac", "yuv420p"), []),
+                1: (time.time(), _media_info(), []),
+                2: (time.time(), _media_info(), []),
             },
         }
 
@@ -1278,16 +1260,12 @@ class TestResolveHlsMasterPlaylist:
 
     def test_non_m3u8_url_returns_unchanged(self):
         """Non-m3u8 URLs should be returned unchanged."""
-        from ffmpeg_command import resolve_hls_master_playlist
 
         url = "http://example.com/video.mp4"
         assert resolve_hls_master_playlist(url) == url
 
     def test_master_playlist_selects_highest_bandwidth(self):
         """Master playlist should resolve to highest bandwidth variant."""
-        from unittest.mock import MagicMock, patch
-
-        from ffmpeg_command import resolve_hls_master_playlist
 
         master_playlist = """#EXTM3U
 #EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=640x360
@@ -1309,9 +1287,6 @@ high.m3u8
 
     def test_media_playlist_returns_unchanged(self):
         """Media playlist (not master) should return original URL."""
-        from unittest.mock import MagicMock, patch
-
-        from ffmpeg_command import resolve_hls_master_playlist
 
         media_playlist = """#EXTM3U
 #EXT-X-VERSION:3
@@ -1333,9 +1308,6 @@ segment1.ts
 
     def test_fetch_error_returns_original_url(self):
         """On fetch error, should return original URL."""
-        from unittest.mock import patch
-
-        from ffmpeg_command import resolve_hls_master_playlist
 
         with patch("urllib.request.urlopen", side_effect=Exception("Network error")):
             result = resolve_hls_master_playlist("http://example.com/master.m3u8")
@@ -1344,9 +1316,6 @@ segment1.ts
 
     def test_relative_url_resolved_correctly(self):
         """Relative variant URLs should be resolved against base URL."""
-        from unittest.mock import MagicMock, patch
-
-        from ffmpeg_command import resolve_hls_master_playlist
 
         master_playlist = """#EXTM3U
 #EXT-X-STREAM-INF:BANDWIDTH=3000000
@@ -1363,12 +1332,6 @@ segment1.ts
         assert result == "http://example.com/streams/1080p/index.m3u8"
 
 
-if __name__ == "__main__":
-    from testing import run_tests
-
-    run_tests(__file__)
-
-
 @pytest.mark.parametrize("hw", ["software", "nvenc+software", "amf+software", "qsv", "vaapi"])
 def test_bandwidth_saver_bypasses_ai_and_scales_down(hw: HwAccel):
     media_info = MediaInfo(
@@ -1376,7 +1339,7 @@ def test_bandwidth_saver_bypasses_ai_and_scales_down(hw: HwAccel):
         audio_codec="aac",
         pix_fmt="yuv420p",
         audio_channels=2,
-        audio_sample_rate=48000,
+        audio_sample_rate=48_000,
         audio_profile="LC",
         height=2160,
     )
@@ -1386,9 +1349,13 @@ def test_bandwidth_saver_bypasses_ai_and_scales_down(hw: HwAccel):
         patch("ffmpeg_command._build_sr_filter") as sr_filter,
     ):
         cmd = build_hls_ffmpeg_cmd(
-            "http://example.com/live.ts", hw, "/tmp/hls",
-            media_info=media_info, max_resolution="720p",
-            quality="low", allow_upscale=False,
+            "http://example.com/live.ts",
+            hw,
+            "/tmp/hls",
+            media_info=media_info,
+            max_resolution="720p",
+            quality="low",
+            allow_upscale=False,
         )
     sr_filter.assert_not_called()
     assert "720" in " ".join(cmd)
@@ -1399,8 +1366,13 @@ def test_bandwidth_saver_bypasses_ai_and_scales_down(hw: HwAccel):
 @pytest.mark.parametrize("height", [720, 1080, 2160])
 def test_archive_policy_copies_compatible_source_without_ai_upscaling(height):
     media_info = MediaInfo(
-        video_codec="h264", audio_codec="aac", pix_fmt="yuv420p",
-        audio_channels=2, audio_sample_rate=48000, audio_profile="LC", height=height,
+        video_codec="h264",
+        audio_codec="aac",
+        pix_fmt="yuv420p",
+        audio_channels=2,
+        audio_sample_rate=48_000,
+        audio_profile="LC",
+        height=height,
     )
     with (
         patch("ffmpeg_command._load_settings", return_value={"sr_model": "upscale-model"}),
@@ -1409,8 +1381,12 @@ def test_archive_policy_copies_compatible_source_without_ai_upscaling(height):
     ):
         cmd = build_hls_ffmpeg_cmd(
             "https://upstream.test/timeshift/user/pass/60/2026-09-28:10-00/1.ts",
-            "nvenc+software", "/tmp/hls", is_vod=True,
-            media_info=media_info, max_resolution="4k", allow_upscale=False,
+            "nvenc+software",
+            "/tmp/hls",
+            is_vod=True,
+            media_info=media_info,
+            max_resolution="4k",
+            allow_upscale=False,
         )
     sr_filter.assert_not_called()
     assert cmd[cmd.index("-c:v") + 1] == "copy"
@@ -1421,45 +1397,73 @@ def test_archive_policy_copies_compatible_source_without_ai_upscaling(height):
 @pytest.mark.skipif(not __import__("shutil").which("ffmpeg"), reason="ffmpeg not installed")
 def test_probe_audio_reads_local_surround_segment(tmp_path):
     """probe_audio reports the layout that decides 5.1 handling."""
-    import subprocess
 
     path = tmp_path / "input.ts"
     subprocess.run(
-        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=sample_rate=48000",
-         "-af", "pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0", "-t", "1",
-         "-c:a", "ac3", str(path)],
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=sample_rate=48000",
+            "-af",
+            "pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0",
+            "-t",
+            "1",
+            "-c:a",
+            "ac3",
+            str(path),
+        ],
         check=True,
-    )  # fmt: skip
+    )
     info = probe_audio(str(path))
     assert info is not None
-    assert (info.audio_codec, info.audio_channels, info.audio_sample_rate) == ("ac3", 6, 48000)
+    assert (info.audio_codec, info.audio_channels, info.audio_sample_rate) == ("ac3", 6, 48_000)
     assert probe_audio(str(tmp_path / "missing.ts")) is None
 
 
 @pytest.mark.skipif(not __import__("shutil").which("ffmpeg"), reason="ffmpeg not installed")
 def test_probe_video_codec_reads_local_segment(tmp_path):
-    import subprocess
 
     path = tmp_path / "input.ts"
     subprocess.run(
-        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x64", "-t", "1",
-         "-c:v", "mpeg2video", str(path)],
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x64",
+            "-t",
+            "1",
+            "-c:v",
+            "mpeg2video",
+            str(path),
+        ],
         check=True,
-    )  # fmt: skip
+    )
     assert probe_video_codec(str(path)) == "mpeg2video"
     assert probe_video_codec(str(tmp_path / "missing.ts")) == ""
 
 
-@pytest.mark.parametrize("side_data_type, expected", [
-    ("ATSC A53 Part 4 Closed Captions", True),
-    ("H.264 User Data Unregistered SEI message", False),
-])
+@pytest.mark.parametrize(
+    "side_data_type, expected",
+    [
+        ("ATSC A53 Part 4 Closed Captions", True),
+        ("H.264 User Data Unregistered SEI message", False),
+    ],
+)
 def test_probe_closed_captions_reads_video_side_data(side_data_type, expected):
     result = MagicMock(
         returncode=0,
-        stdout=json.dumps({
-            "frames": [{"side_data_list": [{"side_data_type": side_data_type}]}],
-        }),
+        stdout=json.dumps(
+            {
+                "frames": [{"side_data_list": [{"side_data_type": side_data_type}]}],
+            },
+        ),
     )
     with patch("ffmpeg_command.subprocess.run", return_value=result) as run:
         assert probe_closed_captions("/tmp/input.ts") is expected
@@ -1467,3 +1471,38 @@ def test_probe_closed_captions_reads_video_side_data(side_data_type, expected):
     command = run.call_args.args[0]
     assert command[command.index("-read_intervals") + 1] == "%+2"
     assert command[command.index("-show_entries") + 1] == "frame=side_data_list"
+
+
+def _media_info(
+    *,
+    video_codec: str = "h264",
+    audio_codec: str = "aac",
+    pix_fmt: str = "yuv420p",
+    audio_channels: int = 2,
+    audio_sample_rate: int = 48_000,
+    audio_profile: str = "LC",
+    height: int = 1080,
+    interlaced: bool = False,
+    is_10bit: bool = False,
+    is_hdr: bool = False,
+    is_hls: bool = False,
+) -> MediaInfo:
+    return MediaInfo(
+        video_codec=video_codec,
+        audio_codec=audio_codec,
+        pix_fmt=pix_fmt,
+        audio_channels=audio_channels,
+        audio_sample_rate=audio_sample_rate,
+        audio_profile=audio_profile,
+        height=height,
+        interlaced=interlaced,
+        is_10bit=is_10bit,
+        is_hdr=is_hdr,
+        is_hls=is_hls,
+    )
+
+
+if __name__ == "__main__":
+    from codedoctor.lib.testing.runner import test_main
+
+    test_main(__file__)

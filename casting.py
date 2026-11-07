@@ -27,7 +27,6 @@ log = logging.getLogger(__name__)
 _LAN_NETWORKS = tuple(
     ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")
 )
-_ACTIVE_STATES = ("PLAYING", "PAUSED", "BUFFERING")
 
 
 def lan_host(host: str) -> str:
@@ -35,7 +34,8 @@ def lan_host(host: str) -> str:
         address = ip_address(host)
     except ValueError as exc:
         raise HTTPException(
-            400, "Enter the Chromecast's LAN IP address, not a hostname or URL."
+            400,
+            "Enter the Chromecast's LAN IP address, not a hostname or URL.",
         ) from exc
     if not any(address in network for network in _LAN_NETWORKS):
         raise HTTPException(400, "The Chromecast address must be a private LAN IP address.")
@@ -43,7 +43,14 @@ def lan_host(host: str) -> str:
 
 
 def media_origin(address: str) -> str:
-    """Validate the public-facing origin without trusting a container's own address."""
+    """Validate the public-facing origin without trusting a container's own address.
+
+    Args:
+        address: Server origin reachable by the receiver.
+
+    Returns:
+        origin: Validated HTTP or HTTPS origin without a trailing slash.
+    """
     try:
         parsed = urlsplit(address)
         hostname = parsed.hostname
@@ -74,12 +81,13 @@ def media_origin(address: str) -> str:
         )
     ):
         raise HTTPException(
-            400, "Set the neTV server address to an address reachable by the TV, not localhost."
+            400,
+            "Set the neTV server address to an address reachable by the TV, not localhost.",
         )
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class CastSession:
     username: str
     host: str
@@ -130,7 +138,9 @@ class CastManager:
             if self._worker is None or not self._worker.is_alive():
                 self._stop.clear()
                 self._worker = threading.Thread(
-                    target=self._monitor, daemon=True, name="cast-monitor"
+                    target=self._monitor,
+                    daemon=True,
+                    name="cast-monitor",
                 )
                 self._worker.start()
 
@@ -149,7 +159,8 @@ class CastManager:
             session = ffmpeg_session.get_session(session_id)
             if not session or session.get("username") != username:
                 raise HTTPException(
-                    404, "Playback session not found. Start playback and try again."
+                    404,
+                    "Playback session not found. Start playback and try again.",
                 )
             with self._lock:
                 if host in self._sessions or any(
@@ -158,12 +169,12 @@ class CastManager:
                     raise HTTPException(409, "Stop the existing cast before starting another.")
                 filename = "master.m3u8" if session.get("fast_start") else "stream.m3u8"
                 record = CastSession(
-                    username,
-                    host,
-                    session_id,
-                    f"{origin}/transcode/{session_id}/{filename}",
-                    session["url"],
-                    host,
+                    username=username,
+                    host=host,
+                    session_id=session_id,
+                    url=f"{origin}/transcode/{session_id}/{filename}",
+                    source_url=session["url"],
+                    name=host,
                 )
                 self._sessions[host] = record
             self._ensure_worker()
@@ -190,7 +201,11 @@ class CastManager:
                 deadline = time.monotonic() + 15
                 while time.monotonic() < deadline:
                     status = cast.media_controller.status
-                    if status.content_id == record.url and status.player_state in _ACTIVE_STATES:
+                    if status.content_id == record.url and status.player_state in (
+                        "PLAYING",
+                        "PAUSED",
+                        "BUFFERING",
+                    ):
                         record.starting = False
                         return self.status(username)
                     if status.content_id == record.url and status.idle_reason == "ERROR":
@@ -204,7 +219,8 @@ class CastManager:
             except (PyChromecastError, OSError) as exc:
                 log.warning("Chromecast connection failed for %s: %s", host, type(exc).__name__)
                 raise HTTPException(
-                    502, "Could not connect to the Chromecast. Check its IP and LAN access."
+                    502,
+                    "Could not connect to the Chromecast. Check its IP and LAN access.",
                 ) from exc
             finally:
                 if record.starting:
@@ -266,10 +282,14 @@ class CastManager:
                     cast.set_volume(volume)
             except (PyChromecastError, OSError) as exc:
                 log.warning(
-                    "Chromecast %s failed for %s: %s", action, record.host, type(exc).__name__
+                    "Chromecast %s failed for %s: %s",
+                    action,
+                    record.host,
+                    type(exc).__name__,
                 )
                 raise HTTPException(
-                    502, "The Chromecast did not respond. Check the TV and network."
+                    502,
+                    "The Chromecast did not respond. Check the TV and network.",
                 ) from exc
             return self.status(username)
 
@@ -298,7 +318,10 @@ class CastManager:
             return
         try:
             save_watch_position(
-                record.username, record.source_url, position, session.get("duration", 0)
+                record.username,
+                record.source_url,
+                position,
+                session.get("duration", 0),
             )
         except OSError:
             log.exception("Could not save Chromecast watch position")
@@ -315,7 +338,7 @@ class CastManager:
                 cast
                 and cast.socket_client.is_connected
                 and cast.media_controller.status.content_id == record.url
-                and cast.media_controller.status.player_state in _ACTIVE_STATES
+                and cast.media_controller.status.player_state in ("PLAYING", "PAUSED", "BUFFERING")
             ):
                 ffmpeg_session.touch_session(record.session_id)
                 self._save_position(record)

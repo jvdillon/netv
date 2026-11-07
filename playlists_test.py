@@ -17,12 +17,42 @@ def cache_dir(tmp_path: Path):
 
 
 STREAMS = [
-    {"stream_id": 1, "name": "US| ESPN HD", "source_id": "a", "epg_channel_id": "espn.us", "category_ids": ["10"]},
-    {"stream_id": 2, "name": "US| FOX SPORTS 1 HD", "source_id": "a", "epg_channel_id": "", "category_ids": ["10"]},
-    {"stream_id": 3, "name": "US| ABC 7 SAN FRANCISCO CA (KGO)", "source_id": "a", "epg_channel_id": "", "category_ids": ["20"]},
-    {"stream_id": 4, "name": "UK| ESPN", "source_id": "a", "epg_channel_id": "", "category_ids": ["30"]},
-    {"stream_id": 5, "name": "##### SPORTS #####", "source_id": "a", "epg_channel_id": "", "category_ids": ["10"]},
-]  # fmt: skip
+    {
+        "stream_id": 1,
+        "name": "US| ESPN HD",
+        "source_id": "a",
+        "epg_channel_id": "espn.us",
+        "category_ids": ["10"],
+    },
+    {
+        "stream_id": 2,
+        "name": "US| FOX SPORTS 1 HD",
+        "source_id": "a",
+        "epg_channel_id": "",
+        "category_ids": ["10"],
+    },
+    {
+        "stream_id": 3,
+        "name": "US| ABC 7 SAN FRANCISCO CA (KGO)",
+        "source_id": "a",
+        "epg_channel_id": "",
+        "category_ids": ["20"],
+    },
+    {
+        "stream_id": 4,
+        "name": "UK| ESPN",
+        "source_id": "a",
+        "epg_channel_id": "",
+        "category_ids": ["30"],
+    },
+    {
+        "stream_id": 5,
+        "name": "##### SPORTS #####",
+        "source_id": "a",
+        "epg_channel_id": "",
+        "category_ids": ["10"],
+    },
+]
 CATEGORY_NAMES = {"10": "US| SPORTS", "20": "US| ABC NETWORK", "30": "UK| SPORTS"}
 
 
@@ -65,7 +95,7 @@ def test_resolve_survives_stream_id_changes():
             {"stream_id": "3", "name": "US| ABC 7 SAN FRANCISCO CA (KGO)", "source_id": "a"},
             {"stream_id": "888", "name": "Renamed", "source_id": "a", "epg_channel_id": "espn.us"},
             {"stream_id": "777", "name": "Gone", "source_id": "a", "epg_channel_id": ""},
-        ]
+        ],
     }
     resolved = playlists.resolve(playlist, STREAMS)
     # ESPN resolves by name, KGO by id; the EPG-id fallback duplicates ESPN and is dropped.
@@ -79,7 +109,10 @@ def test_resolve_prefers_name_when_stream_id_was_reused():
 
 def test_match_names_uses_aliases_and_category_prefix():
     matches = playlists.match_names(
-        ["FS1", "KGO", "ESPN", "Nope Channel"], STREAMS, CATEGORY_NAMES, "US|"
+        ["FS1", "KGO", "ESPN", "Nope Channel"],
+        STREAMS,
+        CATEGORY_NAMES,
+        "US|",
     )
     best = {
         m["query"]: (m["candidates"][0]["stream_id"] if m["candidates"] else None) for m in matches
@@ -107,7 +140,7 @@ def test_resolve_keeps_sources_apart():
         "channels": [
             {"stream_id": "7", "name": "BBC", "source_id": "b"},
             {"stream_id": "7", "name": "CNN", "source_id": "a"},
-        ]
+        ],
     }
     assert [s["name"] for s in playlists.resolve(playlist, streams)] == ["BBC", "CNN"]
 
@@ -121,7 +154,7 @@ def test_resolve_entry_epg_overrides_stream():
         "channels": [
             {"stream_id": "1", "name": "Alpha", "source_id": "a", "epg_channel_id": "alpha.guide"},
             {"stream_id": "2", "name": "Beta", "source_id": "a", "epg_channel_id": "old.beta"},
-        ]
+        ],
     }
     resolved = playlists.resolve(playlist, streams)
     assert [s["epg_channel_id"] for s in resolved] == ["alpha.guide", "old.beta"]
@@ -138,8 +171,24 @@ def test_resolve_prefers_epg_over_reused_id():
     assert stream is not None and stream["stream_id"] == 2
 
 
+def test_non_string_ids_and_names_are_accepted():
+    assert playlists.is_playlist_id("pl:abc")
+    assert not playlists.is_playlist_id(42)
+    assert playlists.normalize(None) == []
+    assert playlists.normalize(7) == ["7"]
+
+
 def test_index_rebuilds_for_new_stream_list():
     entry = {"stream_id": "1", "name": "A", "source_id": "s"}
     for name in ("A", "B"):
-        stream = playlists.resolve_channel(entry, [{"stream_id": 1, "name": name, "source_id": "s"}])
+        stream = playlists.resolve_channel(
+            entry,
+            [{"stream_id": 1, "name": name, "source_id": "s"}],
+        )
         assert stream is not None and stream["name"] == name
+
+
+if __name__ == "__main__":
+    from codedoctor.lib.testing.runner import test_main
+
+    test_main(__file__)

@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import gc
+import sqlite3
+import threading
+import warnings
 
 import pytest
 
@@ -17,10 +22,7 @@ def db(tmp_path: Path):
     """Initialize EPG database in temp directory."""
     epg.init(tmp_path)
     yield epg
-    # Clear thread-local connection
-    if hasattr(epg._local, "conn"):
-        epg._local.conn.close()
-        epg._local.conn = None
+    epg.close()
 
 
 class TestInit:
@@ -33,6 +35,39 @@ class TestInit:
         assert "channels" in table_names
         assert "icons" in table_names
         assert "programs" in table_names
+
+
+class TestConnectionLifecycle:
+    """Tests that every per-thread connection is closed."""
+
+    def test_connection_of_exited_thread_is_closed(self, db):
+        worker = threading.Thread(target=db.has_programs)
+        worker.start()
+        worker.join()
+        del worker
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            gc.collect()
+        assert [w for w in caught if issubclass(w.category, ResourceWarning)] == []
+
+    def test_close_closes_connections_of_every_thread(self, db):
+        conns: list[sqlite3.Connection] = []
+        worker = threading.Thread(target=lambda: conns.append(db._get_conn()))
+        worker.start()
+        worker.join()
+        conns.append(db._get_conn())
+        db.close()
+        for conn in conns:
+            with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                conn.execute("SELECT 1")
+        with pytest.raises(RuntimeError, match="not initialized"):
+            db.has_programs()
+
+    def test_reinit_reconnects_to_new_database(self, db, tmp_path):
+        db.insert_channel("ch1", "Channel One", "src1")
+        db.commit()
+        db.init(tmp_path / "other")
+        assert db.get_channel_count() == 0
 
 
 class TestChannels:
@@ -93,7 +128,7 @@ class TestPrograms:
     """Tests for program operations."""
 
     def test_insert_programs(self, db):
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         programs = [
             (
                 "ch1",
@@ -119,7 +154,7 @@ class TestPrograms:
         assert count == 2
 
     def test_get_programs_in_range(self, db):
-        now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+        now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
         programs = [
             (
                 "ch1",
@@ -149,7 +184,7 @@ class TestPrograms:
         db.insert_programs(programs)
         db.commit()
 
-        # Query for middle hour
+        # Query for middle hour.
         result = db.get_programs_in_range(
             "ch1",
             now + timedelta(minutes=30),
@@ -160,12 +195,12 @@ class TestPrograms:
         assert result[1].title == "Show 2"
 
     def test_get_programs_in_range_empty(self, db):
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         result = db.get_programs_in_range("ch1", now, now + timedelta(hours=1))
         assert result == []
 
     def test_get_programs_batch(self, db):
-        now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+        now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
         programs = [
             ("ch1", "Show A", now.timestamp(), (now + timedelta(hours=1)).timestamp(), "", "src1"),
             ("ch2", "Show B", now.timestamp(), (now + timedelta(hours=1)).timestamp(), "", "src1"),
@@ -185,22 +220,22 @@ class TestPrograms:
         assert result["ch2"][0].title == "Show B"
 
     def test_get_programs_batch_empty_channels(self, db):
-        result = db.get_programs_batch([], datetime.now(UTC), datetime.now(UTC))
+        result = db.get_programs_batch([], datetime.now(timezone.utc), datetime.now(timezone.utc))
         assert result == {}
 
     def test_has_programs_false(self, db):
         assert db.has_programs() is False
 
     def test_has_programs_true(self, db):
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         db.insert_programs(
-            [("ch1", "Show", now.timestamp(), (now + timedelta(hours=1)).timestamp(), "", "src1")]
+            [("ch1", "Show", now.timestamp(), (now + timedelta(hours=1)).timestamp(), "", "src1")],
         )
         db.commit()
         assert db.has_programs() is True
 
     def test_get_program_count(self, db):
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         assert db.get_program_count() == 0
 
         db.insert_programs(
@@ -221,7 +256,7 @@ class TestPrograms:
                     "",
                     "src1",
                 ),
-            ]
+            ],
         )
         db.commit()
 
@@ -241,11 +276,11 @@ class TestClear:
     """Tests for clear operations."""
 
     def test_clear_all(self, db):
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         db.insert_channel("ch1", "Channel 1", "src1")
         db.insert_icon("ch1", "http://example.com/icon.png")
         db.insert_programs(
-            [("ch1", "Show", now.timestamp(), (now + timedelta(hours=1)).timestamp(), "", "src1")]
+            [("ch1", "Show", now.timestamp(), (now + timedelta(hours=1)).timestamp(), "", "src1")],
         )
         db.commit()
 
@@ -256,7 +291,7 @@ class TestClear:
         assert db.get_icon("ch1") == ""
 
     def test_clear_source(self, db):
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         db.insert_channel("ch1", "Channel 1", "src1")
         db.insert_channel("ch2", "Channel 2", "src2")
         db.insert_programs(
@@ -277,7 +312,7 @@ class TestClear:
                     "",
                     "src2",
                 ),
-            ]
+            ],
         )
         db.commit()
 
@@ -291,9 +326,9 @@ class TestPrune:
     """Tests for prune operations."""
 
     def test_has_programs_after(self, db):
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         db.insert_programs(
-            [("ch1", "Show", now.timestamp(), (now + timedelta(hours=1)).timestamp(), "", "src1")]
+            [("ch1", "Show", now.timestamp(), (now + timedelta(hours=1)).timestamp(), "", "src1")],
         )
         db.commit()
 
@@ -301,7 +336,7 @@ class TestPrune:
         assert not db.has_programs_after(now + timedelta(hours=2))
 
     def test_search_channels_ranks_channels_with_listings_first(self, db):
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         db.insert_channel("alpha.one", "XX| ALPHA ONE", "src1")
         db.insert_channel("XX-Alpha One", "XX| ALPHA ONE HD", "src1")
         db.insert_channel("beta.one", "XX| BETA", "src1")
@@ -314,8 +349,8 @@ class TestPrune:
                     (now + timedelta(hours=1)).timestamp(),
                     "",
                     "src1",
-                )
-            ]
+                ),
+            ],
         )
         db.commit()
 
@@ -326,7 +361,7 @@ class TestPrune:
         assert db.search_channels([]) == []
 
     def test_prune_old_programs(self, db):
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         old = now - timedelta(days=2)
         db.insert_programs(
             [
@@ -346,7 +381,7 @@ class TestPrune:
                     "",
                     "src1",
                 ),
-            ]
+            ],
         )
         db.commit()
 
@@ -360,8 +395,8 @@ class TestPreferredSource:
     """Tests for preferred source deduplication."""
 
     def test_prefer_source_in_range(self, db):
-        now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
-        # Two overlapping programs from different sources
+        now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        # Two overlapping programs from different sources.
         db.insert_programs(
             [
                 (
@@ -380,20 +415,26 @@ class TestPreferredSource:
                     "",
                     "src2",
                 ),
-            ]
+            ],
         )
         db.commit()
 
-        # Prefer src2
+        # Prefer src2.
         result = db.get_programs_in_range(
-            "ch1", now, now + timedelta(hours=1), preferred_source_id="src2"
+            "ch1",
+            now,
+            now + timedelta(hours=1),
+            preferred_source_id="src2",
         )
         assert len(result) == 1
         assert result[0].title == "From Src2"
 
-        # Prefer src1
+        # Prefer src1.
         result = db.get_programs_in_range(
-            "ch1", now, now + timedelta(hours=1), preferred_source_id="src1"
+            "ch1",
+            now,
+            now + timedelta(hours=1),
+            preferred_source_id="src1",
         )
         assert len(result) == 1
         assert result[0].title == "From Src1"
@@ -403,7 +444,7 @@ class TestProgram:
     """Tests for Program dataclass."""
 
     def test_program_dataclass(self):
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         p = Program(
             channel_id="ch1",
             title="Test Show",
@@ -418,13 +459,13 @@ class TestProgram:
         assert p.source_id == "src1"
 
     def test_program_defaults(self):
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         p = Program(channel_id="ch1", title="Test", start=now, stop=now + timedelta(hours=1))
         assert p.desc == ""
         assert p.source_id == ""
 
 
 if __name__ == "__main__":
-    from testing import run_tests
+    from codedoctor.lib.testing.runner import test_main
 
-    run_tests(__file__)
+    test_main(__file__)

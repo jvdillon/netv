@@ -1,12 +1,12 @@
 """Single upstream ingest and independent local encoders for live fast start."""
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
+from urllib import parse
 
 import math
 import pathlib
 import re
 import time
-import urllib.parse
 
 from ffmpeg_command import (
     PASSTHROUGH_AUDIO_CODECS,
@@ -21,24 +21,45 @@ from ffmpeg_command import (
 
 
 _PLAYLIST_ENTRIES = re.compile(r"#EXTINF:([\d.]+),[^\n]*\n(?:#[^\n]*\n)*([^#\n]+)")
-DEFAULT_PLAYBACK_BUFFER_SECONDS = 12.0
-MAX_PLAYBACK_BUFFER_SECONDS = 60.0
 
 
-def live_buffer_durations(segment_durations: list[float]) -> tuple[float, float]:
-    """Return startup reserve and client buffer targets for bursty upstream media."""
+def live_buffer_durations(
+    segment_durations: list[float],
+    *,
+    playback_buffer_seconds: float = 12.0,
+    max_playback_buffer_seconds: float = 60.0,
+) -> tuple[float, float]:
+    """Return startup reserve and client buffer targets for bursty upstream media.
+
+    Args:
+        segment_durations: Observed upstream segment lengths in seconds.
+        playback_buffer_seconds: Minimum client playback buffer.
+        max_playback_buffer_seconds: Maximum client playback buffer.
+
+    Returns:
+        startup_buffer: Reserve covering two upstream segments.
+        playback_buffer: Bounded client buffer target in seconds.
+    """
     valid = [value for value in segment_durations if math.isfinite(value) and value > 0]
     upstream_duration = max(valid, default=4.0)
     startup_buffer = max(8.0, 2 * upstream_duration)
     playback_buffer = min(
-        MAX_PLAYBACK_BUFFER_SECONDS,
-        max(DEFAULT_PLAYBACK_BUFFER_SECONDS, startup_buffer),
+        max_playback_buffer_seconds,
+        max(playback_buffer_seconds, startup_buffer),
     )
     return startup_buffer, playback_buffer
 
 
 def add_live_start_offset(content: str, seconds: float) -> str:
-    """Prefer a safe initial position behind the live edge for native HLS clients."""
+    """Prefer a safe initial position behind the live edge for native HLS clients.
+
+    Args:
+        content: HLS playlist text.
+        seconds: Requested distance behind the live edge.
+
+    Returns:
+        playlist: Original text or text with a native start-offset tag.
+    """
     if not math.isfinite(seconds) or seconds <= 0 or "#EXT-X-START:" in content:
         return content
     line_ending = "\r\n" if content.startswith("#EXTM3U\r\n") else "\n"
@@ -54,7 +75,7 @@ def add_live_start_offset(content: str, seconds: float) -> str:
 
 
 def is_hls_url(url: str) -> bool:
-    path = urllib.parse.urlparse(url).path.lower()
+    path = parse.urlparse(url).path.lower()
     return path.endswith((".m3u8", ".m3u"))
 
 
@@ -160,9 +181,15 @@ def encoder_command(
 
 
 def master_playlist(resolution: str, *, include_high: bool, audio_bitrate: int = 0) -> str:
-    """Stable rendition URLs; clients keep high disabled until health permits it.
+    """Build stable rendition URLs for client-controlled quality promotion.
 
-    audio_bitrate covers surround audio beyond the stereo AAC in the usual 10% margin.
+    Args:
+        resolution: High rendition resolution preset.
+        include_high: Whether the high encoder is available.
+        audio_bitrate: Surround bandwidth beyond the usual ten-percent margin.
+
+    Returns:
+        playlist: Master playlist advertising available local renditions.
     """
     renditions = [("low", "720p")]
     if include_high:
@@ -182,7 +209,16 @@ def closed_caption_master_playlist(
     *,
     audio_bitrate: int = 0,
 ) -> str:
-    """Single-rendition master declaring embedded CEA-608/708 captions."""
+    """Build a single-rendition master declaring embedded CEA-608/708 captions.
+
+    Args:
+        rendition: Local rendition basename.
+        resolution: Video resolution preset.
+        audio_bitrate: Additional surround bandwidth in bits per second.
+
+    Returns:
+        playlist: Master playlist with an in-stream caption declaration.
+    """
     _, maximum = live_video_bitrates(resolution)
     bandwidth = int(maximum * 1.1) + audio_bitrate
     return "\n".join(
@@ -194,7 +230,7 @@ def closed_caption_master_playlist(
             f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CLOSED-CAPTIONS="cc"',
             f"{rendition}.m3u8",
             "",
-        ]
+        ],
     )
 
 
@@ -216,7 +252,14 @@ def playlist_duration(directory: str, name: str) -> float:
 
 
 def segment_pts(path: pathlib.Path) -> float | None:
-    """First video PES presentation timestamp in an MPEG-TS segment, in seconds."""
+    """Read the first video PES presentation timestamp in an MPEG-TS segment.
+
+    Args:
+        path: Local MPEG-TS segment.
+
+    Returns:
+        timestamp: Presentation time in seconds, or None when unavailable.
+    """
     try:
         with path.open("rb") as source:
             data = source.read(188 * 512)
@@ -231,18 +274,28 @@ def segment_pts(path: pathlib.Path) -> float | None:
             continue
         start = 4 if control == 1 else 5 + packet[4]
         pes = packet[start:]
-        if len(pes) < 14 or pes[:3] != b"\x00\x00\x01" or not 0xE0 <= pes[3] <= 0xEF:
+        if len(pes) < 14 or pes[:3] != b"\x00\x00\x01" or pes[3] < 0xE0 or pes[3] > 0xEF:
             continue
         if not pes[7] & 0x80:
             continue
         p = pes[9:14]
         pts = (p[0] >> 1 & 7) << 30 | p[1] << 22 | (p[2] >> 1) << 15 | p[3] << 7 | p[4] >> 1
-        return pts / 90000
+        return pts / 90_000
     return None
 
 
 def dated_playlist(directory: str, content: str, origin_pts: float, origin_time: float) -> str:
-    """Map both renditions to the same clock, independent of encoder warm-up."""
+    """Map both renditions to the same clock, independent of encoder warm-up.
+
+    Args:
+        directory: Directory containing local segment files.
+        content: Media playlist text.
+        origin_pts: Shared source presentation timestamp in seconds.
+        origin_time: Wall-clock time corresponding to origin_pts.
+
+    Returns:
+        playlist: Media playlist with synchronized program dates.
+    """
     lines = content.splitlines()
     result = []
     reset_clock = False
@@ -261,22 +314,29 @@ def dated_playlist(directory: str, content: str, origin_pts: float, origin_time:
                 if reset_clock:
                     try:
                         segment_time = segment.stat().st_mtime - duration
-                        elapsed = (pts - origin_pts) % ((1 << 33) / 90000)
+                        elapsed = (pts - origin_pts) % ((1 << 33) / 90_000)
                         if abs(origin_time + elapsed - segment_time) > 60:
                             origin_time = segment_time
                             origin_pts = pts
                     except OSError:
                         pass
                     reset_clock = False
-                elapsed = (pts - origin_pts) % ((1 << 33) / 90000)
-                date = datetime.fromtimestamp(origin_time + elapsed, UTC)
+                elapsed = (pts - origin_pts) % ((1 << 33) / 90_000)
+                date = datetime.fromtimestamp(origin_time + elapsed, timezone.utc)
                 result.append("#EXT-X-PROGRAM-DATE-TIME:" + date.isoformat(timespec="milliseconds"))
         result.append(line)
     return "\n".join(result) + "\n"
 
 
 def aligned(directory: str) -> bool:
-    """Do not promote an encoder that is still catching up with the low rendition."""
+    """Check whether the high encoder has caught up with the low rendition.
+
+    Args:
+        directory: Directory containing both rendition playlists and segments.
+
+    Returns:
+        caught_up: Whether their final segment endpoints differ by at most three seconds.
+    """
     try:
         ends = []
         for name in ("low.m3u8", "high.m3u8"):
@@ -299,7 +359,17 @@ def ready_bitrate(
     minimum_segments: int = 2,
     max_age: float = 10,
 ) -> float:
-    """Require complete, fresh segments; use the largest recent segment bitrate."""
+    """Require complete, fresh segments; use the largest recent segment bitrate.
+
+    Args:
+        directory: Directory containing playlist and segments.
+        name: Media playlist filename.
+        minimum_segments: Required number of published segments.
+        max_age: Maximum playlist age in seconds.
+
+    Returns:
+        bitrate: Largest recent bitrate, or zero when playback is not ready.
+    """
     path = pathlib.Path(directory) / name
     try:
         if time.time() - path.stat().st_mtime > max_age:

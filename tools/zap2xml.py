@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
-# pyright: reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownLambdaType=false
-"""zap2xml.py -- Fetch TV guide data from zap2it/gracenote in XMLTV format.
+#!/bin/sh
+# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# fmt: off
+'''' 2>/dev/null #
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
+
+Fetch TV guide data from zap2it/gracenote in XMLTV format.
 
 Scrapes the internal JSON feed from zap2it/gracenote to generate XMLTV guide
 data. The site occasionally returns 400 errors for certain time windows; this
@@ -13,12 +17,14 @@ Usage:
 
 Cron example:
     0 0 * * * cd /path/to/tools && ./zap2xml.py --zip 90210
-"""
+'''
+# fmt: on
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, ClassVar
+from typing import Any, Protocol, cast
+from urllib import error, parse, request
 
 import argparse
 import datetime
@@ -27,33 +33,22 @@ import json
 import math
 import pathlib
 import re
-import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 import xml.etree.ElementTree as xml
 
-
-SECONDS_PER_HOUR = 3_600
-SECONDS_PER_DAY = 86_400
 
 # https://en.wikipedia.org/wiki/Call_signs_in_the_United_States#Suffixes
 # Note: Doesn't correctly handly boosters.
 _CALLSIGN_REGEX = re.compile(r"^([A-Z]+?)(LD|DT|CD|CA|LP|TV|FM|D)(\d*)$")
 
 
-class Namespace(dict):  # pyright: ignore[reportMissingTypeArgument]
-    """Allows a dictionary to be accessed as `x.item` vs. `x['item']`."""
-
-    __slots__: ClassVar[tuple[str, ...]] = ()
-    __getattr__ = dict.__getitem__
-    __setattr__ = dict.__setitem__
-    __delattr__ = dict.__delitem__
-
-
-def main() -> None:
-    args = parse_args()
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Fetch TV data from zap2it.",
+        epilog="This tool is noisy to stdout; with cron use chronic from moreutils.",
+    )
+    _add_arguments(parser)
+    args = cast(Flags, parser.parse_args())
     working_dir = pathlib.Path(args.path)
 
     cache_dir = working_dir / ".zap2xml"
@@ -67,7 +62,7 @@ def main() -> None:
     zap_time = int(datetime.datetime.now().timestamp())
     print(f"Local time:     {zap_time}  {strf_time_int(zap_time)}")
 
-    zap_time_window = args.zap_timespan * SECONDS_PER_HOUR
+    zap_time_window = args.zap_timespan * 3_600
     zap_time = (zap_time // zap_time_window) * zap_time_window
     print(f"First zap time: {zap_time}  {strf_time_int(zap_time)}")
 
@@ -99,7 +94,7 @@ def main() -> None:
         print(f"Getting data:   {i_time}  {strf_time_int(i_time)}")
 
         url = f"https://{args.base_url}/api/grid?"
-        url += urllib.parse.urlencode({**url_flags, "time": i_time})
+        url += parse.urlencode({**url_flags, "time": i_time})
 
         result = get_cached(cache_dir, i_time, args.delay, url)
         json_result = json.loads(result)
@@ -115,14 +110,14 @@ def main() -> None:
                 #  'id': '2077555',
                 #  'stationFilters': ['filter-sports'],
                 #  'stationGenres': [False],
-                #  'thumbnail': '//zap2it.tmsimg.com/h3/NowShowing/20775/s28708_ll_h15_ac.png?w=55'}
+                #  'thumbnail': '//zap2it.tmsimg.com/h3/NowShowing/20775/s28708_ll_h15_ac.png?w=55'}.
                 channel_key = get_channel_key(c_in)
                 channel_display_name = " - ".join(
                     [
                         c_in["affiliateName"].title(),  # Eg, "CATCHY COMEDY"
                         parse_callsign(c_in["callSign"]),  # Eg, "KOVR-DT-5"
                         c_in["channelNo"],  # Eg., "13.5"
-                    ]
+                    ],
                 )
                 channel_map[channel_key] = channel_display_name
                 c_out = add_xml_child(
@@ -155,7 +150,7 @@ def main() -> None:
         f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
         f.write(xml.tostring(out, encoding="UTF-8"))
 
-    sys.exit(0)
+    return 0
 
 
 def get_cached(
@@ -173,7 +168,7 @@ def get_cached(
     print(f"Fetching: '{url}'.")
     if not url.startswith(("http:", "https:")):
         raise ValueError(f"URL '{url}' must start with 'http:' or 'https:'") from None
-    request = urllib.request.Request(
+    req = request.Request(
         url,
         headers={
             "User-Agent": (
@@ -184,16 +179,16 @@ def get_cached(
             "Sec-Ch-Ua": ('"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"'),
             "Sec-Ch-Ua-Mobile": "?0",
             "Sec-Ch-Ua-Platform": '"Linux"',
-            # "Accept-Encoding": "br, gzip, deflate, zstd, identity",
+            # "Accept-Encoding": "br, gzip, deflate, zstd, identity".
             "Accept-Language": "en-US,en;q=0.9",
             "Content-Type": "text/plain;charset=UTF-8",
             "Priority": "u=1, i",
         },
     )
     try:
-        response = urllib.request.urlopen(request)
+        response = request.urlopen(req)
         result = response.read()
-    except urllib.error.HTTPError as e:
+    except error.HTTPError as e:
         if e.code != 400:
             e.add_note(f'Url is "{url}".')
             raise
@@ -207,34 +202,21 @@ def get_cached(
 
 def remove_stale_cache(cache_dir: pathlib.Path, zap_time: int) -> None:
     for p in sorted(cache_dir.glob("*")):
-        x = Namespace()
-        x.name = p.name
-        x.zap_time = zap_time
-        x.data_time = int(str(p.name).removesuffix("".join(p.suffixes)))
-        x.file_time = int(p.stat().st_mtime)
-
-        x.is_irrelevant = x.data_time < zap_time
-        x.is_1day_expired = _expired(3, 1, x.data_time, x.file_time, zap_time)
-        x.is_7day_expired = _expired(7, 7, x.data_time, x.file_time, zap_time)
-
-        if any(v for k, v in x.items() if k.startswith("is_")):
-            x.file_time_str = strf_time_int(x.file_time)
-            x.data_time_str = strf_time_int(x.data_time)
-            s = " ".join(f"{k}={v}" for k, v in x.items())
-            print(f"Removing stale cache file: {s}")
+        data_time = int(p.name.removesuffix("".join(p.suffixes)))
+        file_time = int(p.stat().st_mtime)
+        is_irrelevant = data_time < zap_time
+        is_1day_expired = _expired(3, 1, data_time, file_time, zap_time)
+        is_7day_expired = _expired(7, 7, data_time, file_time, zap_time)
+        if is_irrelevant or is_1day_expired or is_7day_expired:
+            print(
+                f"Removing stale cache file: name={p.name} zap_time={zap_time} "
+                f"data_time={data_time} file_time={file_time} "
+                f"is_irrelevant={is_irrelevant} is_1day_expired={is_1day_expired} "
+                f"is_7day_expired={is_7day_expired} "
+                f"file_time_str={strf_time_int(file_time)} "
+                f"data_time_str={strf_time_int(data_time)}",
+            )
             p.unlink()
-
-
-def _expired(
-    data_days: float,
-    file_days: float,
-    data_time: int,
-    file_time: int,
-    zap_time: int,
-) -> bool:
-    data_time_within_limit = data_time < zap_time + data_days * SECONDS_PER_DAY
-    file_time_within_limit = zap_time < file_time + file_days * SECONDS_PER_DAY
-    return data_time_within_limit and not file_time_within_limit
 
 
 def add_programme(
@@ -250,7 +232,7 @@ def add_programme(
     #     'tmsId': 'EP000019960180',
     #     'shortDesc': 'Richie is selected to become a contestant on a popular game show with a chance to win $3,200.',
     #     'season': '2', 'releaseYear': None, 'episode': '9', 'episodeTitle': 'Big Money', 'seriesId': 'SH00001996', 'isGeneric': '0'}
-    # }
+    # }.
     # https://tvlistings.gracenote.com/overview-affiliates.html?programSeriesId=SH00001996&tmsId=EP000019960180&aid=lat
 
     prog_out = add_xml_child(
@@ -267,7 +249,7 @@ def add_programme(
         _ = add_xml_child(
             parent=prog_out,
             tag="title",
-            # lang="en",
+            # lang="en".
             text=prog_in["title"],
         )
 
@@ -277,7 +259,7 @@ def add_programme(
         _ = add_xml_child(
             parent=prog_out,
             tag="sub-title",
-            # lang="en",
+            # lang="en".
             text=prog_in["episodeTitle"],
         )
     elif "filter-movie" in event["filter"]:
@@ -291,7 +273,7 @@ def add_programme(
         _ = add_xml_child(
             parent=prog_out,
             tag="sub-title",
-            # lang="en",
+            # lang="en".
             text=text,
         )
 
@@ -299,7 +281,7 @@ def add_programme(
         _ = add_xml_child(
             parent=prog_out,
             tag="desc",
-            # lang="en",
+            # lang="en".
             text=prog_in["shortDesc"],
         )
 
@@ -363,7 +345,7 @@ def add_programme(
         _ = add_xml_child(
             parent=prog_out,
             tag="category",  # Was: "genre"
-            # lang="en",
+            # lang="en".
             text=f[len("filter-") :].title(),
         )
 
@@ -399,7 +381,7 @@ def add_programme(
             tag="stereo",
             text="bilingual",
         )
-        # if False:
+        # If False:
         #     a = strf_time_str(
         #         event["startTime"],
         #         format_str="%Y-%b-%d %_I:%M%P",
@@ -421,7 +403,7 @@ def add_programme(
             text="English",
         )
 
-    if "New" in event["flag"]:  # and "Live" not in event["flag"]:
+    if "New" in event["flag"]:  # And "Live" not in event["flag"]:
         _ = add_xml_child(
             parent=prog_out,
             tag="new",
@@ -470,7 +452,7 @@ def add_programme_tvimate(
         _ = add_xml_child(
             parent=prog_out,
             tag="title",
-            # lang="en",
+            # lang="en".
             text=title,
         )
 
@@ -485,11 +467,11 @@ def add_programme_tvimate(
         _ = add_xml_child(
             parent=prog_out,
             tag="desc",
-            # lang="en",
+            # lang="en".
             text=description,
         )
 
-    # if event["rating"]:
+    # If event["rating"]:
     #     r = add_xml_child(
     #         parent=prog_out,
     #         tag="rating",
@@ -515,23 +497,26 @@ def add_programme_tvimate(
         _ = add_xml_child(
             parent=prog_out,
             tag="category",  # Was: "genre"
-            # lang="en",
+            # lang="en".
             text=f[len("filter-") :].title(),
         )
 
 
 def get_channel_key(c: Mapping[str, Any]) -> str:
-    # old way:
+    # Old way:
     # return f"I{c['channelNo']}.{c['channelId']}.zap2it.com"
     return c["callSign"]
 
 
 def parse_callsign(coded_callsign: str) -> str:
     result = _CALLSIGN_REGEX.search(coded_callsign.upper())
-    assert result
+    if not result:
+        raise ValueError("Expected result.")
     call, suffix, num = result.groups()
-    assert suffix
-    assert num != "1"
+    if not suffix:
+        raise ValueError("Expected suffix.")
+    if num == "1":
+        raise ValueError('Expected num != "1".')
     if call == "KQS" and suffix == "LD":
         # Appears to be a bug in their coded callsign.
         call = "KQSL"
@@ -584,11 +569,28 @@ def toint(x: str | None, fail: int = 0) -> int:
     return int(x)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Fetch TV data from zap2it.",
-        epilog="This tool is noisy to stdout; with cron use chronic from moreutils.",
-    )
+class Flags(Protocol):
+    """Guide fetch and output options."""
+
+    delay: int
+    base_url: str
+    days: float
+    path: str
+    zap_aid: str
+    zap_country: str
+    zap_device: str
+    zap_headendId: str
+    zap_isOverride: bool
+    zap_languagecode: str
+    zap_pref: str
+    zap_timespan: int
+    zap_timezone: str
+    zap_userId: str
+    zap_postalCode: str
+    tvimate: bool
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument(
         "--delay",
         dest="delay",
@@ -601,7 +603,7 @@ def parse_args() -> argparse.Namespace:
         dest="base_url",
         type=str,
         default="tvlistings.gracenote.com",
-        # default="tvlistings.zap2it.com",
+        # default="tvlistings.zap2it.com".
         help="Source url without http prefix.",
     )
     _ = parser.add_argument(
@@ -706,8 +708,19 @@ def parse_args() -> argparse.Namespace:
         help="Guide formatted specifically for TViMate.",
     )
 
-    return parser.parse_args()
+
+def _expired(
+    data_days: float,
+    file_days: float,
+    data_time: int,
+    file_time: int,
+    zap_time: int,
+) -> bool:
+    data_time_within_limit = data_time < zap_time + data_days * 86_400
+    file_time_within_limit = zap_time < file_time + file_days * 86_400
+    return data_time_within_limit and not file_time_within_limit
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
+# vim: ft=python

@@ -6,14 +6,14 @@ from pydantic import BaseModel, Field
 
 
 class PlaybackHealth(BaseModel):
-    buffer_seconds: float = Field(ge=0, le=86400, allow_inf_nan=False)
+    buffer_seconds: float = Field(ge=0, le=86_400, allow_inf_nan=False)
     waiting: bool
     # Zero means unavailable. The client supplies a recent download sample.
     observed_bitrate: float = Field(default=0, ge=0, le=1e12, allow_inf_nan=False)
     required_bitrate: float = Field(default=0, ge=0, le=1e12, allow_inf_nan=False)
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class PlaybackPolicy:
     started: float | None = None
     last_sample: float | None = None
@@ -94,7 +94,7 @@ class PlaybackPolicy:
         return self.bandwidth_saver
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class UpgradePolicy:
     """Keep recent capacity evidence across HLS download and encoder batching gaps."""
 
@@ -102,7 +102,11 @@ class UpgradePolicy:
     reason: str = "waiting for throughput"
 
     def observe(
-        self, health: PlaybackHealth, target_bitrate: float, ready: bool, now: float
+        self,
+        health: PlaybackHealth,
+        target_bitrate: float,
+        ready: bool,
+        now: float,
     ) -> bool:
         self.samples = [(at, rate) for at, rate in self.samples if now - at <= 10]
         if health.waiting or health.buffer_seconds < 3:
@@ -132,17 +136,15 @@ class UpgradePolicy:
         return False
 
 
-_LIVE_STALL_CONFIRM_SECONDS = 2
-_LIVE_HIGH_WARMUP_SECONDS = 30
-_LIVE_RESTART_WINDOW_SECONDS = 300
-_LIVE_RESTART_LIMIT = 3
-
-
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class LiveRecoveryPolicy:
     """Confirm media stalls and bound stage restarts independently of playback pressure."""
 
     high_started: float
+    stall_confirm_seconds: float = 2
+    high_warmup_seconds: float = 30
+    restart_window_seconds: float = 300
+    restart_limit: int = 3
     failures: dict[str, float] = field(default_factory=dict)
     attempts: dict[str, list[float]] = field(default_factory=dict)
     pending: set[str] = field(default_factory=set)
@@ -157,15 +159,11 @@ class LiveRecoveryPolicy:
         if process_alive and output_ready:
             self.failures.pop(stage, None)
             return False
-        if (
-            stage == "high"
-            and process_alive
-            and now - self.high_started < _LIVE_HIGH_WARMUP_SECONDS
-        ):
+        if stage == "high" and process_alive and now - self.high_started < self.high_warmup_seconds:
             self.failures.pop(stage, None)
             return False
         since = self.failures.setdefault(stage, now)
-        return now - since >= _LIVE_STALL_CONFIRM_SECONDS
+        return now - since >= self.stall_confirm_seconds
 
     def permit_restart(self, action: str, now: float) -> bool:
         if action in self.pending:
@@ -173,10 +171,10 @@ class LiveRecoveryPolicy:
         attempts = [
             attempt
             for attempt in self.attempts.get(action, [])
-            if now - attempt < _LIVE_RESTART_WINDOW_SECONDS
+            if now - attempt < self.restart_window_seconds
         ]
         self.attempts[action] = attempts
-        if len(attempts) >= _LIVE_RESTART_LIMIT:
+        if len(attempts) >= self.restart_limit:
             return False
         if attempts:
             cooldown = 30 if action == "high" else (5 if len(attempts) == 1 else 15)

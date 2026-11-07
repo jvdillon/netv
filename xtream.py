@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from urllib import parse
 
 import json
-import urllib.parse
 
 from util import safe_urlopen
 
 
-@dataclass(slots=True)
+@dataclass(kw_only=True, slots=True)
 class XtreamClient:
     """Client for Xtream Codes API.
 
@@ -25,7 +25,6 @@ class XtreamClient:
     user_agent: str | None = None
 
     def __post_init__(self) -> None:
-        # Normalize URL: strip trailing slashes
         self.base_url = self.base_url.rstrip("/")
 
     @property
@@ -34,7 +33,7 @@ class XtreamClient:
 
     @property
     def api_url(self) -> str:
-        params = urllib.parse.urlencode(self._base_params)
+        params = parse.urlencode(self._base_params)
         return f"{self.base_url}/player_api.php?{params}"
 
     def _fetch(self, url: str, timeout: int = 30) -> str:
@@ -46,7 +45,7 @@ class XtreamClient:
         if action:
             query["action"] = action
         query.update(params)
-        url = f"{self.base_url}/player_api.php?{urllib.parse.urlencode(query)}"
+        url = f"{self.base_url}/player_api.php?{parse.urlencode(query)}"
         return json.loads(self._fetch(url, timeout=timeout))
 
     def get_server_info(self, timeout: int = 15) -> dict[str, Any]:
@@ -88,9 +87,9 @@ class XtreamClient:
         return self._api("get_short_epg", stream_id=stream_id, limit=limit)
 
     def build_stream_url(self, stream_type: str, stream_id: int, ext: str = "") -> str:
-        # URL-encode username/password to handle special chars like # in passwords
-        user = urllib.parse.quote(self.username, safe="")
-        pwd = urllib.parse.quote(self.password, safe="")
+        # URL-encode username/password to handle special chars like # in passwords.
+        user = parse.quote(self.username, safe="")
+        pwd = parse.quote(self.password, safe="")
         base = f"{self.base_url}/{stream_type}/{user}/{pwd}/{stream_id}"
         return f"{base}.{ext}" if ext else base
 
@@ -102,12 +101,12 @@ class XtreamClient:
         ext: str = "ts",
     ) -> str:
         """For streams with tv_archive=1. start format: YYYY-MM-DD:HH-MM."""
-        # URL-encode username/password to handle special chars like # in passwords
-        user = urllib.parse.quote(self.username, safe="")
-        pwd = urllib.parse.quote(self.password, safe="")
+        # URL-encode username/password to handle special chars like # in passwords.
+        user = parse.quote(self.username, safe="")
+        pwd = parse.quote(self.password, safe="")
         return f"{self.base_url}/timeshift/{user}/{pwd}/{duration}/{start}/{stream_id}.{ext}"
 
     @property
     def epg_url(self) -> str:
-        params = urllib.parse.urlencode(self._base_params)
+        params = parse.urlencode(self._base_params)
         return f"{self.base_url}/xmltv.php?{params}"

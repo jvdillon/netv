@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest import mock
 
 import json
 
 import pytest
 
+import auth
+
 
 @pytest.fixture
 def auth_module(tmp_path: Path):
     """Import auth module with temp settings file."""
-    import auth
 
-    # Patch settings files to temp location
+    # Patch settings files to temp location.
     original_server = auth.SERVER_SETTINGS_FILE
     original_users = auth.USERS_DIR
     auth.SERVER_SETTINGS_FILE = tmp_path / "server_settings.json"
@@ -31,8 +31,8 @@ class TestPasswordHashing:
         hashed = auth_module._hash_password("mypassword")
         assert ":" in hashed
         salt, key = hashed.split(":")
-        assert len(salt) == 32  # 16 bytes hex
-        assert len(key) == 64  # 32 bytes hex
+        assert len(salt) == 32  # 16 bytes hex.
+        assert len(key) == 64  # 32 bytes hex.
 
     def test_hash_password_with_salt_deterministic(self, auth_module):
         salt = "a" * 32
@@ -75,7 +75,7 @@ class TestTokens:
         token = auth_module.create_token({"test": 1})
         assert "." in token
         _, sig = token.split(".")
-        assert len(sig) == 64  # sha256 hex
+        assert len(sig) == 64  # sha256 hex.
 
     def test_invalid_token_rejected(self, auth_module):
         assert auth_module.verify_token("invalid") is None
@@ -84,24 +84,23 @@ class TestTokens:
 
     def test_tampered_token_rejected(self, auth_module):
         token = auth_module.create_token({"user": "admin"})
-        # Tamper with signature
+        # Tamper with signature.
         data, _ = token.split(".")
         tampered = f"{data}.{'0' * 64}"
         assert auth_module.verify_token(tampered) is None
 
     def test_expired_token_rejected(self, auth_module):
-        # Create token with expired time
-        with mock.patch.object(auth_module, "TOKEN_EXPIRY", -1):
-            token = auth_module.create_token({"user": "admin"})
+        # Create token with expired time.
+        token = auth_module.create_token({"user": "admin"}, expiry_seconds=-1)
         assert auth_module.verify_token(token) is None
 
 
 class TestSecretKey:
     def test_get_secret_key_generates_and_persists(self, auth_module):
         key1 = auth_module._get_secret_key()
-        assert len(key1) == 64  # 32 bytes hex
+        assert len(key1) == 64  # 32 bytes hex.
 
-        # Should return same key
+        # Should return same key.
         key2 = auth_module._get_secret_key()
         assert key1 == key2
 
@@ -112,6 +111,6 @@ class TestSecretKey:
 
 
 if __name__ == "__main__":
-    from testing import run_tests
+    from codedoctor.lib.testing.runner import test_main
 
-    run_tests(__file__)
+    test_main(__file__)

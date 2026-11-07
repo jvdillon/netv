@@ -63,7 +63,8 @@ def start(env, username="alice", host="192.168.1.50"):
 
 
 @pytest.mark.parametrize(
-    "host", ["localhost", "127.0.0.1", "0.0.0.0", "8.8.8.8", "169.254.1.1", "::1", "224.0.0.1"]
+    "host",
+    ["localhost", "127.0.0.1", "0.0.0.0", "8.8.8.8", "169.254.1.1", "::1", "224.0.0.1"],
 )
 def test_device_must_be_private_lan_ip(host):
     with pytest.raises(HTTPException) as error:
@@ -226,3 +227,9 @@ def test_discovery_closes_browser_and_returns_lan_devices():
         }
         assert manager.discover() == [{"host": "192.168.1.50", "name": "TV"}]
         browser.stop_discovery.assert_called_once()
+
+
+if __name__ == "__main__":
+    from codedoctor.lib.testing.runner import test_main
+
+    test_main(__file__)

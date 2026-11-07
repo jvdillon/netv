@@ -7,7 +7,7 @@ Apple apps, can show them without editing support.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Final
 
 import json
 import re
@@ -20,19 +20,12 @@ from util import atomic_write_json
 import cache
 
 
-PREFIX = "pl:"
-MAX_PLAYLISTS = 100
-MAX_CHANNELS = 2000
-MAX_NAME_LEN = 80
+PREFIX: Final = "pl:"
 
 _lock = threading.Lock()
 
 
-def _path():
-    return cache.CACHE_DIR / "playlists.json"
-
-
-def is_playlist_id(category_id: str) -> bool:
+def is_playlist_id(category_id: object) -> bool:
     return str(category_id).startswith(PREFIX)
 
 
@@ -61,52 +54,7 @@ def get(playlist_id: str) -> dict[str, Any] | None:
     return next((p for p in load() if p["id"] == playlist_id), None)
 
 
-def _clean_name(name: Any) -> str:
-    name = str(name or "").strip()[:MAX_NAME_LEN]
-    if not name:
-        raise ValueError("Playlist name is required")
-    return name
-
-
-def _clean_channel(entry: Any) -> dict[str, str] | None:
-    if not isinstance(entry, dict):
-        return None
-    stream_id = str(entry.get("stream_id", "")).strip()
-    name = str(entry.get("name", "")).strip()
-    if not stream_id and not name:
-        return None
-    return {
-        "stream_id": stream_id,
-        "name": name,
-        "source_id": str(entry.get("source_id") or "").strip(),
-        "epg_channel_id": str(entry.get("epg_channel_id") or "").strip(),
-    }
-
-
-def _clean_channels(channels: Any) -> list[dict[str, str]]:
-    if not isinstance(channels, list):
-        raise ValueError("channels must be a list")
-    if len(channels) > MAX_CHANNELS:
-        raise ValueError(f"A playlist can hold at most {MAX_CHANNELS} channels")
-    cleaned: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for entry in channels:
-        channel = _clean_channel(entry)
-        if not channel:
-            continue
-        key = (
-            f"{channel['source_id']}:{channel['stream_id']}"
-            if channel["stream_id"]
-            else f"name:{channel['source_id']}:{channel['name']}"
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(channel)
-    return cleaned
-
-
-def create(name: str, channels: Any = None) -> dict[str, Any]:
+def create(name: str, channels: Any = None, *, max_playlists: int = 100) -> dict[str, Any]:
     playlist = {
         "id": uuid.uuid4().hex[:12],
         "name": _clean_name(name),
@@ -114,8 +62,8 @@ def create(name: str, channels: Any = None) -> dict[str, Any]:
     }
     with _lock:
         playlists = load()
-        if len(playlists) >= MAX_PLAYLISTS:
-            raise ValueError(f"At most {MAX_PLAYLISTS} playlists are allowed")
+        if len(playlists) >= max_playlists:
+            raise ValueError(f"At most {max_playlists} playlists are allowed")
         playlists.append(playlist)
         save(playlists)
         return playlist
@@ -171,38 +119,19 @@ _index: (
 ) = None
 
 
-def _stream_index(streams: list[dict]):
-    """Index streams by (source, id), bare id, (source, name) and (source, epg id).
-
-    Cached per stream list; the list itself is kept so its identity can't be reused.
-    """
-    global _index
-    with _index_lock:
-        if _index is not None and _index[0] is streams:
-            return _index[1:]
-        by_id: dict[tuple[str, str], dict] = {}
-        by_bare_id: dict[str, dict] = {}
-        by_name: dict[tuple[str, str], dict] = {}
-        by_epg: dict[tuple[str, str], dict] = {}
-        for s in streams:
-            source = str(s.get("source_id") or "")
-            stream_id = str(s.get("stream_id", ""))
-            by_id.setdefault((source, stream_id), s)
-            by_bare_id.setdefault(stream_id, s)
-            by_name.setdefault((source, str(s.get("name", ""))), s)
-            epg_id = s.get("epg_channel_id") or ""
-            if epg_id:
-                by_epg.setdefault((source, epg_id), s)
-        _index = (streams, by_id, by_bare_id, by_name, by_epg)
-        return _index[1:]
-
-
 def resolve_channel(entry: dict, streams: list[dict]) -> dict | None:
     """Find the current stream for a saved entry.
 
     Stream IDs can change (or be reused) when a provider refreshes, so an id
     match must agree on the name; otherwise try the name, then the EPG id, within
     the same source, and only then the bare id match.
+
+    Args:
+        entry: Saved playlist channel metadata.
+        streams: Current provider streams.
+
+    Returns:
+        stream: Best matching stream, or None.
     """
     by_id, by_bare_id, by_name, by_epg = _stream_index(streams)
     source = entry.get("source_id", "")
@@ -220,8 +149,15 @@ def resolve_channel(entry: dict, streams: list[dict]) -> dict | None:
 
 
 def with_entry_epg(entry: dict, stream: dict) -> dict:
-    """The entry's EPG id overrides the stream's, so a curated playlist can
-    repair guide data when the provider's tvg-id doesn't match the EPG feed."""
+    """Apply a curated guide identity without mutating the provider stream.
+
+    Args:
+        entry: Saved playlist channel metadata.
+        stream: Resolved provider stream.
+
+    Returns:
+        stream: Stream metadata with any curated guide identity applied.
+    """
     epg_id = entry.get("epg_channel_id") or ""
     if epg_id:
         return {**stream, "epg_channel_id": epg_id}
@@ -229,7 +165,15 @@ def with_entry_epg(entry: dict, stream: dict) -> dict:
 
 
 def resolve(playlist: dict, streams: list[dict]) -> list[dict]:
-    """Return the playlist's available streams in playlist order, without duplicates."""
+    """Resolve available streams in playlist order without duplicates.
+
+    Args:
+        playlist: Saved playlist with ordered channel entries.
+        streams: Current provider streams.
+
+    Returns:
+        resolved: Available streams with curated guide identities.
+    """
     resolved: list[dict] = []
     seen: set[str] = set()
     for entry in playlist.get("channels", []):
@@ -248,35 +192,34 @@ def resolve(playlist: dict, streams: list[dict]) -> list[dict]:
 # Search and bulk matching
 # =============================================================================
 
-_NOISE = {
-    "HD", "FHD", "UHD", "SD", "4K", "8K", "RAW", "60FPS", "HEVC", "CITY", "A3",
-    "US", "USA", "TV", "PRIME", "BK", "HDTV", "EVENT", "ONLY",
-}  # fmt: skip
-_ALIASES = {
-    "FS1": "FOX SPORTS 1",
-    "FS2": "FOX SPORTS 2",
-    "MSNBC": "MS NOW",
-    "ESPNU": "ESPN U",
-    "ESPNEWS": "ESPN NEWS",
-    "ESPN2": "ESPN 2",
-    "ID": "INVESTIGATION DISCOVERY",
-    "NICK": "NICKELODEON",
-    "BTN": "BIG TEN NETWORK",
-    "CBSSN": "CBS SPORTS NETWORK",
-}
-_PREFIX_RE = re.compile(r"^\s*[A-Z0-9+&/ ]{1,12}\|\s*")
 
-
-def normalize(name: str) -> list[str]:
+def normalize(name: object) -> list[str]:
+    noise = {
+        "HD",
+        "FHD",
+        "UHD",
+        "SD",
+        "4K",
+        "8K",
+        "RAW",
+        "60FPS",
+        "HEVC",
+        "CITY",
+        "A3",
+        "US",
+        "USA",
+        "TV",
+        "PRIME",
+        "BK",
+        "HDTV",
+        "EVENT",
+        "ONLY",
+    }
     text = unicodedata.normalize("NFKD", str(name or "")).upper()
-    text = _PREFIX_RE.sub("", text)
+    text = re.sub(r"^\s*[A-Z0-9+&/ ]{1,12}\|\s*", "", text)
     text = text.replace("&", " AND ").replace("+", " PLUS ")
     tokens = re.findall(r"[A-Z0-9]+", text)
-    return [t for t in tokens if t not in _NOISE]
-
-
-def _is_separator(name: str) -> bool:
-    return "#####" in name or not re.search(r"[A-Za-z0-9]", name)
+    return [t for t in tokens if t not in noise]
 
 
 def summarize(stream: dict, category_names: dict[str, str]) -> dict[str, Any]:
@@ -290,19 +233,6 @@ def summarize(stream: dict, category_names: dict[str, str]) -> dict[str, Any]:
         "icon": stream.get("stream_icon") or "",
         "category": category,
     }
-
-
-def _category_filter(streams: list[dict], category_names: dict[str, str], category_prefix: str):
-    prefix = category_prefix.strip().upper()
-    for s in streams:
-        name = str(s.get("name", ""))
-        if _is_separator(name):
-            continue
-        if prefix:
-            names = [category_names.get(str(c), "") for c in (s.get("category_ids") or [])]
-            if not any(n.upper().startswith(prefix) for n in names):
-                continue
-        yield s
 
 
 def search(
@@ -332,23 +262,6 @@ def search(
     return results
 
 
-def _score(query_tokens: list[str], stream_tokens: list[str]) -> float:
-    if not query_tokens or not stream_tokens:
-        return 0.0
-    stream_set = set(stream_tokens)
-    matched = sum(1 for t in query_tokens if t in stream_set)
-    if matched == 0:
-        return 0.0
-    coverage = matched / len(query_tokens)
-    extra = len(stream_set - set(query_tokens))
-    score = coverage * 100 - extra * 3
-    if stream_tokens == query_tokens:
-        score += 50
-    elif stream_tokens[: len(query_tokens)] == query_tokens:
-        score += 20
-    return score
-
-
 def match_names(
     lines: list[str],
     streams: list[dict],
@@ -356,7 +269,30 @@ def match_names(
     category_prefix: str = "",
     candidates_per_line: int = 5,
 ) -> list[dict[str, Any]]:
-    """Fuzzy-match pasted channel names to streams."""
+    """Fuzzy-match pasted channel names to streams.
+
+    Args:
+        lines: Channel names to match.
+        streams: Available provider streams.
+        category_names: Category names indexed by identifier.
+        category_prefix: Restrict matching to categories with this prefix.
+        candidates_per_line: Maximum distinct candidate names per input line.
+
+    Returns:
+        matches: Queries with ranked candidate stream metadata and scores.
+    """
+    aliases = {
+        "FS1": "FOX SPORTS 1",
+        "FS2": "FOX SPORTS 2",
+        "MSNBC": "MS NOW",
+        "ESPNU": "ESPN U",
+        "ESPNEWS": "ESPN NEWS",
+        "ESPN2": "ESPN 2",
+        "ID": "INVESTIGATION DISCOVERY",
+        "NICK": "NICKELODEON",
+        "BTN": "BIG TEN NETWORK",
+        "CBSSN": "CBS SPORTS NETWORK",
+    }
     pool = [
         (s, normalize(s.get("name", "")))
         for s in _category_filter(streams, category_names, category_prefix)
@@ -367,7 +303,7 @@ def match_names(
         if not query:
             continue
         variants = [normalize(query)]
-        alias = _ALIASES.get(" ".join(variants[0]))
+        alias = aliases.get(" ".join(variants[0]))
         if alias:
             variants.append(normalize(alias))
         scored = []
@@ -388,3 +324,111 @@ def match_names(
                 break
         results.append({"query": query, "candidates": candidates})
     return results
+
+
+def _path():
+    cache.initialize_paths()
+    return cache.CACHE_DIR / "playlists.json"
+
+
+def _clean_name(name: Any, *, max_length: int = 80) -> str:
+    name = str(name or "").strip()[:max_length]
+    if not name:
+        raise ValueError("Playlist name is required")
+    return name
+
+
+def _clean_channel(entry: Any) -> dict[str, str] | None:
+    if not isinstance(entry, dict):
+        return None
+    stream_id = str(entry.get("stream_id", "")).strip()
+    name = str(entry.get("name", "")).strip()
+    if not stream_id and not name:
+        return None
+    return {
+        "stream_id": stream_id,
+        "name": name,
+        "source_id": str(entry.get("source_id") or "").strip(),
+        "epg_channel_id": str(entry.get("epg_channel_id") or "").strip(),
+    }
+
+
+def _clean_channels(channels: Any, *, max_channels: int = 2000) -> list[dict[str, str]]:
+    if not isinstance(channels, list):
+        raise ValueError("channels must be a list")
+    if len(channels) > max_channels:
+        raise ValueError(f"A playlist can hold at most {max_channels} channels")
+    cleaned: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in channels:
+        channel = _clean_channel(entry)
+        if not channel:
+            continue
+        key = (
+            f"{channel['source_id']}:{channel['stream_id']}"
+            if channel["stream_id"]
+            else f"name:{channel['source_id']}:{channel['name']}"
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(channel)
+    return cleaned
+
+
+# Cached per stream list; the list itself is kept so its identity can't be reused.
+def _stream_index(streams: list[dict]):
+    """Index streams by (source, id), bare id, (source, name) and (source, epg id)."""
+    global _index
+    with _index_lock:
+        if _index is not None and _index[0] is streams:
+            return _index[1:]
+        by_id: dict[tuple[str, str], dict] = {}
+        by_bare_id: dict[str, dict] = {}
+        by_name: dict[tuple[str, str], dict] = {}
+        by_epg: dict[tuple[str, str], dict] = {}
+        for s in streams:
+            source = str(s.get("source_id") or "")
+            stream_id = str(s.get("stream_id", ""))
+            by_id.setdefault((source, stream_id), s)
+            by_bare_id.setdefault(stream_id, s)
+            by_name.setdefault((source, str(s.get("name", ""))), s)
+            epg_id = s.get("epg_channel_id") or ""
+            if epg_id:
+                by_epg.setdefault((source, epg_id), s)
+        _index = (streams, by_id, by_bare_id, by_name, by_epg)
+        return _index[1:]
+
+
+def _is_separator(name: str) -> bool:
+    return "#####" in name or not re.search(r"[A-Za-z0-9]", name)
+
+
+def _category_filter(streams: list[dict], category_names: dict[str, str], category_prefix: str):
+    prefix = category_prefix.strip().upper()
+    for s in streams:
+        name = str(s.get("name", ""))
+        if _is_separator(name):
+            continue
+        if prefix:
+            names = [category_names.get(str(c), "") for c in (s.get("category_ids") or [])]
+            if not any(n.upper().startswith(prefix) for n in names):
+                continue
+        yield s
+
+
+def _score(query_tokens: list[str], stream_tokens: list[str]) -> float:
+    if not query_tokens or not stream_tokens:
+        return 0.0
+    stream_set = set(stream_tokens)
+    matched = sum(1 for t in query_tokens if t in stream_set)
+    if matched == 0:
+        return 0.0
+    coverage = matched / len(query_tokens)
+    extra = len(stream_set - set(query_tokens))
+    score = coverage * 100 - extra * 3
+    if stream_tokens == query_tokens:
+        score += 50
+    elif stream_tokens[: len(query_tokens)] == query_tokens:
+        score += 20
+    return score

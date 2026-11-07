@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import json
 import re
 
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
+
 import pytest
 
+from epg import Program
+from main import PlayerInfo
+
+import auth
 import cache as cache_module
+import handoff
 import m3u as m3u_module
+import main
 
 
 @pytest.fixture
@@ -20,7 +31,8 @@ def mock_deps():
     """Mock all external dependencies before importing main."""
     with (
         patch.dict(
-            "sys.modules", {"defusedxml": MagicMock(), "defusedxml.ElementTree": MagicMock()}
+            "sys.modules",
+            {"defusedxml": MagicMock(), "defusedxml.ElementTree": MagicMock()},
         ),
         patch("cache.CACHE_DIR", Path("/tmp/test_cache")),
         patch("cache.SERVER_SETTINGS_FILE", Path("/tmp/test_cache/server_settings.json")),
@@ -32,9 +44,8 @@ def mock_deps():
 @pytest.fixture
 def client(tmp_path: Path, mock_deps):
     """Create test client with mocked dependencies."""
-    from fastapi.testclient import TestClient
 
-    # Patch paths before importing main
+    # Patch paths before importing main.
     with (
         patch("cache.CACHE_DIR", tmp_path),
         patch("cache.SERVER_SETTINGS_FILE", tmp_path / "server_settings.json"),
@@ -47,9 +58,8 @@ def client(tmp_path: Path, mock_deps):
         patch("ffmpeg_session.cleanup_and_recover_sessions"),
     ):
         (tmp_path / "users").mkdir(exist_ok=True)
-        import main
 
-        # Disable background loading
+        # Disable background loading.
         cache_module.get_cache().clear()
         yield TestClient(main.app)
 
@@ -57,7 +67,6 @@ def client(tmp_path: Path, mock_deps):
 @pytest.fixture
 def auth_client(tmp_path: Path, mock_deps):
     """Create test client with a logged-in user."""
-    from fastapi.testclient import TestClient
 
     with (
         patch("cache.CACHE_DIR", tmp_path),
@@ -71,13 +80,11 @@ def auth_client(tmp_path: Path, mock_deps):
         patch("ffmpeg_session.cleanup_and_recover_sessions"),
     ):
         (tmp_path / "users").mkdir(exist_ok=True)
-        import auth
-        import main
 
         cache_module.get_cache().clear()
         client = TestClient(main.app)
 
-        # Create user and get token
+        # Create user and get token.
         auth.create_user("testuser", "testpass123")
         token = auth.create_token({"sub": "testuser"})
         client.cookies.set("token", token)
@@ -86,7 +93,6 @@ def auth_client(tmp_path: Path, mock_deps):
 
 
 def test_web_player_includes_resolution_badge(auth_client):
-    from main import PlayerInfo
 
     info = PlayerInfo(url="https://example.test/live.m3u8", channel_name="Test channel")
     with patch("main._get_live_player_info", return_value=info):
@@ -95,10 +101,10 @@ def test_web_player_includes_resolution_badge(auth_client):
     assert 'id="quality-badge"' in response.text
     assert response.text.index('id="player-container"') < response.text.index('id="quality-badge"')
     assert response.text.index("/static/js/player-quality.js") < response.text.index(
-        "/static/js/player.js"
+        "/static/js/player.js",
     )
     assert response.text.index("/static/js/live-playback.js") < response.text.index(
-        "/static/js/player.js"
+        "/static/js/player.js",
     )
     script = auth_client.get("/static/js/player-quality.js")
     assert script.status_code == 200
@@ -107,7 +113,6 @@ def test_web_player_includes_resolution_badge(auth_client):
     assert 'id="cast-dialog"' in response.text
     assert "cast_sender.js" not in response.text
     assert response.text.index("/static/js/cast.js") < response.text.index("/static/js/player.js")
-    from html.parser import HTMLParser
 
     class CastPlacement(HTMLParser):
         def __init__(self):
@@ -128,11 +133,13 @@ def test_web_player_includes_resolution_badge(auth_client):
 
     placement = CastPlacement()
     placement.feed(response.text)
-    assert placement.parents == {"cast-overlay": "player-container", "cast-dialog": "player-container"}
+    assert placement.parents == {
+        "cast-overlay": "player-container",
+        "cast-dialog": "player-container",
+    }
 
 
 def test_live_player_records_view(auth_client):
-    from main import PlayerInfo
 
     info = PlayerInfo(
         url="https://example.test/live.m3u8",
@@ -158,38 +165,70 @@ def test_cast_commands_require_authentication(client, path):
 
 def test_cast_api_uses_http_and_remembers_lan_address(auth_client):
     with patch("casting.manager.start", return_value={"active": True}) as start:
-        response = auth_client.post("/api/cast/start", json={
-            "host": "192.168.1.50", "session_id": "abc", "server_url": "http://192.168.1.10:9000/",
-            "title": "News", "current_time": 15,
-        })
+        response = auth_client.post(
+            "/api/cast/start",
+            json={
+                "host": "192.168.1.50",
+                "session_id": "abc",
+                "server_url": "http://192.168.1.10:9000/",
+                "title": "News",
+                "current_time": 15,
+            },
+        )
         assert response.status_code == 200
-        start.assert_called_once_with("testuser", "192.168.1.50", "abc", "http://192.168.1.10:9000", "News", 15)
-        assert cache_module.load_user_settings("testuser")["cast_host"] == "http://192.168.1.10:9000"
+        start.assert_called_once_with(
+            "testuser",
+            "192.168.1.50",
+            "abc",
+            "http://192.168.1.10:9000",
+            "News",
+            15,
+        )
+        assert (
+            cache_module.load_user_settings("testuser")["cast_host"] == "http://192.168.1.10:9000"
+        )
 
 
 def test_cast_api_uses_request_origin_and_supports_legacy_host_preference(auth_client):
     with patch("casting.manager.start", return_value={"active": True}) as start:
-        response = auth_client.post("/api/cast/start", json={"host": "192.168.1.50", "session_id": "abc"})
+        response = auth_client.post(
+            "/api/cast/start",
+            json={"host": "192.168.1.50", "session_id": "abc"},
+        )
         assert response.status_code == 200
         assert start.call_args.args[3] == "http://testserver"
         cache_module.save_user_settings("testuser", {"cast_host": "192.168.1.10:8000"})
-        response = auth_client.post("/api/cast/start", json={"host": "192.168.1.50", "session_id": "abc"})
+        response = auth_client.post(
+            "/api/cast/start",
+            json={"host": "192.168.1.50", "session_id": "abc"},
+        )
         assert response.status_code == 200
         assert start.call_args.args[3] == "http://192.168.1.10:8000"
 
 
 def test_cast_rejects_localhost_media_address(auth_client):
     with patch("casting.manager.start") as start:
-        response = auth_client.post("/api/cast/start", json={
-            "host": "192.168.1.50", "session_id": "abc", "server_url": "http://localhost:8000",
-        })
+        response = auth_client.post(
+            "/api/cast/start",
+            json={
+                "host": "192.168.1.50",
+                "session_id": "abc",
+                "server_url": "http://localhost:8000",
+            },
+        )
         assert response.status_code == 400
         start.assert_not_called()
 
 
 def test_cast_command_validation_and_user_scope(auth_client):
     with patch("casting.manager.command", return_value={"active": True}) as command:
-        assert auth_client.post("/api/cast/control", json={"action": "volume", "volume": 2}).status_code == 422
+        assert (
+            auth_client.post(
+                "/api/cast/control",
+                json={"action": "volume", "volume": 2},
+            ).status_code
+            == 422
+        )
         assert auth_client.post("/api/cast/control", json={"action": "reboot"}).status_code == 422
         command.assert_not_called()
         assert auth_client.post("/api/cast/control", json={"action": "pause"}).status_code == 200
@@ -204,7 +243,10 @@ def test_cast_discovery_reports_network_errors(auth_client):
 
 
 def test_browser_cannot_stop_or_seek_cast_owned_session(auth_client):
-    with patch("casting.manager.owns_session", return_value=True), patch("ffmpeg_session.stop_session") as stop:
+    with (
+        patch("casting.manager.owns_session", return_value=True),
+        patch("ffmpeg_session.stop_session") as stop,
+    ):
         response = auth_client.post("/transcode/abc/stop?force=true")
         assert response.json() == {"status": "casting"}
         assert auth_client.delete("/transcode/abc?force=true").json() == {"status": "casting"}
@@ -213,7 +255,10 @@ def test_browser_cannot_stop_or_seek_cast_owned_session(auth_client):
 
 
 def test_cast_source_cannot_be_restarted_while_receiver_owns_it(auth_client):
-    with patch("casting.manager.owns_url", return_value=True), patch("ffmpeg_session.clear_url_session") as clear:
+    with (
+        patch("casting.manager.owns_url", return_value=True),
+        patch("ffmpeg_session.clear_url_session") as clear,
+    ):
         assert auth_client.delete("/transcode-clear?url=http://provider/live").status_code == 409
         assert auth_client.get("/transcode/start?url=http://provider/live").status_code == 409
         clear.assert_not_called()
@@ -221,7 +266,10 @@ def test_cast_source_cannot_be_restarted_while_receiver_owns_it(auth_client):
 
 def test_receiver_hls_request_keeps_session_alive_without_cookie(client, tmp_path):
     (tmp_path / "stream.m3u8").write_text("#EXTM3U\n#EXTINF:6,\nseg001.ts\n")
-    with patch("ffmpeg_session.get_session", return_value={"dir": str(tmp_path)}), patch("ffmpeg_session.touch_session") as touch:
+    with (
+        patch("ffmpeg_session.get_session", return_value={"dir": str(tmp_path)}),
+        patch("ffmpeg_session.touch_session") as touch,
+    ):
         response = client.get("/transcode/abc/stream.m3u8")
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "*"
@@ -229,18 +277,16 @@ def test_receiver_hls_request_keeps_session_alive_without_cookie(client, tmp_pat
 
 
 def test_live_dvr_routes_auto_mode_through_server(auth_client):
-    from main import PlayerInfo
 
     info = PlayerInfo(url="https://example.test/live.ts", channel_name="Test channel")
     with patch("main._get_live_player_info", return_value=info):
         response = auth_client.get("/play/live/test")
     assert response.status_code == 200
     assert 'transcodeMode: "always"' in response.text
-    assert 'liveDvrMins: 120' in response.text
+    assert "liveDvrMins: 120" in response.text
 
 
 def test_live_dvr_disabled_keeps_direct_auto_mode(auth_client):
-    from main import PlayerInfo
 
     settings = cache_module.load_server_settings()
     settings["live_dvr_mins"] = 0
@@ -250,11 +296,10 @@ def test_live_dvr_disabled_keeps_direct_auto_mode(auth_client):
         response = auth_client.get("/play/live/test")
     assert response.status_code == 200
     assert 'transcodeMode: "auto"' in response.text
-    assert 'liveDvrMins: 0' in response.text
+    assert "liveDvrMins: 0" in response.text
 
 
 def test_live_player_passes_program_window_from_epg(auth_client):
-    from main import PlayerInfo
 
     info = PlayerInfo(
         url="https://example.test/live.ts",
@@ -273,15 +318,10 @@ def test_live_player_passes_program_window_from_epg(auth_client):
 
 
 def test_live_player_info_reads_program_window_from_epg():
-    from datetime import UTC, datetime, timedelta
 
-    from epg import Program
-
-    import main
-
-    start = datetime.now(UTC) - timedelta(minutes=30)
-    stop = datetime.now(UTC) + timedelta(minutes=30)
-    program = Program("ch1", "News", start, stop)
+    start = datetime.now(timezone.utc) - timedelta(minutes=30)
+    stop = datetime.now(timezone.utc) + timedelta(minutes=30)
+    program = Program(channel_id="ch1", title="News", start=start, stop=stop)
     stream = {
         "stream_id": "1",
         "name": "Channel",
@@ -300,13 +340,16 @@ def test_live_player_info_reads_program_window_from_epg():
 
 
 def test_live_program_api_returns_current_program(auth_client):
-    from datetime import UTC, datetime, timedelta
 
-    from epg import Program
-
-    start = datetime.now(UTC) - timedelta(minutes=10)
+    start = datetime.now(timezone.utc) - timedelta(minutes=10)
     stop = start + timedelta(minutes=45)
-    program = Program("ch1", "News", start, stop, desc="Tonight's headlines")
+    program = Program(
+        channel_id="ch1",
+        title="News",
+        start=start,
+        stop=stop,
+        desc="Tonight's headlines",
+    )
     stream = {"stream_id": "1", "name": "Channel", "epg_channel_id": "ch1"}
     with (
         patch("main._ensure_live_cache"),
@@ -343,32 +386,15 @@ def test_live_program_api_unknown_stream_is_not_found(auth_client):
     assert response.status_code == 404
 
 
-def _archive_stream(**overrides):
-    stream = {
-        "stream_id": "src1_42",
-        "name": "Channel",
-        "source_id": "src1",
-        "source_type": "xtream",
-        "source_url": "http://upstream.test",
-        "source_username": "user",
-        "source_password": "pass",
-        "epg_channel_id": "ch1",
-        "tv_archive": 1,
-        "tv_archive_duration": 2,
-    }
-    stream.update(overrides)
-    return stream
-
-
 def test_catchup_player_info_builds_timeshift_url():
-    from zoneinfo import ZoneInfo
 
-    from epg import Program
-
-    import main
-
-    start = (datetime.now(UTC) - timedelta(hours=3)).replace(second=0, microsecond=0)
-    program = Program("ch1", "Earlier news", start, start + timedelta(minutes=30))
+    start = (datetime.now(timezone.utc) - timedelta(hours=3)).replace(second=0, microsecond=0)
+    program = Program(
+        channel_id="ch1",
+        title="Earlier news",
+        start=start,
+        stop=start + timedelta(minutes=30),
+    )
     client = MagicMock()
     client.get_server_info.return_value = {"server_info": {"timezone": "Europe/Amsterdam"}}
     with (
@@ -388,12 +414,17 @@ def test_catchup_player_info_builds_timeshift_url():
 
 
 def test_catchup_player_info_starts_mid_program():
-    from epg import Program
 
-    import main
-
-    program_start = (datetime.now(UTC) - timedelta(hours=3)).replace(second=0, microsecond=0)
-    program = Program("ch1", "Earlier news", program_start, program_start + timedelta(minutes=30))
+    program_start = (datetime.now(timezone.utc) - timedelta(hours=3)).replace(
+        second=0,
+        microsecond=0,
+    )
+    program = Program(
+        channel_id="ch1",
+        title="Earlier news",
+        start=program_start,
+        stop=program_start + timedelta(minutes=30),
+    )
     target = program_start + timedelta(minutes=10, seconds=25)
     with (
         patch("main._ensure_live_cache"),
@@ -411,11 +442,8 @@ def test_catchup_player_info_starts_mid_program():
 
 
 def test_catchup_player_info_rejects_programs_outside_archive():
-    from fastapi import HTTPException
 
-    import main
-
-    too_old = datetime.now(UTC) - timedelta(days=3)
+    too_old = datetime.now(timezone.utc) - timedelta(days=3)
     with (
         patch("main._ensure_live_cache"),
         patch("main.get_cache", return_value={"live_streams": [_archive_stream()]}),
@@ -427,7 +455,6 @@ def test_catchup_player_info_rejects_programs_outside_archive():
 
 
 def test_catchup_player_page_plays_archive_as_vod(auth_client):
-    from main import PlayerInfo
 
     info = PlayerInfo(
         url="http://upstream.test/timeshift/user/pass/30/2026-01-01:10-00/42.ts",
@@ -449,7 +476,6 @@ def test_catchup_player_page_plays_archive_as_vod(auth_client):
 
 
 def test_live_player_offers_start_over_with_archive(auth_client):
-    from main import PlayerInfo
 
     info = PlayerInfo(url="https://example.test/live.ts", channel_name="Channel", catchup_days=1)
     with patch("main._get_live_player_info", return_value=info):
@@ -460,13 +486,27 @@ def test_live_player_offers_start_over_with_archive(auth_client):
 
 
 def test_catchup_api_lists_archived_programs_newest_first(auth_client):
-    from epg import Program
 
-    now = datetime.now(UTC)
+    now = datetime.now(timezone.utc)
     programs = [
-        Program("ch1", "Too old", now - timedelta(days=2, hours=1), now - timedelta(days=2) + timedelta(minutes=1)),
-        Program("ch1", "Morning", now - timedelta(hours=5), now - timedelta(hours=4)),
-        Program("ch1", "On now", now - timedelta(minutes=10), now + timedelta(minutes=20)),
+        Program(
+            channel_id="ch1",
+            title="Too old",
+            start=now - timedelta(days=2, hours=1),
+            stop=now - timedelta(days=2) + timedelta(minutes=1),
+        ),
+        Program(
+            channel_id="ch1",
+            title="Morning",
+            start=now - timedelta(hours=5),
+            stop=now - timedelta(hours=4),
+        ),
+        Program(
+            channel_id="ch1",
+            title="On now",
+            start=now - timedelta(minutes=10),
+            stop=now + timedelta(minutes=20),
+        ),
     ]
     with (
         patch("main._ensure_live_cache"),
@@ -491,15 +531,24 @@ def test_catchup_api_without_archive_is_empty(auth_client):
 
 
 def test_catchup_api_uses_playlist_guide_assignment(auth_client):
-    from epg import Program
 
-    now = datetime.now(UTC)
-    earlier = Program("assigned", "Morning", now - timedelta(hours=5), now - timedelta(hours=4))
+    now = datetime.now(timezone.utc)
+    earlier = Program(
+        channel_id="assigned",
+        title="Morning",
+        start=now - timedelta(hours=5),
+        stop=now - timedelta(hours=4),
+    )
     stream = _archive_stream(epg_channel_id="")
     playlist = {
         "id": "pl1",
         "channels": [
-            {"stream_id": "src1_42", "source_id": "src1", "name": "Channel", "epg_channel_id": "assigned"}
+            {
+                "stream_id": "src1_42",
+                "source_id": "src1",
+                "name": "Channel",
+                "epg_channel_id": "assigned",
+            },
         ],
     }
     with (
@@ -590,7 +639,6 @@ def test_archive_stop_without_force_still_releases_only_owner_session(auth_clien
 
 class TestLoadAllEpg:
     def test_refetches_when_listings_ran_out(self, mock_deps):
-        import main
 
         urls = [("http://epg", 30, "s")]
         with (
@@ -601,7 +649,6 @@ class TestLoadAllEpg:
         fetch.assert_called_once_with(urls)
 
     def test_skips_fetch_when_listings_are_current(self, mock_deps):
-        import main
 
         with (
             patch("main.epg.has_programs_after", return_value=True),
@@ -621,7 +668,6 @@ class TestSetup:
         assert b"setup" in resp.content.lower() or b"Create" in resp.content
 
     def test_setup_redirects_when_users_exist(self, client, tmp_path):
-        import auth
 
         auth.create_user("admin", "password123")
 
@@ -637,8 +683,6 @@ class TestSetup:
         )
         assert resp.status_code == 303
         assert resp.headers["location"] == "/login"
-
-        import auth
 
         assert auth.verify_password("admin", "password123")
 
@@ -676,7 +720,6 @@ class TestLogin:
         assert resp.headers["location"] == "/setup"
 
     def test_login_page_shown_when_users_exist(self, client, tmp_path):
-        import auth
 
         auth.create_user("admin", "password123")
 
@@ -684,7 +727,6 @@ class TestLogin:
         assert resp.status_code == 200
 
     def test_login_success_sets_cookie(self, client, tmp_path):
-        import auth
 
         auth.create_user("admin", "password123")
 
@@ -697,7 +739,6 @@ class TestLogin:
         assert "token" in resp.cookies
 
     def test_login_failure_returns_401(self, client, tmp_path):
-        import auth
 
         auth.create_user("admin", "password123")
 
@@ -723,7 +764,6 @@ class TestAuthRequired:
     """Tests for auth-protected routes."""
 
     def test_index_redirects_to_login(self, client, tmp_path):
-        import auth
 
         auth.create_user("admin", "password123")
 
@@ -732,7 +772,6 @@ class TestAuthRequired:
         assert resp.headers["location"] == "/login"
 
     def test_guide_redirects_to_login(self, client, tmp_path):
-        import auth
 
         auth.create_user("admin", "password123")
 
@@ -741,7 +780,6 @@ class TestAuthRequired:
         assert resp.headers["location"] == "/login"
 
     def test_vod_redirects_to_login(self, client, tmp_path):
-        import auth
 
         auth.create_user("admin", "password123")
 
@@ -750,7 +788,6 @@ class TestAuthRequired:
         assert resp.headers["location"] == "/login"
 
     def test_series_redirects_to_login(self, client, tmp_path):
-        import auth
 
         auth.create_user("admin", "password123")
 
@@ -783,15 +820,15 @@ class TestGuide:
         with patch("main.load_file_cache", return_value=None):
             resp = auth_client.get("/guide")
             assert resp.status_code == 200
-            # Should show loading state
+            # Should show loading state.
             assert b"loading" in resp.content.lower() or b"Loading" in resp.content
 
     def test_guide_shows_channels_from_cache(self, auth_client):
         cache_module.get_cache()["live_categories"] = [
-            {"category_id": "1", "category_name": "News"}
+            {"category_id": "1", "category_name": "News"},
         ]
         cache_module.get_cache()["live_streams"] = [
-            {"stream_id": 1, "name": "CNN", "category_ids": ["1"], "epg_channel_id": ""}
+            {"stream_id": 1, "name": "CNN", "category_ids": ["1"], "epg_channel_id": ""},
         ]
 
         with patch("main.epg.has_programs", return_value=True):
@@ -800,7 +837,7 @@ class TestGuide:
 
     def test_guide_limits_initial_virtual_rows(self, auth_client):
         cache_module.get_cache()["live_categories"] = [
-            {"category_id": "1", "category_name": "News"}
+            {"category_id": "1", "category_name": "News"},
         ]
         cache_module.get_cache()["live_streams"] = [
             {
@@ -822,7 +859,7 @@ class TestGuide:
 
     def test_guide_rows_include_category_metadata(self, auth_client):
         cache_module.get_cache()["live_categories"] = [
-            {"category_id": "1", "category_name": "News"}
+            {"category_id": "1", "category_name": "News"},
         ]
         cache_module.get_cache()["live_streams"] = [
             {
@@ -830,7 +867,7 @@ class TestGuide:
                 "name": "CNN",
                 "category_ids": ["1"],
                 "epg_channel_id": "",
-            }
+            },
         ]
 
         resp = auth_client.get("/api/guide/rows?cats=1")
@@ -870,16 +907,20 @@ class TestGuide:
         assert reordered["rows"][0]["channel"]["stream_id"] == 500
 
     def test_guide_rows_timestamps_anchor_local_timeline(self, auth_client):
-        from epg import Program
 
-        now = datetime(2026, 9, 14, 0, 15, tzinfo=UTC)
+        now = datetime(2026, 9, 14, 0, 15, tzinfo=timezone.utc)
         window_start = now.replace(minute=0)
         program_start = window_start - timedelta(minutes=30)
         program_end = window_start + timedelta(hours=1)
         cache_module.get_cache()["live_streams"] = [
-            {"stream_id": 1, "name": "News", "category_ids": ["1"], "epg_channel_id": "news"}
+            {"stream_id": 1, "name": "News", "category_ids": ["1"], "epg_channel_id": "news"},
         ]
-        program = Program("news", "Overnight news", program_start, program_end)
+        program = Program(
+            channel_id="news",
+            title="Overnight news",
+            start=program_start,
+            stop=program_end,
+        )
 
         with (
             patch("main.datetime") as clock,
@@ -901,9 +942,8 @@ class TestGuide:
         assert listing["width_pct"] == pytest.approx(100 / 3)
 
     def test_guide_rows_flag_archived_programs(self, auth_client):
-        from epg import Program
 
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         cache_module.get_cache()["live_streams"] = [
             {
                 "stream_id": 1,
@@ -916,9 +956,19 @@ class TestGuide:
             },
             {"stream_id": 2, "name": "Other", "category_ids": ["1"], "epg_channel_id": "other"},
         ]
-        past = Program("news", "Earlier", now - timedelta(hours=1), now - timedelta(minutes=5))
-        current = Program("news", "Now", now - timedelta(minutes=5), now + timedelta(hours=1))
-        other = Program("other", "Earlier", past.start, past.stop)
+        past = Program(
+            channel_id="news",
+            title="Earlier",
+            start=now - timedelta(hours=1),
+            stop=now - timedelta(minutes=5),
+        )
+        current = Program(
+            channel_id="news",
+            title="Now",
+            start=now - timedelta(minutes=5),
+            stop=now + timedelta(hours=1),
+        )
+        other = Program(channel_id="other", title="Earlier", start=past.start, stop=past.stop)
 
         with (
             patch("main.epg.get_icons_batch", return_value={}),
@@ -943,9 +993,6 @@ class TestGuide:
 
     @pytest.mark.parametrize("archive_days", [0, 1, 3])
     def test_guide_disables_unavailable_past_listings(self, auth_client, archive_days):
-        from html.parser import HTMLParser
-
-        from epg import Program
 
         class ProgramLinks(HTMLParser):
             def __init__(self):
@@ -957,14 +1004,28 @@ class TestGuide:
                 if tag == "a" and "data-start" in attrs:
                     self.links.append(attrs)
 
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         start = now - timedelta(days=2)
-        cache_module.get_cache()["live_categories"] = [{"category_id": "1", "category_name": "Group"}]
-        cache_module.get_cache()["live_streams"] = [{
-            "stream_id": 1, "name": "Stream", "category_ids": ["1"], "epg_channel_id": "guide",
-            "source_type": "xtream", "tv_archive": 1, "tv_archive_duration": archive_days,
-        }]
-        program = Program("guide", "Earlier program", start, start + timedelta(hours=1))
+        cache_module.get_cache()["live_categories"] = [
+            {"category_id": "1", "category_name": "Group"},
+        ]
+        cache_module.get_cache()["live_streams"] = [
+            {
+                "stream_id": 1,
+                "name": "Stream",
+                "category_ids": ["1"],
+                "epg_channel_id": "guide",
+                "source_type": "xtream",
+                "tv_archive": 1,
+                "tv_archive_duration": archive_days,
+            },
+        ]
+        program = Program(
+            channel_id="guide",
+            title="Earlier program",
+            start=start,
+            stop=start + timedelta(hours=1),
+        )
         with (
             patch("main.epg.has_programs", return_value=True),
             patch("main.epg.get_icons_batch", return_value={}),
@@ -992,14 +1053,20 @@ class TestGuide:
             assert rows[0][programs][0]["unavailable"] is (archive_days != 3)
 
     def test_guide_page_exposes_timestamps_for_local_times(self, auth_client):
-        from epg import Program
 
-        now = datetime.now(UTC)
-        cache_module.get_cache()["live_categories"] = [{"category_id": "1", "category_name": "News"}]
-        cache_module.get_cache()["live_streams"] = [
-            {"stream_id": 1, "name": "News", "category_ids": ["1"], "epg_channel_id": "news"}
+        now = datetime.now(timezone.utc)
+        cache_module.get_cache()["live_categories"] = [
+            {"category_id": "1", "category_name": "News"},
         ]
-        program = Program("news", "Headlines", now - timedelta(minutes=5), now + timedelta(minutes=55))
+        cache_module.get_cache()["live_streams"] = [
+            {"stream_id": 1, "name": "News", "category_ids": ["1"], "epg_channel_id": "news"},
+        ]
+        program = Program(
+            channel_id="news",
+            title="Headlines",
+            start=now - timedelta(minutes=5),
+            stop=now + timedelta(minutes=55),
+        )
         with (
             patch("main.epg.has_programs", return_value=True),
             patch("main.epg.get_icons_batch", return_value={}),
@@ -1036,10 +1103,10 @@ class TestVod:
 
     def test_vod_shows_movies_from_cache(self, auth_client):
         cache_module.get_cache()["vod_categories"] = [
-            {"category_id": "10", "category_name": "Movies", "source_id": "src1"}
+            {"category_id": "10", "category_name": "Movies", "source_id": "src1"},
         ]
         cache_module.get_cache()["vod_streams"] = [
-            {"stream_id": 100, "name": "Movie 1", "category_id": "10", "source_id": "src1"}
+            {"stream_id": 100, "name": "Movie 1", "category_id": "10", "source_id": "src1"},
         ]
 
         resp = auth_client.get("/vod")
@@ -1079,10 +1146,10 @@ class TestSeries:
 
     def test_series_shows_list_from_cache(self, auth_client):
         cache_module.get_cache()["series_categories"] = [
-            {"category_id": "30", "category_name": "Drama", "source_id": "src1"}
+            {"category_id": "30", "category_name": "Drama", "source_id": "src1"},
         ]
         cache_module.get_cache()["series"] = [
-            {"series_id": 200, "name": "Show 1", "category_id": "30", "source_id": "src1"}
+            {"series_id": 200, "name": "Show 1", "category_id": "30", "source_id": "src1"},
         ]
 
         resp = auth_client.get("/series")
@@ -1137,10 +1204,9 @@ class TestSettings:
     """Tests for settings page."""
 
     def test_only_nomos_engine_is_discovered(self, auth_client, tmp_path: Path):
-        import main
 
         (tmp_path / "retired-model_720p_fp16.engine").write_bytes(b"engine")
-        with patch("main.SR_ENGINE_DIR", tmp_path):
+        with patch.dict("os.environ", {"SR_ENGINE_DIR": str(tmp_path)}):
             assert main.get_sr_models() == []
 
             (tmp_path / "2x-nomosuni-compact_720p_fp16.engine").write_bytes(b"engine")
@@ -1297,10 +1363,10 @@ class TestDeleteSource:
                             "name": "Test",
                             "type": "xtream",
                             "url": "http://example.com",
-                        }
-                    ]
-                }
-            )
+                        },
+                    ],
+                },
+            ),
         )
 
         with patch("main.clear_all_caches"):
@@ -1352,7 +1418,7 @@ class TestWatchPosition:
         assert resp.status_code == 200
 
     def test_get_watch_position(self, auth_client):
-        # Save first
+        # Save first.
         auth_client.post(
             "/api/watch-position",
             json={"url": "http://example.com/movie.mkv", "position": 1234.5, "duration": 7200},
@@ -1375,7 +1441,6 @@ class TestUserManagement:
     """Tests for user management endpoints."""
 
     def test_delete_user(self, auth_client, tmp_path):
-        import auth
 
         auth.create_user("otheruser", "password123")
 
@@ -1455,7 +1520,10 @@ class TestTranscodeRoutes:
 
     @pytest.mark.parametrize("filename", ["master.m3u8", "low.m3u8", "high.m3u8"])
     def test_adaptive_playlists_share_dates_but_master_is_not_rewritten(
-        self, auth_client, tmp_path, filename
+        self,
+        auth_client,
+        tmp_path,
+        filename,
     ):
         content = "#EXTM3U\n"
         (tmp_path / filename).write_text(content)
@@ -1489,9 +1557,7 @@ class TestTranscodeRoutes:
 
     def test_segmented_webvtt_is_mapped_to_the_video_clock(self, auth_client, tmp_path):
         filename = "sub0_000001.vtt"
-        (tmp_path / filename).write_text(
-            "WEBVTT\n\n00:01.000 --> 00:03.000\nCaption\n"
-        )
+        (tmp_path / filename).write_text("WEBVTT\n\n00:01.000 --> 00:03.000\nCaption\n")
         session = {"dir": str(tmp_path)}
         with (
             patch("main.ffmpeg_session.get_session", return_value=session),
@@ -1503,10 +1569,7 @@ class TestTranscodeRoutes:
             response = auth_client.get(f"/transcode/session/{filename}")
 
         assert response.status_code == 200
-        assert (
-            "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:907200"
-            in response.text
-        )
+        assert "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:907200" in response.text
 
 
 class TestSubtitleRoutes:
@@ -1562,20 +1625,23 @@ class TestRefreshStatus:
         assert resp.status_code == 200
 
 
-if __name__ == "__main__":
-    from testing import run_tests
-
-    run_tests(__file__)
-
-
 class TestPlaybackHealth:
     def test_invalid_feedback_is_rejected(self, auth_client):
-        response = auth_client.post("/transcode/missing/health", json={"buffer_seconds": -1, "waiting": True})
+        response = auth_client.post(
+            "/transcode/missing/health",
+            json={"buffer_seconds": -1, "waiting": True},
+        )
         assert response.status_code == 422
 
     def test_feedback_is_passed_to_backend(self, auth_client):
-        with patch("ffmpeg_session.report_playback_health", return_value={"bandwidth_saver": True}) as report:
-            response = auth_client.post("/transcode/live/health", json={"buffer_seconds": 0, "waiting": True})
+        with patch(
+            "ffmpeg_session.report_playback_health",
+            return_value={"bandwidth_saver": True},
+        ) as report:
+            response = auth_client.post(
+                "/transcode/live/health",
+                json={"buffer_seconds": 0, "waiting": True},
+            )
         assert response.json() == {"bandwidth_saver": True}
         assert report.call_args.args[:2] == ("live", "testuser")
 
@@ -1605,9 +1671,27 @@ class TestPlaylists:
             {"category_id": "2", "category_name": "Sports"},
         ]
         cache_module.get_cache()["live_streams"] = [
-            {"stream_id": 1, "name": "CNN", "category_ids": ["1"], "epg_channel_id": "", "source_id": "s"},
-            {"stream_id": 2, "name": "ESPN", "category_ids": ["2"], "epg_channel_id": "", "source_id": "s"},
-            {"stream_id": 3, "name": "FS1", "category_ids": ["2"], "epg_channel_id": "", "source_id": "s"},
+            {
+                "stream_id": 1,
+                "name": "CNN",
+                "category_ids": ["1"],
+                "epg_channel_id": "",
+                "source_id": "s",
+            },
+            {
+                "stream_id": 2,
+                "name": "ESPN",
+                "category_ids": ["2"],
+                "epg_channel_id": "",
+                "source_id": "s",
+            },
+            {
+                "stream_id": 3,
+                "name": "FS1",
+                "category_ids": ["2"],
+                "epg_channel_id": "",
+                "source_id": "s",
+            },
         ]
 
     def _create(self, client, name="Favorites", ids=(3, 1)):
@@ -1691,7 +1775,10 @@ class TestPlaylists:
         assert match
         sections = json.loads(match.group(1))
         assert sections == [{"start": 0, "name": "★ Favorites"}, {"start": 2, "name": "Sports"}]
-        headings = re.findall(r'class="guide-section[^"]*">\s*<span class="truncate">([^<]*)</span>', resp.text)
+        headings = re.findall(
+            r'class="guide-section[^"]*">\s*<span class="truncate">([^<]*)</span>',
+            resp.text,
+        )
         assert headings == ["★ Favorites", "Sports"]
         rows = re.findall(r'<div class="guide-row[^"]*" data-row="(\d+)"', resp.text)
         assert rows == ["0", "1", "2"]
@@ -1700,13 +1787,16 @@ class TestPlaylists:
         with patch("main.epg.has_programs", return_value=True):
             text = client.get(url).text
         aside = text[text.index("<aside") : text.index("</aside>")]
-        links = re.findall(r'data-nav="cat".*?title="([^"]*)">.*?tabular-nums[^>]*>(\d+)<', aside, re.S)
+        links = re.findall(
+            r'data-nav="cat".*?title="([^"]*)">.*?tabular-nums[^>]*>(\d+)<',
+            aside,
+            re.S,
+        )
         current = re.findall(r'aria-current="page" title="([^"]*)"', aside)
         rows = re.findall(r'<div class="guide-row[^"]*" data-row="\d+"', text)
         return links, current, len(rows)
 
     def test_guide_sidebar_lists_playlists_and_categories(self, auth_client):
-        import main
 
         auth_client.post("/settings/guide-filter", json={"cats": ["1", "2"]})
         auth_client.post("/api/user-prefs", json={"guide_selected_cats": ["2"]})
@@ -1720,7 +1810,9 @@ class TestPlaylists:
         links, current, rows = self._sidebar(auth_client, f"/guide?cats={playlist['category_id']}")
         assert current == ["Favorites"]
         assert rows == 2
-        assert main.load_user_settings("testuser")["guide_selected_cats"] == [playlist["category_id"]]
+        assert main.load_user_settings("testuser")["guide_selected_cats"] == [
+            playlist["category_id"],
+        ]
 
         _, current, rows = self._sidebar(auth_client, "/guide?cats=")
         assert current == ["All Channels"]
@@ -1738,7 +1830,13 @@ class TestPlaylists:
 
     def test_guide_rows_use_earliest_selected_category(self, auth_client):
         cache_module.get_cache()["live_streams"].append(
-            {"stream_id": 4, "name": "Both", "category_ids": ["2", "1"], "epg_channel_id": "", "source_id": "s"}
+            {
+                "stream_id": 4,
+                "name": "Both",
+                "category_ids": ["2", "1"],
+                "epg_channel_id": "",
+                "source_id": "s",
+            },
         )
 
         payload = auth_client.get("/api/guide/rows?cats=1,2").json()
@@ -1757,7 +1855,10 @@ class TestPlaylists:
         resp = auth_client.put(f"/api/playlists/{first['id']}", json={"name": "A2", "channels": []})
         assert resp.json()["name"] == "A2"
         auth_client.post("/api/playlists/order", json={"ids": [second["id"], first["id"]]})
-        assert [p["name"] for p in auth_client.get("/api/playlists").json()["playlists"]] == ["B", "A2"]
+        assert [p["name"] for p in auth_client.get("/api/playlists").json()["playlists"]] == [
+            "B",
+            "A2",
+        ]
         assert auth_client.delete(f"/api/playlists/{second['id']}").status_code == 200
         assert auth_client.get(f"/api/playlists/{second['id']}").status_code == 404
 
@@ -1769,7 +1870,13 @@ class TestPlaylists:
         )
         channels = auth_client.get(f"/api/playlists/{playlist['id']}").json()["channels"]
         assert channels == [
-            {"stream_id": "42", "name": "Gone", "source_id": "s", "epg_channel_id": "", "available": False}
+            {
+                "stream_id": "42",
+                "name": "Gone",
+                "source_id": "s",
+                "epg_channel_id": "",
+                "available": False,
+            },
         ]
 
     def test_assigned_guide_survives_round_trip_and_feeds_guide(self, auth_client):
@@ -1795,13 +1902,14 @@ class TestPlaylists:
         search.assert_called_once_with(["ALPHA", "ONE"], 20)
 
     def test_match_and_search(self, auth_client):
-        matches = auth_client.post("/api/playlists/match", json={"lines": ["ESPN", ""]}).json()["matches"]
+        matches = auth_client.post("/api/playlists/match", json={"lines": ["ESPN", ""]}).json()[
+            "matches"
+        ]
         assert [(m["query"], m["candidates"][0]["stream_id"]) for m in matches] == [("ESPN", "2")]
         results = auth_client.get("/api/playlists/search?category_id=2").json()["results"]
         assert [r["stream_id"] for r in results] == ["2", "3"]
 
     def test_non_admin_can_read_but_not_edit(self, auth_client):
-        import auth
 
         playlist = self._create(auth_client)
         auth.create_user("viewer", "viewerpass1")
@@ -1810,7 +1918,10 @@ class TestPlaylists:
         assert auth_client.get("/api/playlists").status_code == 200
         assert auth_client.get(f"/api/playlists/{playlist['id']}").status_code == 200
         assert auth_client.post("/api/playlists", json={"name": "X"}).status_code == 403
-        assert auth_client.put(f"/api/playlists/{playlist['id']}", json={"name": "X"}).status_code == 403
+        assert (
+            auth_client.put(f"/api/playlists/{playlist['id']}", json={"name": "X"}).status_code
+            == 403
+        )
         assert auth_client.delete(f"/api/playlists/{playlist['id']}").status_code == 403
         assert auth_client.get("/playlists").status_code == 403
         rows = auth_client.get("/api/guide/rows?cats=1").json()["rows"]
@@ -1823,7 +1934,13 @@ class TestPlaylists:
 
     def test_same_stream_id_from_two_sources_is_kept(self, auth_client):
         cache_module.get_cache()["live_streams"].append(
-            {"stream_id": 1, "name": "BBC", "category_ids": ["1"], "epg_channel_id": "", "source_id": "t"}
+            {
+                "stream_id": 1,
+                "name": "BBC",
+                "category_ids": ["1"],
+                "epg_channel_id": "",
+                "source_id": "t",
+            },
         )
         resp = auth_client.post(
             "/api/playlists",
@@ -1833,12 +1950,14 @@ class TestPlaylists:
 
         rows = auth_client.get("/api/guide/rows?cats=1").json()["rows"]
 
-        assert [(r["channel"]["stream_id"], r["channel"]["name"]) for r in rows] == [(1, "BBC"), (1, "CNN")]
+        assert [(r["channel"]["stream_id"], r["channel"]["name"]) for r in rows] == [
+            (1, "BBC"),
+            (1, "CNN"),
+        ]
         assert playlist["category_id"] in rows[0]["channel"]["category_ids"]
         assert playlist["category_id"] not in rows[1]["channel"]["category_ids"]
 
     def test_restricted_viewer_does_not_see_restricted_playlist_channels(self, auth_client):
-        import auth
 
         playlist = self._create(auth_client, ids=(3, 1))
         only_sports = self._create(auth_client, "Sports", ids=(3,))
@@ -1856,11 +1975,16 @@ class TestPlaylists:
 
     def test_invalid_create_does_not_persist(self, auth_client):
         too_many = [{"stream_id": i, "name": str(i)} for i in range(2001)]
-        assert auth_client.post("/api/playlists", json={"name": "Big", "channels": too_many}).status_code == 400
+        assert (
+            auth_client.post(
+                "/api/playlists",
+                json={"name": "Big", "channels": too_many},
+            ).status_code
+            == 400
+        )
         assert auth_client.get("/api/playlists").json()["playlists"] == []
 
     def test_saved_view_drops_deleted_playlist(self, auth_client):
-        import main
 
         playlist = self._create(auth_client)
         auth_client.post("/settings/guide-filter", json={"cats": ["1"]})
@@ -1878,13 +2002,18 @@ class TestPlaylists:
 class TestSourceAssignment:
     """Sources can be limited to selected users; admins always see everything."""
 
-    @staticmethod
-    def _setup(auth_client, family_users):
-        import auth
+    @classmethod
+    def _setup(cls, auth_client, family_users):
 
         settings = cache_module.load_server_settings()
         settings["sources"] = [
-            {"id": "fam", "name": "Family", "type": "m3u", "url": "http://a", "users": family_users},
+            {
+                "id": "fam",
+                "name": "Family",
+                "type": "m3u",
+                "url": "http://a",
+                "users": family_users,
+            },
             {"id": "pub", "name": "Shared", "type": "m3u", "url": "http://b"},
         ]
         cache_module.save_server_settings(settings)
@@ -1895,17 +2024,26 @@ class TestSourceAssignment:
                     {"category_id": "pub_1", "category_name": "Pub", "source_id": "pub"},
                 ],
                 "live_streams": [
-                    {"stream_id": "fam_1", "name": "A", "category_ids": ["fam_1"], "source_id": "fam"},
-                    {"stream_id": "pub_1", "name": "B", "category_ids": ["pub_1"], "source_id": "pub"},
+                    {
+                        "stream_id": "fam_1",
+                        "name": "A",
+                        "category_ids": ["fam_1"],
+                        "source_id": "fam",
+                    },
+                    {
+                        "stream_id": "pub_1",
+                        "name": "B",
+                        "category_ids": ["pub_1"],
+                        "source_id": "pub",
+                    },
                 ],
-            }
+            },
         )
         auth.create_user("friend", "friendpass1")
         auth.create_user("kid", "kidpass123")
         return auth
 
     def _rows(self, auth_client, user):
-        import auth
 
         auth_client.cookies.set("token", auth.create_token({"sub": user}))
         rows = auth_client.get("/api/guide/rows?cats=fam_1,pub_1&exact=1").json()["rows"]
@@ -1913,7 +2051,7 @@ class TestSourceAssignment:
 
     def test_assigned_source_is_hidden_from_other_users(self, auth_client):
         self._setup(auth_client, ["kid"])
-        assert self._rows(auth_client, "testuser") == ["A", "B"]  # admin
+        assert self._rows(auth_client, "testuser") == ["A", "B"]  # Admin.
         assert self._rows(auth_client, "kid") == ["A", "B"]
         assert self._rows(auth_client, "friend") == ["B"]
 
@@ -1922,7 +2060,6 @@ class TestSourceAssignment:
         assert self._rows(auth_client, "friend") == ["A", "B"]
 
     def test_hidden_source_blocks_transcode(self, auth_client):
-        import auth
 
         self._setup(auth_client, [])
         auth_client.cookies.set("token", auth.create_token({"sub": "kid"}))
@@ -1975,32 +2112,12 @@ class TestSourceAssignment:
 
 @pytest.fixture
 def clean_handoff():
-    import handoff
 
     handoff._records.clear()
     handoff._watches.clear()
     yield handoff
     handoff._records.clear()
     handoff._watches.clear()
-
-
-def _handoff_record(**overrides):
-    record = {
-        "id": "h1",
-        "stream_id": "src1_42",
-        "channel_name": "Channel",
-        "program_title": "Match",
-        "program_start": 1767261600.0,
-        "program_end": 1767268800.0,
-        "position": 1767264000.0,
-        "mode": "recording",
-        "recording_id": "rec1",
-        "recording_start": 1767263990.0,
-        "resumed": False,
-        "expires": 9e9,
-    }
-    record.update(overrides)
-    return record
 
 
 def test_handoff_api_offers_the_users_handoff(auth_client, clean_handoff):
@@ -2014,7 +2131,6 @@ def test_handoff_api_offers_the_users_handoff(auth_client, clean_handoff):
 
 
 def test_handoff_recording_resumes_from_where_it_was_left(auth_client, clean_handoff):
-    from main import PlayerInfo
 
     clean_handoff._records["testuser"] = _handoff_record()
     info = PlayerInfo(url="http://upstream.test/live/u/p/42.m3u8", channel_name="Channel")
@@ -2029,7 +2145,6 @@ def test_handoff_recording_resumes_from_where_it_was_left(auth_client, clean_han
 
 
 def test_handoff_catchup_resumes_through_the_archive(auth_client, clean_handoff):
-    from main import PlayerInfo
 
     clean_handoff._records["testuser"] = _handoff_record(mode="catchup", recording_id="")
     info = PlayerInfo(url="http://upstream.test/timeshift/x.ts", catchup_start=1767264000.0)
@@ -2040,7 +2155,6 @@ def test_handoff_catchup_resumes_through_the_archive(auth_client, clean_handoff)
 
 
 def test_playing_something_else_cancels_the_handoff(auth_client, clean_handoff):
-    from main import PlayerInfo
 
     clean_handoff._records["testuser"] = _handoff_record(mode="catchup", recording_id="")
     info = PlayerInfo(url="https://example.test/live.m3u8", channel_name="Other")
@@ -2057,17 +2171,27 @@ def test_stale_handoff_cannot_be_resumed(auth_client, clean_handoff):
 
 
 def test_handoff_stop_hands_off_the_watched_channel(auth_client, clean_handoff):
-    import handoff
 
-    now = datetime.now(UTC).timestamp()
-    clean_handoff._watches["testuser"] = handoff._Watch("src1_42", now - 10, now - 600, now - 15)
-    channel = handoff.Channel("src1_42", "Channel", "http://x/42.m3u8", catchup_days=2)
+    now = datetime.now(timezone.utc).timestamp()
+    clean_handoff._watches["testuser"] = handoff._Watch(
+        stream_id="src1_42",
+        position=now - 10,
+        first_seen=now - 600,
+        last_seen=now - 15,
+    )
+    channel = handoff.Channel(
+        stream_id="src1_42",
+        name="Channel",
+        url="http://x/42.m3u8",
+        catchup_days=2,
+    )
     with (
         patch("main._handoff_stream_allowed", return_value=True),
         patch("main._handoff_channel", return_value=channel),
     ):
         response = auth_client.post(
-            "/api/handoff/stop", json={"stream_id": "src1_42", "position": now - 5}
+            "/api/handoff/stop",
+            json={"stream_id": "src1_42", "position": now - 5},
         )
     assert response.status_code == 200
     assert clean_handoff._records["testuser"]["mode"] == "catchup"
@@ -2124,7 +2248,7 @@ class TestManagedDirectGuide:
 
     def test_direct_export_excludes_restricted_channels(self, auth_client):
         cache_module.get_cache()["live_categories"] = [
-            {"category_id": "1", "category_name": "News"}
+            {"category_id": "1", "category_name": "News"},
         ]
         cache_module.get_cache()["live_streams"] = [
             {
@@ -2132,9 +2256,51 @@ class TestManagedDirectGuide:
                 "name": "Secret",
                 "category_ids": ["1"],
                 "direct_url": "https://provider.test/private.m3u8",
-            }
+            },
         ]
         with patch("main._unavailable_groups", return_value={"cat:1"}):
             payload = auth_client.get("/api/guide/rows?cats=1&direct=true").json()
         assert payload["rows"] == []
         assert payload["direct_playback"] is True
+
+
+def _archive_stream(**overrides):
+    stream = {
+        "stream_id": "src1_42",
+        "name": "Channel",
+        "source_id": "src1",
+        "source_type": "xtream",
+        "source_url": "http://upstream.test",
+        "source_username": "user",
+        "source_password": "pass",
+        "epg_channel_id": "ch1",
+        "tv_archive": 1,
+        "tv_archive_duration": 2,
+    }
+    stream.update(overrides)
+    return stream
+
+
+def _handoff_record(**overrides):
+    record = {
+        "id": "h1",
+        "stream_id": "src1_42",
+        "channel_name": "Channel",
+        "program_title": "Match",
+        "program_start": 1767261600.0,
+        "program_end": 1767268800.0,
+        "position": 1767264000.0,
+        "mode": "recording",
+        "recording_id": "rec1",
+        "recording_start": 1767263990.0,
+        "resumed": False,
+        "expires": 9e9,
+    }
+    record.update(overrides)
+    return record
+
+
+if __name__ == "__main__":
+    from codedoctor.lib.testing.runner import test_main
+
+    test_main(__file__)

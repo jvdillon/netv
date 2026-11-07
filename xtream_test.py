@@ -15,59 +15,63 @@ class TestXtreamClient:
     """Tests for XtreamClient."""
 
     def test_api_url_property(self):
-        client = XtreamClient("http://example.com", "user", "pass")
+        client = XtreamClient(base_url="http://example.com", username="user", password="pass")
         assert client.api_url == "http://example.com/player_api.php?username=user&password=pass"
 
     def test_epg_url_property(self):
-        client = XtreamClient("http://example.com", "user", "pass")
+        client = XtreamClient(base_url="http://example.com", username="user", password="pass")
         assert client.epg_url == "http://example.com/xmltv.php?username=user&password=pass"
 
     def test_url_normalization_strips_trailing_slash(self):
-        client = XtreamClient("http://example.com/", "user", "pass")
+        client = XtreamClient(base_url="http://example.com/", username="user", password="pass")
         assert client.base_url == "http://example.com"
-        # No double slashes after the domain
+        # No double slashes after the domain.
         assert "example.com/player_api" in client.api_url
 
     def test_url_normalization_strips_multiple_trailing_slashes(self):
-        client = XtreamClient("http://example.com///", "user", "pass")
+        client = XtreamClient(base_url="http://example.com///", username="user", password="pass")
         assert client.base_url == "http://example.com"
 
     def test_special_chars_in_credentials_are_encoded(self):
-        client = XtreamClient("http://example.com", "user@test", "p&ss=word")
-        # Check that special chars are URL-encoded in api_url
+        client = XtreamClient(
+            base_url="http://example.com",
+            username="user@test",
+            password="p&ss=word",
+        )
+        # Check that special chars are URL-encoded in api_url.
         assert "user%40test" in client.api_url
         assert "p%26ss%3Dword" in client.api_url
-        # Same for epg_url
+        # Same for epg_url.
         assert "user%40test" in client.epg_url
         assert "p%26ss%3Dword" in client.epg_url
 
     def test_build_stream_url_live_no_ext(self):
-        client = XtreamClient("http://example.com", "user", "pass")
+        client = XtreamClient(base_url="http://example.com", username="user", password="pass")
         url = client.build_stream_url("live", 123)
         assert url == "http://example.com/live/user/pass/123"
 
     def test_build_stream_url_live_with_ext(self):
-        client = XtreamClient("http://example.com", "user", "pass")
+        client = XtreamClient(base_url="http://example.com", username="user", password="pass")
         url = client.build_stream_url("live", 123, "m3u8")
         assert url == "http://example.com/live/user/pass/123.m3u8"
 
     def test_build_stream_url_movie(self):
-        client = XtreamClient("http://example.com", "user", "pass")
+        client = XtreamClient(base_url="http://example.com", username="user", password="pass")
         url = client.build_stream_url("movie", 456, "mkv")
         assert url == "http://example.com/movie/user/pass/456.mkv"
 
     def test_build_stream_url_series(self):
-        client = XtreamClient("http://example.com", "user", "pass")
+        client = XtreamClient(base_url="http://example.com", username="user", password="pass")
         url = client.build_stream_url("series", 789, "mp4")
         assert url == "http://example.com/series/user/pass/789.mp4"
 
     def test_build_timeshift_url(self):
-        client = XtreamClient("http://example.com", "user", "pass")
+        client = XtreamClient(base_url="http://example.com", username="user", password="pass")
         url = client.build_timeshift_url(123, 60, "2024-01-15:14-30")
         assert url == "http://example.com/timeshift/user/pass/60/2024-01-15:14-30/123.ts"
 
     def test_build_timeshift_url_custom_ext(self):
-        client = XtreamClient("http://example.com", "user", "pass")
+        client = XtreamClient(base_url="http://example.com", username="user", password="pass")
         url = client.build_timeshift_url(123, 30, "2024-01-15:10-00", ext="m3u8")
         assert url == "http://example.com/timeshift/user/pass/30/2024-01-15:10-00/123.m3u8"
 
@@ -77,7 +81,7 @@ class TestXtreamClientApi:
 
     @pytest.fixture
     def client(self):
-        return XtreamClient("http://example.com", "user", "pass")
+        return XtreamClient(base_url="http://example.com", username="user", password="pass")
 
     @pytest.fixture
     def mock_urlopen(self):
@@ -229,7 +233,7 @@ class TestXtreamClientApi:
         assert result == server_info
         assert result["user_info"]["auth"] == 1
         url = mock_urlopen.call_args[0][0]
-        # get_server_info calls API with no action
+        # get_server_info calls API with no action.
         assert "action" not in url
 
     def test_get_server_info_auth_failed(self, client, mock_urlopen):
@@ -254,25 +258,25 @@ class TestXtreamClientApi:
 
         client.get_live_categories()
 
-        # Default timeout is 30s
+        # Default timeout is 30s.
         _, kwargs = mock_urlopen.call_args
         assert kwargs["timeout"] == 30
 
     def test_api_encodes_special_chars_in_params(self, client, mock_urlopen):
         self._setup_response(mock_urlopen, {})
 
-        client._api("test_action", foo="bar&baz", key="val=ue")
+        client._api("test_action", foo="bar&baz", key="left=right")
 
         url = mock_urlopen.call_args[0][0]
         assert "foo=bar%26baz" in url
-        assert "key=val%3Due" in url
+        assert "key=left%3Dright" in url
 
     def test_get_short_epg(self, client, mock_urlopen):
         epg_data = {
             "epg_listings": [
                 {"title": "Show 1", "start": "2024-01-15 14:00:00"},
                 {"title": "Show 2", "start": "2024-01-15 15:00:00"},
-            ]
+            ],
         }
         self._setup_response(mock_urlopen, epg_data)
 
@@ -282,7 +286,7 @@ class TestXtreamClientApi:
         url = mock_urlopen.call_args[0][0]
         assert "action=get_short_epg" in url
         assert "stream_id=123" in url
-        assert "limit=10" in url  # default limit
+        assert "limit=10" in url  # Default limit.
 
     def test_get_short_epg_custom_limit(self, client, mock_urlopen):
         self._setup_response(mock_urlopen, {"epg_listings": []})
@@ -312,19 +316,31 @@ class TestXtreamClientUserAgent:
             yield mock
 
     def test_defaults_to_none(self):
-        assert XtreamClient("http://example.com", "user", "pass").user_agent is None
+        assert (
+            XtreamClient(base_url="http://example.com", username="user", password="pass").user_agent
+            is None
+        )
 
     def test_user_agent_forwarded_to_urlopen(self, mock_urlopen):
-        client = XtreamClient("http://example.com", "user", "pass", user_agent="TiviMate/4.7.0")
+        client = XtreamClient(
+            base_url="http://example.com",
+            username="user",
+            password="pass",
+            user_agent="TiviMate/4.7.0",
+        )
         client.get_live_streams()
         assert mock_urlopen.call_args.kwargs["user_agent"] == "TiviMate/4.7.0"
 
     def test_none_user_agent_forwarded_so_default_applies(self, mock_urlopen):
-        XtreamClient("http://example.com", "user", "pass").get_live_streams()
+        XtreamClient(
+            base_url="http://example.com",
+            username="user",
+            password="pass",
+        ).get_live_streams()
         assert mock_urlopen.call_args.kwargs["user_agent"] is None
 
 
 if __name__ == "__main__":
-    from testing import run_tests
+    from codedoctor.lib.testing.runner import test_main
 
-    run_tests(__file__)
+    test_main(__file__)

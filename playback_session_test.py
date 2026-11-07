@@ -2,16 +2,20 @@
 
 from unittest.mock import AsyncMock, patch
 
+from fastapi import HTTPException
+
 import pytest
 
 from ffmpeg_session_test import FakeProcess
+from playback_policy import PlaybackHealth
 
 import ffmpeg_session
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "configured_resolution,expected_resolution", [("4k", "720p"), ("480p", "480p")]
+    "configured_resolution,expected_resolution",
+    [("4k", "720p"), ("480p", "480p")],
 )
 async def test_fallback_command_and_cleanup(tmp_path, configured_resolution, expected_resolution):
     settings = {"max_resolution": configured_resolution, "quality": "high", "sr_model": "nomos"}
@@ -20,7 +24,8 @@ async def test_fallback_command_and_cleanup(tmp_path, configured_resolution, exp
         patch("ffmpeg_session.get_transcode_dir", return_value=tmp_path),
         patch("ffmpeg_session.resolve_hls_master_playlist", side_effect=lambda url: url),
         patch(
-            "ffmpeg_session.build_hls_ffmpeg_cmd", return_value=["ffmpeg", "-i", "stream"]
+            "ffmpeg_session.build_hls_ffmpeg_cmd",
+            return_value=["ffmpeg", "-i", "stream"],
         ) as command,
         patch(
             "ffmpeg_session.asyncio.create_subprocess_exec",
@@ -28,12 +33,14 @@ async def test_fallback_command_and_cleanup(tmp_path, configured_resolution, exp
             return_value=FakeProcess(),
         ),
         patch(
-            "ffmpeg_session._spawn_background_task", side_effect=lambda coroutine: coroutine.close()
+            "ffmpeg_session._spawn_background_task",
+            side_effect=lambda coroutine: coroutine.close(),
         ),
         patch("ffmpeg_session._wait_for_playlist", new_callable=AsyncMock, return_value=True),
     ):
         result = await ffmpeg_session.start_transcode(
-            "http://example.com/live.ts", bandwidth_saver=True
+            "http://example.com/live.ts",
+            bandwidth_saver=True,
         )
         try:
             assert command.call_args.args[6:8] == (expected_resolution, "low")
@@ -66,7 +73,9 @@ async def test_fallback_does_not_reuse_high_quality_stream():
         ) as start,
     ):
         result = await ffmpeg_session.start_transcode(
-            "stream", username="viewer", bandwidth_saver=True
+            "stream",
+            username="viewer",
+            bandwidth_saver=True,
         )
     assert result == {"session_id": "new"}
     stop.assert_called_once_with("old", force=True)
@@ -76,27 +85,36 @@ async def test_fallback_does_not_reuse_high_quality_stream():
 
 @pytest.mark.asyncio
 async def test_legacy_saver_session_can_request_recovery(tmp_path):
-    from playback_policy import PlaybackHealth
 
     with (
         patch("ffmpeg_session.get_settings", return_value={"max_resolution": "1080p"}),
         patch("ffmpeg_session.get_transcode_dir", return_value=tmp_path),
         patch("ffmpeg_session.resolve_hls_master_playlist", side_effect=lambda url: url),
         patch("ffmpeg_session.build_hls_ffmpeg_cmd", return_value=["ffmpeg", "-i", "stream"]),
-        patch("ffmpeg_session.asyncio.create_subprocess_exec", new=AsyncMock(return_value=FakeProcess())),
+        patch(
+            "ffmpeg_session.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=FakeProcess()),
+        ),
         patch("ffmpeg_session._spawn_background_task", side_effect=lambda coro: coro.close()),
         patch("ffmpeg_session._wait_for_playlist", new=AsyncMock(return_value=True)),
     ):
-        result = await ffmpeg_session.start_transcode("http://example.com/live.ts", bandwidth_saver=True)
+        result = await ffmpeg_session.start_transcode(
+            "http://example.com/live.ts",
+            bandwidth_saver=True,
+        )
         session_id = result["session_id"]
         try:
             good = PlaybackHealth(buffer_seconds=12, waiting=False, observed_bitrate=20_000_000)
             with patch("ffmpeg_session.time.monotonic") as clock:
                 for now in range(0, 60, 2):
                     clock.return_value = now
-                    assert ffmpeg_session.report_playback_health(session_id, "", good) == {"bandwidth_saver": True}
+                    assert ffmpeg_session.report_playback_health(session_id, "", good) == {
+                        "bandwidth_saver": True,
+                    }
                 clock.return_value = 60
-                assert ffmpeg_session.report_playback_health(session_id, "", good) == {"bandwidth_saver": False}
+                assert ffmpeg_session.report_playback_health(session_id, "", good) == {
+                    "bandwidth_saver": False,
+                }
         finally:
             ffmpeg_session.stop_session(session_id, force=True)
 
@@ -123,7 +141,7 @@ async def test_aac_client_does_not_reuse_dolby_session():
     assert result == {"session_id": "new"}
     stop.assert_called_once_with("old", force=True)
     reuse.assert_not_called()
-    assert start.call_args.args[4] == 12.0  # VOD resume position survives the restart
+    assert start.call_args.args[4] == 12.0  # VOD resume position survives the restart.
     assert start.call_args.kwargs["audio_passthrough"] is False
 
 
@@ -137,7 +155,7 @@ async def test_dolby_session_of_another_user_is_not_stopped():
         ),
         patch("ffmpeg_session.stop_session") as stop,
         patch("ffmpeg_session.enforce_stream_limits", return_value=None),
-        pytest.raises(ffmpeg_session.HTTPException) as error,
+        pytest.raises(HTTPException) as error,
     ):
         await ffmpeg_session.start_transcode("stream", username="viewer")
     assert error.value.status_code == 409
@@ -159,7 +177,9 @@ async def test_passthrough_client_reuses_dolby_session():
         ),
     ):
         result = await ffmpeg_session.start_transcode(
-            "stream", username="viewer", audio_passthrough=True
+            "stream",
+            username="viewer",
+            audio_passthrough=True,
         )
     assert result == {"session_id": "old"}
     stop.assert_not_called()
@@ -169,9 +189,15 @@ async def test_passthrough_client_reuses_dolby_session():
 async def test_starting_passthrough_session_is_not_reused_by_aac_client():
     """While the audio probe is pending, a passthrough request's session counts as Dolby."""
     ffmpeg_session._transcode_sessions["pending"] = {
-        "username": "viewer", "fast_start": True, "audio_passthrough": True, "url": "stream",
-        "process": None, "dir": "/nonexistent", "last_access": 0, "started": 0,
-    }  # fmt: skip
+        "username": "viewer",
+        "fast_start": True,
+        "audio_passthrough": True,
+        "url": "stream",
+        "process": None,
+        "dir": "/nonexistent",
+        "last_access": 0,
+        "started": 0,
+    }
     ffmpeg_session._url_to_session["stream"] = "pending"
     try:
         with (
@@ -189,3 +215,9 @@ async def test_starting_passthrough_session_is_not_reused_by_aac_client():
     finally:
         ffmpeg_session._transcode_sessions.pop("pending", None)
         ffmpeg_session._url_to_session.pop("stream", None)
+
+
+if __name__ == "__main__":
+    from codedoctor.lib.testing.runner import test_main
+
+    test_main(__file__)

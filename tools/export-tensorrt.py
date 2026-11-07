@@ -1,5 +1,10 @@
-#!/usr/bin/env python3
-"""Export the NomosUni upscaler to TensorRT for FFmpeg dnn_processing.
+#!/bin/sh
+# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# fmt: off
+'''' 2>/dev/null #
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
+
+Export the NomosUni upscaler to TensorRT for FFmpeg dnn_processing.
 
 This script converts the 2x NomosUni model to TensorRT engines (.engine files)
 that can be loaded by FFmpeg's TensorRT DNN backend.
@@ -20,126 +25,121 @@ Requirements:
 
 Example FFmpeg usage after export:
     ffmpeg -i input.mp4 -vf "dnn_processing=dnn_backend=tensorrt:model=model.engine" output.mp4
-"""
+'''
+# fmt: on
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Protocol, cast
+from urllib import request
 
 import argparse
 import tempfile
-import urllib.request
 
+from onnxconverter_common import float16
+from safetensors.torch import load_file
+from torch import nn
+from torch.nn import functional as F
 
-if TYPE_CHECKING:
-    import tensorrt as trt
-    import torch
-    import torch.nn as nn
-
-
-MODEL_NAME = "2x-nomosuni-compact"
-MODEL_DESCRIPTION = "Fast universal upscale - compression, noise, and blur handling"
-MODEL_URL = (
-    "https://huggingface.co/Phips/2xNomosUni_compact_otf_medium/"
-    "resolve/3241c877a6e09036f9e466c840822bb066f11c44/"
-    "2xNomosUni_compact_otf_medium.safetensors"
-)
-MODEL_FILENAME = "2xNomosUni_compact_otf_medium.safetensors"
-MODEL_SCALE = 2
+import onnx
+import tensorrt as trt
+import torch
 
 
 def download_model(cache_dir: Path) -> Path:
-    """Download the Nomos model weights."""
-    path = cache_dir / MODEL_FILENAME
+    """Download the Nomos model weights.
+
+    Args:
+        cache_dir: Directory in which to reuse or save model weights.
+
+    Returns:
+        path: Local safetensors checkpoint.
+    """
+    filename = "2xNomosUni_compact_otf_medium.safetensors"
+    model_url = (
+        "https://huggingface.co/Phips/2xNomosUni_compact_otf_medium/"
+        "resolve/3241c877a6e09036f9e466c840822bb066f11c44/"
+        "2xNomosUni_compact_otf_medium.safetensors"
+    )
+    path = cache_dir / filename
     if path.exists():
         print(f"Using cached model: {path}")
         return path
 
-    if not MODEL_URL.startswith("https://"):
-        raise ValueError(f"URL must use HTTPS: {MODEL_URL}")
-    print(f"Downloading {MODEL_FILENAME}...")
+    if not model_url.startswith("https://"):
+        raise ValueError(f"URL must use HTTPS: {model_url}")
+    print(f"Downloading {filename}...")
 
-    # Download to a temp file first, then rename to avoid partial downloads
+    # Download to a temp file first, then rename to avoid partial downloads.
     temp_path = path.with_suffix(path.suffix + ".tmp")
     try:
         with (
-            urllib.request.urlopen(MODEL_URL, timeout=300) as response,
+            request.urlopen(model_url, timeout=300) as response,
             open(temp_path, "wb") as f,
         ):
             f.write(response.read())
-        # Verify the download succeeded and file is not empty
+        # Verify the download succeeded and file is not empty.
         file_size = temp_path.stat().st_size
         if file_size == 0:
             raise RuntimeError(f"Downloaded file is empty: {temp_path}")
         temp_path.rename(path)
         print(f"Downloaded to {path} ({file_size / 1024 / 1024:.1f} MB)")
     except Exception as e:
-        # Clean up partial download
+        # Clean up partial download.
         if temp_path.exists():
             temp_path.unlink()
-        raise RuntimeError(f"Failed to download model from {MODEL_URL}: {e}") from e
+        raise RuntimeError(f"Failed to download model from {model_url}: {e}") from e
 
     return path
 
 
 def list_models() -> None:
     """Print the supported model."""
-    print(f"\nSupported model:\n\n  {MODEL_NAME:24s} {MODEL_DESCRIPTION}\n")
+    print(
+        f"\nSupported model:\n\n  {'2x-nomosuni-compact':24s} "
+        "Fast universal upscale - compression, noise, and blur handling\n",
+    )
 
 
 def build_nomos_model(state_dict: dict[str, torch.Tensor]) -> nn.Module:
-    """Build the Nomos SRVGG network represented by the downloaded weights."""
-    import torch.nn as nn
-    import torch.nn.functional as F
+    """Build the Nomos SRVGG network represented by the downloaded weights.
 
-    class NomosSRVGG(nn.Module):
-        def __init__(self, num_conv: int):
-            super().__init__()
-            self.body = nn.ModuleList(
-                [
-                    nn.Conv2d(3, 64, 3, 1, 1),
-                    nn.PReLU(num_parameters=64),
-                ]
-            )
-            for _ in range(num_conv - 2):
-                self.body.append(nn.Conv2d(64, 64, 3, 1, 1))
-                self.body.append(nn.PReLU(num_parameters=64))
-            self.body.append(
-                nn.Conv2d(64, 3 * MODEL_SCALE * MODEL_SCALE, 3, 1, 1)
-            )
-            self.upsampler = nn.PixelShuffle(MODEL_SCALE)
+    Args:
+        state_dict: Weights whose convolution count determines network depth.
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            out = x
-            for layer in self.body[:-1]:
-                out = layer(out)
-            out = self.upsampler(self.body[-1](out))
-            return out + F.interpolate(x, scale_factor=MODEL_SCALE, mode="nearest")
-
+    Returns:
+        model: Uninitialized network matching the checkpoint architecture.
+    """
     num_conv_layers = sum(
         1 for key, value in state_dict.items() if "weight" in key and len(value.shape) == 4
     )
-    return NomosSRVGG(num_conv_layers)
+    return _NomosSRVGG(num_conv=num_conv_layers, scale=2)
 
 
 def load_model(cache_dir: Path | None = None) -> nn.Module:
-    """Load the Nomos model."""
-    from safetensors.torch import load_file as load_safetensors
+    """Load the Nomos model.
+
+    Args:
+        cache_dir: Weight cache directory, or the provisioned default.
+
+    Returns:
+        model: Loaded network in evaluation mode.
+    """
 
     if cache_dir is None:
-        cache_dir = Path.home() / ".cache" / "ai_upscale"
+        cache_dir = Path("/opt/scratch/caches/netv/ai_upscale")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     model_path = download_model(cache_dir)
     print(f"Loading PyTorch model from {model_path}")
-    state_dict = load_safetensors(model_path, device="cpu")
+    state_dict = load_file(model_path, device="cpu")
     model = build_nomos_model(state_dict)
 
     model.load_state_dict(state_dict)
     model.eval()
     params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"  Loaded SRVGGNetCompact ({params:.2f}M params), Scale: {MODEL_SCALE}x")
+    print(f"  Loaded SRVGGNetCompact ({params:.2f}M params), Scale: 2x")
     return model
 
 
@@ -151,11 +151,15 @@ def export_onnx(
     fixed_shape: bool = False,
     precision: str = "fp32",
 ) -> None:
-    """Export model to ONNX format."""
-    from onnxconverter_common import float16 as onnx_float16
+    """Export a model to ONNX format.
 
-    import onnx
-    import torch
+    Args:
+        model: Loaded upscaler to export.
+        opt_shape: Example input width and height.
+        onnx_path: Destination model file.
+        fixed_shape: Whether to omit dynamic spatial axes.
+        precision: Requested ONNX floating-point format.
+    """
 
     opt_w, opt_h = opt_shape
     print(f"Exporting to ONNX: {onnx_path}")
@@ -188,7 +192,7 @@ def export_onnx(
         dynamo=False,
     )
     if precision == "fp16":
-        converted = onnx_float16.convert_float_to_float16(
+        converted = float16.convert_float_to_float16(
             onnx.load(onnx_path),
             keep_io_types=False,
         )
@@ -197,27 +201,6 @@ def export_onnx(
         print("  BF16 ONNX conversion is unavailable; TensorRT will select BF16 kernels")
     shape_mode = "fixed shape" if fixed_shape else "dynamic H/W"
     print(f"  ONNX export complete ({shape_mode}, {precision})")
-
-
-def _get_trt_dtype_map() -> dict[str, trt.DataType]:
-    """Get mapping from precision string to TensorRT DataType."""
-    import tensorrt as trt
-
-    dtype_map: dict[str, trt.DataType] = {
-        "fp32": trt.float32,
-        "fp16": trt.float16,
-    }
-    if hasattr(trt, "bfloat16"):
-        dtype_map["bf16"] = trt.bfloat16
-    return dtype_map
-
-
-def _trt_dtype_str(dtype: trt.DataType) -> str:
-    """Convert TensorRT DataType to human-readable string."""
-    for name, dt in _get_trt_dtype_map().items():
-        if dtype == dt:
-            return name.upper()
-    return str(dtype)
 
 
 def build_engine(
@@ -230,8 +213,18 @@ def build_engine(
     workspace_gb: int = 4,
     opt_level: int = 3,
 ) -> None:
-    """Build TensorRT engine from ONNX model with dynamic shapes."""
-    import tensorrt as trt
+    """Build a TensorRT engine from an ONNX model with dynamic shapes.
+
+    Args:
+        onnx_path: Input ONNX model file.
+        engine_path: Destination serialized engine file.
+        min_shape: Minimum input width and height.
+        opt_shape: Optimal input width and height.
+        max_shape: Maximum input width and height.
+        precision: Requested compute and I/O precision.
+        workspace_gb: Builder workspace budget in GiB.
+        opt_level: TensorRT builder optimization level.
+    """
 
     min_w, min_h = min_shape
     opt_w, opt_h = opt_shape
@@ -264,7 +257,7 @@ def build_engine(
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb * (1 << 30))
 
     # Optimization level (0-5, default is 3)
-    # Higher levels enable more aggressive kernel selection/fusion but use more memory
+    # Higher levels enable more aggressive kernel selection/fusion but use more memory.
     config.builder_optimization_level = opt_level
     print(f"  Optimization level: {opt_level}")
 
@@ -278,7 +271,7 @@ def build_engine(
     )
     config.add_optimization_profile(profile)
 
-    # Set compute precision
+    # Set compute precision.
     if precision in ("fp16", "bf16"):
         fp16_flag = getattr(trt.BuilderFlag, "FP16", None)
         if fp16_flag is None:
@@ -319,12 +312,14 @@ def build_engine(
         f.write(serialized_engine)
 
     print(
-        f"  Engine saved: {engine_path} ({Path(engine_path).stat().st_size / 1024 / 1024:.1f} MB)"
+        f"  Engine saved: {engine_path} ({Path(engine_path).stat().st_size / 1024 / 1024:.1f} MB)",
     )
 
-    # Verify the built engine has correct I/O types
+    # Verify the built engine has correct I/O types.
     runtime = trt.Runtime(logger)
     engine = runtime.deserialize_cuda_engine(serialized_engine)
+    if engine is None:
+        raise RuntimeError("Failed to deserialize the built TensorRT engine")
     print("  Verifying engine I/O:")
     for i in range(engine.num_io_tensors):
         name = engine.get_tensor_name(i)
@@ -341,21 +336,174 @@ def height_to_shape(h: int, aspect: float = 16 / 9) -> tuple[int, int]:
 
     Both width and height are aligned to 8 pixels, as required by many
     neural network architectures with pooling/striding layers.
+
+    Args:
+        h: Requested input height in pixels.
+        aspect: Width divided by height before alignment.
+
+    Returns:
+        width: Aligned input width.
+        height: Aligned input height.
     """
-    # Align height to 8 first
+    # Align height to 8 first.
     h = (h + 7) // 8 * 8
-    # Calculate width from aligned height
+    # Calculate width from aligned height.
     w = int(h * aspect)
-    # Align width to 8
+    # Align width to 8.
     w = (w + 7) // 8 * 8
     return (w, h)
 
 
-def main() -> None:
+def main() -> int:
+    """Export the NomosUni TensorRT engine.
+
+    Returns:
+        exit_code: Process exit status.
+    """
     parser = argparse.ArgumentParser(
         description="Export NomosUni to a TensorRT engine",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    _add_arguments(parser)
+    args = cast(Flags, parser.parse_args())
+    model_name = "2x-nomosuni-compact"
+
+    if args.list:
+        list_models()
+        return 0
+
+    min_h = args.min_height or 720
+    opt_h = args.opt_height or 1080
+    max_h = args.max_height or 1080
+
+    # Validate height constraints.
+    if min_h > max_h:
+        raise ValueError(f"--min-height ({min_h}) cannot be greater than --max-height ({max_h})")
+    if opt_h < min_h or opt_h > max_h:
+        raise ValueError(
+            f"--opt-height ({opt_h}) must be between --min-height ({min_h}) and --max-height ({max_h})",
+        )
+
+    min_shape = height_to_shape(min_h)
+    opt_shape = height_to_shape(opt_h)
+    max_shape = height_to_shape(max_h)
+
+    if args.output is None:
+        args.output = f"{model_name}_{opt_h}p_{args.precision}.engine"
+    output_path = Path(args.output)
+    if output_path.exists() and output_path.is_dir():
+        raise ValueError(
+            f"--output must include an engine filename, not a directory: {output_path}",
+        )
+
+    print("=" * 60)
+    print("AI Upscale: TensorRT Engine Export")
+    print("=" * 60)
+    print(f"Model: {model_name}")
+    print("  Fast universal upscale - compression, noise, and blur handling")
+    print()
+
+    model = load_model()
+
+    if args.onnx_only:
+        # Save ONNX to current directory with sensible name.
+        onnx_path = Path(f"{model_name}_{opt_h}p.onnx")
+        cleanup_onnx = False
+    else:
+        # Temp file for intermediate ONNX.
+        with tempfile.NamedTemporaryFile(
+            prefix="export-tensorrt-",
+            suffix=".onnx",
+            delete=False,
+        ) as tmp:
+            onnx_path = Path(tmp.name)
+        cleanup_onnx = True
+
+    try:
+        export_onnx(
+            model,
+            opt_shape,
+            onnx_path,
+            fixed_shape=min_shape == opt_shape == max_shape,
+            precision=args.precision,
+        )
+
+        if args.onnx_only:
+            print(f"\nONNX saved to: {onnx_path}")
+            print("Skipping TensorRT build (--onnx-only). Build later with:")
+            print(f"  trtexec --onnx={onnx_path} --saveEngine={args.output} --fp16")
+            return 0
+
+        build_engine(
+            onnx_path,
+            output_path,
+            min_shape=min_shape,
+            opt_shape=opt_shape,
+            max_shape=max_shape,
+            precision=args.precision,
+            workspace_gb=args.workspace,
+            opt_level=args.opt_level,
+        )
+    finally:
+        if cleanup_onnx and (onnx_file := Path(onnx_path)).exists():
+            onnx_file.unlink()
+
+    print()
+    print("=" * 60)
+    print("Export complete!")
+    print("=" * 60)
+    print()
+    print(f"Model: {model_name} (2x upscale)")
+    print(f"Engine accepts input heights from {min_h} to {max_h} (16:9)")
+    print()
+    print("Usage with FFmpeg:")
+    print(
+        f'  ffmpeg -i input.mp4 -vf "dnn_processing=dnn_backend=tensorrt:model={output_path}" output.mp4',
+    )
+    return 0
+
+
+class Flags(Protocol):
+    """Parsed command-line flags."""
+
+    list: bool
+    min_height: int | None
+    opt_height: int | None
+    max_height: int | None
+    output: str | None
+    precision: str
+    workspace: int
+    opt_level: int
+    onnx_only: bool
+
+
+class _NomosSRVGG(nn.Module):
+    """SRVGG compact upscaler matching the Nomos checkpoint layout."""
+
+    def __init__(self, *, num_conv: int, scale: int) -> None:
+        super().__init__()
+        self.scale = scale
+        self.body = nn.ModuleList(
+            [
+                nn.Conv2d(3, 64, 3, 1, 1),
+                nn.PReLU(num_parameters=64),
+            ],
+        )
+        for _ in range(num_conv - 2):
+            self.body.append(nn.Conv2d(64, 64, 3, 1, 1))
+            self.body.append(nn.PReLU(num_parameters=64))
+        self.body.append(nn.Conv2d(64, 3 * scale * scale, 3, 1, 1))
+        self.upsampler = nn.PixelShuffle(scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = x
+        for layer in self.body[:-1]:
+            out = layer(out)
+        out = self.upsampler(self.body[-1](out))
+        return out + F.interpolate(x, scale_factor=self.scale, mode="nearest")
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--list", "-l", action="store_true", help="Show the supported model")
     parser.add_argument(
         "--min-height",
@@ -408,97 +556,28 @@ def main() -> None:
         action="store_true",
         help="Only export ONNX, skip TensorRT engine build",
     )
-    args = parser.parse_args()
 
-    if args.list:
-        list_models()
-        return
 
-    min_h = args.min_height or 720
-    opt_h = args.opt_height or 1080
-    max_h = args.max_height or 1080
+def _get_trt_dtype_map() -> dict[str, trt.DataType]:
+    """Get mapping from precision string to TensorRT DataType."""
 
-    # Validate height constraints
-    if min_h > max_h:
-        raise ValueError(f"--min-height ({min_h}) cannot be greater than --max-height ({max_h})")
-    if opt_h < min_h or opt_h > max_h:
-        raise ValueError(
-            f"--opt-height ({opt_h}) must be between --min-height ({min_h}) and --max-height ({max_h})"
-        )
+    dtype_map: dict[str, trt.DataType] = {
+        "fp32": trt.float32,
+        "fp16": trt.float16,
+    }
+    if hasattr(trt, "bfloat16"):
+        dtype_map["bf16"] = trt.bfloat16
+    return dtype_map
 
-    min_shape = height_to_shape(min_h)
-    opt_shape = height_to_shape(opt_h)
-    max_shape = height_to_shape(max_h)
 
-    if args.output is None:
-        args.output = f"{MODEL_NAME}_{opt_h}p_{args.precision}.engine"
-    output_path = Path(args.output)
-    if output_path.exists() and output_path.is_dir():
-        raise ValueError(
-            f"--output must include an engine filename, not a directory: {output_path}"
-        )
-
-    print("=" * 60)
-    print("AI Upscale: TensorRT Engine Export")
-    print("=" * 60)
-    print(f"Model: {MODEL_NAME}")
-    print(f"  {MODEL_DESCRIPTION}")
-    print()
-
-    model = load_model()
-
-    if args.onnx_only:
-        # Save ONNX to current directory with sensible name
-        onnx_path = Path(f"{MODEL_NAME}_{opt_h}p.onnx")
-        cleanup_onnx = False
-    else:
-        # Temp file for intermediate ONNX
-        with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
-            onnx_path = Path(tmp.name)
-        cleanup_onnx = True
-
-    try:
-        export_onnx(
-            model,
-            opt_shape,
-            onnx_path,
-            fixed_shape=min_shape == opt_shape == max_shape,
-            precision=args.precision,
-        )
-
-        if args.onnx_only:
-            print(f"\nONNX saved to: {onnx_path}")
-            print("Skipping TensorRT build (--onnx-only). Build later with:")
-            print(f"  trtexec --onnx={onnx_path} --saveEngine={args.output} --fp16")
-            return
-
-        build_engine(
-            onnx_path,
-            output_path,
-            min_shape=min_shape,
-            opt_shape=opt_shape,
-            max_shape=max_shape,
-            precision=args.precision,
-            workspace_gb=args.workspace,
-            opt_level=args.opt_level,
-        )
-    finally:
-        if cleanup_onnx and (onnx_file := Path(onnx_path)).exists():
-            onnx_file.unlink()
-
-    print()
-    print("=" * 60)
-    print("Export complete!")
-    print("=" * 60)
-    print()
-    print(f"Model: {MODEL_NAME} ({MODEL_SCALE}x upscale)")
-    print(f"Engine accepts input heights from {min_h} to {max_h} (16:9)")
-    print()
-    print("Usage with FFmpeg:")
-    print(
-        f'  ffmpeg -i input.mp4 -vf "dnn_processing=dnn_backend=tensorrt:model={output_path}" output.mp4'
-    )
+def _trt_dtype_str(dtype: trt.DataType) -> str:
+    """Convert TensorRT DataType to human-readable string."""
+    for name, dt in _get_trt_dtype_map().items():
+        if dtype == dt:
+            return name.upper()
+    return str(dtype)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
+# vim: ft=python

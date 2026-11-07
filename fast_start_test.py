@@ -8,6 +8,8 @@ import pathlib
 import shutil
 import subprocess
 
+from fastapi import HTTPException
+
 import pytest
 
 from ffmpeg_command import HwAccel, MediaInfo
@@ -19,7 +21,7 @@ import ffmpeg_session
 
 
 def video_packet(seconds):
-    pts = int(seconds * 90000)
+    pts = int(seconds * 90_000)
     encoded = bytes(
         [
             0x21 | ((pts >> 29) & 14),
@@ -27,7 +29,7 @@ def video_packet(seconds):
             ((pts >> 14) & 254) | 1,
             (pts >> 7) & 255,
             ((pts << 1) & 254) | 1,
-        ]
+        ],
     )
     pes = b"\x00\x00\x01\xe0\x00\x00\x80\x80\x05" + encoded
     return (b"\x47\x41\x00\x10" + pes).ljust(188, b"\xff")
@@ -89,7 +91,12 @@ def test_commands_only_ingest_opens_upstream(tmp_path):
     assert "-reconnect" not in fast_start.ingest_command("/tmp/source.ts", str(tmp_path), None)
     for high in (False, True):
         cmd = fast_start.encoder_command(
-            str(tmp_path), "software", "1080p" if high else "720p", "low", False, high
+            str(tmp_path),
+            "software",
+            "1080p" if high else "720p",
+            "low",
+            False,
+            high,
         )
         assert url not in cmd
         assert cmd[cmd.index("-i") + 1] == f"{tmp_path}/input.m3u8"
@@ -176,10 +183,14 @@ def test_discontinuity_keeps_shared_clock_when_pts_remain_continuous(tmp_path):
 @pytest.mark.parametrize("high", [False, True])
 def test_encoders_keep_surround_audio(tmp_path, high):
     """Both renditions keep 5.1; Dolby is copied only for passthrough clients."""
-    from ffmpeg_command import MediaInfo
 
-    audio = MediaInfo(video_codec="", audio_codec="eac3", pix_fmt="", audio_channels=6,
-                      audio_sample_rate=48000)  # fmt: skip
+    audio = MediaInfo(
+        video_codec="",
+        audio_codec="eac3",
+        pix_fmt="",
+        audio_channels=6,
+        audio_sample_rate=48_000,
+    )
     args = (str(tmp_path), "software", "1080p" if high else "720p", "low", False, high)
     aac = fast_start.encoder_command(*args, audio=audio)
     assert aac[aac.index("-c:a") + 1] == "aac"
@@ -237,7 +248,6 @@ def test_encoders_decode_on_gpu_when_source_codec_is_known(tmp_path):
 
 
 def test_master_playlist_reserves_surround_audio_bandwidth():
-    from ffmpeg_command import MediaInfo
 
     def audio(codec, channels):
         return MediaInfo(video_codec="", audio_codec=codec, pix_fmt="", audio_channels=channels)
@@ -283,7 +293,7 @@ def test_upgrade_fallback_and_recovery_keep_same_encoder_and_session(tmp_path):
         high_process=high,
         playback_policy=policy,
     )
-    good = PlaybackHealth(buffer_seconds=10, waiting=False, observed_bitrate=20000)
+    good = PlaybackHealth(buffer_seconds=10, waiting=False, observed_bitrate=20_000)
     weak = PlaybackHealth(buffer_seconds=10, waiting=False, observed_bitrate=8000)
     with (
         patch.dict(ffmpeg_session._transcode_sessions, {"fast": session}),
@@ -296,15 +306,15 @@ def test_upgrade_fallback_and_recovery_keep_same_encoder_and_session(tmp_path):
         for now in (8, 10, 12):
             clock.return_value = now
             assert ffmpeg_session.report_playback_health("fast", "u", good)["playlist"].endswith(
-                "/low.m3u8"
+                "/low.m3u8",
             )
         clock.return_value = 14
         assert ffmpeg_session.report_playback_health("fast", "u", good)["playlist"].endswith(
-            "/high.m3u8"
+            "/high.m3u8",
         )
         with patch("ffmpeg_session.ready_bitrate", return_value=0):
             assert ffmpeg_session.report_playback_health("fast", "u", good)["playlist"].endswith(
-                "/high.m3u8"
+                "/high.m3u8",
             )
         policy.bandwidth_saver = True
         clock.return_value = 16
@@ -348,11 +358,11 @@ async def test_shared_session_cleanup(tmp_path, fail_high, source_duration, band
             assert minimum_segments == 1
             (pathlib.Path(directory) / "input_0.ts").write_bytes(video_packet(10))
             (pathlib.Path(directory) / name).write_text(
-                f"#EXTM3U\n#EXTINF:{source_duration},\ninput_0.ts\n"
+                f"#EXTM3U\n#EXTINF:{source_duration},\ninput_0.ts\n",
             )
         else:
             assert minimum_segments == 2
-        return 10000
+        return 10_000
 
     def measure_duration(directory, name):
         nonlocal startup_ready
@@ -377,7 +387,9 @@ async def test_shared_session_cleanup(tmp_path, fail_high, source_duration, band
         ) as duration,
     ):
         result = await ffmpeg_session.start_transcode(
-            "https://provider/live", fast_start=True, bandwidth_saver=bandwidth_saver
+            "https://provider/live",
+            fast_start=True,
+            bandwidth_saver=bandwidth_saver,
         )
         assert duration.call_count == 4
         assert len(launched) == (2 if fail_high else 3)
@@ -428,13 +440,16 @@ async def test_disconnected_startup_stops_waiting_and_cleans_ingest(tmp_path):
         patch("ffmpeg_session.get_settings", return_value={"max_resolution": "4k"}),
         patch("ffmpeg_session.get_transcode_dir", return_value=tmp_path),
         patch(
-            "ffmpeg_session.asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+            "ffmpeg_session.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=proc),
         ) as launch,
         patch("ffmpeg_session._spawn_background_task", side_effect=lambda coro: coro.close()),
     ):
-        with pytest.raises(ffmpeg_session.HTTPException) as error:
+        with pytest.raises(HTTPException) as error:
             await ffmpeg_session.start_transcode(
-                "https://provider/disconnected", fast_start=True, is_disconnected=disconnected
+                "https://provider/disconnected",
+                fast_start=True,
+                is_disconnected=disconnected,
             )
         assert error.value.status_code == 499
         assert launch.call_count == 1
@@ -452,7 +467,7 @@ async def test_low_startup_failure_never_launches_high(tmp_path, cancelled):
             path = pathlib.Path(directory)
             (path / "input_0.ts").write_bytes(video_packet(10) * 10)
             (path / name).write_text("#EXTM3U\n#EXTINF:4,\ninput_0.ts\n")
-            return 10000
+            return 10_000
         if cancelled:
             raise asyncio.CancelledError
         processes[1].returncode = 1
@@ -468,7 +483,7 @@ async def test_low_startup_failure_never_launches_high(tmp_path, cancelled):
         patch("ffmpeg_session._spawn_background_task", side_effect=lambda coro: coro.close()),
         patch("ffmpeg_session.ready_bitrate", side_effect=ready),
     ):
-        expected = asyncio.CancelledError if cancelled else ffmpeg_session.HTTPException
+        expected = asyncio.CancelledError if cancelled else HTTPException
         with pytest.raises(expected):
             await ffmpeg_session.start_transcode("https://provider/failed-low", fast_start=True)
         assert launch.call_count == 2
@@ -484,7 +499,7 @@ async def test_dvr_compatible_source_remuxes_without_fast_start():
         audio_codec="aac",
         pix_fmt="yuv420p",
         audio_channels=2,
-        audio_sample_rate=48000,
+        audio_sample_rate=48_000,
         audio_profile="LC",
         height=1080,
     )
@@ -515,7 +530,7 @@ async def test_dvr_compatible_source_remuxes_without_fast_start():
                 audio_codec="aac",
                 pix_fmt="yuv420p",
                 audio_channels=2,
-                audio_sample_rate=48000,
+                audio_sample_rate=48_000,
                 audio_profile="LC",
                 height=1080,
             ),
@@ -527,7 +542,7 @@ async def test_dvr_compatible_source_remuxes_without_fast_start():
                 audio_codec="aac",
                 pix_fmt="yuv420p",
                 audio_channels=2,
-                audio_sample_rate=48000,
+                audio_sample_rate=48_000,
                 audio_profile="LC",
                 height=1080,
             ),
@@ -548,7 +563,9 @@ async def test_dvr_keeps_fast_start_when_remux_is_unavailable(media, bandwidth_s
         patch("ffmpeg_session._start_fast_live", new=AsyncMock(return_value=fast)) as fast_live,
     ):
         result = await ffmpeg_session.start_transcode(
-            "https://provider/live", fast_start=True, bandwidth_saver=bandwidth_saver
+            "https://provider/live",
+            fast_start=True,
+            bandwidth_saver=bandwidth_saver,
         )
     assert result == fast
     assert fast_live.await_count == 1
@@ -659,7 +676,7 @@ def test_saver_does_not_recover_when_high_encoder_has_failed(tmp_path):
         playback_policy=PlaybackPolicy(bandwidth_saver=True),
         recovery_bitrate=7520,
     )
-    good = PlaybackHealth(buffer_seconds=12, waiting=False, observed_bitrate=100000)
+    good = PlaybackHealth(buffer_seconds=12, waiting=False, observed_bitrate=100_000)
     with (
         patch.dict(ffmpeg_session._transcode_sessions, {"failed": session}),
         patch("ffmpeg_session.time.monotonic") as clock,
@@ -669,3 +686,9 @@ def test_saver_does_not_recover_when_high_encoder_has_failed(tmp_path):
             result = ffmpeg_session.report_playback_health("failed", "u", good)
             assert result["bandwidth_saver"]
             assert result["playlist"].endswith("/low.m3u8")
+
+
+if __name__ == "__main__":
+    from codedoctor.lib.testing.runner import test_main
+
+    test_main(__file__)

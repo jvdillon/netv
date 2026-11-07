@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from urllib import parse
 
 import hashlib
 import json
@@ -11,8 +12,6 @@ import logging
 import pathlib
 import threading
 import time
-import urllib.error
-import urllib.parse
 
 from m3u import fetch_source_live_data
 from util import atomic_write_json
@@ -21,17 +20,9 @@ import cache
 
 
 log = logging.getLogger(__name__)
-_FAILED_LOAD_RETRY_SECONDS = 60
 
 
-def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, kw_only=True, slots=True)
 class GatewayStream:
     """A public stream entry and its private upstream mapping."""
 
@@ -44,7 +35,7 @@ class GatewayStream:
     public: dict[str, Any]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, kw_only=True, slots=True)
 class CatalogSnapshot:
     categories: list[dict[str, Any]]
     category_access_ids: dict[str, str]
@@ -75,16 +66,16 @@ class StreamIdRegistry:
                 raise ValueError("registry must contain an object-valued 'ids' field")
             ids = raw["ids"]
             self._ids = {
-                str(key): int(value)
+                str(key): value
                 for key, value in ids.items()
-                if isinstance(value, int) and value > 0
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0
             }
             if len(self._ids) != len(ids) or len(set(self._ids.values())) != len(self._ids):
                 raise ValueError("registry contains invalid or duplicate IDs")
             self._next_id = max(self._ids.values(), default=0) + 1
         except FileNotFoundError:
             pass
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, TypeError) as exc:
             log.error("Invalid gateway stream ID registry: %s", exc)
             raise RuntimeError("Invalid gateway stream ID registry") from exc
         self._loaded = True
@@ -113,10 +104,13 @@ class GatewayCatalog:
     def __init__(
         self,
         registry: StreamIdRegistry | None = None,
-        ttl_seconds: int = cache.LIVE_CACHE_TTL,
+        ttl_seconds: int = 2 * 3600,
+        *,
+        failed_load_retry_seconds: int = 60,
     ) -> None:
         self._registry = registry or StreamIdRegistry()
         self._ttl_seconds = ttl_seconds
+        self._failed_load_retry_seconds = failed_load_retry_seconds
         self._lock = threading.Lock()
         self._snapshot: CatalogSnapshot | None = None
         self._loaded_at = 0.0
@@ -141,16 +135,16 @@ class GatewayCatalog:
                 self._loaded_at = (
                     time.monotonic()
                     - self._ttl_seconds
-                    + min(_FAILED_LOAD_RETRY_SECONDS, self._ttl_seconds)
+                    + min(self._failed_load_retry_seconds, self._ttl_seconds)
                 )
                 return self._snapshot
             self._snapshot = candidate
             self._loaded_at = (
                 time.monotonic()
-                if not had_errors
-                else time.monotonic()
                 - self._ttl_seconds
-                + min(_FAILED_LOAD_RETRY_SECONDS, self._ttl_seconds)
+                + min(self._failed_load_retry_seconds, self._ttl_seconds)
+                if had_errors
+                else time.monotonic()
             )
             return self._snapshot
 
@@ -168,7 +162,7 @@ class GatewayCatalog:
                     source,
                     persist_epg_url=False,
                 )
-            except (KeyError, OSError, TypeError, ValueError, urllib.error.URLError) as exc:
+            except (KeyError, OSError, TypeError, ValueError) as exc:
                 had_errors = True
                 log.error(
                     "Gateway failed to load source %s (%s)",
@@ -208,7 +202,7 @@ class GatewayCatalog:
                     public_id: source_category_id
                     for source_category_id, public_id in category_id_map.items()
                     if source_category_id != uncategorized_id
-                }
+                },
             )
             categories.extend(self._public_categories(source_categories, category_id_map))
             if needs_uncategorized:
@@ -217,7 +211,7 @@ class GatewayCatalog:
                         "category_id": category_id_map[uncategorized_id],
                         "category_name": "Uncategorized",
                         "parent_id": 0,
-                    }
+                    },
                 )
             registry_entries: list[tuple[dict[str, Any], str]] = []
             key_occurrences: dict[str, int] = {}
@@ -227,11 +221,7 @@ class GatewayCatalog:
                 base_key = self._stream_registry_key(source.id, source.type, stream)
                 occurrence = key_occurrences.get(base_key, 0)
                 key_occurrences[base_key] = occurrence + 1
-                key = (
-                    base_key
-                    if occurrence == 0
-                    else f"{base_key}:duplicate:{occurrence + 1}"
-                )
+                key = base_key if occurrence == 0 else f"{base_key}:duplicate:{occurrence + 1}"
                 registry_entries.append((stream, key))
             registry_keys = [key for _, key in registry_entries]
             local_ids = self._registry.get_or_create_many(registry_keys)
@@ -259,8 +249,9 @@ class GatewayCatalog:
             had_errors,
         )
 
-    @staticmethod
+    @classmethod
     def _stream_registry_key(
+        cls,
         source_id: str,
         source_type: str,
         stream: dict[str, Any],
@@ -271,9 +262,9 @@ class GatewayCatalog:
         direct_url = str(stream.get("direct_url") or "")
         epg_channel_id = str(stream.get("epg_channel_id") or "")
         name = str(stream.get("name") or "")
-        parsed_url = urllib.parse.urlparse(direct_url)
-        stable_url = urllib.parse.urlunparse(
-            (parsed_url.scheme, parsed_url.netloc, parsed_url.path, "", "", "")
+        parsed_url = parse.urlparse(direct_url)
+        stable_url = parse.urlunparse(
+            (parsed_url.scheme, parsed_url.netloc, parsed_url.path, "", "", ""),
         )
         identity = f"{epg_channel_id}\0{name}\0{stable_url}"
         if not epg_channel_id and not name and not stable_url:
@@ -281,8 +272,9 @@ class GatewayCatalog:
         digest = hashlib.sha256(identity.encode()).hexdigest()
         return f"{source_id}:live-url:{digest}"
 
-    @staticmethod
+    @classmethod
     def _public_categories(
+        cls,
         categories: list[dict[str, Any]],
         category_id_map: dict[str, str],
     ) -> list[dict[str, Any]]:
@@ -316,9 +308,7 @@ class GatewayCatalog:
         source_category_id = str(stream.get("category_id", ""))
         access_group_ids = tuple(source_category_ids)
         fallback_source_id = (
-            source_category_id
-            if source_category_id in category_id_map
-            else uncategorized_source_id
+            source_category_id if source_category_id in category_id_map else uncategorized_source_id
         )
         category_id = (
             category_ids[0]
@@ -328,9 +318,7 @@ class GatewayCatalog:
         if not category_ids and category_id:
             category_ids = [category_id]
             access_group_ids = (
-                (fallback_source_id,)
-                if fallback_source_id != uncategorized_source_id
-                else ()
+                (fallback_source_id,) if fallback_source_id != uncategorized_source_id else ()
             )
         access_group_ids = tuple(value for value in access_group_ids if value)
         public = {
@@ -356,3 +344,10 @@ class GatewayCatalog:
             access_group_ids=access_group_ids,
             public=public,
         )
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default

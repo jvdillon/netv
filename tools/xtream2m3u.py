@@ -1,5 +1,12 @@
-#!/usr/bin/env python3
-# pyright: reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportImplicitStringConcatenation=false, reportUnknownParameterType=false
+#!/bin/sh
+# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# fmt: off
+'''' 2>/dev/null #
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
+
+Fetch Xtream catalogs and write M3U playlists.
+'''
+# fmt: on
 
 # M3U Details:
 #   https://github.com/HamzaBhf00/m3u-tags-iptv
@@ -7,10 +14,11 @@
 #   https://github.com/engenex/xtream-codes-api-v2/blob/main/%5BHow-To%5D%20Player%20API%20v2%20-%20Tutorials%20-%20Xtream%20Codes.pdf
 from __future__ import annotations
 
-from typing import Any, Protocol
+from concurrent import futures
+from typing import Any, Protocol, TypedDict
+from urllib import error, parse, request
 
 import collections
-import concurrent.futures
 import functools
 import gzip  # lzma(80%), bz2(78%), gzip(75%) but gzip was fastest.
 import json
@@ -20,59 +28,30 @@ import pickle
 import shutil
 import threading
 import time
-import urllib
-import urllib.error
-import urllib.parse
-import urllib.request
 
 
 class RetryableError(Exception):
-    pass
+    """A fetch failure worth retrying (rate limit or timeout)."""
 
 
-TOOLS_DIR = pathlib.Path(__file__).parent.resolve()
-CONFIG_FILE = TOOLS_DIR / "xtream.json"
-TEMPDIR = TOOLS_DIR
-DESTDIR = TOOLS_DIR
+VideoInfo = TypedDict(
+    "VideoInfo",
+    {
+        "tvg-name": str,
+        "tvg-logo": str,
+        "group-title": list[str],
+        "tvg-id": str | None,
+        "url": str | None,
+        "category_ids": list[int],
+        "year": int | None,
+        "rating": float | None,
+        "num": int,
+        "last_modified": int | None,
+    },
+)
 
 
-def _load_config() -> dict:
-    """Load config from xtream.json, creating template if missing."""
-    if not CONFIG_FILE.exists():
-        template = {
-            "url": "https://your-provider.com",
-            "username": "your_username",
-            "password": "your_password",
-            "live_filter": {},
-            "locals_group": "",
-            "locals_filter": [],
-        }
-        CONFIG_FILE.write_text(json.dumps(template, indent=2))
-        raise SystemExit(f"Created {CONFIG_FILE} - edit with your credentials and re-run")
-    return json.loads(CONFIG_FILE.read_text())
-
-
-def _get_urls() -> tuple[str, str, str]:
-    """Return (api_url, get_url, epg_url) from config."""
-    cfg = _load_config()
-    base = cfg["url"].rstrip("/")
-    user, passwd = cfg["username"], cfg["password"]
-    api = f"{base}/player_api.php?username={user}&password={passwd}"
-    get = f"{base}/get.php?username={user}&password={passwd}"
-    epg = f"{base}/xmltv.php?username={user}&password={passwd}"
-    return api, get, epg
-
-
-def _get_filters() -> tuple[dict[int, str], str, set[str]]:
-    """Return (live_filter, locals_group, locals_filter) from config."""
-    cfg = _load_config()
-    live_filter = {int(k): v for k, v in cfg.get("live_filter", {}).items()}
-    locals_group = cfg.get("locals_group", "")
-    locals_filter = set(cfg.get("locals_filter", []))
-    return live_filter, locals_group, locals_filter
-
-
-def main(cached_only: bool = False) -> None:
+def main(cached_only: bool = False) -> int:
     api_url, _, epg_url = _get_urls()
     live_filter, locals_group, locals_filter = _get_filters()
 
@@ -111,6 +90,7 @@ def main(cached_only: bool = False) -> None:
     del series_categories
     series_info = fetch_series_info(series, api_url, cached_only=cached_only)
     write_m3u_series(series, series_info, auth, series_url)
+    return 0
 
 
 ###############################################################################
@@ -124,86 +104,84 @@ def main(cached_only: bool = False) -> None:
 
 
 def fetch_all_data(api_url: str) -> None:
-    if False:  # Intentionally disabled debug code
-        r = fetch_text(api_url + "&type=m3u_plus").encode("utf-8")  # pyright: ignore[reportUnreachable]
-        with gzip.open(TEMPDIR / "xtream.m3u.gz", "wb") as f:
-            f.write(r)
-
     print("Fetching authentication...", end=" ", flush=True)
     t0 = time.perf_counter()
     r = fetch_text(api_url)
-    with open(TEMPDIR / "authentication.json", "w") as f:
+    with open(pathlib.Path(__file__).parent.resolve() / "authentication.json", "w") as f:
         f.write(r)
     print(f"({time.perf_counter() - t0:.1f}s)")
 
     print("Fetching live streams...", end=" ", flush=True)
     t0 = time.perf_counter()
     r = fetch_text(api_url + "&action=get_live_streams", timeout=120)
-    with open(TEMPDIR / "get_live_stream.json", "w") as f:
+    with open(pathlib.Path(__file__).parent.resolve() / "get_live_stream.json", "w") as f:
         f.write(r)
     print(f"({time.perf_counter() - t0:.1f}s)")
 
     print("Fetching live categories...", end=" ", flush=True)
     t0 = time.perf_counter()
     r = fetch_text(api_url + "&action=get_live_categories")
-    with open(TEMPDIR / "get_live_categories.json", "w") as f:
+    with open(pathlib.Path(__file__).parent.resolve() / "get_live_categories.json", "w") as f:
         f.write(r)
     print(f"({time.perf_counter() - t0:.1f}s)")
 
     print("Fetching series...", end=" ", flush=True)
     t0 = time.perf_counter()
     r = fetch_text(api_url + "&action=get_series", timeout=120)
-    with open(TEMPDIR / "get_series.json", "w") as f:
+    with open(pathlib.Path(__file__).parent.resolve() / "get_series.json", "w") as f:
         f.write(r)
     print(f"({time.perf_counter() - t0:.1f}s)")
 
     print("Fetching series categories...", end=" ", flush=True)
     t0 = time.perf_counter()
     r = fetch_text(api_url + "&action=get_series_categories")
-    with open(TEMPDIR / "get_series_categories.json", "w") as f:
+    with open(pathlib.Path(__file__).parent.resolve() / "get_series_categories.json", "w") as f:
         f.write(r)
     print(f"({time.perf_counter() - t0:.1f}s)")
 
     print("Fetching VOD streams...", end=" ", flush=True)
     t0 = time.perf_counter()
     r = fetch_text(api_url + "&action=get_vod_streams", timeout=120)
-    with open(TEMPDIR / "get_vod_streams.json", "w") as f:
+    with open(pathlib.Path(__file__).parent.resolve() / "get_vod_streams.json", "w") as f:
         f.write(r)
     print(f"({time.perf_counter() - t0:.1f}s)")
 
     print("Fetching VOD categories...", end=" ", flush=True)
     t0 = time.perf_counter()
     r = fetch_text(api_url + "&action=get_vod_categories")
-    with open(TEMPDIR / "get_vod_categories.json", "w") as f:
+    with open(pathlib.Path(__file__).parent.resolve() / "get_vod_categories.json", "w") as f:
         f.write(r)
     print(f"({time.perf_counter() - t0:.1f}s)")
 
 
 def fetch_text(url: str, timeout: int = 5) -> str:
-    parsed = urllib.parse.urlparse(url)
+    parsed = parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"Unsupported URL scheme: {parsed.scheme}")
 
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        with request.urlopen(url, timeout=timeout) as response:
             return response.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
+    except error.HTTPError as e:
         if e.code == 429:
             raise RetryableError(f"Unable to get {url}; http error {e.code}.") from e
         raise ValueError(f"Unable to get {url}; http error {e.code}.") from e
-    except (urllib.error.URLError, TimeoutError) as e:
-        reason = e.reason if isinstance(e, urllib.error.URLError) else str(e)
+    except (error.URLError, TimeoutError) as e:
+        reason = e.reason if isinstance(e, error.URLError) else str(e)
         raise RetryableError(f"Unable to get {url}; timeout {reason}.") from e
 
 
 def fetch_series_info(
-    series: dict[int, dict[str, Any]],
+    series: dict[int, VideoInfo],
     api_url: str,
     cached_only: bool = False,
 ) -> dict[int, Any]:
     series_info: dict[int, None | Any] = {}
     try:
-        with gzip.open(TEMPDIR / "series_info.pickle.gz", "rb") as f:
+        with gzip.open(
+            pathlib.Path(__file__).parent.resolve() / "series_info.pickle.gz",
+            "rb",
+        ) as f:
             series_info = pickle.load(f)
     except Exception as e:
         print(f"Cache miss: {e}")
@@ -218,10 +196,13 @@ def fetch_series_info(
     for k in series:
         series_info.setdefault(k, None)
         try:
-            t = int(series_info[k]["info"]["last_modified"])  # pyright: ignore[reportOptionalSubscript]
+            info = series_info[k]
+            t = int(info["info"]["last_modified"]) if info is not None else -1
         except (KeyError, TypeError, ValueError):
             t = -1
-        if series[k]["last_modified"] > t:
+        last_modified = series[k]["last_modified"]
+        assert isinstance(last_modified, int)
+        if last_modified > t:
             refetch_count += 1
             series_info[k] = None
 
@@ -253,7 +234,7 @@ def fetch_series_info(
         ids := [k for k, v in series_info.items() if v is None]
     ):
         changed = True
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        executor = futures.ThreadPoolExecutor(max_workers=max_workers)
         try:
             list(executor.map(task_, ids))
             executor.shutdown(wait=True)
@@ -263,7 +244,7 @@ def fetch_series_info(
             raise
 
     if changed:
-        pickle_filename = TEMPDIR / "series_info.pickle.gz"
+        pickle_filename = pathlib.Path(__file__).parent.resolve() / "series_info.pickle.gz"
         with gzip.open(pickle_filename.with_suffix(".tmp"), "wb") as f:
             pickle.dump(series_info, f)
         shutil.move(pickle_filename.with_suffix(".tmp"), pickle_filename)
@@ -277,44 +258,14 @@ class RateLimiter(Protocol):
     def acquire(self) -> None: ...
 
 
-def _task(
-    id_: int,
-    limiter: RateLimiter,
-    series_info: dict[int, Any],
-    api_url: str,
-    progress_lock: threading.Lock,
-    progress_count_ref: list[int],
-) -> None:
-    try:
-        limiter.acquire()
-        result = json.loads(
-            fetch_text(
-                url=f"{api_url}&action=get_series_info&series_id={id_}",
-                timeout=60,
-            )
-        )
-        series_info[id_] = result
-        with progress_lock:
-            progress_count_ref[0] += 1
-            print_progress_bar(
-                iteration=progress_count_ref[0],
-                total=len(series_info),
-            )
-    except RetryableError as e:
-        print(e)
-    except (json.JSONDecodeError, ValueError, KeyError) as e:
-        print(e)
-        series_info[id_] = {}
-
-
 def filter_live(
-    live: dict[int, dict[str, Any]],
+    live: dict[int, VideoInfo],
     live_filter: dict[int, str],
     locals_group: str,
     locals_filter: set[str],
-) -> dict[int, dict[str, Any]]:
+) -> dict[int, VideoInfo]:
     if live_filter:
-        live_ = collections.defaultdict(dict)
+        live_: collections.defaultdict[str, dict[int, VideoInfo]] = collections.defaultdict(dict)
         for k, v in live.items():
             if not any(c in live_filter for c in v["category_ids"]):
                 continue
@@ -352,11 +303,12 @@ def process(
     elements: list[dict[str, Any]],
     categories: list[dict[str, Any]],
     iptv_url: list[str],
-) -> tuple[dict[int, dict[str, Any]], dict[int, Any]]:
+) -> tuple[dict[int, VideoInfo], dict[int, str]]:
     categories_dict: dict[int, str] = {
         int(c["category_id"]): c["category_name"] for c in categories
     }
-    elements_dict: dict[int, dict[str, None | int | str | list[str]]] = {}
+    elements_dict: dict[int, VideoInfo] = {}
+    attr: VideoInfo
     for s in elements:
         stream_type = s.get("stream_type")
         if stream_type in ("live", "radio_streams"):
@@ -376,7 +328,7 @@ def process(
             }
             if s["tv_archive"] not in (0, 1):
                 raise ValueError(f"Invalid tv_archive value: {s}")
-            # assert not s["direct_source"], s
+            # Assert not s["direct_source"], s.
         elif stream_type == "series" or s.get("series_id") is not None:
             id_ = int(s["series_id"])
             attr = {
@@ -446,7 +398,7 @@ def tofloat(x: str | None) -> float | None:
 
 
 def load(filename: str) -> Any:
-    with open(TEMPDIR / filename) as f:
+    with open(pathlib.Path(__file__).parent.resolve() / filename) as f:
         return json.load(f)
 
 
@@ -519,34 +471,35 @@ def print_progress_bar(
     fill: str = "█",
     printEnd: str = "\r",
 ) -> None:
-    r"""Call in a loop to create terminal progress bar
-    @params:
-        iteration   - Required  : current iteration (Int)
-        total       - Required  : total iterations (Int)
-        prefix      - Optional  : prefix string (Str)
-        suffix      - Optional  : suffix string (Str)
-        decimals    - Optional  : positive number of decimals in percent complete (Int)
-        length      - Optional  : character length of bar (Int)
-        fill        - Optional  : bar fill character (Str)
-        printEnd    - Optional  : end character (e.g. "\r", "\r\n") (Str)
+    r"""Print a terminal progress bar for a CLI fetch.
+
+    Args:
+        iteration: Completed iterations.
+        total: Total iterations.
+        prefix: Text before the bar.
+        suffix: Text after the percentage.
+        decimals: Decimal places in the percentage.
+        length: Width of the bar in characters.
+        fill: Character marking completed work.
+        printEnd: End character, such as "\r" or "\r\n".
     """
     if total == 0:
         return
     percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
-    filledLength = int(length * iteration // total)
+    filledLength = length * iteration // total
     bar = fill * filledLength + "-" * (length - filledLength)
     print(f"\r{prefix} |{bar}| {percent}% {suffix}", end=printEnd)
-    # Print New Line on Complete
+    # Print New Line on Complete.
     if iteration == total:
         print()
 
 
 def write_m3u_live(
-    live: dict[int, dict[str, Any]],
+    live: dict[int, VideoInfo],
     auth: dict[str, dict[str, Any]],
     epg_url: str,
 ) -> None:
-    with open(DESTDIR / "live.m3u", "w") as f:
+    with open(pathlib.Path(__file__).parent.resolve() / "live.m3u", "w") as f:
         print(f'#EXTM3U url-tvg="{epg_url}" x-tvg-url="{epg_url}"', file=f)
         if auth["server_info"].get("xui") is not None:
             version = auth["server_info"]["version"]
@@ -566,10 +519,10 @@ def write_m3u_live(
 
 
 def write_m3u_vod(
-    vod: dict[int, dict[str, Any]],
+    vod: dict[int, VideoInfo],
     auth: dict[str, dict[str, Any]],
 ) -> None:
-    with open(DESTDIR / "vod.m3u", "w") as f:
+    with open(pathlib.Path(__file__).parent.resolve() / "vod.m3u", "w") as f:
         print("#EXTM3U", file=f)
         if auth["server_info"].get("xui") is not None:
             version = auth["server_info"]["version"]
@@ -588,7 +541,7 @@ def write_m3u_vod(
 
 
 def write_m3u_series(
-    series: dict[int, dict[str, Any]],
+    series: dict[int, VideoInfo],
     series_info: dict[int, None | Any],
     auth: dict[str, dict[str, Any]],
     series_url: list[str],
@@ -603,7 +556,7 @@ def write_m3u_series(
         except Exception as e:
             print(f"Series {k}: {e}")
 
-    with open(DESTDIR / "series.m3u", "w") as f:
+    with open(pathlib.Path(__file__).parent.resolve() / "series.m3u", "w") as f:
         print("#EXTM3U", file=f)
         if auth["server_info"].get("xui") is not None:
             version = auth["server_info"]["version"]
@@ -635,5 +588,73 @@ def _descend(x: Any):
             yield from _descend(x_)
 
 
+def _load_config() -> dict:
+    """Load config from xtream.json, creating template if missing."""
+    config_file = pathlib.Path(__file__).parent.resolve() / "xtream.json"
+    if not config_file.exists():
+        template = {
+            "url": "https://your-provider.com",
+            "username": "your_username",
+            "password": "your_password",
+            "live_filter": {},
+            "locals_group": "",
+            "locals_filter": [],
+        }
+        config_file.write_text(json.dumps(template, indent=2))
+        raise SystemExit(f"Created {config_file} - edit with your credentials and re-run")
+    return json.loads(config_file.read_text())
+
+
+def _get_urls() -> tuple[str, str, str]:
+    """Return (api_url, get_url, epg_url) from config."""
+    cfg = _load_config()
+    base = cfg["url"].rstrip("/")
+    user, passwd = cfg["username"], cfg["password"]
+    api = f"{base}/player_api.php?username={user}&password={passwd}"
+    get = f"{base}/get.php?username={user}&password={passwd}"
+    epg = f"{base}/xmltv.php?username={user}&password={passwd}"
+    return api, get, epg
+
+
+def _get_filters() -> tuple[dict[int, str], str, set[str]]:
+    """Return (live_filter, locals_group, locals_filter) from config."""
+    cfg = _load_config()
+    live_filter = {int(k): v for k, v in cfg.get("live_filter", {}).items()}
+    locals_group = cfg.get("locals_group", "")
+    locals_filter = set(cfg.get("locals_filter", []))
+    return live_filter, locals_group, locals_filter
+
+
+def _task(
+    id_: int,
+    limiter: RateLimiter,
+    series_info: dict[int, Any],
+    api_url: str,
+    progress_lock: threading.Lock,
+    progress_count_ref: list[int],
+) -> None:
+    try:
+        limiter.acquire()
+        result = json.loads(
+            fetch_text(
+                url=f"{api_url}&action=get_series_info&series_id={id_}",
+                timeout=60,
+            ),
+        )
+        series_info[id_] = result
+        with progress_lock:
+            progress_count_ref[0] += 1
+            print_progress_bar(
+                iteration=progress_count_ref[0],
+                total=len(series_info),
+            )
+    except RetryableError as e:
+        print(e)
+    except (json.JSONDecodeError, ValueError, KeyError) as e:
+        print(e)
+        series_info[id_] = {}
+
+
 if __name__ == "__main__":
-    main(cached_only=False)
+    raise SystemExit(main(cached_only=False))
+# vim: ft=python

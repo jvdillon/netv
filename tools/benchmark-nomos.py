@@ -1,21 +1,31 @@
-#!/usr/bin/env python3
-"""Benchmark the fixed 1080p NomosUni TensorRT engine."""
+#!/bin/sh
+# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# fmt: off
+'''' 2>/dev/null #
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
+
+Benchmark the fixed 1080p NomosUni TensorRT engine.
+'''
+# fmt: on
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Final, Protocol, TypedDict, cast
 
 import argparse
-import json
 import shutil
 import subprocess
 import tempfile
 import time
 
+from treekle import json_loads
 
-ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MODEL_DIR = Path.home() / "ffmpeg_build/models"
+
+_CWD: Final = Path(__file__).resolve().parent
+
+ROOT = _CWD.parent
 
 
 def find_binary(name: str) -> Path:
@@ -28,8 +38,10 @@ def find_binary(name: str) -> Path:
     raise FileNotFoundError(f"Unable to find {name}; add it to PATH or place it in {ROOT / 'bin'}")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Result:
+    """Measured timing and source metadata for one engine run."""
+
     model: str
     elapsed_seconds: float
     startup_seconds: float
@@ -59,17 +71,17 @@ def probe_sample(ffprobe: Path, sample: Path) -> tuple[float, float]:
         str(sample),
     ]
     result = subprocess.run(command, capture_output=True, text=True, check=True)
-    payload = json.loads(result.stdout)
+    payload = json_loads(result.stdout, ProbeResult)
     stream = payload["streams"][0]
     if (stream["width"], stream["height"]) != (1920, 1080):
         raise RuntimeError(
-            f"Benchmark sample must be 1920x1080, got {stream['width']}x{stream['height']}"
+            f"Benchmark sample must be 1920x1080, got {stream['width']}x{stream['height']}",
         )
     numerator, denominator = stream["avg_frame_rate"].split("/", 1)
     return float(payload["format"]["duration"]), float(numerator) / float(denominator)
 
 
-def command_for(
+def ffmpeg_command(
     ffmpeg: Path,
     sample: Path,
     engine: Path,
@@ -129,7 +141,7 @@ def command_for(
             "-hls_segment_filename",
             str(output_dir / "seg%05d.ts"),
             str(output_dir / "stream.m3u8"),
-        ]
+        ],
     )
     return command
 
@@ -147,7 +159,7 @@ def run_once(
         started = time.monotonic()
         startup_at: float | None = None
         process = subprocess.Popen(
-            command_for(ffmpeg, sample, engine, output_dir, duration),
+            ffmpeg_command(ffmpeg, sample, engine, output_dir, duration),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -172,18 +184,10 @@ def run_once(
         )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--sample",
-        type=Path,
-        required=True,
-        help="30-second 1920x1080 test clip",
-    )
-    parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
-    parser.add_argument("--warmup-seconds", type=float, default=5.0)
-    parser.add_argument("--target-fps", type=float, default=60.0)
-    args = parser.parse_args()
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 2)[2] if __doc__ else None)
+    _add_arguments(parser)
+    args = cast(Flags, parser.parse_args())
 
     ffmpeg = find_binary("ffmpeg")
     ffprobe = find_binary("ffprobe")
@@ -193,10 +197,7 @@ def main() -> None:
         if not path.exists():
             raise FileNotFoundError(path)
 
-    print(
-        f"Sample: {args.sample.name} (1920x1080, {source_fps:.3f} FPS, "
-        f"{source_seconds:.2f}s)"
-    )
+    print(f"Sample: {args.sample.name} (1920x1080, {source_fps:.3f} FPS, {source_seconds:.2f}s)")
     print(f"Target: >= {args.target_fps:.3f} FPS end-to-end")
     print()
 
@@ -214,9 +215,57 @@ def main() -> None:
     status = "PASS" if result.throughput_fps >= args.target_fps else "FAIL"
     print(
         f"  {result.throughput_fps:.2f} FPS ({result.speed:.3f}x), "
-        f"startup {result.startup_seconds:.3f}s: {status}"
+        f"startup {result.startup_seconds:.3f}s: {status}",
     )
+    return 0
+
+
+class Flags(Protocol):
+    """Benchmark inputs and acceptance target."""
+
+    sample: Path
+    model_dir: Path
+    warmup_seconds: float
+    target_fps: float
+
+
+class ProbeStream(TypedDict):
+    """Video metadata produced by ffprobe."""
+
+    width: int
+    height: int
+    avg_frame_rate: str
+
+
+class ProbeFormat(TypedDict):
+    """Container duration produced by ffprobe."""
+
+    duration: str
+
+
+class ProbeResult(TypedDict):
+    """ffprobe response used by the benchmark."""
+
+    streams: list[ProbeStream]
+    format: ProbeFormat
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--sample",
+        type=Path,
+        required=True,
+        help="30-second 1920x1080 test clip",
+    )
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=Path("~/ffmpeg_build/models").expanduser(),
+    )
+    parser.add_argument("--warmup-seconds", type=float, default=5.0)
+    parser.add_argument("--target-fps", type=float, default=60.0)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
+# vim: ft=python

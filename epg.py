@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Thread
 from typing import Any
+from weakref import finalize
 
 import contextlib
 import gzip
@@ -15,7 +17,7 @@ import sqlite3
 import threading
 import time
 
-import defusedxml.ElementTree as ET  # Safe XML parsing
+import defusedxml.ElementTree as ET  # Safe XML parsing.
 
 from util import safe_urlopen
 
@@ -28,7 +30,7 @@ log = logging.getLogger(__name__)
 # =============================================================================
 
 
-@dataclass(slots=True)
+@dataclass(kw_only=True, slots=True)
 class Program:
     channel_id: str
     title: str
@@ -42,14 +44,31 @@ class Program:
 # SQLite Storage
 # =============================================================================
 
+
+class _ThreadState(threading.local):
+    """Per-thread SQLite connection and the finalizer that closes it."""
+
+    conn: sqlite3.Connection | None = None
+    closer: finalize[[], Thread] | None = None
+
+
 _DB_PATH: Path | None = None
-_local = threading.local()
+_local: _ThreadState | None = None
+_closers: list[finalize[[], Thread]] = []
 
 
 def init(cache_dir: Path) -> None:
-    """Initialize EPG database."""
-    global _DB_PATH
+    """Initialize EPG database, closing connections to any earlier one.
+
+    Args:
+        cache_dir: Directory containing the persistent guide database.
+    """
+    global _DB_PATH, _local
+    close()
+    cache_dir.mkdir(parents=True, exist_ok=True)
     _DB_PATH = cache_dir / "epg.db"
+    if _local is None:
+        _local = _ThreadState()
     conn = _get_conn()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS channels (
@@ -78,15 +97,12 @@ def init(cache_dir: Path) -> None:
     conn.commit()
 
 
-def _get_conn() -> sqlite3.Connection:
-    """Get thread-local database connection."""
-    if not hasattr(_local, "conn") or _local.conn is None:
-        if _DB_PATH is None:
-            raise RuntimeError("EPG database not initialized")
-        _local.conn = sqlite3.connect(_DB_PATH, timeout=30.0)
-        _local.conn.row_factory = sqlite3.Row
-        _local.conn.execute("PRAGMA journal_mode=WAL")
-    return _local.conn
+def close() -> None:
+    """Close every thread's connection and forget the database path."""
+    global _DB_PATH
+    _DB_PATH = None
+    while _closers:
+        _closers.pop()()
 
 
 def clear() -> None:
@@ -149,7 +165,17 @@ def get_programs_in_range(
     end: datetime,
     preferred_source_id: str = "",
 ) -> list[Program]:
-    """Get programs for a channel within a time range."""
+    """Get programs for a channel within a time range.
+
+    Args:
+        channel_id: XMLTV channel identifier.
+        start: Beginning of the requested interval.
+        end: End of the requested interval.
+        preferred_source_id: Source preferred when listings overlap.
+
+    Returns:
+        programs: Matching programs ordered by start time.
+    """
     conn = _get_conn()
     start_ts = start.timestamp()
     end_ts = end.timestamp()
@@ -168,8 +194,8 @@ def get_programs_in_range(
         Program(
             channel_id=row["channel_id"],
             title=row["title"],
-            start=datetime.fromtimestamp(row["start_ts"], tz=UTC),
-            stop=datetime.fromtimestamp(row["stop_ts"], tz=UTC),
+            start=datetime.fromtimestamp(row["start_ts"], tz=timezone.utc),
+            stop=datetime.fromtimestamp(row["stop_ts"], tz=timezone.utc),
             desc=row["desc"] or "",
             source_id=row["source_id"] or "",
         )
@@ -179,35 +205,12 @@ def get_programs_in_range(
     if not preferred_source_id or len(programs) <= 1:
         return programs
 
-    # Deduplicate overlapping programs, preferring the preferred source
+    # Deduplicate overlapping programs, preferring the preferred source.
     result: list[Program] = []
     for p in programs:
         dominated = False
         for i, existing in enumerate(result):
             if p.start < existing.stop and p.stop > existing.start:
-                if p.source_id == preferred_source_id and existing.source_id != preferred_source_id:
-                    result[i] = p
-                dominated = True
-                break
-        if not dominated:
-            result.append(p)
-    return sorted(result, key=lambda p: p.start)
-
-
-_MAX_IN_CLAUSE = 500  # SQLite limit is 999, stay well below
-
-
-def _dedupe_programs(programs: list[Program], preferred_source_id: str) -> list[Program]:
-    """Deduplicate overlapping programs, preferring the preferred source."""
-    if not preferred_source_id or len(programs) <= 1:
-        return programs
-    result: list[Program] = []
-    for p in programs:
-        dominated = False
-        for i, existing in enumerate(result):
-            # Check for overlap
-            if p.start < existing.stop and p.stop > existing.start:
-                # Prefer the preferred source
                 if p.source_id == preferred_source_id and existing.source_id != preferred_source_id:
                     result[i] = p
                 dominated = True
@@ -222,6 +225,8 @@ def get_programs_batch(
     start: datetime,
     end: datetime,
     preferred_sources: dict[str, str] | None = None,
+    *,
+    chunk_size: int = 500,
 ) -> dict[str, list[Program]]:
     """Get programs for multiple channels in a single query.
 
@@ -232,6 +237,10 @@ def get_programs_batch(
         preferred_sources: Optional dict mapping channel_id -> preferred source_id
             for deduplication. If provided, overlapping programs from the preferred
             source will be kept over programs from other sources.
+        chunk_size: Channel IDs per query, below SQLite's parameter limit.
+
+    Returns:
+        programs: Matching programs grouped by channel identifier.
     """
     if not channel_ids:
         return {}
@@ -240,9 +249,9 @@ def get_programs_batch(
     end_ts = end.timestamp()
     result: dict[str, list[Program]] = {ch: [] for ch in channel_ids}
 
-    # Process in chunks to avoid huge IN clauses
-    for i in range(0, len(channel_ids), _MAX_IN_CLAUSE):
-        chunk = channel_ids[i : i + _MAX_IN_CLAUSE]
+    # Process in chunks to avoid huge IN clauses.
+    for i in range(0, len(channel_ids), chunk_size):
+        chunk = channel_ids[i : i + chunk_size]
         placeholders = ",".join("?" * len(chunk))
         rows = conn.execute(
             f"""
@@ -258,14 +267,14 @@ def get_programs_batch(
                 Program(
                     channel_id=row["channel_id"],
                     title=row["title"],
-                    start=datetime.fromtimestamp(row["start_ts"], tz=UTC),
-                    stop=datetime.fromtimestamp(row["stop_ts"], tz=UTC),
+                    start=datetime.fromtimestamp(row["start_ts"], tz=timezone.utc),
+                    stop=datetime.fromtimestamp(row["stop_ts"], tz=timezone.utc),
                     desc=row["desc"] or "",
                     source_id=row["source_id"] or "",
-                )
+                ),
             )
 
-    # Deduplicate overlapping programs if preferred_sources provided
+    # Deduplicate overlapping programs if preferred_sources provided.
     if preferred_sources:
         for ch_id in result:
             if ch_id in preferred_sources and result[ch_id]:
@@ -280,14 +289,22 @@ def get_programs_batch(
     return result
 
 
-def get_icons_batch(channel_ids: list[str]) -> dict[str, str]:
-    """Get icons for multiple channels in a single query."""
+def get_icons_batch(channel_ids: list[str], *, chunk_size: int = 500) -> dict[str, str]:
+    """Get icons for multiple channels in batched queries.
+
+    Args:
+        channel_ids: XMLTV channel identifiers.
+        chunk_size: Channel IDs per query, below SQLite's parameter limit.
+
+    Returns:
+        icons: Icon URLs indexed by channel identifier.
+    """
     if not channel_ids:
         return {}
     conn = _get_conn()
     result: dict[str, str] = {}
-    for i in range(0, len(channel_ids), _MAX_IN_CLAUSE):
-        chunk = channel_ids[i : i + _MAX_IN_CLAUSE]
+    for i in range(0, len(channel_ids), chunk_size):
+        chunk = channel_ids[i : i + chunk_size]
         placeholders = ",".join("?" * len(chunk))
         rows = conn.execute(
             f"SELECT channel_id, url FROM icons WHERE channel_id IN ({placeholders})",
@@ -306,10 +323,18 @@ def has_programs() -> bool:
 
 
 def has_programs_after(when: datetime) -> bool:
-    """Check if any program is still airing (or scheduled) after the given time."""
+    """Check whether programs extend beyond an instant.
+
+    Args:
+        when: Exclusive lower bound on program end times.
+
+    Returns:
+        available: Whether a program ends after the instant.
+    """
     conn = _get_conn()
     row = conn.execute(
-        "SELECT 1 FROM programs WHERE stop_ts > ? LIMIT 1", (when.timestamp(),)
+        "SELECT 1 FROM programs WHERE stop_ts > ? LIMIT 1",
+        (when.timestamp(),),
     ).fetchone()
     return row is not None
 
@@ -318,6 +343,13 @@ def search_channels(terms: list[str], limit: int = 20) -> list[dict[str, Any]]:
     """Find EPG channels whose id or name contains every term.
 
     Channels with upcoming listings come first.
+
+    Args:
+        terms: Case-insensitive substrings required in channel IDs or names.
+        limit: Maximum number of results.
+
+    Returns:
+        channels: Matching IDs, names, and upcoming-listing flags.
     """
     terms = [t for t in terms if t]
     if not terms:
@@ -327,7 +359,7 @@ def search_channels(terms: list[str], limit: int = 20) -> list[dict[str, Any]]:
     for t in terms:
         like = f"%{t}%"
         params += [like, like]
-    now = datetime.now(UTC).timestamp()
+    now = datetime.now(timezone.utc).timestamp()
     conn = _get_conn()
     rows = conn.execute(
         f"""
@@ -337,7 +369,7 @@ def search_channels(terms: list[str], limit: int = 20) -> list[dict[str, Any]]:
         FROM channels c WHERE {where}
         ORDER BY has_listings DESC, length(c.id)
         LIMIT ?
-        """,  # noqa: S608 - only placeholders are interpolated
+        """,
         [now, *params, limit],
     ).fetchall()
     return [
@@ -372,34 +404,6 @@ def prune_old_programs(before: datetime) -> int:
 # =============================================================================
 
 
-def _parse_epg_time(s: str) -> datetime:
-    """Parse XMLTV time format: 20241130120000 +0000 or 20241130120000+0530."""
-    s = s.replace(" ", "")
-    if len(s) >= 14:
-        dt = datetime.strptime(s[:14], "%Y%m%d%H%M%S")
-        if len(s) > 14:
-            tz_str = s[14:]
-            sign = -1 if tz_str[0] == "-" else 1
-            tz_hours = int(tz_str[1:3]) if len(tz_str) >= 3 else 0
-            tz_mins = int(tz_str[3:5]) if len(tz_str) >= 5 else 0
-            offset = timedelta(hours=tz_hours, minutes=tz_mins)
-            dt = dt.replace(tzinfo=timezone(sign * offset))
-        return dt
-    return datetime.now(UTC)
-
-
-def _sanitize_epg_xml(xml_str: str) -> str:
-    """Try to fix corrupted EPG XML by extracting valid elements."""
-    channels = re.findall(r"<channel\s+[^>]*>.*?</channel>", xml_str, re.DOTALL)
-    programmes = re.findall(
-        r'<programme\s+start="[^"<>]+"\s+stop="[^"<>]+"\s+channel="[^"<>]+"[^>]*>.*?</programme>',
-        xml_str,
-        re.DOTALL,
-    )
-    log.info("Sanitized EPG: extracted %d channels, %d programmes", len(channels), len(programmes))
-    return '<?xml version="1.0"?>\n<tv>\n' + "\n".join(channels) + "\n".join(programmes) + "\n</tv>"
-
-
 def fetch_epg(
     epg_url: str,
     cache_dir: Path,
@@ -417,7 +421,7 @@ def fetch_epg(
         user_agent: User-Agent header to send. If None, uses default.
 
     Returns:
-        Number of programs inserted.
+        program_count: Number of programs inserted.
     """
     with safe_urlopen(epg_url, timeout=timeout, user_agent=user_agent) as resp:
         content = resp.read()
@@ -439,7 +443,7 @@ def fetch_epg(
             log.error("Sanitized EPG also failed: %s", e2)
             raise
 
-    # Parse channels directly into sqlite
+    # Parse channels directly into sqlite.
     channel_ids: set[str] = set()
     for ch in root.findall("channel"):
         ch_id = ch.get("id", "")
@@ -451,9 +455,9 @@ def fetch_epg(
         if icon_el is not None:
             insert_icon(ch_id, icon_el.get("src", ""))
 
-    # Parse programs in batches
+    # Parse programs in batches.
     batch: list[tuple[str, str, float, float, str, str]] = []
-    batch_size = 10000
+    batch_size = 10_000
     program_count = 0
     program_channel_ids: set[str] = set()
 
@@ -493,3 +497,69 @@ def fetch_epg(
         program_count,
     )
     return program_count
+
+
+def _get_conn() -> sqlite3.Connection:
+    """Get thread-local database connection."""
+    if _local is None or _DB_PATH is None:
+        raise RuntimeError("EPG database not initialized")
+    if _local.conn is None or _local.closer is None or not _local.closer.alive:
+        # A thread's locals vanish when it exits, dropping the connection
+        # unclosed. The finalizer closes it once the thread object is gone, or
+        # at exit; it may run on another thread, hence check_same_thread=False.
+        conn = sqlite3.connect(_DB_PATH, timeout=30.0, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        closer = finalize(threading.current_thread(), conn.close)
+        _closers.append(closer)
+        _local.conn = conn
+        _local.closer = closer
+    return _local.conn
+
+
+def _dedupe_programs(programs: list[Program], preferred_source_id: str) -> list[Program]:
+    """Deduplicate overlapping programs, preferring the preferred source."""
+    if not preferred_source_id or len(programs) <= 1:
+        return programs
+    result: list[Program] = []
+    for p in programs:
+        dominated = False
+        for i, existing in enumerate(result):
+            # Check for overlap.
+            if p.start < existing.stop and p.stop > existing.start:
+                # Prefer the preferred source.
+                if p.source_id == preferred_source_id and existing.source_id != preferred_source_id:
+                    result[i] = p
+                dominated = True
+                break
+        if not dominated:
+            result.append(p)
+    return sorted(result, key=lambda p: p.start)
+
+
+def _parse_epg_time(s: str) -> datetime:
+    """Parse XMLTV time format: 20241130120000 +0000 or 20241130120000+0530."""
+    s = s.replace(" ", "")
+    if len(s) >= 14:
+        dt = datetime.strptime(s[:14], "%Y%m%d%H%M%S")
+        if len(s) > 14:
+            tz_str = s[14:]
+            sign = -1 if tz_str[0] == "-" else 1
+            tz_hours = int(tz_str[1:3]) if len(tz_str) >= 3 else 0
+            tz_mins = int(tz_str[3:5]) if len(tz_str) >= 5 else 0
+            offset = timedelta(hours=tz_hours, minutes=tz_mins)
+            dt = dt.replace(tzinfo=timezone(sign * offset))
+        return dt
+    return datetime.now(timezone.utc)
+
+
+def _sanitize_epg_xml(xml_str: str) -> str:
+    """Try to fix corrupted EPG XML by extracting valid elements."""
+    channels = re.findall(r"<channel\s+[^>]*>.*?</channel>", xml_str, re.DOTALL)
+    programmes = re.findall(
+        r'<programme\s+start="[^"<>]+"\s+stop="[^"<>]+"\s+channel="[^"<>]+"[^>]*>.*?</programme>',
+        xml_str,
+        re.DOTALL,
+    )
+    log.info("Sanitized EPG: extracted %d channels, %d programmes", len(channels), len(programmes))
+    return '<?xml version="1.0"?>\n<tv>\n' + "\n".join(channels) + "\n".join(programmes) + "\n</tv>"

@@ -1,0 +1,393 @@
+
+fail_fast: false
+default_stages:
+- pre-commit
+default_install_hook_types:
+- pre-commit
+- pre-push
+repos:
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v6.0.0
+  hooks:
+  - id: end-of-file-fixer
+    name: end-of-file-fixer
+    stages:
+    - pre-commit
+    exclude: "(?x)^(\n  (.*/)?third_party/\n)\n"
+  - id: trailing-whitespace
+    name: trailing-whitespace
+    stages:
+    - pre-commit
+    exclude: "(?x)^(\n  (.*/)?third_party/\n)\n"
+  - id: check-added-large-files
+    name: check-added-large-files
+    stages:
+    - pre-commit
+    args:
+    - --maxkb=5000
+    - --enforce-all
+    exclude: "(?x)^(\n  uv\\.lock\n  |typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\\
+      .export/typings/\n  |(.*/)?chrome/chrome_(desktop|android)_useragents\\.txt\n\
+      \  |(.*/)?uv\\.public\\.lock\n  |(.*/)?\\.export/uv\\.lock\n  |\\.(claude|sagent)/sessions/\n\
+      )\n"
+  - id: check-merge-conflict
+    name: check-merge-conflict
+    stages:
+    - pre-commit
+    args:
+    - --assume-in-merge
+  - id: check-yaml
+    name: check-yaml
+    stages:
+    - pre-commit
+  - id: check-toml
+    name: check-toml
+    stages:
+    - pre-commit
+- repo: https://github.com/rhysd/actionlint
+  rev: v1.7.12
+  hooks:
+  - id: actionlint
+    name: actionlint
+    stages:
+    - pre-commit
+    args:
+    - -ignore
+    - 'SC2016:'
+- repo: https://github.com/astral-sh/uv-pre-commit
+  rev: 0.13.7
+  hooks:
+  - id: uv-lock
+    name: uv-lock
+    stages:
+    - pre-commit
+    files: ^(pyproject\.toml|uv\.lock)$
+- repo: local
+  hooks:
+  - id: houselint
+    name: houselint
+    language: system
+    stages:
+    - pre-commit
+    require_serial: true
+    types_or:
+    - python
+    - jupyter
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.lint
+  - id: codespell
+    name: codespell
+    language: system
+    stages:
+    - pre-commit
+    types_or:
+    - python
+    - markdown
+    - jupyter
+    - shell
+    entry: uv --quiet run --frozen --group pre-commit codespell
+    args:
+    - -w
+    exclude: "(?x)^(\n  typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n\
+      \  |(.*/)?third_party/\n  |\\.(claude|sagent)/sessions/\n  |docs/symbols\\.md\n\
+      )\n"
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  rev: v0.17.4
+  hooks:
+  - id: ruff-format
+    name: ruff-format-pre
+    stages:
+    - pre-commit
+    require_serial: true
+    types_or:
+    - python
+    - pyi
+    - jupyter
+  - id: ruff-check
+    name: ruff-check
+    stages:
+    - pre-commit
+    require_serial: true
+    types_or:
+    - python
+    - pyi
+    - jupyter
+    args:
+    - --fix
+    - --extend-select
+    - COM812
+  - id: ruff-format
+    name: ruff-format
+    stages:
+    - pre-commit
+    require_serial: true
+    types_or:
+    - python
+    - pyi
+    - jupyter
+- repo: local
+  hooks:
+  - id: codegraph-sync
+    name: codegraph-sync
+    alias: harvest-affected
+    language: system
+    stages:
+    - pre-commit
+    require_serial: true
+    types:
+    - python
+    pass_filenames: false
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.affected.codegraph_sync
+      --caches /opt/scratch/caches/codegraph
+  - id: ty-check-spool
+    name: ty-check-spool
+    alias: ty-check
+    language: system
+    stages:
+    - pre-commit
+    require_serial: true
+    types_or:
+    - python
+    - pyi
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool
+      ty-check
+  - id: ty-check
+    name: ty-check
+    language: system
+    stages:
+    - pre-commit
+    verbose: true
+    require_serial: true
+    pass_filenames: false
+    alias: superseded-at-pre-push
+    types_or:
+    - python
+    - pyi
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.typecheck
+      ty-check
+    args:
+    - --dependents
+    - codedoctor.affected
+  - id: pyrefly-check-spool
+    name: pyrefly-check-spool
+    alias: pyrefly-check
+    language: system
+    stages:
+    - pre-commit
+    require_serial: true
+    types_or:
+    - python
+    - pyi
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool
+      pyrefly-check
+  - id: pyrefly-check
+    name: pyrefly-check
+    language: system
+    stages:
+    - pre-commit
+    verbose: true
+    require_serial: true
+    pass_filenames: false
+    alias: superseded-at-pre-push
+    types_or:
+    - python
+    - pyi
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.typecheck
+      pyrefly-check
+    args:
+    - --dependents
+    - codedoctor.affected
+    - --fixer
+    - codedoctor.assert_isinstance
+  - id: basedpyright-spool
+    name: basedpyright-spool
+    alias: basedpyright
+    language: system
+    stages:
+    - pre-commit
+    require_serial: true
+    types_or:
+    - python
+    - pyi
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool
+      basedpyright
+    exclude: "(?x)^(\n  typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n\
+      \  |(.*/)?third_party/\n  |website/rekursiv-ai\\.github\\.io/_site/\n)\n"
+  - id: basedpyright
+    name: basedpyright
+    language: system
+    stages:
+    - pre-commit
+    verbose: true
+    require_serial: true
+    pass_filenames: false
+    types_or:
+    - python
+    - pyi
+    entry: env NODE_OPTIONS=--max-old-space-size=2048 uv --quiet run --frozen --group
+      pre-commit python -m codedoctor.typecheck basedpyright
+    args:
+    - --dependents
+    - codedoctor.affected
+    - --fixer
+    - codedoctor.assert_isinstance
+- repo: local
+  hooks:
+  - id: pytest-spool
+    name: pytest-spool
+    alias: pytest
+    language: system
+    stages:
+    - pre-commit
+    require_serial: true
+    types:
+    - python
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool
+      pytest
+  - id: pytest
+    name: pytest
+    language: system
+    stages:
+    - pre-commit
+    require_serial: true
+    pass_filenames: false
+    verbose: true
+    alias: superseded-at-pre-push
+    types:
+    - python
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing
+      pytest
+    args:
+    - --dependents
+    - codedoctor.affected
+  - id: mutation-spool
+    name: mutation-spool
+    alias: mutation
+    language: system
+    stages:
+    - pre-commit
+    require_serial: true
+    types:
+    - python
+    exclude: "(?x)^(\n  typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n\
+      \  |(.*/)?third_party/\n)\n"
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool
+      mutation
+  - id: mutation
+    name: mutation
+    language: system
+    stages:
+    - pre-commit
+    require_serial: true
+    pass_filenames: false
+    verbose: true
+    types:
+    - python
+    exclude: "(?x)^(\n  typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n\
+      \  |(.*/)?third_party/\n)\n"
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate run
+      mutation -- codedoctor.mutation --function-sample-rate 0.05 --max-functions-sampled
+      4 --timeout-sec 900 --explain --prefer-changed-in-pre-commit
+  - id: coverage-floor-spool
+    name: coverage-floor-spool
+    alias: coverage-floor
+    language: system
+    stages:
+    - pre-commit
+    require_serial: true
+    types:
+    - python
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool
+      coverage-floor
+  - id: coverage-floor
+    name: coverage-floor
+    language: system
+    stages:
+    - pre-commit
+    verbose: true
+    types:
+    - python
+    require_serial: true
+    pass_filenames: false
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing
+      coverage-floor
+- repo: local
+  hooks:
+  - id: ty-check-global
+    name: ty-check-global
+    language: system
+    always_run: true
+    pass_filenames: false
+    stages:
+    - pre-push
+    entry: uv --quiet run --frozen --group pre-commit ty check
+  - id: basedpyright-global
+    name: basedpyright-global
+    language: system
+    always_run: true
+    pass_filenames: false
+    stages:
+    - manual
+    entry: env NODE_OPTIONS=--max-old-space-size=2048 uv --quiet run --frozen --group
+      pre-commit python -m codedoctor.gate threaded basedpyright-global -- basedpyright
+      --threads={workers}
+  - id: pyrefly-check-global
+    name: pyrefly-check-global
+    language: system
+    always_run: true
+    pass_filenames: false
+    stages:
+    - pre-push
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate threaded
+      pyrefly-check-global -- pyrefly check --threads={workers}
+  - id: pytest-global
+    name: pytest-global
+    language: system
+    always_run: true
+    pass_filenames: false
+    stages:
+    - pre-push
+    verbose: true
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing
+      tier pytest-global
+    args:
+    - --plugin
+    - codedoctor.testing.listing
+  - id: pytest-slow-global
+    name: pytest-slow-global
+    language: system
+    always_run: true
+    pass_filenames: false
+    stages:
+    - pre-push
+    verbose: true
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing
+      tier pytest-slow-global
+    args:
+    - --plugin
+    - codedoctor.testing.listing
+  - id: pytest-ci-smoke-global
+    name: pytest-ci-smoke-global
+    language: system
+    always_run: true
+    pass_filenames: false
+    stages:
+    - pre-push
+    verbose: true
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing
+      tier pytest-ci-smoke-global
+    args:
+    - --plugin
+    - codedoctor.testing.listing
+  - id: pytest-integration-global
+    name: pytest-integration-global
+    language: system
+    always_run: true
+    pass_filenames: false
+    stages:
+    - pre-push
+    verbose: true
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing
+      tier pytest-integration-global
+    args:
+    - --plugin
+    - codedoctor.testing.listing

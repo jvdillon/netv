@@ -5,7 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from unittest import mock
 
+import os
 import subprocess
+import time
 
 import pytest
 
@@ -16,7 +18,7 @@ import cache
 def cache_module(tmp_path: Path):
     """Import cache module with temp directories."""
 
-    # Patch paths to temp locations
+    # Patch paths to temp locations.
     original_server_settings = cache.SERVER_SETTINGS_FILE
     original_users_dir = cache.USERS_DIR
     original_cache_dir = cache.CACHE_DIR
@@ -26,7 +28,7 @@ def cache_module(tmp_path: Path):
     cache.CACHE_DIR = tmp_path / "cache"
     cache.CACHE_DIR.mkdir(exist_ok=True)
 
-    # Clear memory cache
+    # Clear memory cache.
     cache._cache.clear()
 
     yield cache
@@ -81,7 +83,7 @@ class TestCachedInfo:
         fetch_fn = mock.Mock(return_value={"result": 1})
         cache_module.get_cached_info("key1", fetch_fn)
         cache_module.get_cached_info("key1", fetch_fn)
-        # Only called once - second call uses memory cache
+        # Only called once - second call uses memory cache.
         fetch_fn.assert_called_once()
 
     def test_get_cached_info_force_bypasses_memory(self, cache_module):
@@ -121,6 +123,12 @@ class TestSettings:
         cache_module.save_server_settings({"live_dvr_mins": -5})
         assert cache_module.load_server_settings()["live_dvr_mins"] == 0
 
+    @pytest.mark.parametrize("value", ["120", [], {}])
+    def test_live_dvr_window_rejects_non_integer_settings(self, cache_module, value):
+        cache_module.save_server_settings({"live_dvr_mins": value})
+        with pytest.raises(TypeError, match="live_dvr_mins must be an integer"):
+            cache_module.load_server_settings()
+
 
 class TestUserSettings:
     def test_load_user_settings_defaults(self, cache_module):
@@ -145,10 +153,10 @@ class TestUserSettings:
         assert entry["duration"] == 3600.0
 
     def test_watch_position_resets_at_95_percent(self, cache_module):
-        # Save at 96% watched
+        # Save at 96% watched.
         cache_module.save_watch_position("user1", "http://video.url", 960.0, 1000.0)
         entry = cache_module.get_watch_position("user1", "http://video.url")
-        assert entry is None  # Should be reset
+        assert entry is None  # Should be reset.
 
     def test_live_views_are_counted_by_source_and_stream(self, cache_module):
         assert cache_module.record_live_view("user1", "source-a", 7) == 1
@@ -186,8 +194,8 @@ class TestSource:
                     "name": "Source 1",
                     "type": "m3u",
                     "url": "http://example.com/playlist.m3u",
-                }
-            ]
+                },
+            ],
         }
         cache_module.save_server_settings(settings)
         sources = cache_module.get_sources()
@@ -213,8 +221,8 @@ class TestUpdateSourceEpgUrl:
                     "type": "m3u",
                     "url": "http://x",
                     "epg_url": "http://existing",
-                }
-            ]
+                },
+            ],
         }
         cache_module.save_server_settings(settings)
         cache_module.update_source_epg_url("s1", "http://new")
@@ -230,9 +238,7 @@ class TestUpdateSourceEpgUrl:
 
     def test_update_source_epg_url_does_not_log_credentials(self, cache_module, caplog):
         caplog.set_level("INFO", logger=cache_module.log.name)
-        settings = {
-            "sources": [{"id": "s1", "name": "S1", "type": "xtream", "url": "http://x"}]
-        }
+        settings = {"sources": [{"id": "s1", "name": "S1", "type": "xtream", "url": "http://x"}]}
         cache_module.save_server_settings(settings)
 
         cache_module.update_source_epg_url(
@@ -316,7 +322,7 @@ class TestEncoderDetection:
         """Test detect_encoders with mixed hardware availability."""
 
         def mock_test(cmd, timeout=5, env=None):
-            # Return True only for VAAPI
+            # Return True only for VAAPI.
             if "h264_vaapi" in cmd:
                 return True, ""
             return False, "not available"
@@ -358,7 +364,7 @@ class TestEncoderDetection:
             captured_envs.append(env)
             return False, "test"
 
-        # Mock auto-detected VAAPI device
+        # Mock auto-detected VAAPI device.
         with (
             mock.patch.object(cache, "_test_encoder", side_effect=capture_cmd),
             mock.patch.object(cache, "VAAPI_DEVICE", "/dev/dri/renderD128"),
@@ -374,7 +380,7 @@ class TestEncoderDetection:
         assert "-init_hw_device" in vaapi_cmds[0]
         assert "hwupload" in " ".join(vaapi_cmds[0])
         assert "constrained_baseline" not in " ".join(vaapi_cmds[0])
-        # Second command: constrained_baseline fallback
+        # Second command: constrained_baseline fallback.
         assert "constrained_baseline" in " ".join(vaapi_cmds[1])
 
     def test_detect_encoders_qsv_command_structure(self):
@@ -388,7 +394,7 @@ class TestEncoderDetection:
         with mock.patch.object(cache, "_test_encoder", side_effect=capture_cmd):
             cache.detect_encoders()
 
-        # Find QSV command
+        # Find QSV command.
         qsv_cmd = [c for c in captured_cmds if "h264_qsv" in c][0]
         assert "-hwaccel" in qsv_cmd
         assert "qsv" in qsv_cmd
@@ -412,7 +418,7 @@ class TestEncoderDetection:
             }
             assert result == cache.AVAILABLE_ENCODERS
 
-        # Restore original
+        # Restore original.
         cache.AVAILABLE_ENCODERS = original
 
     def test_default_encoder_prefers_nvenc_with_vaapi(self):
@@ -500,6 +506,75 @@ class TestEncoderDetection:
             cache.AVAILABLE_ENCODERS = original
 
 
+class TestInitialize:
+    def test_initialize_paths_prefers_legacy_cache_dir(self, monkeypatch, tmp_path):
+        (tmp_path / "cache").mkdir()
+        monkeypatch.setattr(cache, "APP_DIR", tmp_path)
+        monkeypatch.setattr(cache, "CACHE_DIR", tmp_path / ".cache")
+        monkeypatch.setattr(cache, "SERVER_SETTINGS_FILE", tmp_path / ".cache/server_settings.json")
+        monkeypatch.setattr(cache, "USERS_DIR", tmp_path / ".cache/users")
+        monkeypatch.setattr(cache, "LOGOS_DIR", tmp_path / ".cache/logos")
+        cache.initialize_paths()
+        assert tmp_path / "cache" == cache.CACHE_DIR
+        assert tmp_path / "cache/server_settings.json" == cache.SERVER_SETTINGS_FILE
+        assert tmp_path / "cache/users" == cache.USERS_DIR
+        assert tmp_path / "cache/logos" == cache.LOGOS_DIR
+
+    def test_initialize_paths_keeps_caller_overrides(self, monkeypatch, tmp_path):
+        (tmp_path / "cache").mkdir()
+        custom = tmp_path / "custom"
+        monkeypatch.setattr(cache, "APP_DIR", tmp_path)
+        monkeypatch.setattr(cache, "CACHE_DIR", custom)
+        monkeypatch.setattr(cache, "SERVER_SETTINGS_FILE", custom / "settings.json")
+        monkeypatch.setattr(cache, "USERS_DIR", custom / "people")
+        monkeypatch.setattr(cache, "LOGOS_DIR", custom / "icons")
+        cache.initialize_paths()
+        assert custom == cache.CACHE_DIR
+        assert custom / "settings.json" == cache.SERVER_SETTINGS_FILE
+        assert custom / "people" == cache.USERS_DIR
+        assert custom / "icons" == cache.LOGOS_DIR
+        assert not custom.exists()
+
+    def test_initialize_detects_once_into_shared_table(self, monkeypatch):
+        table: dict[str, bool] = {}
+        monkeypatch.setattr(cache, "AVAILABLE_ENCODERS", table)
+        monkeypatch.setattr(cache, "VAAPI_DEVICE", None)
+        monkeypatch.setattr(cache, "LIBVA_DRIVER", None)
+        monkeypatch.setattr(cache, "DRI_PATH", None)
+        monkeypatch.setattr(cache, "_detect_vaapi_device", lambda: "/dev/dri/renderD128")
+        monkeypatch.setattr(cache, "_detect_libva_driver", lambda: "iHD")
+        monkeypatch.setattr(cache, "_detect_dri_path", lambda: "/usr/lib/dri")
+        detect = mock.Mock(return_value={"nvenc": True})
+        monkeypatch.setattr(cache, "detect_encoders", detect)
+        cache.initialize()
+        cache.initialize()
+        detect.assert_called_once()
+        assert table == {"nvenc": True}
+        assert cache.VAAPI_DEVICE == "/dev/dri/renderD128"
+        assert cache.LIBVA_DRIVER == "iHD"
+        assert cache.DRI_PATH == "/usr/lib/dri"
+
+    def test_initialize_keeps_supplied_hardware(self, monkeypatch):
+        monkeypatch.setattr(cache, "AVAILABLE_ENCODERS", {})
+        monkeypatch.setattr(cache, "VAAPI_DEVICE", "/dev/custom")
+        monkeypatch.setattr(cache, "LIBVA_DRIVER", "radeonsi")
+        monkeypatch.setattr(cache, "DRI_PATH", "/opt/dri")
+        monkeypatch.setattr(cache, "detect_encoders", lambda: {"vaapi": True})
+        cache.initialize()
+        assert (cache.VAAPI_DEVICE, cache.LIBVA_DRIVER, cache.DRI_PATH) == (
+            "/dev/custom",
+            "radeonsi",
+            "/opt/dri",
+        )
+
+    def test_refresh_encoders_updates_shared_table_in_place(self, monkeypatch):
+        table = {"nvenc": True}
+        monkeypatch.setattr(cache, "AVAILABLE_ENCODERS", table)
+        monkeypatch.setattr(cache, "detect_encoders", lambda: {"qsv": True})
+        assert cache.refresh_encoders() is table
+        assert table == {"qsv": True}
+
+
 class TestLogoCache:
     """Tests for logo caching functions."""
 
@@ -524,7 +599,7 @@ class TestLogoCache:
     def test_url_to_filename_extracts_name(self):
         result = cache._url_to_filename("http://example.com/logos/channel1.png")
         assert result.startswith("channel1_")
-        assert len(result) == len("channel1_") + 8  # name + underscore + 8 char hash
+        assert len(result) == len("channel1_") + 8  # `name` + underscore + 8 char hash.
 
     def test_url_to_filename_strips_extension(self):
         result = cache._url_to_filename("http://example.com/logo.png")
@@ -534,29 +609,32 @@ class TestLogoCache:
     def test_url_to_filename_hash_differs_by_url(self):
         r1 = cache._url_to_filename("http://example.com/a/logo.png")
         r2 = cache._url_to_filename("http://example.com/b/logo.png")
-        # Same base name but different hashes
+        # Same base name but different hashes.
         assert r1.startswith("logo_")
         assert r2.startswith("logo_")
         assert r1 != r2
 
     def test_url_to_filename_fallback_to_hash(self):
         result = cache._url_to_filename("http://example.com/")
-        assert len(result) == 8  # Just the hash
+        assert len(result) == 8  # Just the hash.
 
     def test_save_and_get_cached_logo(self, cache_module, tmp_path):
         cache_module.LOGOS_DIR = tmp_path / "logos"
         cache_module.LOGOS_DIR.mkdir()
 
-        # Save a logo
-        data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100  # Fake PNG
+        # Save a logo.
+        data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100  # Fake PNG.
         path = cache_module.save_logo(
-            "TestSource", "http://example.com/logo.png", data, "image/png"
+            "TestSource",
+            "http://example.com/logo.png",
+            data,
+            "image/png",
         )
         assert path.exists()
         assert path.suffix == ".png"
         assert path.read_bytes() == data
 
-        # Get cached logo
+        # Get cached logo.
         cached = cache_module.get_cached_logo("TestSource", "http://example.com/logo.png")
         assert cached == path
 
@@ -568,25 +646,23 @@ class TestLogoCache:
         assert cached is None
 
     def test_get_cached_logo_expires(self, cache_module, tmp_path):
-        import time
 
         cache_module.LOGOS_DIR = tmp_path / "logos"
         cache_module.LOGOS_DIR.mkdir()
 
-        # Save a logo
+        # Save a logo.
         data = b"\x89PNG" + b"\x00" * 100
         path = cache_module.save_logo("TestSource", "http://example.com/old.png", data, "image/png")
 
-        # Backdate the file
-        old_time = time.time() - cache_module.LOGO_CACHE_TTL - 100
-        import os
+        # Backdate the file.
+        old_time = time.time() - 7 * 24 * 3600 - 100
 
         os.utime(path, (old_time, old_time))
 
-        # Should be expired
+        # Should be expired.
         cached = cache_module.get_cached_logo("TestSource", "http://example.com/old.png")
         assert cached is None
-        assert not path.exists()  # Should be deleted
+        assert not path.exists()  # Should be deleted.
 
     def test_save_logo_content_type_mapping(self, cache_module, tmp_path):
         cache_module.LOGOS_DIR = tmp_path / "logos"
@@ -601,6 +677,6 @@ class TestLogoCache:
 
 
 if __name__ == "__main__":
-    from testing import run_tests
+    from codedoctor.lib.testing.runner import test_main
 
-    run_tests(__file__)
+    test_main(__file__)

@@ -17,67 +17,6 @@ NOW = 1_800_000_000.0
 T = TypeVar("T")
 
 
-def _some(value: T | None) -> T:
-    assert value is not None
-    return value
-
-
-@pytest.fixture(autouse=True)
-def _state(tmp_path: Path):
-    users = tmp_path / "users"
-    (users / "ann").mkdir(parents=True)
-    handoff.load(users)
-    handoff._watches.clear()
-    handoff._recorders.clear()
-    handoff._generations.clear()
-    with patch("ffmpeg_command.get_transcode_dir", return_value=tmp_path):
-        yield users
-    handoff._users_dir = None
-    handoff._records.clear()
-    handoff._watches.clear()
-    handoff._recorders.clear()
-
-
-def _channel(catchup_days: int = 0, **overrides) -> handoff.Channel:
-    channel = handoff.Channel(
-        stream_id="7",
-        name="News",
-        url="http://upstream.test/live/u/p/7.m3u8",
-        catchup_days=catchup_days,
-        program_title="Evening News",
-        program_start=NOW - 1800,
-        program_end=NOW + 1800,
-    )
-    for key, value in overrides.items():
-        setattr(channel, key, value)
-    return channel
-
-
-def _process(running: bool = True) -> MagicMock:
-    process = MagicMock()
-    process.poll.return_value = None if running else 0
-    return process
-
-
-def _watch(
-    seconds: float, position: float = NOW - 5, handoff_id: str = "", now: float = NOW
-) -> None:
-    handoff.report_watch("ann", "7", now - seconds, handoff_id, now=now - seconds)
-    handoff.report_watch("ann", "7", position, handoff_id, now=now)
-
-
-def _stop(channel, position: float = NOW - 5, handoff_id: str = "", release=None, now=NOW):
-    return handoff.stop_watch(
-        "ann",
-        "7",
-        position,
-        lambda _stream_id, _position: channel,
-        release or MagicMock(),
-        handoff_id,
-        now=now,
-    )
-
-
 class TestStop:
     def test_short_views_are_not_handed_off(self):
         _watch(60)
@@ -87,14 +26,14 @@ class TestStop:
     def test_stop_without_a_watch_is_ignored(self):
         assert _stop(_channel(catchup_days=2)) is None
 
-    def test_archived_channel_resumes_as_catchup(self, _state):
+    def test_archived_channel_resumes_as_catchup(self, state):
         _watch(600)
         record = _some(_stop(_channel(catchup_days=2)))
         assert record["mode"] == "catchup"
         assert record["position"] == NOW - 5
         assert record["program_title"] == "Evening News"
         assert _some(handoff.current("ann", now=NOW))["id"] == record["id"]
-        saved = json.loads((_state / "ann" / "handoff.json").read_text())
+        saved = json.loads((state / "ann" / "handoff.json").read_text())
         assert saved["id"] == record["id"]
 
     def test_channel_without_archive_records_until_program_end(self):
@@ -108,13 +47,13 @@ class TestStop:
         assert record["mode"] == "recording"
         assert record["recording_id"] == recording_id
         assert record["recording_start"] == NOW
-        assert record["expires"] == NOW + 1800 + handoff.KEEP_SECS
+        assert record["expires"] == NOW + 1800 + 24 * 3600
 
     def test_recording_without_guide_end_is_capped(self):
         _watch(600)
         with patch("handoff._start_recorder", return_value=_process()) as start:
             _stop(_channel(program_end=0.0))
-        assert start.call_args.args[2] == handoff.MAX_RECORDING_SECS
+        assert start.call_args.args[2] == 3 * 3600
 
     def test_stopping_at_program_end_leaves_nothing(self):
         _watch(600)
@@ -200,7 +139,7 @@ class TestCancel:
         process = _process()
 
         def launch(*_args):
-            handoff.cancel("ann")  # Another device starts playing meanwhile
+            handoff.cancel("ann")  # Another device starts playing meanwhile.
             return process
 
         with patch("handoff._start_recorder", side_effect=launch):
@@ -228,7 +167,7 @@ class TestSweep:
     def test_expired_handoff_is_dropped(self):
         _watch(600)
         _stop(_channel(catchup_days=2))
-        handoff.sweep(MagicMock(), MagicMock(), now=NOW + handoff.KEEP_SECS + 1)
+        handoff.sweep(MagicMock(), MagicMock(), now=NOW + 24 * 3600 + 1)
         assert handoff._records == {}
 
     def test_finished_recorder_is_marked_and_kept(self, tmp_path):
@@ -284,3 +223,73 @@ class TestRecordingFiles:
         assert cmd[i - 2 : i + 2] == ["-t", "1800", "-i", "http://upstream.test/7.m3u8"]
         assert "event" in cmd
         assert cmd[-1] == f"{tmp_path}/stream.m3u8"
+
+
+def _some(value: T | None) -> T:
+    assert value is not None
+    return value
+
+
+@pytest.fixture(autouse=True)
+def state(tmp_path: Path):
+    users = tmp_path / "users"
+    (users / "ann").mkdir(parents=True)
+    handoff.load(users)
+    handoff._watches.clear()
+    handoff._recorders.clear()
+    handoff._generations.clear()
+    with patch("ffmpeg_command.get_transcode_dir", return_value=tmp_path):
+        yield users
+    handoff._users_dir = None
+    handoff._records.clear()
+    handoff._watches.clear()
+    handoff._recorders.clear()
+
+
+def _channel(catchup_days: int = 0, **overrides) -> handoff.Channel:
+    channel = handoff.Channel(
+        stream_id="7",
+        name="News",
+        url="http://upstream.test/live/u/p/7.m3u8",
+        catchup_days=catchup_days,
+        program_title="Evening News",
+        program_start=NOW - 1800,
+        program_end=NOW + 1800,
+    )
+    for key, value in overrides.items():
+        setattr(channel, key, value)
+    return channel
+
+
+def _process(running: bool = True) -> MagicMock:
+    process = MagicMock()
+    process.poll.return_value = None if running else 0
+    return process
+
+
+def _watch(
+    seconds: float,
+    position: float = NOW - 5,
+    handoff_id: str = "",
+    now: float = NOW,
+) -> None:
+    handoff.report_watch("ann", "7", now - seconds, handoff_id, now=now - seconds)
+    handoff.report_watch("ann", "7", position, handoff_id, now=now)
+
+
+def _stop(channel, position: float = NOW - 5, handoff_id: str = "", release=None, now=NOW):
+    return handoff.stop_watch(
+        "ann",
+        "7",
+        position,
+        lambda _stream_id, _position: channel,
+        release or MagicMock(),
+        handoff_id,
+        now=now,
+    )
+
+
+if __name__ == "__main__":
+    from codedoctor.lib.testing.runner import test_main
+
+    test_main(__file__)

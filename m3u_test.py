@@ -11,12 +11,12 @@ import json
 import pytest
 
 import cache
+import m3u
 
 
 @pytest.fixture
 def m3u_module(tmp_path: Path):
     """Import m3u module with mocked cache."""
-    import cache
 
     cache.SERVER_SETTINGS_FILE = tmp_path / "server_settings.json"
     cache.USERS_DIR = tmp_path / "users"
@@ -24,8 +24,6 @@ def m3u_module(tmp_path: Path):
     cache.CACHE_DIR = tmp_path / "cache"
     cache.CACHE_DIR.mkdir(exist_ok=True)
     cache.get_cache().clear()
-
-    import m3u
 
     yield m3u
 
@@ -130,7 +128,7 @@ class TestMakeClientUserAgent:
     def test_make_client_uses_persisted_user_agent(self, m3u_module):
         source = SimpleNamespace(url="http://example.com", username="u", password="p")
         cache.SERVER_SETTINGS_FILE.write_text(
-            json.dumps({"user_agent_preset": "custom", "user_agent_custom": "MyAgent/9.9"})
+            json.dumps({"user_agent_preset": "custom", "user_agent_custom": "MyAgent/9.9"}),
         )
         assert m3u_module._make_client(source).user_agent == "MyAgent/9.9"
 
@@ -142,7 +140,7 @@ class TestMakeClientUserAgent:
         resp.__exit__ = MagicMock(return_value=False)
         with patch.object(m3u_module, "safe_urlopen", return_value=resp) as mock_open:
             m3u_module.fetch_m3u("http://example.com/list.m3u", "src1")
-        assert mock_open.call_args.kwargs["user_agent"] == cache.USER_AGENT_PRESETS["vlc"]
+        assert mock_open.call_args.kwargs["user_agent"] == "VLC/3.0.20 LibVLC/3.0.20"
 
 
 class TestFetchSourceLiveData:
@@ -173,9 +171,7 @@ class TestFetchSourceLiveData:
 
 class TestAggregateSourceData:
     @pytest.mark.parametrize("epg_enabled", [True, False])
-    def test_live_sources_share_normalization_without_persisting_epg(
-        self, m3u_module, epg_enabled
-    ):
+    def test_live_sources_share_normalization_without_persisting_epg(self, m3u_module, epg_enabled):
         sources = [
             cache.Source(
                 id=kind,
@@ -227,22 +223,39 @@ class TestAggregateSourceData:
         persist.assert_not_called()
 
     def test_live_source_failure_does_not_drop_other_sources(self, m3u_module, caplog):
-        broken = cache.Source("broken", "Offline source", "xtream", "https://offline.example")
-        working = cache.Source("working", "EPG source", "epg", "https://epg.example")
+        broken = cache.Source(
+            id="broken",
+            name="Offline source",
+            type="xtream",
+            url="https://offline.example",
+        )
+        working = cache.Source(
+            id="working",
+            name="EPG source",
+            type="epg",
+            url="https://epg.example",
+        )
         with (
             patch.object(m3u_module, "get_sources", return_value=[broken, working]),
             patch.object(m3u_module, "_make_client", side_effect=OSError("offline")),
         ):
             assert m3u_module._fetch_all_live_data() == (
-                [], [], [(working.url, working.epg_timeout, working.id)]
+                [],
+                [],
+                [(working.url, working.epg_timeout, working.id)],
             )
         assert "Error loading source Offline source" in caplog.text
 
     def test_vod_sources_use_shared_loader_and_keep_order(self, m3u_module):
         sources = [
-            cache.Source("a", "First", "xtream", "https://a.example"),
-            cache.Source("playlist", "Playlist", "m3u", "https://playlist.example"),
-            cache.Source("b", "Second", "xtream", "https://b.example"),
+            cache.Source(id="a", name="First", type="xtream", url="https://a.example"),
+            cache.Source(
+                id="playlist",
+                name="Playlist",
+                type="m3u",
+                url="https://playlist.example",
+            ),
+            cache.Source(id="b", name="Second", type="xtream", url="https://b.example"),
         ]
         clients = {source.id: MagicMock() for source in sources if source.type == "xtream"}
         for client in clients.values():
@@ -252,7 +265,9 @@ class TestAggregateSourceData:
             patch.object(m3u_module, "get_sources", return_value=sources),
             patch.object(m3u_module, "_make_client", side_effect=lambda s: clients[s.id]),
             patch.object(
-                m3u_module, "fetch_source_vod_data", wraps=m3u_module.fetch_source_vod_data
+                m3u_module,
+                "fetch_source_vod_data",
+                wraps=m3u_module.fetch_source_vod_data,
             ) as fetch,
         ):
             cats, streams = m3u_module._fetch_vod_data()
@@ -262,15 +277,12 @@ class TestAggregateSourceData:
             {"category_id": "films", "source_id": "a"},
             {"category_id": "films", "source_id": "b"},
         ]
-        assert streams == [
-            {"stream_id": 1, "source_id": "a"},
-            {"stream_id": 1, "source_id": "b"},
-        ]
+        assert streams == [{"stream_id": 1, "source_id": "a"}, {"stream_id": 1, "source_id": "b"}]
 
     def test_vod_source_failure_does_not_drop_other_sources(self, m3u_module, caplog):
         sources = [
-            cache.Source("broken", "Offline", "xtream", "https://offline.example"),
-            cache.Source("working", "Online", "xtream", "https://online.example"),
+            cache.Source(id="broken", name="Offline", type="xtream", url="https://offline.example"),
+            cache.Source(id="working", name="Online", type="xtream", url="https://online.example"),
         ]
         client = MagicMock()
         client.get_vod_categories.return_value = [{"category_id": "films"}]
@@ -286,6 +298,6 @@ class TestAggregateSourceData:
 
 
 if __name__ == "__main__":
-    from testing import run_tests
+    from codedoctor.lib.testing.runner import test_main
 
-    run_tests(__file__)
+    test_main(__file__)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pathlib
 import sqlite3
@@ -11,41 +11,30 @@ import xml.etree.ElementTree as ET
 from gateway_catalog import GatewayStream
 
 
-_SQL_CHUNK_SIZE = 400
-_GUIDE_HISTORY_HOURS = 12
-_GUIDE_DAYS = 7
-
-
 class EpgUnavailableError(RuntimeError):
     """Raised when the shared neTV EPG database is not ready."""
-
-
-def _xml_text(value: object) -> str:
-    text = str(value or "")
-    return "".join(
-        char
-        for char in text
-        if char in ("\t", "\n", "\r") or ord(char) >= 0x20
-    )
-
-
-def _xmltv_time(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp, tz=UTC).strftime("%Y%m%d%H%M%S +0000")
-
-
-def _chunks(values: list[str]) -> list[list[str]]:
-    return [
-        values[index : index + _SQL_CHUNK_SIZE]
-        for index in range(0, len(values), _SQL_CHUNK_SIZE)
-    ]
 
 
 def build_filtered_xmltv(
     database_path: pathlib.Path,
     streams: list[GatewayStream],
     now: datetime | None = None,
+    *,
+    history_hours: int = 12,
+    guide_days: int = 7,
 ) -> bytes:
-    """Build XMLTV containing only guide entries for the supplied streams."""
+    """Build XMLTV containing only guide entries for the supplied streams.
+
+    Args:
+        database_path: Shared EPG SQLite database.
+        streams: Authorized streams whose channels should be included.
+        now: Window reference instant; defaults to the current UTC time.
+        history_hours: Past guide hours to include.
+        guide_days: Future guide days to include.
+
+    Returns:
+        xmltv: UTF-8 XMLTV document.
+    """
     stream_channels: dict[str, dict[str, object]] = {}
     for stream in streams:
         channel_id = str(stream.public.get("epg_channel_id") or "")
@@ -76,9 +65,9 @@ def build_filtered_xmltv(
         raise EpgUnavailableError("EPG database is not available") from exc
 
     channel_ids = list(stream_channels)
-    current = now or datetime.now(UTC)
-    start_timestamp = (current - timedelta(hours=_GUIDE_HISTORY_HOURS)).timestamp()
-    stop_timestamp = (current + timedelta(days=_GUIDE_DAYS)).timestamp()
+    current = now or datetime.now(timezone.utc)
+    start_timestamp = (current - timedelta(hours=history_hours)).timestamp()
+    stop_timestamp = (current + timedelta(days=guide_days)).timestamp()
     programs: list[sqlite3.Row] = []
     try:
         connection.execute("PRAGMA query_only=ON")
@@ -109,7 +98,7 @@ def build_filtered_xmltv(
                     ORDER BY channel_id, start_ts
                     """,
                     [*chunk, start_timestamp, stop_timestamp],
-                ).fetchall()
+                ).fetchall(),
             )
     except sqlite3.Error as exc:
         raise EpgUnavailableError("EPG database schema is not ready") from exc
@@ -134,8 +123,7 @@ def build_filtered_xmltv(
             (
                 index
                 for index, existing in enumerate(channel_programs)
-                if row["start_ts"] < existing["stop_ts"]
-                and row["stop_ts"] > existing["start_ts"]
+                if row["start_ts"] < existing["stop_ts"] and row["stop_ts"] > existing["start_ts"]
             ),
             None,
         )
@@ -143,21 +131,15 @@ def build_filtered_xmltv(
             overlapping = [
                 existing
                 for existing in channel_programs
-                if row["start_ts"] < existing["stop_ts"]
-                and row["stop_ts"] > existing["start_ts"]
+                if row["start_ts"] < existing["stop_ts"] and row["stop_ts"] > existing["start_ts"]
             ]
             if (
                 isinstance(preferred_sources, set)
                 and row["source_id"] in preferred_sources
-                and not any(
-                    existing["source_id"] in preferred_sources
-                    for existing in overlapping
-                )
+                and not any(existing["source_id"] in preferred_sources for existing in overlapping)
             ):
                 channel_programs[:] = [
-                    existing
-                    for existing in channel_programs
-                    if existing not in overlapping
+                    existing for existing in channel_programs if existing not in overlapping
                 ]
                 channel_programs.append(row)
             continue
@@ -179,3 +161,16 @@ def build_filtered_xmltv(
                 ET.SubElement(programme, "desc").text = _xml_text(row["desc"])
 
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _xml_text(value: object) -> str:
+    text = str(value or "")
+    return "".join(char for char in text if char in ("\t", "\n", "\r") or ord(char) >= 0x20)
+
+
+def _xmltv_time(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y%m%d%H%M%S +0000")
+
+
+def _chunks(values: list[str], *, chunk_size: int = 400) -> list[list[str]]:
+    return [values[index : index + chunk_size] for index in range(0, len(values), chunk_size)]

@@ -5,9 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from urllib import error
 
 import json
-import urllib.error
 
 from fastapi.testclient import TestClient
 
@@ -19,14 +19,6 @@ import auth
 import cache
 import gateway
 import gateway_catalog
-
-
-class _FakeCatalog:
-    def __init__(self, snapshot: CatalogSnapshot) -> None:
-        self.snapshot = snapshot
-
-    def get(self) -> CatalogSnapshot:
-        return self.snapshot
 
 
 @pytest.fixture
@@ -72,7 +64,7 @@ def gateway_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 "category_id": "src_1_news",
                 "category_name": "News",
                 "parent_id": 0,
-            }
+            },
         ],
         category_access_ids={"src_1_news": "src_1_news"},
         streams=[stream],
@@ -178,11 +170,14 @@ def test_success_cache_is_checked_before_client_rate_limit(
     client, _ = gateway_client
     valid = {"username": "player", "password": "local-pass"}
     assert client.get("/player_api.php", params=valid).status_code == 200
-    monkeypatch.setattr(gateway, "_MAX_LOGIN_FAILURES", 1)
-    assert client.get(
-        "/player_api.php",
-        params={"username": "player", "password": "wrong"},
-    ).status_code == 200
+    gateway.authenticator.max_login_failures = 1
+    assert (
+        client.get(
+            "/player_api.php",
+            params={"username": "player", "password": "wrong"},
+        ).status_code
+        == 200
+    )
 
     assert client.get("/player_api.php", params=valid).status_code == 200
 
@@ -212,7 +207,7 @@ def test_player_api_exposes_local_live_catalog(gateway_client):
             "custom_sid": "",
             "tv_archive": 0,
             "tv_archive_duration": 0,
-        }
+        },
     ]
 
 
@@ -282,7 +277,7 @@ def test_upscale_setting_controls_gateway_mode(
     engine = tmp_path / "2x-nomosuni-compact_720p_fp16.engine"
     engine.write_bytes(b"engine")
     (tmp_path / "retired-model_720p_fp16.engine").write_bytes(b"engine")
-    monkeypatch.setattr(gateway, "_UPSCALE_ENGINE_DIR", tmp_path)
+    monkeypatch.setenv("SR_ENGINE_DIR", str(tmp_path))
     settings = {
         "sr_model": "",
         "transcode_hw": "nvenc+software",
@@ -305,7 +300,7 @@ def test_disabled_upscale_accepts_480p_max_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setattr(gateway, "_UPSCALE_ENGINE_DIR", tmp_path)
+    monkeypatch.setenv("SR_ENGINE_DIR", str(tmp_path))
     monkeypatch.setattr(
         gateway.cache,
         "load_server_settings",
@@ -372,9 +367,7 @@ def test_upscale_files_are_served_from_session(
     tmp_path: Path,
 ):
     client, _ = gateway_client
-    (tmp_path / "stream.m3u8").write_text(
-        "#EXTM3U\n#EXTINF:2.0,\nsegment000.ts\n"
-    )
+    (tmp_path / "stream.m3u8").write_text("#EXTM3U\n#EXTINF:2.0,\nsegment000.ts\n")
     (tmp_path / "segment000.ts").write_bytes(b"video")
     monkeypatch.setattr(
         gateway.ffmpeg_session,
@@ -388,9 +381,7 @@ def test_upscale_files_are_served_from_session(
     segment = client.get("/upscale/session/segment000.ts")
 
     assert manifest.status_code == 200
-    assert manifest.headers["content-type"].startswith(
-        "application/vnd.apple.mpegurl"
-    )
+    assert manifest.headers["content-type"].startswith("application/vnd.apple.mpegurl")
     assert "segment000.ts" in manifest.text
     assert segment.status_code == 200
     assert segment.content == b"video"
@@ -416,7 +407,7 @@ def test_source_assignment_applies_to_gateway(gateway_client):
     auth.create_user("guest", "guest-pass")
     settings = cache.load_server_settings()
     settings["sources"] = [
-        {"id": "src_1", "name": "A", "type": "xtream", "url": "http://a", "users": []}
+        {"id": "src_1", "name": "A", "type": "xtream", "url": "http://a", "users": []},
     ]
     cache.save_server_settings(settings)
 
@@ -578,7 +569,7 @@ def test_catalog_removes_upstream_credentials(tmp_path: Path, monkeypatch: pytes
                     "source_username": "remote-user",
                     "source_password": "remote-password",
                     "source_url": "https://provider.example",
-                }
+                },
             ],
             "https://provider.example/xmltv.php",
             120,
@@ -738,7 +729,7 @@ def test_catalog_retains_previous_snapshot_when_refresh_fails(
         ttl_seconds=60,
     )
     original = catalog.get()
-    fetch.side_effect = urllib.error.URLError("temporary failure")
+    fetch.side_effect = error.URLError("temporary failure")
 
     refreshed = catalog.get(force=True)
 
@@ -779,3 +770,17 @@ def test_live_stream_password_may_contain_slash(
 
     assert response.status_code == 200
     assert response.content == b"video-data"
+
+
+class _FakeCatalog:
+    def __init__(self, snapshot: CatalogSnapshot) -> None:
+        self.snapshot = snapshot
+
+    def get(self) -> CatalogSnapshot:
+        return self.snapshot
+
+
+if __name__ == "__main__":
+    from codedoctor.lib.testing.runner import test_main
+
+    test_main(__file__)

@@ -143,7 +143,8 @@ async def test_fresh_playlist_waits_for_two_new_segments(tmp_path):
     previous_segments = ffmpeg_session._playlist_segments(path)
     sleep_calls = 0
 
-    async def publish_segment(_delay):
+    async def publish_segment(delay):
+        del delay
         nonlocal sleep_calls
         sleep_calls += 1
         number = sleep_calls + 2
@@ -178,14 +179,15 @@ async def test_cancelled_launch_terminates_late_replacement():
     release = asyncio.Event()
     replacement = process()
 
-    async def launch(_command):
+    async def launch(command):
+        del command
         started.set()
         await release.wait()
         return replacement
 
     with patch("ffmpeg_session._launch_ffmpeg", side_effect=launch):
         task = asyncio.create_task(
-            ffmpeg_session._launch_recovery_ffmpeg(["ffmpeg", "replacement"])
+            ffmpeg_session._launch_recovery_ffmpeg(["ffmpeg", "replacement"]),
         )
         await started.wait()
         task.cancel()
@@ -366,10 +368,7 @@ def test_health_reports_current_recovery_generation(recovery_session):
         )
 
     assert result["playlist"] == "/transcode/recover/high.m3u8?generation=3"
-    assert (
-        result["caption_playlist"]
-        == "/transcode/recover/high-captions.m3u8?generation=3"
-    )
+    assert result["caption_playlist"] == "/transcode/recover/high-captions.m3u8?generation=3"
 
 
 def test_reused_session_response_includes_current_generation(recovery_session):
@@ -381,10 +380,7 @@ def test_reused_session_response_includes_current_generation(recovery_session):
     response = ffmpeg_session._adaptive_session_response("recover")
 
     assert response["playlist"] == "/transcode/recover/low.m3u8?generation=4"
-    assert (
-        response["caption_playlist"]
-        == "/transcode/recover/low-captions.m3u8?generation=4"
-    )
+    assert response["caption_playlist"] == "/transcode/recover/low-captions.m3u8?generation=4"
     assert response["master_playlist"] == "/transcode/recover/master.m3u8"
 
 
@@ -400,3 +396,9 @@ def test_stopping_session_cancels_recovery_tasks(recovery_session):
 
     watchdog.cancel.assert_called_once_with()
     high_recovery.cancel.assert_called_once_with()
+
+
+if __name__ == "__main__":
+    from codedoctor.lib.testing.runner import test_main
+
+    test_main(__file__)

@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
-# pyright: reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false
-"""alignm3u.py -- Align HDHomeRun M3U with XMLTV guide data.
+#!/bin/sh
+# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# fmt: off
+'''' 2>/dev/null #
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
+
+Align HDHomeRun M3U with XMLTV guide data.
 
 Takes an M3U playlist from HDHomeRun and aligns channel IDs with an XMLTV
 guide file (e.g., from zap2xml.py). Outputs a new M3U with tvg-id attributes
@@ -17,9 +21,12 @@ Usage:
     # Optionally specify the URL where xmltv.xml will be served:
     ./alignm3u.py --input lineup.m3u --xmltv xmltv.xml --output ota.m3u \\
         --xmltv-url http://your-server/xmltv.xml
-"""
+'''
+# fmt: on
 
 from __future__ import annotations
+
+from typing import Protocol, cast
 
 import argparse
 import collections
@@ -33,18 +40,34 @@ _CALLSIGN_REGEX = re.compile(r"^([A-Z]+?)(LD|DT|CD|CA|LP|TV|FM|D)(\d*)$")
 
 
 def parse_callsign(coded_callsign: str) -> tuple[str, str, int]:
-    """Parse FCC callsign into (call, suffix, number)."""
+    """Parse an FCC callsign.
+
+    Args:
+        coded_callsign: Callsign with its broadcast suffix and optional number.
+
+    Returns:
+        call: Station callsign.
+        suffix: Broadcast suffix, or an empty string for an unknown format.
+        number: Subchannel number, defaulting to one.
+    """
     result = _CALLSIGN_REGEX.search(coded_callsign.upper())
     if not result:
         return coded_callsign, "", 1
     call, suffix, num = result.groups()
     if call == "KQS" and suffix == "LD":
-        call, suffix = "KQSL", "LD"  # Known bug in some data
+        call, suffix = "KQSL", "LD"  # Known bug in some data.
     return call, suffix, int(num) if num else 1
 
 
 def parse_m3u(path: pathlib.Path) -> list[list]:
-    """Parse M3U file into list of [title, attrs, url]."""
+    """Parse M3U entries without discarding incomplete records.
+
+    Args:
+        path: Playlist file to read.
+
+    Returns:
+        entries: Lists containing title, attributes, and any following URL.
+    """
     with open(path) as f:
         first_line = f.readline().strip()
         if not first_line.startswith("#EXTM3U"):
@@ -67,7 +90,14 @@ def parse_m3u(path: pathlib.Path) -> list[list]:
 
 
 def parse_xmltv_channels(path: pathlib.Path) -> dict[str, tuple[str, ...]]:
-    """Parse XMLTV file and return {channel_id: (display_names...)}."""
+    """Read channel display names from XMLTV.
+
+    Args:
+        path: XMLTV guide file.
+
+    Returns:
+        channels: Channel IDs mapped to their display names.
+    """
     channels = {}
     for elem in ET.parse(path).getroot():
         if elem.tag == "channel":
@@ -91,7 +121,16 @@ def align_channels(
     m3u: list[list],
     lookup: dict[str, set[str]],
 ) -> tuple[list[list], list[list]]:
-    """Align M3U entries with XMLTV channel IDs. Returns (aligned, missing)."""
+    """Align M3U entries with XMLTV channel IDs in place.
+
+    Args:
+        m3u: Playlist entries containing titles, attributes, and URLs.
+        lookup: Channel names and numbers mapped to guide IDs.
+
+    Returns:
+        aligned: Original playlist with matched guide IDs added.
+        missing: Complete entries with no matching guide ID.
+    """
     missing = []
     for entry in m3u:
         if len(entry) < 3:
@@ -107,7 +146,7 @@ def align_channels(
         candidates_num = tuple(lookup.get(chan_num, ()))
         candidates_name = tuple(lookup.get(chan_name, ()))
 
-        # Priority: exact match on number > exact match on name > any match
+        # Priority: exact match on number > exact match on name > any match.
         if len(candidates_num) == 1:
             attrs["tvg-id"] = candidates_num[0]
         elif len(candidates_name) == 1:
@@ -128,7 +167,14 @@ def write_m3u(
     xmltv_url: str,
     group_prefix: str = "OTA",
 ) -> None:
-    """Write aligned M3U file."""
+    """Write an aligned M3U file.
+
+    Args:
+        m3u: Playlist entries to serialize.
+        output: Destination playlist path.
+        xmltv_url: Guide URL included in the playlist header.
+        group_prefix: Prefix prepended to each channel's groups.
+    """
     with open(output, "w") as f:
         if xmltv_url:
             print(f'#EXTM3U url-tvg="{xmltv_url}" x-tvg-url="{xmltv_url}"', file=f)
@@ -138,23 +184,23 @@ def write_m3u(
             if len(entry) < 3:
                 continue
             title, attrs, url = entry
-            # Use tvg-name as title if available
+            # Use tvg-name as title if available.
             title = attrs.get("tvg-name", title)
-            # Build group-title
+            # Build group-title.
             groups = [group_prefix]
             if "group-title" in attrs:
                 groups.append(attrs["group-title"])
-            # Mark ATSC3 channels
+            # Mark ATSC3 channels.
             if "channel-id" in attrs and float(attrs["channel-id"]) >= 100:
                 groups.append("ATSC3")
             attrs["group-title"] = " | ".join(groups)
-            # Format attributes
+            # Format attributes.
             attrs_str = " ".join(f'{k}="{v}"' for k, v in attrs.items())
             print(f"#EXTINF:-1 {attrs_str},{title}", file=f)
             print(url, file=f)
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Align HDHomeRun M3U with XMLTV guide data.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -165,6 +211,48 @@ Example:
     ./alignm3u.py --input lineup.m3u --xmltv xmltv.xml --output ota.m3u
         """,
     )
+    _add_arguments(parser)
+    args = cast(Flags, parser.parse_args())
+
+    # Parse inputs.
+    print(f"Reading M3U: {args.input}")
+    m3u = parse_m3u(args.input)
+    print(f"  Found {len(m3u)} channels")
+
+    print(f"Reading XMLTV: {args.xmltv}")
+    xmltv_channels = parse_xmltv_channels(args.xmltv)
+    print(f"  Found {len(xmltv_channels)} channels")
+
+    # Build lookup and align.
+    lookup = build_lookup(xmltv_channels)
+    m3u, missing = align_channels(m3u, lookup)
+
+    if missing:
+        print(f"\nUnable to align {len(missing)} channels:")
+        for entry in missing:
+            title, attrs = entry[0], entry[1]
+            num = attrs.get("channel-number", "?")
+            print(f"  {num}: {title}")
+
+    # Write output.
+    print(f"\nWriting: {args.output}")
+    write_m3u(m3u, args.output, args.xmltv_url, args.group)
+    aligned = len(m3u) - len(missing)
+    print(f"  Aligned {aligned}/{len(m3u)} channels")
+    return 0
+
+
+class Flags(Protocol):
+    """Playlist alignment command-line arguments."""
+
+    input: pathlib.Path
+    xmltv: pathlib.Path
+    output: pathlib.Path
+    xmltv_url: str
+    group: str
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--input",
         "-i",
@@ -198,34 +286,8 @@ Example:
         default="OTA",
         help="Group prefix for channels (default: OTA)",
     )
-    args = parser.parse_args()
-
-    # Parse inputs
-    print(f"Reading M3U: {args.input}")
-    m3u = parse_m3u(args.input)
-    print(f"  Found {len(m3u)} channels")
-
-    print(f"Reading XMLTV: {args.xmltv}")
-    xmltv_channels = parse_xmltv_channels(args.xmltv)
-    print(f"  Found {len(xmltv_channels)} channels")
-
-    # Build lookup and align
-    lookup = build_lookup(xmltv_channels)
-    m3u, missing = align_channels(m3u, lookup)
-
-    if missing:
-        print(f"\nUnable to align {len(missing)} channels:")
-        for entry in missing:
-            title, attrs = entry[0], entry[1]
-            num = attrs.get("channel-number", "?")
-            print(f"  {num}: {title}")
-
-    # Write output
-    print(f"\nWriting: {args.output}")
-    write_m3u(m3u, args.output, args.xmltv_url, args.group)
-    aligned = len(m3u) - len(missing)
-    print(f"  Aligned {aligned}/{len(m3u)} channels")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
+# vim: ft=python

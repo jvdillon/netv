@@ -1,10 +1,10 @@
 [project]
 name = "netv"
-version = "0.4.0"
+version = "0.4.1"
 description = "Minimal self-hosted IPTV web interface with EPG guide, VOD, and Chromecast"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [
     { name = "Joshua V. Dillon" },
 ]
@@ -17,35 +17,65 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Multimedia :: Video :: Display",
 ]
 dependencies = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.32",
-    "jinja2>=3.1",
-    "python-multipart>=0.0.9",
+    "PyChromecast>=13.1,<15",
     "cryptography>=43.0",
     "defusedxml>=0.7",
-    "PyChromecast>=13.1,<15",
+    "fastapi>=0.115",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
+    "uvicorn[standard]>=0.32",
+    "wrapt>=2.5.2",
 ]
 
 [dependency-groups]
-dev = [
-    "basedpyright>=1.10",
-    "httpx>=0.27",
-    "pytest>=7.0",
-    "pytest-asyncio>=0.23",
-    "ruff>=0.8",
-]
 ai_upscale = [
     "torch>=2.0",
     "onnx>=1.14",
     "onnxconverter-common>=1.14",
     "safetensors>=0.4",
     "tensorrt>=10.0",
+]
+ipython = [
+    "ipython>=9.18.0",
+    "gnureadline>=8.3.3",
+]
+lint = [
+    "codespell>=2.4.3",
+    "ruff>=0.17.3",
+]
+typecheck = [
+    "basedpyright>=1.40.2",
+    "hatchling>=1.33.0",
+    "pyrefly>=1.4.0",
+    "ty>=0.0.95",
+]
+test = [
+    "pytest-cov>=7.1.0",
+    "pytest-testmon>=2.3.0",
+    "pytest-timeout>=2.4.0",
+    "pytest-asyncio>=1.4.1",
+    "pytest-xdist>=3.8.0",
+    "pytest>=9.1.1",
+    "httpx2>=2.16.0",
+]
+pre-commit = [
+    {include-group = "lint"},
+    {include-group = "test"},
+    {include-group = "typecheck"},
+    "codedoctor[coverage,mutation,notebook]",
+    "onnx>=1.23.2",
+    "onnxconverter-common>=1.16.0",
+    "pre-commit>=4.7.0",
+    "rekursiv-ai-typings>=0.1.15",
+    "treekle>=0.4.4",
+    "wrapt>=2.5.2",
 ]
 
 [project.urls]
@@ -59,14 +89,20 @@ build-backend = "hatchling.build"
 include = ["*.py"]
 
 [tool.uv]
-package = false
+package = true
 
+[tool.uv.sources]
+codedoctor = { path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-v6/codedoctor-0.1.2-py3-none-any.whl" }
+rekursiv-ai-typings = { path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-typings-v2/rekursiv_ai_typings-0.1.15-py3-none-any.whl" }
+
+[tool.uv.dependency-groups.pre-commit]
+requires-python = ">=3.12"
 [tool.ruff]
 fix = true
 show-fixes = true
 line-length = 100
 output-format = "concise"
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
@@ -99,11 +135,23 @@ section-order = [
 
 [tool.basedpyright]
 typeCheckingMode = "standard"
-pythonVersion = "3.11"
+pythonVersion = "3.12"
 exclude = ["tools/", ".venv/"]  # Optional scripts + virtual env
+
+[tool.pyrefly]
+search-path = ["."]
+
+[tool.ty.environment]
+extra-paths = ["."]
 
 [tool.pytest.ini_options]
 testpaths = ["."]
 python_files = ["*_test.py"]
 pythonpath = ["."]
+asyncio_default_fixture_loop_scope = "function"
 filterwarnings = ["ignore::pytest.PytestUnraisableExceptionWarning:coroutine.*was never awaited"]
+
+[tool.houselint]
+select = "ALL"
+fix = "ALL"
+exclude = ["*_test.py test_*.py **/tests/test*.py =\n    args-section assert cache-kwarg def-order final-inline globals\n    lazy-import-cost mkdir-mode module-side-effects nested-def returns-named\n    returns-section single-use-helper tempfile-prefix tensor-value-guard\n    tmp-literal xdg-literal", "conftest.py =\n    args-section def-order lazy-import-cost module-side-effects returns-section"]

@@ -81,7 +81,10 @@ def test_upgrade_survives_idle_download_polls_and_encoder_batches():
         sample = health(buffer=8, waiting=False, observed=100_000_000 if now % 4 == 0 else 0)
         assert not policy.observe(sample, 60_000_000, ready=False, now=now)
     assert policy.observe(
-        health(buffer=8, waiting=False, observed=100_000_000), 60_000_000, ready=True, now=8
+        health(buffer=8, waiting=False, observed=100_000_000),
+        60_000_000,
+        ready=True,
+        now=8,
     )
 
 
@@ -90,7 +93,10 @@ def test_upgrade_does_not_invent_bandwidth(observed):
     policy = UpgradePolicy()
     for now in range(0, 30, 2):
         assert not policy.observe(
-            health(buffer=12, waiting=False, observed=observed), 60_000_000, ready=True, now=now
+            health(buffer=12, waiting=False, observed=observed),
+            60_000_000,
+            ready=True,
+            now=now,
         )
 
 
@@ -153,7 +159,10 @@ def test_recovery_survives_bursty_downloads_but_expires_on_pause():
     # No downloads for over ten seconds invalidates earlier evidence.
     for now in range(60, 74, 2):
         assert policy.observe(
-            health(buffer=10, waiting=False), now, 20_000_000, recovery_ready=False
+            health(buffer=10, waiting=False),
+            now,
+            20_000_000,
+            recovery_ready=False,
         )
     good = health(buffer=10, waiting=False, observed=40_000_000)
     for now in range(74, 104, 2):
@@ -216,3 +225,9 @@ def test_live_restarts_have_cooldowns_and_sliding_budget():
     policy.finish_restart("pipeline")
     assert not policy.permit_restart("pipeline", 19)
     assert policy.permit_restart("pipeline", 20)
+
+
+if __name__ == "__main__":
+    from codedoctor.lib.testing.runner import test_main
+
+    test_main(__file__)
