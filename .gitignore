@@ -29,3 +29,5 @@ tools/.zap2xml/
 
 # Local App Store source material
 /apple/AppStoreScreenshots/**/*.pdf
+
+.testmondata
