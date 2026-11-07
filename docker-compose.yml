@@ -2,7 +2,7 @@
 #
 # Build:
 #   docker compose build                              # Default (optimized FFmpeg)
-#   FFMPEG_IMAGE=ubuntu:24.04 docker compose build    # Alternative (apt FFmpeg)
+#   FFMPEG_IMAGE=ubuntu:26.04 docker compose build    # Alternative (apt FFmpeg)
 #
 # Run:
 #   docker compose up -d                    # Auto-detects hardware (Intel/AMD)

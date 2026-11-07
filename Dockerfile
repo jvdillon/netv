@@ -4,7 +4,7 @@
 #   docker compose build
 #
 # Alternative: use apt FFmpeg (fewer codecs, no NVENC/QSV):
-#   FFMPEG_IMAGE=ubuntu:24.04 docker compose build
+#   FFMPEG_IMAGE=ubuntu:26.04 docker compose build
 #
 # The optimized FFmpeg base image includes:
 # - NVENC (NVIDIA hardware encoding)

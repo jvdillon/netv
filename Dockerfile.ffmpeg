@@ -22,7 +22,7 @@
 # =============================================================================
 # Builder stage: compile FFmpeg using install-ffmpeg.sh
 # =============================================================================
-ARG FFMPEG_BASE_IMAGE=ubuntu:24.04
+ARG FFMPEG_BASE_IMAGE=ubuntu:26.04
 FROM ${FFMPEG_BASE_IMAGE} AS builder
 
 # Build configuration - these are passed to install-ffmpeg.sh via environment
@@ -129,7 +129,7 @@ RUN set -e; \
 # =============================================================================
 # Runtime stage: minimal image with just FFmpeg binaries
 # =============================================================================
-ARG FFMPEG_BASE_IMAGE=ubuntu:24.04
+ARG FFMPEG_BASE_IMAGE=ubuntu:26.04
 FROM ${FFMPEG_BASE_IMAGE}
 
 ARG BUILD_DATE

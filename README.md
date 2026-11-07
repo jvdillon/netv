@@ -542,7 +542,7 @@ For customization or development:
 git clone https://github.com/jvdillon/netv.git
 cd netv
 docker compose build                              # optimized FFmpeg (default)
-# FFMPEG_IMAGE=ubuntu:24.04 docker compose build  # or stock FFmpeg
+# FFMPEG_IMAGE=ubuntu:26.04 docker compose build  # or stock FFmpeg
 docker compose up -d
 ```
 

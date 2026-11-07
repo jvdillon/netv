@@ -24,7 +24,7 @@ FROM ${FFMPEG_IMAGE}
 
 # Build metadata (passed from workflow, used for documentation/debugging)
 ARG NVIDIA=cuda:13.0
-ARG BASE_IMAGE=ubuntu:24.04
+ARG BASE_IMAGE=ubuntu:26.04
 
 # Store build info as labels
 LABEL org.opencontainers.image.description="netv with AI Upscale (TensorRT)"
