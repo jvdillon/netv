@@ -234,6 +234,18 @@ fi
 # Helper Functions
 # =============================================================================
 
+# Retry downloads: wget does not retry TLS handshake failures on its own,
+# and one flaky connection should not abort a long build.
+wget() {
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        command wget "$@" && return 0
+        echo "wget failed (attempt $attempt/5), retrying in $((attempt * 10))s..." >&2
+        sleep $((attempt * 10))
+    done
+    return 1
+}
+
 # Log error message to stderr
 log_error() {
     echo "ERROR: $*" >&2
@@ -841,19 +853,34 @@ SRCEOF
         echo "CUDA $CUDA_VERSION NVCC_GENCODE=$NVCC_GENCODE -> $NVCC_ARCH"
     fi
 
-    # Pin nv-codec-headers for specific builds:
-    # - netv-ffmpeg:cuda12.4 OR CUDA_VERSION=12.4 -> use NVENC API 12.2 headers (sdk/12.2)
-    # - otherwise                                 -> use upstream master
-    NV_CODEC_REF="master"
-    if [ "${FFMPEG_IMAGE:-}" = "netv-ffmpeg:cuda12.4" ] || [ "${CUDA_VERSION:-}" = "12-4" ]; then
-        NV_CODEC_REF="sdk/12.2"
+    # nv-codec-headers sets the NVENC/NVDEC API ffmpeg requires at runtime; the driver
+    # must support it or every nvenc open fails ("Driver does not support the required
+    # nvenc API version"). Pick the newest branch the installed driver supports
+    # (minimums from each branch's README). Override with NV_CODEC_REF=<branch>.
+    if [ -z "${NV_CODEC_REF:-}" ]; then
+        NV_DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+        if [ "${FFMPEG_IMAGE:-}" = "netv-ffmpeg:cuda12.4" ] || [ "${CUDA_VERSION:-}" = "12-4" ]; then
+            NV_CODEC_REF="sdk/12.2"
+        elif [ -z "$NV_DRIVER" ]; then
+            NV_CODEC_REF="sdk/13.0"   # no driver to probe: target 570+, not bleeding edge
+        elif version_ge "$NV_DRIVER" 610.0; then
+            NV_CODEC_REF="master"
+        elif version_ge "$NV_DRIVER" 570.0; then
+            NV_CODEC_REF="sdk/13.0"
+        elif version_ge "$NV_DRIVER" 550.54.14; then
+            NV_CODEC_REF="sdk/12.2"
+        elif version_ge "$NV_DRIVER" 530.41.03; then
+            NV_CODEC_REF="sdk/12.1"
+        else
+            NV_CODEC_REF="sdk/12.0"
+        fi
     fi
-    echo "nv-codec-headers: FFMPEG_IMAGE=${FFMPEG_IMAGE:-unset}, CUDA_VERSION=${CUDA_VERSION:-unset}, ref=$NV_CODEC_REF"
+    echo "nv-codec-headers: driver=${NV_DRIVER:-none}, ref=$NV_CODEC_REF"
 
     cd "$SRC_DIR"
     if [ -d nv-codec-headers/.git ]; then
         git -C nv-codec-headers fetch --depth 1 origin "$NV_CODEC_REF"
-        git -C nv-codec-headers checkout -f "$NV_CODEC_REF"
+        git -C nv-codec-headers checkout -q -f FETCH_HEAD
     else
         git clone --depth 1 --branch "$NV_CODEC_REF" https://git.videolan.org/git/ffmpeg/nv-codec-headers.git
     fi
@@ -1705,6 +1732,7 @@ FFMPEG_KEY=$(step_key "$SRC_DIR/$FFMPEG_DIR" \
     "$( [ "$ENABLE_NVIDIA_CUDA" = "1" ] && "$CUDA_PATH/bin/nvcc" --version 2>/dev/null | tail -1)" \
     "${LIBTORCH_VERSION:-}:${TORCH_VARIANT:-}" \
     "${NVCC_CCBIN:-}" \
+    "$(git -C "$SRC_DIR/nv-codec-headers" rev-parse HEAD 2>/dev/null)" \
     "$(sha256sum "$SCRIPT_DIR/install-ffmpeg.sh" "$SCRIPT_DIR"/patches/* 2>/dev/null | cut -c1-64)")
 if ! step_done ffmpeg "$FFMPEG_KEY" "$BIN_DIR/ffmpeg"; then
     PATH="$BUILD_PATH" PKG_CONFIG_PATH="$BUILD_DIR/lib/pkgconfig:$PKG_CONFIG_PATH" "${CONFIGURE_CMD[@]}"
