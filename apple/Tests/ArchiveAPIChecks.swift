@@ -140,7 +140,7 @@ struct ArchiveAPIChecks {
         let live = try await client.playbackConfiguration(
             server: "http://netv.test", channelID: "1"
         )
-        precondition(live.liveBufferDuration == 7200)
+        precondition(live.liveBufferDuration == 999 * 60)
         precondition(live.playbackBufferDuration == 30)
         precondition(live.url.path == "/transcode/live/low-captions.m3u8")
         let liveStart = ArchiveTransport.requests.first { $0.url?.path == "/transcode/start" }!

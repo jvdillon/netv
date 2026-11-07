@@ -1203,7 +1203,7 @@ class TestSettings:
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
 
-    def test_settings_transcode_caps_live_dvr_at_two_hours(self, auth_client):
+    def test_settings_transcode_saves_long_live_dvr(self, auth_client):
         resp = auth_client.post(
             "/settings/transcode",
             data={
@@ -1213,7 +1213,7 @@ class TestSettings:
             },
         )
         assert resp.status_code == 200
-        assert cache_module.load_server_settings()["live_dvr_mins"] == 120
+        assert cache_module.load_server_settings()["live_dvr_mins"] == 999
 
 
 class TestAddSource:

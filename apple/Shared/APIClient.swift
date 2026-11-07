@@ -188,7 +188,7 @@ final class APIClient {
             configuration.archiveStart = playerConfigNumber("catchupStart", in: html)
             configuration.archiveSeek = playerConfigNumber("catchupSeek", in: html)
         } else {
-            let minutes = min(max(playerConfigNumber("liveDvrMins", in: html) ?? 0, 0), 120)
+            let minutes = max(playerConfigNumber("liveDvrMins", in: html) ?? 0, 0)
             configuration.liveBufferDuration = minutes * 60
         }
         return configuration

@@ -115,9 +115,11 @@ class TestSettings:
         assert loaded["sources"] == [{"id": "s1", "name": "Test"}]
         assert loaded["custom"] is True
 
-    def test_live_dvr_window_is_bounded(self, cache_module):
+    def test_live_dvr_window_is_user_set(self, cache_module):
         cache_module.save_server_settings({"live_dvr_mins": 999})
-        assert cache_module.load_server_settings()["live_dvr_mins"] == 120
+        assert cache_module.load_server_settings()["live_dvr_mins"] == 999
+        cache_module.save_server_settings({"live_dvr_mins": -5})
+        assert cache_module.load_server_settings()["live_dvr_mins"] == 0
 
 
 class TestUserSettings:

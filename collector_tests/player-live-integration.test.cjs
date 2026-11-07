@@ -45,7 +45,7 @@ function element() {
 }
 
 async function player({
-  isVod = false, native = false, direct = false,
+  isVod = false, native = false, direct = false, auto = false, noManifest = false,
   programStart = 0, programEnd = 0, nextProgram = null,
   castFailure = false, initialCast = null, seekOffset = 0, statusReady = null,
   airplay = false, browserCast = false,
@@ -126,14 +126,16 @@ async function player({
         this.loadLevel = 0;
       }
     }
-    attachMedia() { this.emit('manifest'); }
+    attachMedia() { if (!noManifest) this.emit('manifest'); }
+    startLoad() { this.loads = (this.loads || 0) + 1; }
+    recoverMediaError() { this.mediaRecoveries = (this.mediaRecoveries || 0) + 1; }
     destroy() { this.destroyed = true; this.handlers.clear(); }
   }
   const window = Object.assign(element(), {
     PLAYER_CONFIG: {
       rawUrl: 'https://provider.example/live.m3u8',
       streamType: isVod ? 'movie' : 'live', isVod,
-      transcodeMode: direct ? 'never' : 'always',
+      transcodeMode: auto ? 'auto' : direct ? 'never' : 'always',
       liveDvrMins: isVod ? 0 : 60,
       streamId: '1', programStart, programEnd,
       catchup, catchupDays, catchupStart, catchupSeek,
@@ -247,6 +249,13 @@ async function player({
     setLiveEdge: value => { for (const engine of engines) engine.liveSyncPosition = value; },
     async tickProgram() {
       const [, timer] = [...timers].find(([, timer]) => timer.ms === 1000);
+      await timer.fn();
+      await flush();
+    },
+    // Runs the newest timer of this delay, as the player just scheduled it.
+    async fireTimer(ms) {
+      const [id, timer] = [...timers].filter(([, timer]) => timer.ms === ms).at(-1);
+      timers.delete(id);
       await timer.fn();
       await flush();
     },
@@ -797,4 +806,78 @@ test('AirPlay prepares a neTV stream for direct playback, then opens the picker'
   assert.match(p.elements.get('airplay-status').textContent, /Tap AirPlay again/);
   await p.elements.get('airplay-btn').emit('click', { stopPropagation() {} });
   assert.deepEqual(p.pickerCalls, ['/transcode/session1/low.m3u8']);
+});
+
+const isHidden = (p, id) => p.elements.get(id).classList.contains('hidden');
+const lose = engine => engine.emit('error', { fatal: true, type: 'network', response: { code: 0 } });
+
+test('live playback reconnects with backoff through a provider outage', async () => {
+  const p = await player();
+  lose(p.engines[0]);
+  assert.equal(p.engines[0].destroyed, true);
+  assert.equal(isHidden(p, 'error'), true);
+  assert.equal(isHidden(p, 'loading'), false);
+  await p.fireTimer(1000);
+  assert.equal(transcodeStarts(p), 2);
+  lose(p.engines[1]);
+  await p.fireTimer(2000);
+  assert.equal(transcodeStarts(p), 3);
+  p.engines[2].emit('fragment');
+  assert.equal(isHidden(p, 'loading'), true);
+  lose(p.engines[2]);
+  await p.fireTimer(1000);
+  assert.equal(transcodeStarts(p), 4, 'backoff resets after recovery');
+  assert.equal(isHidden(p, 'error'), true);
+});
+
+test('live playback gives up after two minutes without the stream', async () => {
+  const p = await player();
+  const now = Date.now;
+  let clock = now();
+  Date.now = () => clock;
+  try {
+    lose(p.engines[0]);
+    await p.fireTimer(1000);
+    clock += 121000;
+    lose(p.engines[1]);
+    assert.equal(isHidden(p, 'error'), false);
+  } finally {
+    Date.now = now;
+  }
+});
+
+test('direct live playback reconnects to the provider', async () => {
+  const p = await player({ direct: true });
+  lose(p.engines[0]);
+  await p.fireTimer(1000);
+  assert.equal(transcodeStarts(p), 0);
+  assert.deepEqual(p.engines[1].sources, ['https://provider.example/live.m3u8']);
+  assert.equal(isHidden(p, 'error'), true);
+});
+
+test('auto mode falls back to transcoding when direct playback fails mid-stream', async () => {
+  const p = await player({ auto: true });
+  assert.equal(transcodeStarts(p), 0);
+  lose(p.engines[0]);
+  await flush();
+  assert.equal(transcodeStarts(p), 1);
+  assert.equal(isHidden(p, 'error'), true);
+});
+
+test('a refused live source shows the error without retrying', async () => {
+  const p = await player({ direct: true, noManifest: true });
+  const timers = p.timers.size;
+  p.engines[0].emit('error', { fatal: true, type: 'network', response: { code: 403 } });
+  assert.equal(p.engines[0].destroyed, true);
+  assert.equal(isHidden(p, 'error'), false);
+  assert.equal(p.timers.size, timers);
+});
+
+test('VOD network errors retry in place with backoff', async () => {
+  const p = await player({ isVod: true });
+  lose(p.engines[0]);
+  assert.equal(p.engines[0].destroyed, undefined);
+  await p.fireTimer(2000);
+  assert.equal(p.engines[0].loads, 1);
+  assert.equal(isHidden(p, 'error'), true);
 });

@@ -42,6 +42,11 @@
   let nativeHls = false;
   let scrubPercent = null;
   let archiveNavigationInProgress = false;
+  // Live streams ride out provider outages, giving up only after this long.
+  const LIVE_GIVE_UP_MS = 120000;
+  let liveOutageStart = 0;
+  let liveReconnects = 0;
+  let liveReconnectTimer = null;
 
   // ============================================================
   // Utilities
@@ -117,6 +122,40 @@
     adaptivePlayback = null;
     hideLoading();
     error.classList.remove('hidden');
+  }
+
+  function isLiveStream() {
+    return !cfg.isVod && !cfg.catchup && !cfg.handoffRecording;
+  }
+
+  function endLiveOutage() {
+    if (!liveOutageStart) return;
+    liveOutageStart = 0;
+    liveReconnects = 0;
+    hideLoading();
+  }
+
+  // Rebuild live playback with exponential backoff until the stream returns.
+  function reconnectLive() {
+    if (castController?.active) return;
+    const now = Date.now();
+    if (!liveOutageStart) liveOutageStart = now;
+    if (now - liveOutageStart > LIVE_GIVE_UP_MS) {
+      liveOutageStart = 0;
+      liveReconnects = 0;
+      showError();
+      return;
+    }
+    const delay = Math.min(1000 * 2 ** liveReconnects++, 30000);
+    console.warn(`[LIVE] Stream lost, reconnecting in ${delay / 1000}s`);
+    showLoading();
+    clearTimeout(liveReconnectTimer);
+    liveReconnectTimer = setTimeout(() => {
+      liveReconnectTimer = null;
+      if (castController?.active) return;
+      if (isTranscoding || cfg.transcodeMode !== 'never') startTranscode();
+      else playWithUrl(cfg.rawUrl);
+    }, delay);
   }
 
   function updateTranscodeCheck() {
@@ -967,6 +1006,7 @@
     } catch (e) {
       console.error('[TC] Error:', e);
       if (onError) onError();
+      else if (isLiveStream()) reconnectLive();
       else showError();
     }
   }
@@ -988,6 +1028,7 @@
       video.src = adaptiveSession ? adaptiveSession.playlist : url;
       if (adaptiveSession) startAdaptivePlayback(null);
       video.addEventListener('loadedmetadata', function() {
+        endLiveOutage();
         hideLoading();
         error.classList.add('hidden');
         if (video.textTracks.length === 0) disableCcButton();
@@ -998,6 +1039,7 @@
       }, { once: true });
       video.addEventListener('error', function() {
         if (onError) onError();
+        else if (isLiveStream()) reconnectLive();
         else showError();
       }, { once: true });
       return;
@@ -1098,24 +1140,46 @@
       }
     });
 
+    hls.on(Hls.Events.FRAG_LOADED, () => {
+      recoveryAttempts = 0;
+      if (currentHls === hls) endLiveOutage();
+    });
+
     hls.on(Hls.Events.ERROR, (event, data) => {
-      if (data.fatal) {
-        recoveryAttempts++;
-        if (recoveryAttempts <= 3) {
-          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
-          else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-          else {
-            hls.destroy();
-            currentHls = null;
-            if (!hasLoaded && onError) onError();
-            else showError();
-          }
-        } else {
-          hls.destroy();
-          currentHls = null;
-          if (!hasLoaded && onError) onError();
-          else showError();
+      if (!data.fatal) return;
+      const status = data.response?.code || 0;
+      // A source refused before playing anything is not an outage.
+      if (!hasLoaded && status >= 400 && status < 500) {
+        if (loadTimeout) clearTimeout(loadTimeout);
+        hls.destroy();
+        currentHls = null;
+        if (onError) onError();
+        else showError();
+        return;
+      }
+      if (isLiveStream()) {
+        // hls.js has already retried loads; only a media error is worth one in-place fix.
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && recoveryAttempts++ === 0) {
+          hls.recoverMediaError();
+          return;
         }
+        if (loadTimeout) clearTimeout(loadTimeout);
+        hls.destroy();
+        if (currentHls === hls) currentHls = null;
+        if (onError) onError();
+        else reconnectLive();
+        return;
+      }
+      recoveryAttempts++;
+      if (recoveryAttempts <= 3 && data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        setTimeout(() => { if (currentHls === hls) hls.startLoad(); }, 1000 * 2 ** recoveryAttempts);
+      } else if (recoveryAttempts <= 3 && data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        hls.recoverMediaError();
+      } else {
+        hls.destroy();
+        currentHls = null;
+        if (!hasLoaded && onError) onError();
+        else showError();
       }
     });
     hls.loadSource(url);

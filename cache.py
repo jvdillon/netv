@@ -21,11 +21,10 @@ from util import atomic_write_json
 log = logging.getLogger(__name__)
 
 DEFAULT_LIVE_DVR_MINS = 120
-MAX_LIVE_DVR_MINS = 120
 
 
 def clamp_live_dvr_mins(value: int) -> int:
-    return min(max(value, 0), MAX_LIVE_DVR_MINS)
+    return max(value, 0)
 
 
 # ===========================================================================
