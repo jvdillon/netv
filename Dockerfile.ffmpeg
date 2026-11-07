@@ -169,6 +169,17 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
             -o /tmp/cuda-keyring.deb && \
         dpkg -i /tmp/cuda-keyring.deb && rm /tmp/cuda-keyring.deb && \
         apt-get update && \
+        # Newer Ubuntu repos may not carry TensorRT yet (ubuntu2604 lacks libnvinfer10);
+        # fall back to ubuntu2404, which is signed with its own key.
+        if [ "$VERSION_CODENAME" != "jammy" ] && ! apt-cache show libnvinfer10 >/dev/null 2>&1; then \
+            curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -o /tmp/k2404.deb && \
+            dpkg-deb -x /tmp/k2404.deb /tmp/k2404 && \
+            install -m 644 /tmp/k2404/usr/share/keyrings/cuda-archive-keyring.gpg /usr/share/keyrings/cuda-archive-keyring-ubuntu2404.gpg && \
+            rm -rf /tmp/k2404 /tmp/k2404.deb && \
+            printf 'Types: deb\nURIs: https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/\nSuites: /\nSigned-By: /usr/share/keyrings/cuda-archive-keyring-ubuntu2404.gpg\n' \
+                > /etc/apt/sources.list.d/cuda-ubuntu2404-x86_64.sources && \
+            apt-get update; \
+        fi && \
         if [ "$VERSION_CODENAME" = "jammy" ]; then \
             apt-get install -y --no-install-recommends libnvinfer8 libnvinfer-plugin8; \
         else \
