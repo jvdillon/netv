@@ -40,6 +40,8 @@ repos:
     name: check-yaml
     stages:
     - pre-commit
+    language: system
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.yamlcheck
   - id: check-toml
     name: check-toml
     stages:

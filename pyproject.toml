@@ -69,11 +69,11 @@ pre-commit = [
     {include-group = "lint"},
     {include-group = "test"},
     {include-group = "typecheck"},
-    "codedoctor[coverage,mutation,notebook]",
+    "codedoctor[coverage,mutation,notebook]>=0.1.3",
     "onnx>=1.23.2",
     "onnxconverter-common>=1.16.0",
     "pre-commit>=4.7.0",
-    "rekursiv-ai-typings>=0.1.15",
+    "rekursiv-ai-typings>=0.1.16",
     "treekle>=0.4.4",
     "wrapt>=2.5.2",
 ]
@@ -90,10 +90,6 @@ include = ["*.py"]
 
 [tool.uv]
 package = true
-
-[tool.uv.sources]
-codedoctor = { path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-v6/codedoctor-0.1.2-py3-none-any.whl" }
-rekursiv-ai-typings = { path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-typings-v2/rekursiv_ai_typings-0.1.15-py3-none-any.whl" }
 
 [tool.uv.dependency-groups.pre-commit]
 requires-python = ">=3.12"

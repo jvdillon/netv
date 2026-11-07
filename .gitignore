@@ -31,3 +31,5 @@ tools/.zap2xml/
 /apple/AppStoreScreenshots/**/*.pdf
 
 .testmondata
+.codegraph
+.coverage

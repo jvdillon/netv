@@ -325,17 +325,19 @@ wheels = [
 
 [[package]]
 name = "codedoctor"
-version = "0.1.2"
-source = { path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-v6/codedoctor-0.1.2-py3-none-any.whl" }
+version = "0.1.3"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pyyaml" },
     { name = "rignore" },
+    { name = "ruamel-yaml" },
     { name = "tomlkit" },
     { name = "treekle" },
     { name = "typing-extensions" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/32/48/d01247b0020ca1a133d47b65e6be353d536c29c94cbe4e61d34969400c72/codedoctor-0.1.3.tar.gz", hash = "sha256:ab5986d23a291b4a7a66479ae4d5a635ee0e94e6f5b9510e59ce49d366076f18", size = 691163, upload-time = "2026-11-07T23:50:27.728Z" }
 wheels = [
-    { filename = "codedoctor-0.1.2-py3-none-any.whl", hash = "sha256:a52d3cb7259aedaa5aa2a48a5d324de0b4276dee161c6be5742eceda74cff90e" },
+    { url = "https://files.pythonhosted.org/packages/0b/65/8710f6e64b42804d21ac2213d96c44c5b30d8d1d83869bb0a00d3f72ece5/codedoctor-0.1.3-py3-none-any.whl", hash = "sha256:ab3e855a73a30c1c54ca220b1a85250afec9690d6b49e970a54ef472498e9315", size = 296588, upload-time = "2026-11-07T23:50:25.97Z" },
 ]
 
 [package.optional-dependencies]
@@ -354,43 +356,6 @@ notebook = [
     { name = "nbstripout", marker = "sys_platform != 'linux'" },
     { name = "nbstripout-fast", marker = "sys_platform == 'linux'" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "coverage", marker = "extra == 'coverage'", specifier = ">=7.17.0" },
-    { name = "jupytext", marker = "extra == 'notebook'", specifier = ">=1.19.6" },
-    { name = "libcst", marker = "extra == 'mutation'", specifier = ">=1.9.0" },
-    { name = "mutmut", marker = "extra == 'mutation'", specifier = ">=3.8.1" },
-    { name = "nbstripout", marker = "sys_platform != 'linux' and extra == 'notebook'", specifier = ">=0.9.1" },
-    { name = "nbstripout-fast", marker = "sys_platform == 'linux' and extra == 'notebook'", specifier = ">=1.1.2" },
-    { name = "pytest", marker = "extra == 'mutation'", specifier = ">=9.2.0" },
-    { name = "pyyaml", specifier = ">=6.0.3" },
-    { name = "rignore", specifier = ">=0.8.1" },
-    { name = "tomlkit", specifier = ">=0.15.2" },
-    { name = "tomlkit", marker = "extra == 'mutation'", specifier = ">=0.15.2" },
-    { name = "torch", marker = "extra == 'cpu'" },
-    { name = "torch", marker = "extra == 'cu126'" },
-    { name = "torch", marker = "extra == 'cu128'" },
-    { name = "torch", marker = "extra == 'cu130'" },
-    { name = "torch", marker = "extra == 'cu132'" },
-    { name = "torch", marker = "extra == 'cu134'" },
-    { name = "torchao", marker = "extra == 'cpu'" },
-    { name = "torchao", marker = "extra == 'cu126'" },
-    { name = "torchao", marker = "extra == 'cu128'" },
-    { name = "torchao", marker = "extra == 'cu130'" },
-    { name = "torchao", marker = "extra == 'cu132'" },
-    { name = "torchao", marker = "extra == 'cu134'" },
-    { name = "torchvision", marker = "extra == 'cpu'" },
-    { name = "torchvision", marker = "extra == 'cu126'" },
-    { name = "torchvision", marker = "extra == 'cu128'" },
-    { name = "torchvision", marker = "extra == 'cu130'" },
-    { name = "torchvision", marker = "extra == 'cu132'" },
-    { name = "torchvision", marker = "extra == 'cu134'" },
-    { name = "treekle", specifier = ">=0.4.1" },
-    { name = "typing-extensions", specifier = ">=4.16.0" },
-    { name = "wrapt", marker = "extra == 'mutation'", specifier = ">=2.5.2" },
-]
-provides-extras = ["coverage", "cpu", "cu126", "cu128", "cu130", "cu132", "cu134", "mutation", "notebook"]
 
 [[package]]
 name = "codespell"
@@ -1501,7 +1466,7 @@ lint = [
 ]
 pre-commit = [
     { name = "basedpyright", marker = "python_full_version >= '3.12'", specifier = ">=1.40.2" },
-    { name = "codedoctor", extras = ["coverage", "mutation", "notebook"], marker = "python_full_version >= '3.12'", path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-v6/codedoctor-0.1.2-py3-none-any.whl" },
+    { name = "codedoctor", extras = ["coverage", "mutation", "notebook"], marker = "python_full_version >= '3.12'", specifier = ">=0.1.3" },
     { name = "codespell", marker = "python_full_version >= '3.12'", specifier = ">=2.4.3" },
     { name = "hatchling", marker = "python_full_version >= '3.12'", specifier = ">=1.33.0" },
     { name = "httpx2", marker = "python_full_version >= '3.12'", specifier = ">=2.16.0" },
@@ -1515,7 +1480,7 @@ pre-commit = [
     { name = "pytest-testmon", marker = "python_full_version >= '3.12'", specifier = ">=2.3.0" },
     { name = "pytest-timeout", marker = "python_full_version >= '3.12'", specifier = ">=2.4.0" },
     { name = "pytest-xdist", marker = "python_full_version >= '3.12'", specifier = ">=3.8.0" },
-    { name = "rekursiv-ai-typings", marker = "python_full_version >= '3.12'", path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-typings-v2/rekursiv_ai_typings-0.1.15-py3-none-any.whl" },
+    { name = "rekursiv-ai-typings", marker = "python_full_version >= '3.12'", specifier = ">=0.1.16" },
     { name = "ruff", marker = "python_full_version >= '3.12'", specifier = ">=0.17.3" },
     { name = "treekle", marker = "python_full_version >= '3.12'", specifier = ">=0.4.4" },
     { name = "ty", marker = "python_full_version >= '3.12'", specifier = ">=0.0.95" },
@@ -2369,34 +2334,12 @@ wheels = [
 
 [[package]]
 name = "rekursiv-ai-typings"
-version = "0.1.15"
-source = { path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-typings-v2/rekursiv_ai_typings-0.1.15-py3-none-any.whl" }
+version = "0.1.16"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/62/7a/a9dac53ad32db0b94831e2802bd13025116efc6948637ab0fa9329a0cb2a/rekursiv_ai_typings-0.1.16.tar.gz", hash = "sha256:de033cbf1852aff88de35a3b5bca161fbbd12cb95755068d61580338eb721bc4", size = 2302563, upload-time = "2026-11-07T23:42:39.093Z" }
 wheels = [
-    { filename = "rekursiv_ai_typings-0.1.15-py3-none-any.whl", hash = "sha256:57d39a6db13142283bed9a7ef72a83918822735786072974cc9758d7fb6844e6" },
+    { url = "https://files.pythonhosted.org/packages/d3/ee/f824089d3960e789bf137adcc25e4318084807721f2ab0bc66df3a25b6ee/rekursiv_ai_typings-0.1.16-py3-none-any.whl", hash = "sha256:3ab6f45c69dd234c16b79de47dae90816bd1782c64009d27fa3d064f4d463250", size = 4915409, upload-time = "2026-11-07T23:42:36.926Z" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "torch", marker = "extra == 'cpu'" },
-    { name = "torch", marker = "extra == 'cu126'" },
-    { name = "torch", marker = "extra == 'cu128'" },
-    { name = "torch", marker = "extra == 'cu130'" },
-    { name = "torch", marker = "extra == 'cu132'" },
-    { name = "torch", marker = "extra == 'cu134'" },
-    { name = "torchao", marker = "extra == 'cpu'" },
-    { name = "torchao", marker = "extra == 'cu126'" },
-    { name = "torchao", marker = "extra == 'cu128'" },
-    { name = "torchao", marker = "extra == 'cu130'" },
-    { name = "torchao", marker = "extra == 'cu132'" },
-    { name = "torchao", marker = "extra == 'cu134'" },
-    { name = "torchvision", marker = "extra == 'cpu'" },
-    { name = "torchvision", marker = "extra == 'cu126'" },
-    { name = "torchvision", marker = "extra == 'cu128'" },
-    { name = "torchvision", marker = "extra == 'cu130'" },
-    { name = "torchvision", marker = "extra == 'cu132'" },
-    { name = "torchvision", marker = "extra == 'cu134'" },
-]
-provides-extras = ["cpu", "cu126", "cu128", "cu130", "cu132", "cu134"]
 
 [[package]]
 name = "requests"
@@ -2636,6 +2579,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ba/a5/9672e532fe02cd3b92c78cfd8743abca939d96853006c63835009a1ecb6f/rpds_py-2026.9.1-pp312-pypy312_pp73-musllinux_1_2_x86_64.whl", hash = "sha256:6b9bf3135b4ad5981df9a73d71a35272d650a2985ae9c2746357b24d59de2448", size = 591126, upload-time = "2026-10-04T16:32:29.274Z" },
     { url = "https://files.pythonhosted.org/packages/80/ef/3a9f8e4279c7920af561deed4cb7ebebed2794a8f608cf404d5eef14a105/rpds_py-2026.9.1-pp312-pypy312_pp80-macosx_10_12_x86_64.whl", hash = "sha256:56c6952a9b15047466d0c2347c446a761d4527f89976156341e68f0ce5cc08b0", size = 357108, upload-time = "2026-10-04T16:32:31.641Z" },
     { url = "https://files.pythonhosted.org/packages/b7/55/4b2fa381a583760aea5c92841e4e928a358e1c6511b129219e9c2826a226/rpds_py-2026.9.1-pp312-pypy312_pp80-macosx_11_0_arm64.whl", hash = "sha256:b242c27c8f836305a4a72df9cdd564386ac57b807bd252a063223331c9316b37", size = 346877, upload-time = "2026-10-04T16:32:34.061Z" },
+]
+
+[[package]]
+name = "ruamel-yaml"
+version = "0.19.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c7/3b/ebda527b56beb90cb7652cb1c7e4f91f48649fbcd8d2eb2fb6e77cd3329b/ruamel_yaml-0.19.1.tar.gz", hash = "sha256:53eb66cd27849eff968ebf8f0bf61f46cdac2da1d1f3576dd4ccee9b25c31993", size = 142709, upload-time = "2026-01-02T16:50:31.84Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b8/0c/51f6841f1d84f404f92463fc2b1ba0da357ca1e3db6b7fbda26956c3b82a/ruamel_yaml-0.19.1-py3-none-any.whl", hash = "sha256:27592957fedf6e0b62f281e96effd28043345e0e66001f97683aa9a40c667c93", size = 118102, upload-time = "2026-01-02T16:50:29.201Z" },
 ]
 
 [[package]]
