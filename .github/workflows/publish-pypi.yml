@@ -25,8 +25,12 @@ jobs:
         env:
           NETV_DATA_DIR: ${{ runner.temp }}/netv-data
         run: |
-          uvx --isolated --from "$PWD"/dist/*.whl netv --help
-          uvx --isolated --from "$PWD"/dist/*.whl netv-gateway --help
+          wheel="$(realpath dist/*.whl)"
+          uvx --isolated --from "$wheel" zap2xml --help
+          uvx --isolated --from "$wheel" alignm3u --help
+          uvx --isolated --from "pynetv[xtream2m3u] @ file://$wheel" xtream2m3u --help
+          uvx --isolated --from "pynetv[server] @ file://$wheel" netv --help
+          uvx --isolated --from "pynetv[server] @ file://$wheel" netv-gateway --help
       - uses: actions/upload-artifact@v4
         with:
           name: distributions

@@ -12,7 +12,7 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY *.py ./
 
-RUN python3 -m pip install --no-cache-dir . && \
+RUN python3 -m pip install --no-cache-dir '.[server]' && \
     groupadd --gid 10001 netv && \
     useradd --uid 10001 --gid 10001 --create-home netv && \
     mkdir -p /app/cache && \

@@ -53,7 +53,7 @@ COPY static/ static/
 RUN test -f pyproject.toml || { echo "ERROR: pyproject.toml not found"; exit 1; }
 
 # Install Python dependencies
-RUN uv pip install --no-cache .
+RUN uv pip install --no-cache '.[server]'
 
 # Runtime config
 EXPOSE 8000 8100

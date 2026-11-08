@@ -71,7 +71,7 @@ RUN set -e; \
         'onnxconverter-common>=1.14' \
         'safetensors>=0.4' \
         'tensorrt>=9.0' \
-        .; \
+        '.[server]'; \
     python3 -c "import torch; import onnx; import tensorrt; print(f'Installed: torch={torch.__version__}, onnx={onnx.__version__}, tensorrt={tensorrt.__version__}')"; \
     # Remove Windows-only TensorRT libraries to save ~500MB
     echo "Removing Windows-only TensorRT libraries..."; \

@@ -1,6 +1,6 @@
 [project]
 name = "pynetv"
-version = "0.4.1"
+version = "0.4.2"
 description = "Minimal self-hosted IPTV web interface with EPG guide, VOD, and Chromecast"
 readme = "README.md"
 license = "Apache-2.0"
@@ -23,7 +23,11 @@ classifiers = [
     "Programming Language :: Python :: 3.15",
     "Topic :: Multimedia :: Video :: Display",
 ]
-dependencies = [
+dependencies = []
+
+[project.optional-dependencies]
+xtream2m3u = ["treekle>=0.4.4"]
+server = [
     "PyChromecast>=13.1",
     "cryptography>=43.0",
     "defusedxml>=0.7",
@@ -36,6 +40,7 @@ dependencies = [
 ]
 
 [dependency-groups]
+dev = ["pynetv[server,xtream2m3u]"]
 ai_upscale = [
     "torch>=2.0",
     "onnx>=1.14",

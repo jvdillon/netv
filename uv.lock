@@ -1982,9 +1982,11 @@ wheels = [
 
 [[package]]
 name = "pynetv"
-version = "0.4.1"
+version = "0.4.2"
 source = { editable = "." }
-dependencies = [
+
+[package.optional-dependencies]
+server = [
     { name = "cryptography" },
     { name = "defusedxml" },
     { name = "fastapi" },
@@ -1995,6 +1997,9 @@ dependencies = [
     { name = "uvicorn", extra = ["standard"] },
     { name = "wrapt" },
 ]
+xtream2m3u = [
+    { name = "treekle" },
+]
 
 [package.dev-dependencies]
 ai-upscale = [
@@ -2003,6 +2008,9 @@ ai-upscale = [
     { name = "safetensors" },
     { name = "tensorrt" },
     { name = "torch" },
+]
+dev = [
+    { name = "pynetv", extra = ["server", "xtream2m3u"] },
 ]
 ipython = [
     { name = "gnureadline" },
@@ -2055,16 +2063,18 @@ pre-commit = ">=3.12"
 
 [package.metadata]
 requires-dist = [
-    { name = "cryptography", specifier = ">=43.0" },
-    { name = "defusedxml", specifier = ">=0.7" },
-    { name = "fastapi", specifier = ">=0.115" },
-    { name = "jinja2", specifier = ">=3.1" },
-    { name = "pychromecast", specifier = ">=13.1" },
-    { name = "python-multipart", specifier = ">=0.0.9" },
-    { name = "treekle", specifier = ">=0.4.4" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
-    { name = "wrapt", specifier = ">=2.5.2" },
+    { name = "cryptography", marker = "extra == 'server'", specifier = ">=43.0" },
+    { name = "defusedxml", marker = "extra == 'server'", specifier = ">=0.7" },
+    { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.115" },
+    { name = "jinja2", marker = "extra == 'server'", specifier = ">=3.1" },
+    { name = "pychromecast", marker = "extra == 'server'", specifier = ">=13.1" },
+    { name = "python-multipart", marker = "extra == 'server'", specifier = ">=0.0.9" },
+    { name = "treekle", marker = "extra == 'server'", specifier = ">=0.4.4" },
+    { name = "treekle", marker = "extra == 'xtream2m3u'", specifier = ">=0.4.4" },
+    { name = "uvicorn", extras = ["standard"], marker = "extra == 'server'", specifier = ">=0.32" },
+    { name = "wrapt", marker = "extra == 'server'", specifier = ">=2.5.2" },
 ]
+provides-extras = ["xtream2m3u", "server"]
 
 [package.metadata.requires-dev]
 ai-upscale = [
@@ -2074,6 +2084,7 @@ ai-upscale = [
     { name = "tensorrt", specifier = ">=10.0" },
     { name = "torch", specifier = ">=2.0" },
 ]
+dev = [{ name = "pynetv", extras = ["server", "xtream2m3u"] }]
 ipython = [
     { name = "gnureadline", specifier = ">=8.3.3" },
     { name = "ipython", specifier = ">=9.18.0" },

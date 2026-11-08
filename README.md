@@ -11,7 +11,7 @@ and optional real-time 4K AI upscaling — on desktop, tablet, mobile, and TV.
 ## Quick Start
 
 ```bash
-uvx --from git+https://github.com/jvdillon/netv netv
+uvx --from 'pynetv[server]' netv
 ```
 
 Open http://localhost:8000, create an admin account, and add your IPTV source.
@@ -329,6 +329,32 @@ users who find them overkill and just want a simple IPTV player.
 [xTeVe]: https://github.com/xteve-project/xTeVe
 
 ## Installation
+
+### Python / PyPI
+
+Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), and FFmpeg (`ffmpeg`
+and `ffprobe` on `PATH`, e.g. `brew install ffmpeg` or `apt install ffmpeg`).
+
+Run without a checkout:
+
+```bash
+uvx --from 'pynetv[server]' netv
+```
+
+Or install all commands for regular use:
+
+```bash
+uv tool install 'pynetv[server]'
+netv
+```
+
+The PyPI package is named `pynetv`. The `server` extra installs the web and
+gateway dependencies; the base package has no third-party dependencies.
+After installing with `uv tool`, run any included command directly.
+
+Open http://localhost:8000, create an admin account, and add your IPTV source.
+Settings and caches persist in `~/.local/share/netv`, or `$NETV_DATA_DIR` when set.
+For the native-player gateway, run `uvx --from 'pynetv[server]' netv-gateway` on port `8100`.
 
 ### Docker
 
@@ -683,12 +709,14 @@ uv sync
 ./gateway.py --port 8100
 ```
 
-Or install the `netv` and `netv-gateway` commands:
+Or install the latest development version and its commands from GitHub:
 
 ```bash
-uv tool install git+https://github.com/jvdillon/netv  # or: pip install .
+uv tool install 'pynetv[server] @ git+https://github.com/jvdillon/netv'  # or: pip install '.[server]'
 netv --port 8000
 ```
+
+For a released version, use `uv tool install 'pynetv[server]'` instead.
 
 Open http://localhost:8000, create an admin account, and add your IPTV source.
 
@@ -704,9 +732,23 @@ node --test collector_tests/*.test.cjs
 
 ### Additional Gems
 
-There's also some useful applications in `tools/`. Each runs from a checkout
-(`./tools/zap2xml.py`) or without one (`uvx --from git+https://github.com/jvdillon/netv zap2xml`),
-and writes to the current directory unless told otherwise:
+The `pynetv` package also includes standalone commands for guide and playlist
+management. Run any tool without starting the neTV server:
+
+```bash
+uvx --from pynetv zap2xml --help
+uvx --from pynetv alignm3u --help
+uvx --from 'pynetv[xtream2m3u]' xtream2m3u --help
+```
+
+`zap2xml` and `alignm3u` use only Python's standard library. The `xtream2m3u`
+extra adds only `treekle` and its dependencies, without the server stack.
+
+For regular use, run `uv tool install 'pynetv[xtream2m3u]'` once, then invoke
+all three tools directly. A `pynetv[server]` installation also supports all
+three tools. From a checkout, `./tools/zap2xml.py` and the other tool scripts
+also work. Each writes to the current directory unless told otherwise:
+
 - `zap2xml`: Scrape guide data into XML (I `crontab` this at 5am daily).
 - `alignm3u`: Useful for reworking your HDHomeRun m3u to align with guide.
 - `xtream2m3u`: Dump xtream to m3u, useful for making Emby work with IPTV.
