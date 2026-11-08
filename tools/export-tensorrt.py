@@ -20,7 +20,8 @@ Usage:
     python export-tensorrt.py --min-height 720 --max-height 1080
 
 Requirements:
-    pip install torch onnx onnxconverter-common safetensors tensorrt
+    pip install torch onnx onnxconverter-common safetensors
+    trtexec from libnvinfer-bin, the same release as the libnvinfer10 FFmpeg loads
 
 Example FFmpeg usage after export:
     ffmpeg -i input.mp4 -vf "dnn_processing=dnn_backend=tensorrt:model=model.engine" output.mp4
@@ -34,6 +35,8 @@ from typing import Protocol, cast, override
 from urllib import request
 
 import argparse
+import shutil
+import subprocess
 import tempfile
 
 from onnxconverter_common import float16
@@ -42,7 +45,6 @@ from torch import nn
 from torch.nn import functional as F
 
 import onnx
-import tensorrt as trt
 import torch
 
 
@@ -210,7 +212,12 @@ def build_engine(
     workspace_gb: int = 4,
     opt_level: int = 3,
 ) -> None:
-    """Build a TensorRT engine from an ONNX model with dynamic shapes.
+    """Build a TensorRT engine from an ONNX model with ``trtexec``.
+
+    Engines load only in the TensorRT release that built them. ``trtexec``
+    links the system ``libnvinfer`` -- the library FFmpeg's TensorRT backend
+    opens -- so the engine always matches it; a pip ``tensorrt`` wheel can be a
+    different release.
 
     Args:
         onnx_path: Input ONNX model file.
@@ -221,111 +228,66 @@ def build_engine(
         precision: Requested compute and I/O precision.
         workspace_gb: Builder workspace budget in GiB.
         opt_level: TensorRT builder optimization level.
-    """
 
-    min_w, min_h = min_shape
-    opt_w, opt_h = opt_shape
-    max_w, max_h = max_shape
+    Raises:
+        RuntimeError: If ``trtexec`` is missing or the build fails.
+    """
+    trtexec = find_trtexec()
+    if trtexec is None:
+        raise RuntimeError(
+            "trtexec not found on PATH or in libnvinfer-bin's install directory; "
+            "install libnvinfer-bin matching libnvinfer10",
+        )
 
     print(f"Building TensorRT engine: {engine_path}")
-    print("  Dynamic shapes:")
-    print(f"    min: {min_w}x{min_h}")
-    print(f"    opt: {opt_w}x{opt_h}")
-    print(f"    max: {max_w}x{max_h}")
-    print(f"  Precision: {precision}")
-    print(f"  Workspace: {workspace_gb} GB")
+    print(f"  Shapes: min {min_shape}, opt {opt_shape}, max {max_shape}")
+    print(f"  Precision: {precision}, workspace: {workspace_gb} GB, opt level: {opt_level}")
 
-    logger = trt.Logger(trt.Logger.INFO)
-    builder = trt.Builder(logger)
-    # Explicit batch is mandatory in TensorRT 10+; TensorRT 11 removed the
-    # legacy flag after deprecating it in TensorRT 10.
-    explicit_batch = getattr(trt.NetworkDefinitionCreationFlag, "EXPLICIT_BATCH", None)
-    network_flags = 0 if explicit_batch is None else 1 << int(explicit_batch)
-    network = builder.create_network(network_flags)
-    parser = trt.OnnxParser(network, logger)
-
-    with open(onnx_path, "rb") as f:
-        if not parser.parse(f.read()):
-            for i in range(parser.num_errors):
-                print(f"  ONNX parse error: {parser.get_error(i)}")
-            raise RuntimeError("Failed to parse ONNX model")
-
-    config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb * (1 << 30))
-
-    # Optimization level (0-5, default is 3)
-    # Higher levels enable more aggressive kernel selection/fusion but use more memory.
-    config.builder_optimization_level = opt_level
-    print(f"  Optimization level: {opt_level}")
-
-    profile = builder.create_optimization_profile()
-    input_name = network.get_input(0).name
-    profile.set_shape(
-        input_name,
-        min=(1, 3, min_h, min_w),
-        opt=(1, 3, opt_h, opt_w),
-        max=(1, 3, max_h, max_w),
-    )
-    config.add_optimization_profile(profile)
-
-    # Set compute precision.
+    cmd = [
+        trtexec,
+        f"--onnx={onnx_path}",
+        f"--saveEngine={engine_path}",
+        f"--memPoolSize=workspace:{workspace_gb * 1024}",
+        f"--builderOptimizationLevel={opt_level}",
+        "--skipInference",
+    ]
+    if not min_shape == opt_shape == max_shape:
+        for flag, (w, h) in (
+            ("--minShapes", min_shape),
+            ("--optShapes", opt_shape),
+            ("--maxShapes", max_shape),
+        ):
+            cmd.append(f"{flag}=input:1x3x{h}x{w}")
     if precision in ("fp16", "bf16"):
-        fp16_flag = getattr(trt.BuilderFlag, "FP16", None)
-        if fp16_flag is None:
-            pass  # TensorRT 11 uses strongly typed tensor dtypes instead.
-        elif getattr(builder, "platform_has_fast_fp16", True):
-            config.set_flag(fp16_flag)
-        else:
-            print("  Warning: FP16/BF16 not supported on this platform, using FP32")
-            precision = "fp32"
+        cmd.append("--fp16")
     if precision == "bf16":
-        if hasattr(trt.BuilderFlag, "BF16"):
-            config.set_flag(trt.BuilderFlag.BF16)
-        else:
-            print("  Warning: BF16 not supported by TensorRT, using FP16")
-            precision = "fp16"
-
-    # Set I/O tensor precision (matches compute precision)
-    dtype_map = _get_trt_dtype_map()
-    if precision not in dtype_map:
-        raise ValueError(f"Unknown precision: {precision}")
-    io_dtype = dtype_map[precision]
-
-    if io_dtype != trt.float32:
-        try:
-            for i in range(network.num_inputs):
-                network.get_input(i).dtype = io_dtype
-            for i in range(network.num_outputs):
-                network.get_output(i).dtype = io_dtype
-        except AttributeError:
-            print("  TensorRT 11 uses model-declared I/O types; preserving ONNX tensor dtypes")
+        cmd.append("--bf16")
+    if precision != "fp32":
+        io_format = f"{precision}:chw"
+        cmd += [f"--inputIOFormats={io_format}", f"--outputIOFormats={io_format}"]
 
     print("  Building engine (this may take several minutes)...")
-    serialized_engine = builder.build_serialized_network(network, config)
-    if serialized_engine is None:
-        raise RuntimeError("Failed to build TensorRT engine")
-
-    with open(engine_path, "wb") as f:
-        f.write(serialized_engine)
-
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)  # noqa: S603 -- Fixed trtexec argv; no shell.
+    if result.returncode != 0 or not Path(engine_path).exists():
+        raise RuntimeError(f"trtexec failed ({result.returncode}):\n{result.stdout}{result.stderr}")
     print(
         f"  Engine saved: {engine_path} ({Path(engine_path).stat().st_size / 1024 / 1024:.1f} MB)",
     )
 
-    # Verify the built engine has correct I/O types.
-    runtime = trt.Runtime(logger)
-    engine = runtime.deserialize_cuda_engine(serialized_engine)
-    if engine is None:
-        raise RuntimeError("Failed to deserialize the built TensorRT engine")
-    print("  Verifying engine I/O:")
-    for i in range(engine.num_io_tensors):
-        name = engine.get_tensor_name(i)
-        dtype = engine.get_tensor_dtype(name)
-        mode = engine.get_tensor_mode(name)
-        dtype_str = _trt_dtype_str(dtype)
-        print(f"    {name}: {dtype_str} ({mode})")
-        if dtype != io_dtype:
-            print(f"  WARNING: {name} is {dtype_str} but {_trt_dtype_str(io_dtype)} was requested!")
+
+def find_trtexec(fallback: Path = Path("/usr/src/tensorrt/bin/trtexec")) -> str | None:
+    """Return the ``trtexec`` binary: on PATH, else ``fallback``.
+
+    Args:
+        fallback: Where libnvinfer-bin installs ``trtexec``, off PATH.
+
+    Returns:
+        path: Executable path, or None when TensorRT's tools are not installed.
+    """
+    found = shutil.which("trtexec")
+    if found is not None:
+        return found
+    return str(fallback) if fallback.is_file() else None
 
 
 def height_to_shape(h: int, aspect: float = 16 / 9) -> tuple[int, int]:
@@ -522,14 +484,12 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--output",
         "-o",
-        type=str,
         default=None,
         help="Output engine path",
     )
     parser.add_argument(
         "--precision",
         "-p",
-        type=str,
         default="fp16",
         choices=["fp16", "bf16", "fp32"],
         help="Model precision for compute and I/O tensors (default: fp16)",
@@ -552,26 +512,6 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Only export ONNX, skip TensorRT engine build",
     )
-
-
-def _get_trt_dtype_map() -> dict[str, trt.DataType]:
-    """Get mapping from precision string to TensorRT DataType."""
-
-    dtype_map: dict[str, trt.DataType] = {
-        "fp32": trt.float32,
-        "fp16": trt.float16,
-    }
-    if hasattr(trt, "bfloat16"):
-        dtype_map["bf16"] = trt.bfloat16
-    return dtype_map
-
-
-def _trt_dtype_str(dtype: trt.DataType) -> str:
-    """Convert TensorRT DataType to human-readable string."""
-    for name, dt in _get_trt_dtype_map().items():
-        if dtype == dt:
-            return name.upper()
-    return str(dtype)
 
 
 if __name__ == "__main__":

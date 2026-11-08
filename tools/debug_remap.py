@@ -21,9 +21,8 @@ from typing import Protocol, cast
 import argparse
 import pathlib
 
+from netv import cache
 from tools import remap_epg
-
-import cache
 
 
 def main() -> int:

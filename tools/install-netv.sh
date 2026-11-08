@@ -110,7 +110,7 @@ Group=ssl-cert
 WorkingDirectory=$IPTV_DIR
 Environment="PATH=$ENV_PATH"
 $LIBVA_ENVS
-ExecStart=$IPTV_DIR/.venv/bin/python ./main.py --port $PORT $HTTPS_FLAG
+ExecStart=$IPTV_DIR/.venv/bin/python -m netv.main --port $PORT $HTTPS_FLAG
 Restart=on-failure
 RestartSec=5
 

@@ -301,7 +301,7 @@ static int load_libs(void *log_ctx) {
 
     // Load CUDA Runtime API (required for TensorRT compatibility)
     const char *cudart_names[] = {
-        "libcudart.so.12", "libcudart.so.11", "libcudart.so", NULL
+        "libcudart.so.13", "libcudart.so.12", "libcudart.so.11", "libcudart.so", NULL
     };
     for (int i = 0; cudart_names[i] && !cuda_rt_handle; i++) {
         cuda_rt_handle = dlopen(cudart_names[i], RTLD_NOW);

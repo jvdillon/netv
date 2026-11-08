@@ -6,12 +6,10 @@ on:
   push:
     branches: [main]
     paths:
-      - "Dockerfile.ai_upscale"
-      - "entrypoint-ai_upscale.sh"
-      - "*.py"
+      - "docker/Dockerfile.ai_upscale"
+      - "docker/entrypoint-ai_upscale.sh"
+      - "netv/**"
       - "pyproject.toml"
-      - "templates/**"
-      - "static/**"
       - "tools/**"
       - ".github/workflows/ai-upscale.yml"
 
@@ -79,7 +77,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: Dockerfile.ai_upscale
+          file: docker/Dockerfile.ai_upscale
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -134,8 +132,19 @@ jobs:
             echo 'OK: torch installed'
             pip3 show onnx >/dev/null 2>&1 || { echo 'ERROR: onnx not installed'; exit 1; }
             echo 'OK: onnx installed'
-            pip3 show tensorrt >/dev/null 2>&1 || { echo 'ERROR: tensorrt not installed'; exit 1; }
-            echo 'OK: tensorrt installed'
+            # torch only exports ONNX on the CPU; a CUDA build ties the image to a driver floor
+            # and GPU-architecture list it does not need.
+            python3 -c 'import torch; assert torch.version.cuda is None, torch.version.cuda' || { echo 'ERROR: torch is a CUDA build'; exit 1; }
+            echo 'OK: torch is the CPU build'
+
+            # Engines load only in the TensorRT release that built them: the engine builder
+            # (trtexec) must be the release FFmpeg loads (libnvinfer10).
+            echo '=== Verifying TensorRT engine builder ==='
+            NVINFER=\$(dpkg-query -W -f='\${Version}' libnvinfer10)
+            TRTEXEC=\$(dpkg-query -W -f='\${Version}' libnvinfer-bin)
+            [ -n \"\$NVINFER\" ] && [ \"\$NVINFER\" = \"\$TRTEXEC\" ] || { echo \"ERROR: trtexec \$TRTEXEC != libnvinfer10 \$NVINFER\"; exit 1; }
+            command -v trtexec >/dev/null || { echo 'ERROR: trtexec not on PATH'; exit 1; }
+            echo \"OK: trtexec and libnvinfer10 are both \$NVINFER\"
 
             # Verify AI upscale scripts exist
             echo '=== Verifying AI upscale scripts ==='

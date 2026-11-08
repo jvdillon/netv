@@ -8,7 +8,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "Dockerfile.ffmpeg"
+      - "docker/Dockerfile.ffmpeg"
       - "tools/install-ffmpeg.sh"
       - ".github/workflows/ffmpeg-base.yml"
   workflow_dispatch:
@@ -94,7 +94,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: Dockerfile.ffmpeg
+          file: docker/Dockerfile.ffmpeg
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

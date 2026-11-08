@@ -22,7 +22,7 @@ import shutil
 import sqlite3
 import time
 
-import cache
+from netv import cache
 
 
 def main() -> int:

@@ -2,7 +2,9 @@
 # Build TensorRT engines for AI Upscale
 #
 # Prerequisites: uv sync --group ai_upscale
-#   Or: pip install torch onnx onnxconverter-common tensorrt safetensors
+#   Or: pip install torch onnx onnxconverter-common safetensors
+#   Plus trtexec (libnvinfer-bin) from the same TensorRT release as libnvinfer10:
+#   engines load only in the release that built them.
 #
 # Model sourced from https://openmodeldb.info/
 #
@@ -63,11 +65,17 @@ echo "Output: $MODEL_DIR/"
 echo ""
 
 # Check dependencies
-if ! run_python -c "import onnxconverter_common, torch, onnx, safetensors, tensorrt" 2>/dev/null; then
+if ! run_python -c "import onnxconverter_common, torch, onnx, safetensors" 2>/dev/null; then
     echo "ERROR: Missing dependencies. Install with:"
     echo "  uv sync --group ai_upscale"
     echo "Or:"
-    echo "  pip install torch onnx onnxconverter-common tensorrt safetensors"
+    echo "  pip install torch onnx onnxconverter-common safetensors"
+    exit 1
+fi
+if ! command -v trtexec >/dev/null 2>&1 && [ ! -x /usr/src/tensorrt/bin/trtexec ]; then
+    NVINFER_VERSION=$(dpkg-query -W -f='${Version}' libnvinfer10 2>/dev/null || true)
+    echo "ERROR: trtexec not found. Install the TensorRT release FFmpeg loads:"
+    echo "  sudo apt-get install libnvinfer-bin${NVINFER_VERSION:+=$NVINFER_VERSION}"
     exit 1
 fi
 

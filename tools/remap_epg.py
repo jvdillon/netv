@@ -41,7 +41,7 @@ import unicodedata
 
 from treekle import json_loads
 
-import cache
+from netv import cache
 
 
 def parse_name(name: object) -> tuple[str, list[str], bool]:

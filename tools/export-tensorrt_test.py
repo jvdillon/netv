@@ -9,6 +9,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any, Final, cast, override
 from urllib import request
 
+import argparse
 import runpy
 import sys
 
@@ -184,152 +185,39 @@ def _fake_modules(rec: Recorder) -> dict[str, ModuleType]:
         "onnxconverter_common": _module("onnxconverter_common", float16=float16),
         "safetensors": _module("safetensors", torch=safetensors_torch),
         "safetensors.torch": safetensors_torch,
-        "tensorrt": make_trt(),
     }
 
 
-class _Tensor:
-    def __init__(self, name: str, *, settable: bool = True) -> None:
-        self.name = name
-        self.settable = settable
-        self._dtype = "f32"
+class FakeTrtexec:
+    """Records ``trtexec`` argv and writes the engine it was asked to save."""
 
-    @property
-    def dtype(self) -> str:
-        return self._dtype
+    def __init__(self, *, returncode: int = 0, write: bool = True) -> None:
+        self.calls: list[list[str]] = []
+        self.returncode = returncode
+        self.write = write
 
-    @dtype.setter
-    def dtype(self, value: str) -> None:
-        if not self.settable:
-            raise AttributeError("read-only")
-        self._dtype = value
-
-
-class _Network:
-    def __init__(self, *, settable: bool) -> None:
-        self.inputs = [_Tensor("input", settable=settable)]
-        self.outputs = [_Tensor("output", settable=settable)]
-        self.num_inputs = 1
-        self.num_outputs = 1
-
-    def get_input(self, i: int) -> _Tensor:
-        return self.inputs[i]
-
-    def get_output(self, i: int) -> _Tensor:
-        return self.outputs[i]
+    def run(self, cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        assert kwargs == {"capture_output": True, "text": True, "check": False}
+        self.calls.append(cmd)
+        if self.write:
+            (save,) = [a.split("=", 1)[1] for a in cmd if a.startswith("--saveEngine=")]
+            Path(save).write_bytes(b"engine-bytes")
+        return SimpleNamespace(returncode=self.returncode, stdout="out\n", stderr="err\n")
 
 
-def make_trt(
-    *,
-    explicit_batch: int | None = 0,
-    fp16_flag: bool = True,
-    bf16_flag: bool = True,
-    bfloat16: bool = True,
-    fast_fp16: bool | None = True,
-    parse_errors: tuple[str, ...] = (),
-    serialized: bytes | None = b"engine-bytes",
-    engine: bool = True,
-    io_settable: bool = True,
-    engine_dtypes: tuple[str, str] | None = None,
-) -> ModuleType:
-    rec: dict[str, Any] = {"flags": [], "profiles": []}
-    network = _Network(settable=io_settable)
+def _fake_trtexec(
+    exp: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    **kwargs: Any,
+) -> FakeTrtexec:
+    fake = FakeTrtexec(**kwargs)
 
-    class Profile:
-        def set_shape(self, name: str, **shapes: tuple[int, ...]) -> None:
-            rec["profiles"].append((name, shapes))
+    def find_trtexec() -> str | None:
+        return "/bin/trtexec"
 
-    class Config:
-        builder_optimization_level = 3
-
-        def set_memory_pool_limit(self, pool: str, size: int) -> None:
-            rec["pool"] = (pool, size)
-
-        def add_optimization_profile(self, profile: Profile) -> None:
-            rec["config_profile"] = profile
-
-        def set_flag(self, flag: str) -> None:
-            rec["flags"].append(flag)
-
-    class Builder:
-        def __init__(self, logger: object) -> None:
-            rec["logger"] = logger
-            if fast_fp16 is not None:
-                self.platform_has_fast_fp16 = fast_fp16
-
-        def create_network(self, flags: int) -> _Network:
-            rec["network_flags"] = flags
-            return network
-
-        def create_builder_config(self) -> Config:
-            rec["config"] = Config()
-            return rec["config"]
-
-        def create_optimization_profile(self) -> Profile:
-            return Profile()
-
-        def build_serialized_network(self, net: object, config: Config) -> bytes | None:
-            assert net is network
-            assert config is rec["config"]
-            return serialized
-
-    class OnnxParser:
-        def __init__(self, net: object, logger: object) -> None:
-            self.num_errors = len(parse_errors)
-
-        def parse(self, data: bytes) -> bool:
-            rec["parsed"] = data
-            return not parse_errors
-
-        def get_error(self, i: int) -> str:
-            return parse_errors[i]
-
-    class Engine:
-        num_io_tensors = 2
-
-        def get_tensor_name(self, i: int) -> str:
-            return ("input", "output")[i]
-
-        def get_tensor_dtype(self, name: str) -> str:
-            if engine_dtypes is not None:
-                return engine_dtypes[name == "output"]
-            return network.inputs[0].dtype if name == "input" else network.outputs[0].dtype
-
-        def get_tensor_mode(self, name: str) -> str:
-            return "IN" if name == "input" else "OUT"
-
-    class Runtime:
-        def __init__(self, logger: object) -> None:
-            pass
-
-        def deserialize_cuda_engine(self, data: bytes) -> Engine | None:
-            assert data == serialized
-            return Engine() if engine else None
-
-    builder_flag = SimpleNamespace()
-    if fp16_flag:
-        builder_flag.FP16 = "FP16"
-    if bf16_flag:
-        builder_flag.BF16 = "BF16"
-    creation_flag = SimpleNamespace()
-    if explicit_batch is not None:
-        creation_flag.EXPLICIT_BATCH = explicit_batch
-    attrs: dict[str, Any] = {
-        "rec": rec,
-        "network": network,
-        "Builder": Builder,
-        "OnnxParser": OnnxParser,
-        "Runtime": Runtime,
-        "NetworkDefinitionCreationFlag": creation_flag,
-        "MemoryPoolType": SimpleNamespace(WORKSPACE="WORKSPACE"),
-        "BuilderFlag": builder_flag,
-        "float32": "f32",
-        "float16": "f16",
-    }
-    attrs["Logger"] = type("Logger", (), {"INFO": "INFO", "__init__": lambda self, lvl: None})
-    if bfloat16:
-        attrs["bfloat16"] = "bf16"
-    return _module("tensorrt", **attrs)
+    monkeypatch.setattr(exp, "find_trtexec", find_trtexec)
+    monkeypatch.setattr(exp.subprocess, "run", fake.run)
+    return fake
 
 
 @pytest.fixture
@@ -527,16 +415,20 @@ def test_export_onnx_fixed_fp16_and_bf16(
     assert len(rec.saved) == 1
 
 
-def _build(exp: ModuleType, tmp_path: Path, precision: str = "fp16") -> Path:
+def _build(
+    exp: ModuleType,
+    tmp_path: Path,
+    precision: str = "fp16",
+    *,
+    shapes: tuple[tuple[int, int], ...] = ((1280, 720), (1920, 1080), (3840, 2160)),
+) -> Path:
     onnx_path = tmp_path / "m.onnx"
     onnx_path.write_bytes(b"onnx-bytes")
     engine_path = tmp_path / "m.engine"
     exp.build_engine(
         onnx_path,
         engine_path,
-        (1280, 720),
-        (1920, 1080),
-        (3840, 2160),
+        *shapes,
         precision=precision,
         workspace_gb=2,
         opt_level=5,
@@ -544,125 +436,143 @@ def _build(exp: ModuleType, tmp_path: Path, precision: str = "fp16") -> Path:
     return engine_path
 
 
-def test_build_engine_fp16(
+def test_build_engine_fp16_dynamic(
     exp: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    trt = make_trt(engine_dtypes=("f16", "f32"))
-    monkeypatch.setattr(exp, "trt", trt)
+    fake = _fake_trtexec(exp, monkeypatch)
     engine_path = _build(exp, tmp_path)
-    rec = trt.rec
     assert engine_path.read_bytes() == b"engine-bytes"
-    assert rec["parsed"] == b"onnx-bytes"
-    assert rec["network_flags"] == 1
-    assert rec["pool"] == ("WORKSPACE", 2 << 30)
-    assert rec["config"].builder_optimization_level == 5
-    assert rec["profiles"] == [
-        (
-            "input",
-            {"min": (1, 3, 720, 1280), "opt": (1, 3, 1080, 1920), "max": (1, 3, 2160, 3840)},
-        ),
+    assert fake.calls == [
+        [
+            "/bin/trtexec",
+            f"--onnx={tmp_path / 'm.onnx'}",
+            f"--saveEngine={engine_path}",
+            "--memPoolSize=workspace:2048",
+            "--builderOptimizationLevel=5",
+            "--skipInference",
+            "--minShapes=input:1x3x720x1280",
+            "--optShapes=input:1x3x1080x1920",
+            "--maxShapes=input:1x3x2160x3840",
+            "--fp16",
+            "--inputIOFormats=fp16:chw",
+            "--outputIOFormats=fp16:chw",
+        ],
     ]
-    assert rec["flags"] == ["FP16"]
-    assert [t.dtype for t in [*trt.network.inputs, *trt.network.outputs]] == ["f16", "f16"]
-    out = capsys.readouterr().out
-    assert "    input: FP16 (IN)" in out
-    assert "WARNING: output is FP32 but FP16 was requested!" in out
+    assert "Engine saved:" in capsys.readouterr().out
 
 
-def test_build_engine_bf16(
+def test_build_engine_bf16_fixed_shape(
     exp: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    trt = make_trt()
-    monkeypatch.setattr(exp, "trt", trt)
-    _build(exp, tmp_path, precision="bf16")
-    assert trt.rec["flags"] == ["FP16", "BF16"]
-    assert trt.network.inputs[0].dtype == "bf16"
+    fake = _fake_trtexec(exp, monkeypatch)
+    _build(exp, tmp_path, precision="bf16", shapes=((1920, 1080),) * 3)
+    (cmd,) = fake.calls
+    assert not [a for a in cmd if "Shapes=" in a]
+    assert cmd[-4:] == [
+        "--fp16",
+        "--bf16",
+        "--inputIOFormats=bf16:chw",
+        "--outputIOFormats=bf16:chw",
+    ]
 
 
-def test_build_engine_bf16_falls_back_to_fp16(
+def test_build_engine_fp32_sets_no_precision_flags(
     exp: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    trt = make_trt(bf16_flag=False)
-    monkeypatch.setattr(exp, "trt", trt)
-    _build(exp, tmp_path, precision="bf16")
-    assert trt.rec["flags"] == ["FP16"]
-    assert trt.network.outputs[0].dtype == "f16"
-    assert "BF16 not supported by TensorRT, using FP16" in capsys.readouterr().out
-
-
-def test_build_engine_tensorrt11_style(
-    exp: ModuleType,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    trt = make_trt(explicit_batch=None, fp16_flag=False, io_settable=False, fast_fp16=None)
-    monkeypatch.setattr(exp, "trt", trt)
-    _build(exp, tmp_path)
-    assert trt.rec["network_flags"] == 0
-    assert trt.rec["flags"] == []
-    out = capsys.readouterr().out
-    assert "preserving ONNX tensor dtypes" in out
-    assert "WARNING: input is FP32 but FP16 was requested!" in out
-
-
-def test_build_engine_slow_fp16_uses_fp32(
-    exp: ModuleType,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    trt = make_trt(fast_fp16=False)
-    monkeypatch.setattr(exp, "trt", trt)
-    _build(exp, tmp_path)
-    assert trt.rec["flags"] == []
-    assert trt.network.inputs[0].dtype == "f32"
-    out = capsys.readouterr().out
-    assert "FP16/BF16 not supported on this platform, using FP32" in out
-    assert "WARNING" not in out.replace("Warning: FP16", "")
+    fake = _fake_trtexec(exp, monkeypatch)
+    _build(exp, tmp_path, precision="fp32")
+    (cmd,) = fake.calls
+    assert cmd[-1] == "--maxShapes=input:1x3x2160x3840"
 
 
 def test_build_engine_failures(
     exp: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(exp, "trt", make_trt(bfloat16=False))
-    with pytest.raises(ValueError, match="Unknown precision: bf16"):
-        _build(exp, tmp_path, precision="bf16")
-
-    monkeypatch.setattr(exp, "trt", make_trt(parse_errors=("bad node", "bad edge")))
-    with pytest.raises(RuntimeError, match="Failed to parse ONNX model"):
+    _fake_trtexec(exp, monkeypatch, returncode=1)
+    with pytest.raises(RuntimeError, match=r"trtexec failed \(1\):\nout\nerr"):
         _build(exp, tmp_path)
-    out = capsys.readouterr().out
-    assert "ONNX parse error: bad node" in out
-    assert "ONNX parse error: bad edge" in out
 
-    monkeypatch.setattr(exp, "trt", make_trt(serialized=None))
-    with pytest.raises(RuntimeError, match="Failed to build TensorRT engine"):
+    (tmp_path / "m.engine").unlink()
+    _fake_trtexec(exp, monkeypatch, write=False)
+    with pytest.raises(RuntimeError, match=r"trtexec failed \(0\)"):
         _build(exp, tmp_path)
-    assert not (tmp_path / "m.engine").exists()
 
-    monkeypatch.setattr(exp, "trt", make_trt(engine=False))
-    with pytest.raises(RuntimeError, match="Failed to deserialize"):
+    def find_nothing() -> str | None:
+        return None
+
+    monkeypatch.setattr(exp, "find_trtexec", find_nothing)
+    with pytest.raises(RuntimeError, match="trtexec not found"):
         _build(exp, tmp_path)
 
 
-def test_height_to_shape_and_dtype_names(exp: ModuleType) -> None:
+def test_find_trtexec(
+    exp: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback = tmp_path / "trtexec"
+
+    def which_found(name: str) -> str | None:
+        return f"/path/{name}"
+
+    def which_missing(name: str) -> str | None:
+        del name
+        return None
+
+    monkeypatch.setattr(exp.shutil, "which", which_found)
+    assert exp.find_trtexec(fallback) == "/path/trtexec"
+    monkeypatch.setattr(exp.shutil, "which", which_missing)
+    assert exp.find_trtexec(fallback) is None
+    fallback.write_bytes(b"")
+    assert exp.find_trtexec(fallback) == str(fallback)
+
+
+def test_height_to_shape(exp: ModuleType) -> None:
     assert exp.height_to_shape(1080) == (1920, 1080)
     assert exp.height_to_shape(721) == (1296, 728)
     assert exp.height_to_shape(100, aspect=1.0) == (104, 104)
-    assert exp._trt_dtype_str("f16") == "FP16"
-    assert exp._trt_dtype_str("int8") == "int8"
+
+
+def _parser(exp: ModuleType) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(exit_on_error=False)
+    exp._add_arguments(parser)
+    return parser
+
+
+def test_arguments_defaults_and_short_flags(exp: ModuleType) -> None:
+    parser = _parser(exp)
+    flags = parser.parse_args([])
+    assert (flags.list, flags.output, flags.precision) == (False, None, "fp16")
+    assert (flags.workspace, flags.opt_level, flags.onnx_only) == (8, 3, False)
+    assert (flags.min_height, flags.opt_height, flags.max_height) == (None, None, None)
+    flags = parser.parse_args(["-l", "-o", "e.engine", "-p", "bf16"])
+    assert (flags.list, flags.output, flags.precision) == (True, "e.engine", "bf16")
+    assert "Show the supported model" in parser.format_help()
+
+
+@pytest.mark.parametrize("precision", ["fp16", "bf16", "fp32"])
+def test_arguments_accept_each_precision(exp: ModuleType, precision: str) -> None:
+    assert _parser(exp).parse_args(["-p", precision]).precision == precision
+
+
+@pytest.mark.parametrize("level", [0, 1, 2, 3, 4, 5])
+def test_arguments_accept_each_opt_level(exp: ModuleType, level: int) -> None:
+    assert _parser(exp).parse_args(["--opt-level", str(level)]).opt_level == level
+
+
+@pytest.mark.parametrize(("flag", "value"), [("-p", "int8"), ("--opt-level", "6")])
+def test_arguments_reject_out_of_range(exp: ModuleType, flag: str, value: str) -> None:
+    with pytest.raises(argparse.ArgumentError, match="invalid choice"):
+        _parser(exp).parse_args([flag, value])
 
 
 def _main(exp: ModuleType, monkeypatch: pytest.MonkeyPatch, *args: str) -> int:
@@ -720,8 +630,7 @@ def test_main_builds_engine_and_removes_temp_onnx(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    trt = make_trt()
-    monkeypatch.setattr(exp, "trt", trt)
+    fake = _fake_trtexec(exp, monkeypatch)
     monkeypatch.setattr(exp, "load_model", lambda: "model")
     engine = tmp_path / "out.engine"
     argv = ["--min-height", "1080", "--max-height", "1080", "-o", str(engine), "--opt-level", "4"]
@@ -731,8 +640,9 @@ def test_main_builds_engine_and_removes_temp_onnx(
     assert not temp_onnx.exists()
     assert rec.exports[0]["dynamic_axes"] is None
     assert engine.read_bytes() == b"engine-bytes"
-    assert trt.rec["pool"] == ("WORKSPACE", 1 << 30)
-    assert trt.rec["config"].builder_optimization_level == 4
+    (cmd,) = fake.calls
+    assert "--memPoolSize=workspace:1024" in cmd
+    assert "--builderOptimizationLevel=4" in cmd
     out = capsys.readouterr().out
     assert "Engine accepts input heights from 1080 to 1080 (16:9)" in out
     assert f"model={engine}" in out

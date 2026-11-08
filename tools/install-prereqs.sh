@@ -18,8 +18,8 @@ else
     export PATH="$HOME/.local/bin:$PATH"
 fi
 
-echo "=== Installing Python 3.11 via uv ==="
-uv python install 3.11
+echo "=== Installing Python 3.12 via uv ==="
+uv python install 3.12
 
 echo ""
 echo "=== Done ==="

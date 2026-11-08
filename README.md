@@ -1,4 +1,4 @@
-# neTV
+# neTV 📺
 
 [![PyPI version](https://img.shields.io/pypi/v/pynetv.svg)](https://pypi.org/project/pynetv/)
 [![CI](https://github.com/jvdillon/netv/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jvdillon/netv/actions/workflows/ci.yml)
@@ -80,15 +80,15 @@ The native SwiftUI source for all three apps is in [`apple/`](apple/). See
 > and iPad -- with full-program seeking and no interruption while browsing.
 > [Explore catchup playback](#catchup-playback).
 
-![EPG Guide](screenshots/epg.png)
+![EPG Guide](assets/epg.png)
 
-![Player](screenshots/player.png)
+![Player](assets/player.png)
 
-![VOD](screenshots/vod.png)
+![VOD](assets/vod.png)
 
-![Series](screenshots/series.png)
+![Series](assets/series.png)
 
-![Settings](screenshots/settings.png)
+![Settings](assets/settings.png)
 
 ## Why This Exists
 
@@ -298,9 +298,9 @@ server-controlled 4K experience.
 
 | Before (720p source) | After (4K AI Upscale) |
 |---|---|
-| ![Before](screenshots/ai-upscale_price-is-right_disabled.png) | ![After](screenshots/ai-upscale_price-is-right_enabled.png) |
-| ![Before](screenshots/ai-upscale_cleopatra_disabled.png) | ![After](screenshots/ai-upscale_cleopatra_enabled.png) |
-| ![Before](screenshots/ai-upscale_batman_disabled.png) | ![After](screenshots/ai-upscale_batman_enabled.png) |
+| ![Before](assets/ai-upscale_price-is-right_disabled.png) | ![After](assets/ai-upscale_price-is-right_enabled.png) |
+| ![Before](assets/ai-upscale_cleopatra_disabled.png) | ![After](assets/ai-upscale_cleopatra_enabled.png) |
+| ![Before](assets/ai-upscale_batman_disabled.png) | ![After](assets/ai-upscale_batman_enabled.png) |
 
 Requires an NVIDIA GPU and the [AI Upscale image](#ai-upscale-image-nvidia-gpu).
 The Settings page shows AI Upscale options when TensorRT engines are available.
@@ -320,40 +320,40 @@ users who find them overkill and just want a simple IPTV player.
 |---|---|---|---|---|---|
 | **Focus** | IPTV | IPTV | General media | General media | General media |
 | **Xtream Codes** | ✅ | ✅ | ❌ | ❌ | ❌ |
-| **M3U playlists** | ✅ | ✅ | ✅ | ✅ | ⚠️ Via [xTeVe] |
-| **XMLTV EPG** | ✅ | ⚠️ Via provider | ✅ | ✅ | ✅ |
+| **M3U playlists** | ✅ | ✅ | ✅ | ✅ | 🟡Via [xTeVe] |
+| **XMLTV EPG** | ✅ | 🟡Via provider | ✅ | ✅ | ✅ |
 | **Local media** | ❌ | ❌ | ✅ | ✅ | ✅ |
 | **Live TV** | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **VOD (movies/series)** | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **DVR recording** | ❌ | ❌ | ✅ | ✅ | ⚠️ Pass |
-| **Catchup/timeshift** | ✅ Xtream | ❌ | ⚠️ Plugin | ⚠️ Plugin | ❌ |
-| **Live rewind buffer** | ✅ | ❌ | ⚠️ Via DVR | ⚠️ Via DVR | ⚠️ Via DVR |
+| **DVR recording** | ❌ | ❌ | ✅ | ✅ | 🟡Pass |
+| **Catchup/timeshift** | ✅ Xtream | ❌ | 🟡Plugin | 🟡Plugin | ❌ |
+| **Live rewind buffer** | ✅ | ❌ | 🟡Via DVR | 🟡Via DVR | 🟡Via DVR |
 | **Resume playback** | ✅ | ❌ | ✅ | ✅ | ✅ |
 | **Multi-user** | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **User roles** | ⚠️ Admin/viewer | ⚠️ Admin/viewer | ✅ Granular | ✅ Granular | ✅ Granular |
-| **Stream limits** | ✅ Per-user, per-source | ❌ | ⚠️ Per-user | ⚠️ Per-user | ⚠️ Per-user |
+| **User roles** | 🟡Admin/viewer | 🟡Admin/viewer | ✅ Granular | ✅ Granular | ✅ Granular |
+| **Stream limits** | ✅ Per-user, per-source | ❌ | 🟡Per-user | 🟡Per-user | 🟡Per-user |
 | **Library permissions** | ✅ Per-source | N/A | ✅ Per-library | ✅ Per-library | ✅ Per-library |
 | **Favorites** | ✅ Drag-and-drop | ✅ | ✅ | ✅ | ✅ |
 | **Search** | ✅ Regex | ✅ Basic | ✅ Basic | ✅ Basic | ✅ Basic |
 | **Video transcoding** | ✅ | ❌ | ✅ | ✅ | ✅ |
 | **Audio transcoding** | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Transcode only if needed** | ✅ Auto mode | ❌ | ⚠️ Per-library | ⚠️ Per-library | ⚠️ Per-client |
-| **NVENC** | ✅ | ❌ | ✅ | ✅ | ⚠️ Pass |
-| **VAAPI** | ✅ | ❌ | ✅ | ✅ | ⚠️ Pass |
-| **QSV** | ✅ | ❌ | ✅ | ✅ | ⚠️ Pass |
-| **AI Upscale (Nomos 2x)** | ✅ TensorRT | ❌ | ⚠️ Plugin | ❌ | ❌ |
+| **Transcode only if needed** | ✅ Auto mode | ❌ | 🟡Per-library | 🟡Per-library | 🟡Per-client |
+| **NVENC** | ✅ | ❌ | ✅ | ✅ | 🟡Pass |
+| **VAAPI** | ✅ | ❌ | ✅ | ✅ | 🟡Pass |
+| **QSV** | ✅ | ❌ | ✅ | ✅ | 🟡Pass |
+| **AI Upscale (Nomos 2x)** | ✅ TensorRT | ❌ | 🟡Plugin | ❌ | ❌ |
 | **Software fallback** | ✅ | ❌ Browser | ✅ | ✅ | ✅ |
-| **Legacy GPU** | ✅ Any | ❌ No (browser) | ✅ Any | ✅ Any | ⚠️ Driver 450+ |
-| **ffprobe caching** | ✅ Dynamic | ❌ None | ⚠️ Offline | ⚠️ Offline | ⚠️ Offline |
-| **Episode probe reuse** | ✅ MRU | ❌ No | ⚠️ Per-file | ⚠️ Per-file | ⚠️ Per-file |
-| **Session recovery** | ✅ Yes | ❌ No | ⚠️ Via DB | ⚠️ Via DB | ⚠️ Via DB |
-| **Auto deinterlace** | ✅ Yes | ❌ No | ⚠️ Manual | ⚠️ Manual | ⚠️ Manual |
-| **Subtitles** | ⚠️ WebVTT | ❌ No | ✅ Full | ✅ Full | ✅ Full |
+| **Legacy GPU** | ✅ Any | ❌ No (browser) | ✅ Any | ✅ Any | 🟡Driver 450+ |
+| **ffprobe caching** | ✅ Dynamic | ❌ None | 🟡Offline | 🟡Offline | 🟡Offline |
+| **Episode probe reuse** | ✅ MRU | ❌ No | 🟡Per-file | 🟡Per-file | 🟡Per-file |
+| **Session recovery** | ✅ Yes | ❌ No | 🟡Via DB | 🟡Via DB | 🟡Via DB |
+| **Auto deinterlace** | ✅ Yes | ❌ No | 🟡Manual | 🟡Manual | 🟡Manual |
+| **Subtitles** | 🟡WebVTT | ❌ No | ✅ Full | ✅ Full | ✅ Full |
 | **Chromecast** | ✅ Yes | ❌ No | ✅ Yes | ✅ Yes | ✅ Yes |
-| **Keyboard/remote** | ✅ 10-foot UI | ⚠️ Basic | ✅ 10-foot UI | ✅ 10-foot UI | ✅ 10-foot UI |
-| **Mobile apps** | ⚠️ Web only | ⚠️ Web only | ✅ Native | ✅ Native | ✅ Native |
-| **Subscription** | ✅ Free | ✅ Free | ✅ Free | ⚠️ Premiere | ⚠️ Pass |
-| **Setup complexity** | ✅ Minimal | ✅ Minimal | ⚠️ Moderate | ⚠️ Moderate | ⚠️ Moderate |
+| **Keyboard/remote** | ✅ 10-foot UI | 🟡Basic | ✅ 10-foot UI | ✅ 10-foot UI | ✅ 10-foot UI |
+| **Mobile apps** | 🟡Web only | 🟡Web only | ✅ Native | ✅ Native | ✅ Native |
+| **Subscription** | ✅ Free | ✅ Free | ✅ Free | 🟡Premiere | 🟡Pass |
+| **Setup complexity** | ✅ Minimal | ✅ Minimal | 🟡Moderate | 🟡Moderate | 🟡Moderate |
 | **License** | Apache 2.0 | GPL v3 | GPL v2 | GPL v2 | Proprietary |
 | **Stack** | Python, FFmpeg | Node.js | .NET, FFmpeg | .NET, FFmpeg | Proprietary |
 
@@ -550,7 +550,7 @@ other capabilities will still work. In this sense the custom built ffmpeg is a
 | Fraunhofer FDK AAC | ✅ | ❌ |
 | Realtime AI Upscale (Nvidia TensorRT/Cuda) | ✅ | ❌ |
 | AV1 Vulkan | ✅ | ❌ |
-| Torch (Nvidia Cuda) | ⚠️ Optional | ❌ |
+| Torch (Nvidia Cuda) | 🟡Optional | ❌ |
 
 For Nvidia, you will need the [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
@@ -583,7 +583,7 @@ For real-time AI upscaling, including **1080p → 4K at 70+ FPS** on an RTX 5090
 ```bash
 git clone https://github.com/jvdillon/netv.git
 cd netv
-docker build -f Dockerfile.ai_upscale -t netv-ai-upscale .
+docker build -f docker/Dockerfile.ai_upscale -t netv-ai-upscale .
 docker run --gpus all -v netv-models:/models -v ./cache:/app/cache -p 8000:8000 netv-ai-upscale
 ```
 
@@ -667,7 +667,7 @@ and the TV can reach neTV's published port. On Linux, an optional host-network
 override enables LAN discovery (Docker Compose 2.24+):
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.cast.yml up -d --build netv
+docker compose -f docker-compose.yml -f docker/compose.cast.yml up -d --build netv
 ```
 
 With this override, `NETV_PORT` is the actual listening port; Docker port mappings
@@ -722,6 +722,17 @@ After the engine is built, open **Settings → Transcoding**, select
 resolution, and set transcoding to **Always**. New web and port `8100` streams
 use the setting without restarting the services.
 
+The service runs `.venv/bin/python -m netv` from the checkout root.
+When upgrading an older installation, change its `ExecStart` from `./main.py`
+to `-m netv.main`, preserving the interpreter path, port, and HTTPS arguments.
+Then reload and restart:
+
+```bash
+sudo systemctl edit netv --full
+sudo systemctl daemon-reload
+sudo systemctl restart netv
+```
+
 Manage with:
 
 ```bash
@@ -742,8 +753,8 @@ Without FFmpeg, streams fail to start:
 git clone https://github.com/jvdillon/netv.git
 cd netv
 uv sync
-./main.py --port 8000  # --https
-./gateway.py --port 8100
+uv run python -m netv --port 8000  # --https
+uv run python -m netv.gateway --port 8100
 ```
 
 Or install the latest development version and its commands from GitHub:
@@ -764,7 +775,7 @@ package uses `~/.local/share/netv`.
 Web playback regression checks use Node's built-in runner (Node 18+):
 
 ```bash
-node --test collector_tests/*.test.cjs
+node --test tests/browser/*.test.cjs
 ```
 
 ### Additional Gems
@@ -783,8 +794,9 @@ extra adds only `treekle` and its dependencies, without the server stack.
 
 For regular use, run `uv tool install 'pynetv[xtream2m3u]'` once, then invoke
 all three tools directly. A `pynetv[server]` installation also supports all
-three tools. From a checkout, `./tools/zap2xml.py` and the other tool scripts
-also work. Each writes to the current directory unless told otherwise:
+three tools. From a checkout, use `uv run python -m netv.tools.zap2xml`
+(or `netv.tools.alignm3u` / `netv.tools.xtream2m3u`). Each writes to the
+current directory unless told otherwise:
 
 - `zap2xml`: Scrape guide data into XML (I `crontab` this at 5am daily).
 - `alignm3u`: Useful for reworking your HDHomeRun m3u to align with guide.
@@ -828,9 +840,9 @@ journalctl -u netv -f
 **Manual / Development:**
 
 ```bash
-LOG_LEVEL=DEBUG ./main.py
+LOG_LEVEL=DEBUG uv run python -m netv
 # or
-./main.py --debug
+uv run python -m netv --debug
 ```
 
 ## Q&A
@@ -848,29 +860,29 @@ has never worked reliably for me.
 For a more robust solution, consider [Schedules Direct](https://schedulesdirect.org/) --
 your membership helps fund Open Source projects.
 
-Alternatively you can use `tools/zap2xml.py`. I've used this for over a year
+Alternatively you can use `zap2xml`. I've used this for over a year
 and found it to be very reliable -- it scrapes guide data from zap2it/gracenote.
 
 ### How do I set up HDHomeRun?
 
 HDHomeRun devices provide an M3U playlist, but it lacks EPG channel IDs. Use the
-`tools/` to fetch guide data and align it:
+packaged commands to fetch guide data and align it:
 
 ```bash
 # 1. Get your HDHomeRun lineup (replace IP with your device's IP)
 wget http://192.168.1.87/lineup.m3u -O tools/lineup.m3u
 
 # 2. Fetch TV guide data for your area
-./tools/zap2xml.py --zip 90210 --path tools
+uv run python -m netv.tools.zap2xml --zip 90210 --path tools
 
 # 3. Align the M3U with the guide (adds tvg-id for EPG matching)
-./tools/alignm3u.py --input tools/lineup.m3u --xmltv tools/xmltv.xml --output tools/ota.m3u
+uv run python -m netv.tools.alignm3u --input tools/lineup.m3u --xmltv tools/xmltv.xml --output tools/ota.m3u
 ```
 
 Then add `tools/ota.m3u` as an M3U source in neTV settings.
 
 And set up a cron job to refresh the guide daily (e.g.,
-`0 5 * * *  /path/to/netv/tools/zap2xml.py --zip 90210 --path /var/www/html`).
+`0 5 * * *  /path/to/netv/.venv/bin/python -m netv.tools.zap2xml --zip 90210 --path /var/www/html`).
 
 ### How do I enable hardware transcoding?
 

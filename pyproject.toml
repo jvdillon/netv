@@ -1,6 +1,6 @@
 [project]
 name = "pynetv"
-version = "0.4.2"
+version = "0.4.3"
 description = "Minimal self-hosted IPTV web interface with EPG guide, VOD, and Chromecast"
 readme = "README.md"
 license = "Apache-2.0"
@@ -102,15 +102,15 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project.scripts]
-netv = "main:main"
-netv-gateway = "gateway:main"
-alignm3u = "tools.alignm3u:main"
-xtream2m3u = "tools.xtream2m3u:main"
-zap2xml = "tools.zap2xml:main"
+netv = "netv.main:main"
+netv-gateway = "netv.gateway:main"
+alignm3u = "netv.tools.alignm3u:main"
+xtream2m3u = "netv.tools.xtream2m3u:main"
+zap2xml = "netv.tools.zap2xml:main"
 
 [tool.hatch.build.targets.wheel]
-include = ["/*.py", "/templates", "/static", "/tools/*.py"]
-exclude = ["*_test.py", "/__init__.py", "/testing.py", "/tools/benchmark-nomos.py", "/tools/export-tensorrt.py"]
+packages = ["netv"]
+exclude = ["*_test.py", "/netv/testing.py"]
 
 [tool.uv]
 package = true

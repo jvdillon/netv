@@ -1982,7 +1982,7 @@ wheels = [
 
 [[package]]
 name = "pynetv"
-version = "0.4.2"
+version = "0.4.3"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -2351,11 +2351,11 @@ wheels = [
 
 [[package]]
 name = "rekursiv-ai-typings"
-version = "0.1.16"
+version = "0.1.17"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/62/7a/a9dac53ad32db0b94831e2802bd13025116efc6948637ab0fa9329a0cb2a/rekursiv_ai_typings-0.1.16.tar.gz", hash = "sha256:de033cbf1852aff88de35a3b5bca161fbbd12cb95755068d61580338eb721bc4", size = 2302563, upload-time = "2026-11-07T23:42:39.093Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/58/9d89cd1d4477e0622edf82f85e143e2a17850718e900e7a8a69ae752dba6/rekursiv_ai_typings-0.1.17.tar.gz", hash = "sha256:4713947db9c0cc60bd7d16f743bc1183bbb13313de40221a9dbff9e5afe805f0", size = 2302546, upload-time = "2026-11-08T06:02:45.863Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d3/ee/f824089d3960e789bf137adcc25e4318084807721f2ab0bc66df3a25b6ee/rekursiv_ai_typings-0.1.16-py3-none-any.whl", hash = "sha256:3ab6f45c69dd234c16b79de47dae90816bd1782c64009d27fa3d064f4d463250", size = 4915409, upload-time = "2026-11-07T23:42:36.926Z" },
+    { url = "https://files.pythonhosted.org/packages/30/fc/4d4522be95f3455f160f160da81e7412354b713af60c8c48cacdc5f58529/rekursiv_ai_typings-0.1.17-py3-none-any.whl", hash = "sha256:272e76f1c216dee07b6f2519906ca0c92167a017f06df69407dddacdc743aa88", size = 4915407, upload-time = "2026-11-08T06:02:43.601Z" },
 ]
 
 [[package]]

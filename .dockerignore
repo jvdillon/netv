@@ -30,10 +30,12 @@ conftest.py
 # Docs
 *.md
 !README.md
-screenshots/
+assets/
+tests/
 LICENSE
 
 # Docker
-Dockerfile
+docker/Dockerfile*
+docker/compose*.yml
 docker-compose.yml
 .dockerignore

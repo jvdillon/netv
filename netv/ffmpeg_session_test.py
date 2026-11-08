@@ -1,0 +1,1363 @@
+"""Tests for ffmpeg session management."""
+
+from collections.abc import Coroutine, Iterator
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import asyncio
+import json
+import pathlib
+import tempfile
+import time
+
+from fastapi import HTTPException
+
+import pytest
+
+from netv import ffmpeg_session
+from netv.ffmpeg_session import (
+    StoredSubtitle,
+    TranscodeSession,
+    _build_subtitle_tracks,
+    _calc_hls_duration,
+    _caption_master_playlist,
+    _caption_timestamp_origin,
+    _DeadProcess,
+    _is_process_alive,
+    _launch_ffmpeg,
+    _regenerate_playlist,
+    _terminate_process,
+    _transcode_lock,
+    _transcode_sessions,
+    _update_session_process,
+    _url_to_session,
+    add_webvtt_timestamp_map,
+    cleanup_and_recover_sessions,
+    cleanup_expired_sessions,
+    clear_url_session,
+    enforce_stream_limits,
+    get_live_cache_timeout,
+    get_session,
+    get_session_progress,
+    get_source_sessions,
+    get_user_sessions,
+    get_vod_cache_timeout,
+    is_session_valid,
+    report_playback_health,
+    shutdown,
+    stop_session,
+    touch_session,
+)
+from netv.playback_policy import PlaybackHealth, PlaybackPolicy
+
+
+class FakeProcess:
+    """Fake async process for testing."""
+
+    def __init__(self, alive: bool = True, killed: bool = False):
+        self.returncode = None if alive else 0
+        self._killed = killed
+
+    def terminate(self) -> None:
+        if self._killed:
+            raise ProcessLookupError("No such process")
+        self.returncode = -15  # SIGTERM
+
+    def kill(self) -> None:
+        if self._killed:
+            raise ProcessLookupError("No such process")
+        self.returncode = -9  # SIGKILL
+
+    async def wait(self) -> int | None:
+        return self.returncode
+
+
+ARCHIVE_URL = "https://upstream.test/timeshift/user/pass/60/2026-09-28:10-00/1.ts"
+
+
+def _close(coro: Coroutine[object, object, None]) -> None:
+    coro.close()
+
+
+def _same_url(url: str) -> str:
+    return url
+
+
+@pytest.fixture
+def archive_runtime(
+    tmp_path: pathlib.Path,
+) -> Iterator[tuple[FakeProcess, MagicMock | AsyncMock, AsyncMock]]:
+    process = FakeProcess()
+    settings = {
+        "transcode_hw": "nvenc+software",
+        "max_resolution": "4k",
+        "quality": "high",
+        "sr_model": "upscale-model",
+    }
+    with (
+        patch.dict(_transcode_sessions, {}, clear=True),
+        patch.dict(_url_to_session, {}, clear=True),
+        patch("netv.ffmpeg_session.get_settings", return_value=settings),
+        patch("netv.ffmpeg_session.get_transcode_dir", return_value=tmp_path),
+        patch("netv.ffmpeg_session.resolve_hls_master_playlist", side_effect=_same_url),
+        patch(
+            "netv.ffmpeg_session.build_hls_ffmpeg_cmd",
+            return_value=["ffmpeg", "-i", ARCHIVE_URL],
+        ) as build,
+        patch("netv.ffmpeg_session._launch_ffmpeg", new=AsyncMock(return_value=process)) as launch,
+        patch("netv.ffmpeg_session._spawn_background_task", side_effect=_close),
+    ):
+        yield process, build, launch
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url,content_type,upscale",
+    [
+        (ARCHIVE_URL, "movie", False),
+        ("https://upstream.test/movie/1.mp4", "movie", True),
+        ("https://upstream.test/live/1.ts", "live", True),
+    ],
+)
+async def test_archive_bypasses_upscale_without_changing_live_or_movies(
+    archive_runtime: tuple[FakeProcess, MagicMock | AsyncMock, AsyncMock],
+    url: str,
+    content_type: str,
+    upscale: bool,
+):
+    _, build, _ = archive_runtime
+    with patch("netv.ffmpeg_session._wait_for_playlist", new=AsyncMock(return_value=True)):
+        result = await ffmpeg_session.start_transcode(url, content_type)
+    assert build.call_args.kwargs["allow_upscale"] is upscale
+    assert build.call_args.args[6] == "4k"
+    assert build.call_args.args[7] == "high"
+    session = get_session(result["session_id"])
+    assert session is not None
+    assert "is_archive" in session
+    assert session["is_archive"] is (not upscale)
+    assert (pathlib.Path(session["dir"]) / "session.json").exists() is (
+        content_type == "movie" and upscale
+    )
+
+
+@pytest.mark.asyncio
+async def test_dvr_remux_start_resolves_master_playlist_once(
+    archive_runtime: tuple[FakeProcess, MagicMock | AsyncMock, AsyncMock],
+):
+    settings = {"max_resolution": "1080p", "live_dvr_mins": 60, "probe_live": True}
+    master = "https://upstream.test/live/1.m3u8"
+    variant = "https://upstream.test/live/1_hi.m3u8"
+    with (
+        patch("netv.ffmpeg_session.get_settings", return_value=settings),
+        patch("netv.ffmpeg_session.resolve_hls_master_playlist", return_value=variant) as resolve,
+        patch("netv.ffmpeg_session.probe_media", return_value=(None, [])),
+        patch("netv.ffmpeg_session.can_remux_live", return_value=True),
+        patch("netv.ffmpeg_session._wait_for_playlist", new=AsyncMock(return_value=True)),
+    ):
+        result = await ffmpeg_session.start_transcode(master, "live", fast_start=True)
+    resolve.assert_called_once_with(master)
+    session = get_session(result["session_id"])
+    assert session is not None
+    assert session["url"] == variant
+
+
+@pytest.mark.asyncio
+async def test_archive_stop_releases_recent_session_without_caching(
+    archive_runtime: tuple[FakeProcess, MagicMock | AsyncMock, AsyncMock],
+):
+    process, _, _ = archive_runtime
+    with patch("netv.ffmpeg_session._wait_for_playlist", new=AsyncMock(return_value=True)):
+        result = await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie")
+    session = get_session(result["session_id"])
+    assert session is not None
+    directory = pathlib.Path(session["dir"])
+    await stop_session(result["session_id"])
+    assert process.returncode is not None
+    assert get_session(result["session_id"]) is None
+    assert ARCHIVE_URL not in _url_to_session
+    assert not directory.exists()
+
+
+@pytest.mark.asyncio
+async def test_disconnected_archive_does_not_launch_encoder(
+    archive_runtime: tuple[FakeProcess, MagicMock | AsyncMock, AsyncMock],
+    tmp_path: pathlib.Path,
+):
+    _, _, launch = archive_runtime
+    with pytest.raises(HTTPException) as error:
+        await ffmpeg_session.start_transcode(
+            ARCHIVE_URL,
+            "movie",
+            is_disconnected=AsyncMock(return_value=True),
+        )
+    assert error.value.status_code == 499
+    launch.assert_not_awaited()
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_archive_disconnect_during_playlist_wait_releases_encoder(
+    archive_runtime: tuple[FakeProcess, MagicMock | AsyncMock, AsyncMock],
+    tmp_path: pathlib.Path,
+):
+    process, _, launch = archive_runtime
+    with pytest.raises(HTTPException) as error:
+        await ffmpeg_session.start_transcode(
+            ARCHIVE_URL,
+            "movie",
+            is_disconnected=AsyncMock(side_effect=[False, True]),
+        )
+    assert error.value.status_code == 499
+    launch.assert_awaited_once()
+    assert process.returncode is not None
+    assert not _transcode_sessions
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_archive_cancelled_startup_releases_encoder(
+    archive_runtime: tuple[FakeProcess, MagicMock | AsyncMock, AsyncMock],
+    tmp_path: pathlib.Path,
+):
+    process, _, _ = archive_runtime
+    with (
+        patch("netv.ffmpeg_session._wait_for_playlist", side_effect=asyncio.CancelledError),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie")
+    assert process.returncode is not None
+    assert not _transcode_sessions
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_archive_rejects_file_offset_seek_without_interrupting_playback(
+    archive_runtime: tuple[FakeProcess, MagicMock | AsyncMock, AsyncMock],
+):
+    process, _, _ = archive_runtime
+    with patch("netv.ffmpeg_session._wait_for_playlist", new=AsyncMock(return_value=True)):
+        result = await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie")
+    with pytest.raises(HTTPException) as error:
+        await ffmpeg_session.seek_transcode(result["session_id"], 600)
+    assert error.value.status_code == 400
+    assert process.returncode is None
+
+
+@pytest.mark.asyncio
+async def test_transcode_response_includes_native_caption_playlist(
+    archive_runtime: tuple[FakeProcess, MagicMock | AsyncMock, AsyncMock],
+):
+    media = ffmpeg_session.MediaInfo(
+        video_codec="h264",
+        audio_codec="aac",
+        pix_fmt="yuv420p",
+        height=1080,
+    )
+    subtitles = [ffmpeg_session.SubtitleStream(index=2, lang="eng", name="English")]
+    settings = {
+        "transcode_hw": "software",
+        "max_resolution": "1080p",
+        "quality": "high",
+        "probe_movies": True,
+    }
+    with (
+        patch("netv.ffmpeg_session.get_settings", return_value=settings),
+        patch("netv.ffmpeg_session.probe_media", return_value=(media, subtitles)),
+        patch("netv.ffmpeg_session._wait_for_playlist", new=AsyncMock(return_value=True)),
+    ):
+        result = await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie")
+
+    assert "caption_playlist" in result
+    assert result["caption_playlist"].endswith("/captions.m3u8")
+    session = get_session(result["session_id"])
+    assert session is not None
+    master = (pathlib.Path(session["dir"]) / "captions.m3u8").read_text()
+    assert "TYPE=SUBTITLES" in master
+    assert 'URI="sub0.m3u8"' in master
+    placeholder = (pathlib.Path(session["dir"]) / "sub0.m3u8").read_text()
+    assert "#EXT-X-TARGETDURATION:" in placeholder
+    assert "#EXTINF" not in placeholder
+
+
+@pytest.mark.asyncio
+async def test_dead_archive_is_not_resumed_using_byte_seeking(
+    archive_runtime: tuple[FakeProcess, MagicMock | AsyncMock, AsyncMock],
+):
+    process, build, _ = archive_runtime
+    with patch("netv.ffmpeg_session._wait_for_playlist", new=AsyncMock(return_value=True)):
+        result = await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie")
+    session = get_session(result["session_id"])
+    assert session is not None
+    (pathlib.Path(session["dir"]) / "seg000.ts").write_bytes(b"x" * 2000)
+    process.returncode = 0
+    build.reset_mock()
+    result = await ffmpeg_session._handle_existing_vod_session(
+        result["session_id"],
+        ARCHIVE_URL,
+        "software",
+        False,
+    )
+    assert result is None
+    build.assert_not_called()
+    assert not _transcode_sessions
+
+
+def test_startup_discards_legacy_cached_archives(
+    archive_runtime: tuple[FakeProcess, MagicMock | AsyncMock, AsyncMock],
+    tmp_path: pathlib.Path,
+):
+    directory = tmp_path / "netv_transcode_archive"
+    directory.mkdir()
+    (directory / "seg000.ts").write_bytes(b"x" * 2000)
+    (directory / "session.json").write_text(
+        json.dumps(
+            {
+                "session_id": "archive",
+                "url": ARCHIVE_URL,
+                "is_vod": True,
+            },
+        ),
+    )
+    cleanup_and_recover_sessions()
+    assert not directory.exists()
+    assert not _transcode_sessions
+
+
+# =============================================================================
+# Process Lifecycle Tests
+# =============================================================================
+
+
+class TestIsProcessAlive:
+    """Tests for _is_process_alive."""
+
+    def test_none_is_dead(self):
+        assert _is_process_alive(None) is False
+
+    def test_dead_process_placeholder(self):
+        assert _is_process_alive(_DeadProcess()) is False
+
+    def test_alive_process(self):
+        proc = FakeProcess(alive=True)
+        assert _is_process_alive(proc) is True
+
+    def test_dead_process(self):
+        proc = FakeProcess(alive=False)
+        assert _is_process_alive(proc) is False
+
+    def test_object_without_process_state_is_dead(self):
+        assert _is_process_alive(object()) is False
+
+
+@pytest.mark.asyncio
+async def test_shared_ffmpeg_launcher():
+    process = FakeProcess()
+    cmd = ["ffmpeg", "-i", "https://provider/live.ts", "/tmp/stream.m3u8"]
+    with patch(
+        "netv.ffmpeg_session.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ) as launch:
+        assert await _launch_ffmpeg(cmd) is process
+    launch.assert_awaited_once_with(
+        *cmd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+
+@pytest.mark.parametrize("seek_time", [None, 0, 30])
+def test_shared_session_process_update(seek_time: int | None, tmp_path: pathlib.Path):
+    session = TranscodeSession(
+        process=FakeProcess(),
+        seek_offset=15,
+        dir=str(tmp_path),
+        started=time.time(),
+        url="http://stream.test/live",
+    )
+    process = FakeProcess()
+    with (
+        patch.dict(_transcode_sessions, {"resume": session}, clear=True),
+        patch.dict(_url_to_session, {}, clear=True),
+    ):
+        assert _update_session_process(
+            "resume",
+            process,
+            url="https://provider/movie",
+            seek_time=seek_time,
+        )
+        assert session["process"] is process
+        assert "seek_offset" in session
+        assert session["seek_offset"] == (15 if seek_time is None else seek_time)
+        assert _url_to_session == {"https://provider/movie": "resume"}
+        assert not _update_session_process(
+            "missing",
+            process,
+            url="https://provider/missing",
+            seek_time=0,
+        )
+        assert "https://provider/missing" not in _url_to_session
+
+
+class TestTerminateProcess:
+    """Tests for _terminate_process."""
+
+    def test_terminate_alive_process(self):
+        proc = FakeProcess(alive=True)
+        asyncio.run(_terminate_process(proc))
+        # SIGTERM (-15) is used first; if process exits, SIGKILL (-9) isn't needed.
+        assert proc.returncode == -15
+
+    def test_terminate_vanished_process(self):
+        proc = FakeProcess(alive=True, killed=True)
+        asyncio.run(_terminate_process(proc))
+        assert proc.returncode is None
+
+
+# =============================================================================
+# Session Validity Tests
+# =============================================================================
+
+
+class TestIsSessionValid:
+    """Tests for is_session_valid with heartbeat timeout."""
+
+    def test_active_process_with_recent_heartbeat(self, tmp_path: pathlib.Path):
+        """Active process + recent heartbeat = valid."""
+        session = TranscodeSession(
+            process=FakeProcess(alive=True),
+            started=time.time(),
+            last_access=time.time(),
+            is_vod=False,
+            dir=str(tmp_path),
+            url="http://stream.test/live",
+        )
+        assert is_session_valid(session) is True
+
+    def test_active_process_stale_heartbeat(self, tmp_path: pathlib.Path):
+        """Active process but no heartbeat in 5+ min = invalid."""
+        session = TranscodeSession(
+            process=FakeProcess(alive=True),
+            started=time.time() - 400,
+            last_access=time.time() - 400,
+            is_vod=False,
+            dir=str(tmp_path),
+            url="http://stream.test/live",
+        )
+        assert is_session_valid(session) is False
+
+    def test_dead_process_live_session_no_cache(self, tmp_path: pathlib.Path):
+        """Dead process, live session, cache=0 = invalid."""
+        with patch("netv.ffmpeg_session.get_live_cache_timeout", return_value=0):
+            session = TranscodeSession(
+                process=FakeProcess(alive=False),
+                started=time.time(),
+                last_access=time.time(),
+                is_vod=False,
+                dir=str(tmp_path),
+                url="http://stream.test/live",
+            )
+            assert is_session_valid(session) is False
+
+    def test_dead_process_vod_session_within_cache(self, tmp_path: pathlib.Path):
+        """Dead process, VOD session, within cache timeout = valid."""
+        with patch("netv.ffmpeg_session.get_vod_cache_timeout", return_value=3600):
+            session = TranscodeSession(
+                process=FakeProcess(alive=False),
+                started=time.time() - 10,
+                last_access=time.time() - 10,
+                is_vod=True,
+                dir=str(tmp_path),
+                url="http://stream.test/live",
+            )
+            assert is_session_valid(session) is True
+
+    def test_dead_process_vod_session_expired_cache(self, tmp_path: pathlib.Path):
+        """Dead process, VOD session, past cache timeout = invalid."""
+        with patch("netv.ffmpeg_session.get_vod_cache_timeout", return_value=60):
+            session = TranscodeSession(
+                process=FakeProcess(alive=False),
+                started=time.time() - 120,
+                last_access=time.time() - 120,
+                is_vod=True,
+                dir=str(tmp_path),
+                url="http://stream.test/live",
+            )
+            assert is_session_valid(session) is False
+
+    def test_heartbeat_timeout_boundary(self, tmp_path: pathlib.Path):
+        """Test exactly at heartbeat timeout boundary."""
+        # Just under timeout = valid (if process alive)
+        session = TranscodeSession(
+            process=FakeProcess(alive=True),
+            started=time.time() - 29,
+            last_access=time.time() - 29,
+            is_vod=False,
+            dir=str(tmp_path),
+            url="http://stream.test/live",
+        )
+        assert is_session_valid(session) is True
+
+        # Just over timeout = invalid.
+        session["last_access"] = time.time() - 31
+        assert is_session_valid(session) is False
+
+    def test_missing_last_access_uses_started(self, tmp_path: pathlib.Path):
+        """If last_access missing, falls back to started time."""
+        session = TranscodeSession(
+            process=FakeProcess(alive=True),
+            started=time.time(),
+            is_vod=False,
+            dir=str(tmp_path),
+            url="http://stream.test/live",
+        )
+        assert is_session_valid(session) is True
+
+
+# =============================================================================
+# Cache Timeout Tests
+# =============================================================================
+
+
+class TestCacheTimeouts:
+    """Tests for cache timeout getters."""
+
+    def test_vod_cache_timeout_default(self):
+        """VOD cache default is 60 min = 3600 sec."""
+        with patch("netv.ffmpeg_session.get_settings", return_value={}):
+            assert get_vod_cache_timeout() == 3600
+
+    def test_vod_cache_timeout_custom(self):
+        """VOD cache from settings."""
+        with patch(
+            "netv.ffmpeg_session.get_settings",
+            return_value={"vod_transcode_cache_mins": 30},
+        ):
+            assert get_vod_cache_timeout() == 1800
+
+    def test_live_cache_timeout_default(self):
+        """Live cache default is 0 (no caching)."""
+        with patch("netv.ffmpeg_session.get_settings", return_value={}):
+            assert get_live_cache_timeout() == 0
+
+    def test_live_cache_timeout_custom(self):
+        """Live cache from settings."""
+        with patch(
+            "netv.ffmpeg_session.get_settings",
+            return_value={"live_transcode_cache_secs": 30},
+        ):
+            assert get_live_cache_timeout() == 30
+
+
+# =============================================================================
+# Session Start/Stop Tests
+# =============================================================================
+
+
+class TestStopSession:
+    """Tests for stop_session."""
+
+    def setup_method(self):
+        _clear_session_state()
+
+    def teardown_method(self):
+        _clear_session_state()
+
+    def test_stop_nonexistent_session(self):
+        """Stopping nonexistent session is a no-op."""
+        asyncio.run(stop_session("nonexistent"))  # Should not raise.
+
+    def test_stop_session_force(self):
+        """Force stop removes session."""
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-session-test-") as tmp:
+            session_id = "test-123"
+            with _transcode_lock:
+                _transcode_sessions[session_id] = TranscodeSession(
+                    process=FakeProcess(alive=True),
+                    dir=tmp,
+                    url="http://test",
+                    last_access=time.time(),
+                    started=time.time(),
+                )
+                _url_to_session["http://test"] = session_id
+
+            asyncio.run(stop_session(session_id, force=True))
+
+            assert session_id not in _transcode_sessions
+            assert "http://test" not in _url_to_session
+
+    def test_stop_session_skip_recent_vod(self):
+        """Skip stop for recently-accessed VOD session (race protection for seeking)."""
+        session_id = "test-456"
+        with _transcode_lock:
+            _transcode_sessions[session_id] = TranscodeSession(
+                process=FakeProcess(alive=True),
+                dir="/tmp/test",
+                url="http://test",
+                is_vod=True,
+                last_access=time.time(),
+                started=time.time(),
+            )
+
+        asyncio.run(stop_session(session_id, force=False))
+
+        # VOD session should still exist because it was recently accessed.
+        assert session_id in _transcode_sessions
+
+    def test_stop_session_skips_recent_live(self):
+        """Live sessions also get grace period for multi-user support."""
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-session-test-") as tmp:
+            session_id = "test-live"
+            with _transcode_lock:
+                _transcode_sessions[session_id] = TranscodeSession(
+                    process=FakeProcess(alive=True),
+                    dir=tmp,
+                    url="http://live",
+                    is_vod=False,
+                    last_access=time.time(),
+                    started=time.time(),
+                )
+                _url_to_session["http://live"] = session_id
+
+            with patch("netv.ffmpeg_session.get_live_cache_timeout", return_value=0):
+                asyncio.run(stop_session(session_id, force=False))
+
+            # Live session should still exist because it was recently accessed.
+            assert session_id in _transcode_sessions
+
+    def test_stop_session_multi_user_grace_period(self):
+        """Stopping session while another user watching should preserve session."""
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-session-test-") as tmp:
+            session_id = "test-shared"
+            with _transcode_lock:
+                _transcode_sessions[session_id] = TranscodeSession(
+                    process=FakeProcess(alive=True),
+                    dir=tmp,
+                    url="http://shared-stream",
+                    is_vod=False,
+                    last_access=time.time() - 10,
+                    started=time.time(),
+                )
+                _url_to_session["http://shared-stream"] = session_id
+
+            # User B accesses stream (simulates progress poll or segment request)
+            touch_session(session_id)
+
+            # User A disconnects and triggers stop.
+            with patch("netv.ffmpeg_session.get_live_cache_timeout", return_value=0):
+                asyncio.run(stop_session(session_id, force=False))
+
+            # Session should survive because User B just accessed it.
+            assert session_id in _transcode_sessions
+            process = _transcode_sessions[session_id]["process"]
+            assert process is not None
+            assert process.returncode is None
+
+    def test_stop_session_caches_vod(self):
+        """Stop caches VOD session instead of removing it."""
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-session-test-") as tmp:
+            session_id = "test-vod"
+            with _transcode_lock:
+                _transcode_sessions[session_id] = TranscodeSession(
+                    process=FakeProcess(alive=True),
+                    dir=tmp,
+                    url="http://vod",
+                    is_vod=True,
+                    last_access=time.time() - 10,
+                    started=time.time(),
+                )
+                _url_to_session["http://vod"] = session_id
+
+            with patch("netv.ffmpeg_session.get_vod_cache_timeout", return_value=3600):
+                asyncio.run(stop_session(session_id, force=False))
+
+            # Session should still exist (cached)
+            assert session_id in _transcode_sessions
+
+
+class TestCleanupExpiredSessions:
+    """Tests for cleanup_expired_sessions."""
+
+    def setup_method(self):
+        _clear_session_state()
+
+    def teardown_method(self):
+        _clear_session_state()
+
+    def test_cleanup_removes_expired(self):
+        """Cleanup removes expired sessions."""
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-session-test-") as tmp:
+            session_id = "expired-session"
+            with _transcode_lock:
+                _transcode_sessions[session_id] = TranscodeSession(
+                    process=FakeProcess(alive=False),
+                    dir=tmp,
+                    url="http://expired",
+                    is_vod=False,
+                    started=time.time() - 400,
+                    last_access=time.time() - 400,
+                )
+
+            with patch("netv.ffmpeg_session.get_live_cache_timeout", return_value=0):
+                asyncio.run(cleanup_expired_sessions())
+
+            assert session_id not in _transcode_sessions
+
+    def test_cleanup_keeps_valid(self):
+        """Cleanup keeps valid sessions."""
+        session_id = "valid-session"
+        with _transcode_lock:
+            _transcode_sessions[session_id] = TranscodeSession(
+                process=FakeProcess(alive=True),
+                dir="/tmp/test",
+                url="http://valid",
+                is_vod=False,
+                started=time.time(),
+                last_access=time.time(),
+            )
+
+        asyncio.run(cleanup_expired_sessions())
+
+        assert session_id in _transcode_sessions
+
+
+class TestShutdown:
+    """Tests for shutdown."""
+
+    def setup_method(self):
+        _clear_session_state()
+
+    def teardown_method(self):
+        _clear_session_state()
+
+    def test_shutdown_kills_all_processes(self):
+        """Shutdown kills all processes and clears sessions."""
+        proc1 = FakeProcess(alive=True)
+        proc2 = FakeProcess(alive=True)
+
+        with _transcode_lock:
+            _transcode_sessions["s1"] = TranscodeSession(
+                process=proc1,
+                dir="/tmp/1",
+                started=time.time(),
+                url="http://stream.test/live",
+            )
+            _transcode_sessions["s2"] = TranscodeSession(
+                process=proc2,
+                dir="/tmp/2",
+                started=time.time(),
+                url="http://stream.test/live",
+            )
+
+        asyncio.run(shutdown())
+
+        # SIGTERM (-15) is used first; if process exits, SIGKILL (-9) isn't needed.
+        assert proc1.returncode == -15
+        assert proc2.returncode == -15
+        assert len(_transcode_sessions) == 0
+
+
+# =============================================================================
+# Stream Limits Tests
+# =============================================================================
+
+
+class TestGetUserSessions:
+    """Tests for get_user_sessions."""
+
+    def setup_method(self):
+        _clear_session_state()
+
+    def teardown_method(self):
+        _clear_session_state()
+
+    def test_get_user_sessions_filters_by_username(self, tmp_path: pathlib.Path):
+        """Returns only sessions for specified user."""
+        with _transcode_lock:
+            _transcode_sessions["s1"] = TranscodeSession(
+                username="alice",
+                started=1,
+                dir=str(tmp_path),
+                process=None,
+                url="http://stream.test/live",
+            )
+            _transcode_sessions["s2"] = TranscodeSession(
+                username="bob",
+                started=2,
+                dir=str(tmp_path),
+                process=None,
+                url="http://stream.test/live",
+            )
+            _transcode_sessions["s3"] = TranscodeSession(
+                username="alice",
+                started=3,
+                dir=str(tmp_path),
+                process=None,
+                url="http://stream.test/live",
+            )
+
+        sessions = get_user_sessions("alice")
+        assert len(sessions) == 2
+        assert sessions[0][0] == "s1"  # Sorted by start time.
+        assert sessions[1][0] == "s3"
+
+    def test_get_user_sessions_empty(self):
+        """Returns empty list for user with no sessions."""
+        sessions = get_user_sessions("nobody")
+        assert sessions == []
+
+
+class TestGetSourceSessions:
+    """Tests for get_source_sessions."""
+
+    def setup_method(self):
+        _clear_session_state()
+
+    def teardown_method(self):
+        _clear_session_state()
+
+    def test_get_source_sessions_filters_by_source(self, tmp_path: pathlib.Path):
+        """Returns only sessions for specified source."""
+        with _transcode_lock:
+            _transcode_sessions["s1"] = TranscodeSession(
+                source_id="src1",
+                started=1,
+                dir=str(tmp_path),
+                process=None,
+                url="http://stream.test/live",
+            )
+            _transcode_sessions["s2"] = TranscodeSession(
+                source_id="src2",
+                started=2,
+                dir=str(tmp_path),
+                process=None,
+                url="http://stream.test/live",
+            )
+            _transcode_sessions["s3"] = TranscodeSession(
+                source_id="src1",
+                started=3,
+                dir=str(tmp_path),
+                process=None,
+                url="http://stream.test/live",
+            )
+
+        sessions = get_source_sessions("src1")
+        assert len(sessions) == 2
+        assert sessions[0][0] == "s1"
+        assert sessions[1][0] == "s3"
+
+
+class TestEnforceStreamLimits:
+    """Tests for enforce_stream_limits."""
+
+    def setup_method(self):
+        _clear_session_state()
+
+    def teardown_method(self):
+        _clear_session_state()
+
+    def test_no_limits_returns_none(self):
+        """No limits set = no error."""
+        result = asyncio.run(enforce_stream_limits("alice", None, 0, 0))
+        assert result is None
+
+    def test_user_limit_stops_oldest(self):
+        """User at limit stops their oldest session."""
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-session-test-") as tmp:
+            with _transcode_lock:
+                _transcode_sessions["s1"] = TranscodeSession(
+                    username="alice",
+                    started=1,
+                    process=FakeProcess(alive=True),
+                    dir=tmp,
+                    url="http://1",
+                    last_access=0,
+                )
+                _transcode_sessions["s2"] = TranscodeSession(
+                    username="alice",
+                    started=2,
+                    process=FakeProcess(alive=True),
+                    dir="/tmp/2",
+                    url="http://2",
+                    last_access=time.time(),
+                )
+
+            result = asyncio.run(enforce_stream_limits("alice", None, 2, 0))
+
+            assert result is None
+            assert "s1" not in _transcode_sessions
+            assert "s2" in _transcode_sessions
+
+    def test_source_limit_stops_user_session(self):
+        """Source at limit stops user's oldest session on that source."""
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-session-test-") as tmp:
+            with _transcode_lock:
+                _transcode_sessions["s1"] = TranscodeSession(
+                    username="alice",
+                    source_id="src1",
+                    started=1,
+                    process=FakeProcess(alive=True),
+                    dir=tmp,
+                    url="http://1",
+                    last_access=0,
+                )
+
+            result = asyncio.run(enforce_stream_limits("alice", "src1", 0, 1))
+
+            assert result is None
+            assert "s1" not in _transcode_sessions
+
+    def test_source_limit_returns_error_for_other_user(self):
+        """Source at limit with other user's session returns error."""
+        with _transcode_lock:
+            _transcode_sessions["s1"] = TranscodeSession(
+                username="bob",
+                source_id="src1",
+                started=1,
+                process=FakeProcess(alive=True),
+                dir="/tmp/1",
+                url="http://1",
+            )
+
+        result = asyncio.run(enforce_stream_limits("alice", "src1", 0, 1))
+
+        assert result == "Source at capacity (1 streams)"
+        assert "s1" in _transcode_sessions  # Not stopped.
+
+
+# =============================================================================
+# Session Query/Update Tests
+# =============================================================================
+
+
+class TestGetSession:
+    """Tests for get_session."""
+
+    def setup_method(self):
+        _clear_session_state()
+
+    def teardown_method(self):
+        _clear_session_state()
+
+    def test_get_existing_session(self):
+        """Returns copy of session dict."""
+        with _transcode_lock:
+            _transcode_sessions["test"] = TranscodeSession(
+                dir="/tmp",
+                url="http://test",
+                process=None,
+                started=time.time(),
+            )
+
+        session = get_session("test")
+        assert session is not None
+        assert session["dir"] == "/tmp"
+
+    def test_get_nonexistent_session(self):
+        """Returns None for nonexistent session."""
+        assert get_session("nonexistent") is None
+
+
+class TestTouchSession:
+    """Tests for touch_session (heartbeat)."""
+
+    def setup_method(self):
+        _clear_session_state()
+
+    def teardown_method(self):
+        _clear_session_state()
+
+    def test_touch_updates_last_access(self, tmp_path: pathlib.Path):
+        """Touch updates last_access timestamp."""
+        old_time = time.time() - 100
+        with _transcode_lock:
+            _transcode_sessions["test"] = TranscodeSession(
+                last_access=old_time,
+                dir=str(tmp_path),
+                process=None,
+                started=time.time(),
+                url="http://stream.test/live",
+            )
+
+        result = touch_session("test")
+
+        assert result is True
+        assert "last_access" in _transcode_sessions["test"]
+        assert _transcode_sessions["test"]["last_access"] > old_time
+
+    def test_touch_nonexistent_returns_false(self):
+        """Touch returns False for nonexistent session."""
+        assert touch_session("nonexistent") is False
+
+
+class TestGetSessionProgress:
+    """Tests for get_session_progress."""
+
+    def setup_method(self):
+        _clear_session_state()
+
+    def teardown_method(self):
+        _clear_session_state()
+
+    def test_progress_with_playlist(self):
+        """Returns progress from playlist."""
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-session-test-") as tmp:
+            playlist = pathlib.Path(tmp) / "stream.m3u8"
+            playlist.write_text("#EXTM3U\n#EXTINF:3.0,\nseg0.ts\n#EXTINF:3.0,\nseg1.ts\n")
+
+            with _transcode_lock:
+                _transcode_sessions["test"] = TranscodeSession(
+                    dir=tmp,
+                    last_access=0,
+                    process=None,
+                    started=time.time(),
+                    url="http://stream.test/live",
+                )
+
+            progress = get_session_progress("test")
+
+            assert progress is not None
+            assert progress["segment_count"] == 2
+            assert progress["duration"] == 6.0
+
+    def test_progress_no_playlist(self):
+        """Returns zero progress without playlist."""
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-session-test-") as tmp:
+            with _transcode_lock:
+                _transcode_sessions["test"] = TranscodeSession(
+                    dir=tmp,
+                    last_access=0,
+                    process=None,
+                    started=time.time(),
+                    url="http://stream.test/live",
+                )
+
+            progress = get_session_progress("test")
+
+            assert progress == {"segment_count": 0, "duration": 0.0}
+
+    def test_progress_nonexistent_session(self):
+        """Returns None for nonexistent session."""
+        assert get_session_progress("nonexistent") is None
+
+
+class TestClearUrlSession:
+    """Tests for clear_url_session."""
+
+    def setup_method(self):
+        _clear_session_state()
+
+    def teardown_method(self):
+        _clear_session_state()
+
+    def test_clear_existing_url(self):
+        """Clears existing URL mapping."""
+        with _transcode_lock:
+            _url_to_session["http://test"] = "session-123"
+
+        result = clear_url_session("http://test")
+
+        assert result == "session-123"
+        assert "http://test" not in _url_to_session
+
+    def test_clear_nonexistent_url(self):
+        """Returns None for nonexistent URL."""
+        result = clear_url_session("http://nonexistent")
+        assert result is None
+
+
+# =============================================================================
+# Playlist Helper Tests
+# =============================================================================
+
+
+class TestCalcHlsDuration:
+    """Tests for _calc_hls_duration."""
+
+    def test_duration_from_playlist(self):
+        """Calculates duration from EXTINF entries."""
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-session-test-") as tmp:
+            playlist = pathlib.Path(tmp) / "stream.m3u8"
+            playlist.write_text("#EXTM3U\n#EXTINF:3.5,\nseg0.ts\n#EXTINF:3.0,\nseg1.ts\n")
+
+            duration = _calc_hls_duration(playlist, 2)
+
+            assert duration == 6.5
+
+    def test_duration_estimate_from_segments(self):
+        """Estimates duration when playlist missing."""
+        with patch("netv.ffmpeg_session.get_hls_segment_duration", return_value=3.0):
+            playlist = pathlib.Path("/nonexistent/stream.m3u8")
+            duration = _calc_hls_duration(playlist, 5)
+
+            assert duration == 15.0
+
+
+class TestBuildSubtitleTracks:
+    """Tests for _build_subtitle_tracks."""
+
+    def test_builds_track_list(self):
+        """Builds subtitle track list."""
+        sub_info: list[StoredSubtitle | int] = [
+            {"index": 2, "lang": "eng", "name": "English"},
+            {"index": 3, "lang": "jpn", "name": "Japanese"},
+        ]
+
+        tracks = _build_subtitle_tracks("session-123", sub_info)
+
+        assert len(tracks) == 2
+        assert tracks[0]["url"] == "/subs/session-123/sub0.vtt"
+        assert tracks[0]["lang"] == "eng"
+        assert tracks[0]["label"] == "English"
+        assert tracks[0]["default"] is True
+        assert tracks[1]["default"] is False
+
+    def test_empty_sub_info(self):
+        """Returns empty list for no subtitles."""
+        assert _build_subtitle_tracks("s", []) == []
+        assert _build_subtitle_tracks("s", None) == []
+
+    def test_non_dict_sub_info(self):
+        """Returns empty list for old format (indices only)."""
+        assert _build_subtitle_tracks("s", [2, 3]) == []
+
+
+class TestCaptionMasterPlaylist:
+    def test_links_native_hls_subtitle_renditions(self):
+        playlist = _caption_master_playlist(
+            [
+                {"index": 2, "lang": "eng", "name": "English"},
+                {"index": 3, "lang": "spa", "name": 'Español "CC"'},
+            ],
+            "1080p",
+        )
+
+        assert 'NAME="English",LANGUAGE="eng"' in playlist
+        assert 'NAME="Español \'CC\'",LANGUAGE="spa"' in playlist
+        assert 'URI="sub0.m3u8"' in playlist
+        assert 'URI="sub1.m3u8"' in playlist
+        assert 'SUBTITLES="captions"' in playlist
+        assert playlist.endswith("stream.m3u8\n")
+
+    def test_disambiguates_duplicate_track_names(self):
+        playlist = _caption_master_playlist(
+            [
+                {"index": 2, "lang": "eng", "name": "English"},
+                {"index": 3, "lang": "eng", "name": "English"},
+            ],
+            "720p",
+        )
+
+        assert 'NAME="English"' in playlist
+        assert 'NAME="English 2"' in playlist
+
+
+class TestWebvttTimestampMap:
+    def test_derives_the_clock_origin_from_a_later_video_segment(self, tmp_path: pathlib.Path):
+        (tmp_path / "stream.m3u8").write_text(
+            "#EXTM3U\n#EXTINF:4.0,\nseg000.ts\n#EXTINF:4.0,\nseg001.ts\n",
+        )
+        (tmp_path / "seg000.ts").touch()
+        (tmp_path / "seg001.ts").touch()
+
+        with patch("netv.ffmpeg_session.segment_pts", side_effect=[None, 14.08]):
+            origin = _caption_timestamp_origin(str(tmp_path))
+
+        assert origin == pytest.approx(10.08)
+
+    def test_maps_webvtt_to_the_mpeg_ts_clock(self):
+        content = "WEBVTT\n\n00:01.000 --> 00:03.000\nCaption\n"
+
+        mapped = add_webvtt_timestamp_map(content, 10.08)
+
+        assert "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:907200\n" in mapped
+        assert mapped.endswith("00:01.000 --> 00:03.000\nCaption\n")
+
+    def test_preserves_existing_mapping_and_non_webvtt_content(self):
+        mapped = "WEBVTT\r\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:90000\r\n"
+
+        assert add_webvtt_timestamp_map(mapped, 10.08) == mapped
+        assert add_webvtt_timestamp_map("not WebVTT", 10.08) == "not WebVTT"
+        assert add_webvtt_timestamp_map("WEBVTT\n", None) == "WEBVTT\n"
+
+
+class TestRegeneratePlaylist:
+    """Tests for _regenerate_playlist."""
+
+    def test_regenerates_playlist_from_segments(self):
+        """Regenerates playlist from segment files."""
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-session-test-") as tmp:
+            output_dir = pathlib.Path(tmp)
+            # Create segment files.
+            (output_dir / "seg000.ts").write_bytes(b"x" * 2000)
+            (output_dir / "seg001.ts").write_bytes(b"x" * 2000)
+            (output_dir / "seg002.ts").write_bytes(b"x" * 2000)
+
+            with patch("netv.ffmpeg_session.get_hls_segment_duration", return_value=3.0):
+                _regenerate_playlist(output_dir, start_segment=1)
+
+            playlist = output_dir / "stream.m3u8"
+            assert playlist.exists()
+            content = playlist.read_text()
+            assert "#EXT-X-MEDIA-SEQUENCE:1" in content
+            assert "seg001.ts" in content
+            assert "seg002.ts" in content
+            assert "seg000.ts" not in content  # Before start_segment.
+
+    def test_regenerate_skips_small_segments(self):
+        """Skips segments smaller than threshold."""
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-session-test-") as tmp:
+            output_dir = pathlib.Path(tmp)
+            (output_dir / "seg000.ts").write_bytes(b"x" * 500)  # Too small.
+            (output_dir / "seg001.ts").write_bytes(b"x" * 2000)  # OK
+
+            with patch("netv.ffmpeg_session.get_hls_segment_duration", return_value=3.0):
+                _regenerate_playlist(output_dir, start_segment=0)
+
+            content = (output_dir / "stream.m3u8").read_text()
+            assert "seg001.ts" in content
+            assert "seg000.ts" not in content
+
+
+# =============================================================================
+# Session Recovery Tests
+# =============================================================================
+
+
+class TestCleanupAndRecoverSessions:
+    """Tests for cleanup_and_recover_sessions."""
+
+    def setup_method(self):
+        _clear_session_state()
+
+    def teardown_method(self):
+        _clear_session_state()
+
+    def test_removes_orphaned_dirs(self):
+        """Removes dirs without session.json."""
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-session-test-") as tmp:
+            transcode_dir = pathlib.Path(tmp)
+            orphan = transcode_dir / "netv_transcode_orphan"
+            orphan.mkdir()
+            (orphan / "seg000.ts").write_bytes(b"data")
+
+            with (
+                patch("netv.ffmpeg_session.get_transcode_dir", return_value=transcode_dir),
+                patch("netv.ffmpeg_session.get_vod_cache_timeout", return_value=3600),
+            ):
+                cleanup_and_recover_sessions()
+
+            assert not orphan.exists()
+
+    def test_recovers_valid_vod_session(self):
+        """Recovers valid VOD session with segments."""
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-session-test-") as tmp:
+            transcode_dir = pathlib.Path(tmp)
+            vod_dir = transcode_dir / "netv_transcode_vod123"
+            vod_dir.mkdir()
+
+            # Create session.json.
+            session_info = {
+                "session_id": "vod123",
+                "url": "http://movie.mp4",
+                "is_vod": True,
+                "started": time.time(),
+                "duration": 3600,
+            }
+            (vod_dir / "session.json").write_text(json.dumps(session_info))
+            (vod_dir / "seg000.ts").write_bytes(b"x" * 2000)
+
+            with (
+                patch("netv.ffmpeg_session.get_transcode_dir", return_value=transcode_dir),
+                patch("netv.ffmpeg_session.get_vod_cache_timeout", return_value=3600),
+            ):
+                cleanup_and_recover_sessions()
+
+            assert "vod123" in _transcode_sessions
+            assert _url_to_session.get("http://movie.mp4") == "vod123"
+
+    def test_removes_expired_vod_session(self):
+        """Removes expired VOD session (older than cache timeout)."""
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-session-test-") as tmp:
+            transcode_dir = pathlib.Path(tmp)
+            vod_dir = transcode_dir / "netv_transcode_expired"
+            vod_dir.mkdir()
+
+            session_info = {
+                "session_id": "expired",
+                "url": "http://old.mp4",
+                "is_vod": True,
+            }
+            (vod_dir / "session.json").write_text(json.dumps(session_info))
+            (vod_dir / "seg000.ts").write_bytes(b"x" * 2000)
+
+            # Very short cache timeout.
+            with (
+                patch("netv.ffmpeg_session.get_transcode_dir", return_value=transcode_dir),
+                patch("netv.ffmpeg_session.get_vod_cache_timeout", return_value=0),
+            ):
+                cleanup_and_recover_sessions()
+
+            assert not vod_dir.exists()
+            assert "expired" not in _transcode_sessions
+
+
+class TestPlaybackFeedback:
+    def setup_method(self):
+        _clear_session_state()
+
+    def teardown_method(self):
+        _clear_session_state()
+
+    def test_feedback_decision_and_heartbeat(self, tmp_path: pathlib.Path):
+
+        _transcode_sessions["live"] = TranscodeSession(
+            username="viewer",
+            playback_policy=PlaybackPolicy(),
+            last_access=0,
+            dir=str(tmp_path),
+            process=None,
+            started=time.time(),
+            url="http://stream.test/live",
+        )
+        health = PlaybackHealth(buffer_seconds=0, waiting=True)
+        result = None
+        with patch("netv.ffmpeg_session.time.monotonic") as clock:
+            for now in range(0, 26, 2):
+                clock.return_value = now
+                result = report_playback_health("live", "viewer", health)
+        assert result == {"bandwidth_saver": True}
+        assert "last_access" in _transcode_sessions["live"]
+        assert _transcode_sessions["live"]["last_access"] > 0
+
+    def test_feedback_requires_owner_and_live_session(self, tmp_path: pathlib.Path):
+
+        health = PlaybackHealth(buffer_seconds=0, waiting=True)
+        _transcode_sessions["vod"] = TranscodeSession(
+            username="viewer",
+            is_vod=True,
+            dir=str(tmp_path),
+            process=None,
+            started=time.time(),
+            url="http://stream.test/live",
+        )
+        for session_id, username, status in [
+            ("missing", "viewer", 404),
+            ("vod", "other", 404),
+            ("vod", "viewer", 400),
+        ]:
+            with pytest.raises(HTTPException) as error:
+                report_playback_health(session_id, username, health)
+            assert error.value.status_code == status
+
+
+def _clear_session_state():
+    """Clear all session state for test isolation."""
+    with _transcode_lock:
+        _transcode_sessions.clear()
+        _url_to_session.clear()
+
+
+if __name__ == "__main__":
+    from codedoctor.lib.testing.runner import test_main
+
+    test_main(__file__)

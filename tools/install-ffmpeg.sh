@@ -1439,32 +1439,36 @@ if [ "$ENABLE_LIBTORCH" = "1" ]; then
         fi
     fi
 
-    # Patch 2: Add CUDA device support (upstream only supports CPU/XPU)
+    # Patch 2: CUDA device support. ffmpeg links only libtorch_cpu, so torch's CUDA
+    # hooks register only once libtorch_cuda.so is loaded; any is_available() check
+    # before that load reports no CUDA. Newer upstream ships its own CUDA branch
+    # (with exactly that early check), so ensure the branch exists, then load
+    # libtorch_cuda.so as the branch's first statement.
     if [ -f "$TORCH_BACKEND" ] && ! grep -q "device.is_cuda()" "$TORCH_BACKEND"; then
-        echo "Patching ffmpeg torch backend for CUDA support..."
-        # Add CUDA device support between XPU and the catch-all error
-        # Also adds dlopen for libtorch_cuda.so to load CUDA kernels at runtime
+        echo "Patching ffmpeg torch backend for CUDA device support..."
         sed -i '/at::detail::getXPUHooks().init/a\
     } else if (device.is_cuda()) {\
         if (!at::cuda::is_available()) {\
             av_log(ctx, AV_LOG_ERROR, "No CUDA device found\\n");\
             goto fail;\
-        }\
-        // Load CUDA kernels - required for libtorch CUDA ops\
-        static bool cuda_lib_loaded = false;\
-        if (!cuda_lib_loaded) {\
-            cuda_lib_loaded = true;\
-            void *cuda_handle = dlopen("libtorch_cuda.so", RTLD_NOW | RTLD_GLOBAL);\
-            if (cuda_handle) {\
-                av_log(ctx, AV_LOG_DEBUG, "libtorch_cuda.so loaded\\n");\
-            } else {\
-                av_log(ctx, AV_LOG_WARNING, "Failed to load libtorch_cuda.so: %s\\n", dlerror());\
-            }\
         }' "$TORCH_BACKEND"
-        # Add required CUDA header
         if ! grep -q "#include <ATen/cuda/CUDAContext.h>" "$TORCH_BACKEND"; then
             sed -i '/#include <torch\/torch.h>/a #include <ATen/cuda/CUDAContext.h>' "$TORCH_BACKEND"
         fi
+    fi
+    if [ -f "$TORCH_BACKEND" ] && ! grep -q 'dlopen("libtorch_cuda.so"' "$TORCH_BACKEND"; then
+        echo "Patching ffmpeg torch backend to load libtorch_cuda.so..."
+        if ! grep -q "#include <dlfcn.h>" "$TORCH_BACKEND"; then
+            sed -i '/#include <torch\/script.h>/a #include <dlfcn.h>' "$TORCH_BACKEND"
+        fi
+        sed -i '/} else if (device.is_cuda()) {/a\
+        static bool cuda_lib_loaded = false;\
+        if (!cuda_lib_loaded) {\
+            cuda_lib_loaded = true;\
+            if (!dlopen("libtorch_cuda.so", RTLD_NOW | RTLD_GLOBAL))\
+                av_log(ctx, AV_LOG_WARNING, "Failed to load libtorch_cuda.so: %s\\n", dlerror());\
+        }' "$TORCH_BACKEND"
+        verify_patch "$TORCH_BACKEND" 'dlopen("libtorch_cuda.so"' "torch backend loads libtorch_cuda.so" || exit 1
         echo "Torch CUDA patch applied"
     fi
 

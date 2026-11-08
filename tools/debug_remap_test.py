@@ -9,9 +9,8 @@ import time
 
 import pytest
 
+from netv import cache
 from tools import debug_remap
-
-import cache
 
 
 @pytest.fixture(autouse=True)
