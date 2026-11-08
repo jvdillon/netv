@@ -9,10 +9,13 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml uv.lock README.md ./
 COPY netv/ netv/
 
-RUN python3 -m pip install --no-cache-dir '.[server]' && \
+# Install the locked server dependencies (the versions CI tests) into the system Python.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+ENV UV_PROJECT_ENVIRONMENT=/usr/local
+RUN uv sync --frozen --no-cache --no-editable --no-default-groups --extra server && \
     groupadd --gid 10001 netv && \
     useradd --uid 10001 --gid 10001 --create-home netv && \
     mkdir -p /app/cache && \

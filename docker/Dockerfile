@@ -44,14 +44,12 @@ RUN uv venv --seed --python "$PYTHON_VERSION" /opt/venv && python3 --version
 WORKDIR /app
 
 # Copy application files with verification
-COPY pyproject.toml README.md ./
+COPY pyproject.toml uv.lock README.md ./
 COPY netv/ netv/
 
-# Verify critical files exist
-RUN test -f pyproject.toml || { echo "ERROR: pyproject.toml not found"; exit 1; }
-
-# Install Python dependencies
-RUN uv pip install --no-cache '.[server]'
+# Install the locked server dependencies (the versions CI tests) into /opt/venv.
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+RUN uv sync --frozen --no-cache --no-editable --no-default-groups --extra server
 
 # Runtime config
 EXPOSE 8000 8100

@@ -65,25 +65,17 @@ RUN uv venv --seed --python "$PYTHON_VERSION" /opt/venv && python3 --version
 WORKDIR /app
 
 # Copy application files with verification
-COPY pyproject.toml README.md ./
+COPY pyproject.toml uv.lock README.md ./
 COPY netv/ netv/
 COPY scripts/ scripts/
 
-# Verify critical files exist
-RUN test -f pyproject.toml || { echo "ERROR: pyproject.toml not found"; exit 1; } && \
-    test -f netv/upscale/export_tensorrt.py || { echo "ERROR: export_tensorrt.py not found"; exit 1; }
-
-# Install Python dependencies with minimum version constraints for compatibility.
-# torch only exports the model to ONNX, on the CPU, so it is the CPU build: no CUDA
-# runtime to mismatch the host driver, and no GPU-architecture floor.
-# set -e: a failed install must fail the build (a trailing `|| true` used to mask it).
+# Install the locked server + AI upscale dependencies (the versions CI tests).
+# torch only exports the model to ONNX, on the CPU, so it is the CPU build (`--extra cpu`):
+# no CUDA runtime to mismatch the host driver, and no GPU-architecture floor.
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 RUN set -e; \
-    uv pip install --no-cache --index-url https://download.pytorch.org/whl/cpu 'torch>=2.1.0'; \
-    uv pip install --no-cache \
-        'onnx>=1.14.0' \
-        'onnxconverter-common>=1.14' \
-        'safetensors>=0.4' \
-        '.[server]'; \
+    uv sync --frozen --no-cache --no-editable --no-default-groups \
+        --extra server --extra cpu --group ai_upscale; \
     python3 -c "import onnx, torch; assert torch.version.cuda is None, torch.version.cuda; print(f'Installed: torch={torch.__version__}, onnx={onnx.__version__}')"; \
     if ldd "$(command -v trtexec)" | grep 'not found'; then exit 1; fi
 

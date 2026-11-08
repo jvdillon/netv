@@ -8,7 +8,6 @@ __pycache__/
 .venv/
 .ruff_cache/
 .pytest_cache/
-uv.lock
 
 # App data (user-specific)
 cache/
