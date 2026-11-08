@@ -29,8 +29,6 @@ class PlaybackPolicy:
         health: PlaybackHealth,
         now: float,
         recovery_bitrate: float = 0,
-        *,
-        recovery_ready: bool = True,
     ) -> bool:
         if self.bandwidth_saver:
             if self.saver_since is None:
@@ -61,7 +59,6 @@ class PlaybackPolicy:
                 and self.recovery_since is not None
                 and now - self.recovery_since >= 30
                 and self.recovery_samples >= 3
-                and recovery_ready
             ):
                 self.bandwidth_saver = False
                 self.saver_since = None
@@ -95,54 +92,10 @@ class PlaybackPolicy:
 
 
 @dataclass(kw_only=True, slots=True)
-class UpgradePolicy:
-    """Keep recent capacity evidence across HLS download and encoder batching gaps."""
-
-    samples: list[tuple[float, float]] = field(default_factory=list)
-    reason: str = "waiting for throughput"
-
-    def observe(
-        self,
-        health: PlaybackHealth,
-        target_bitrate: float,
-        ready: bool,
-        now: float,
-    ) -> bool:
-        self.samples = [(at, rate) for at, rate in self.samples if now - at <= 10]
-        if health.waiting or health.buffer_seconds < 3:
-            self.samples.clear()
-            self.reason = "playback pressure"
-            return False
-        # Zero means no transfer measurement, not zero available bandwidth.
-        if health.observed_bitrate > 0:
-            if target_bitrate > 0 and health.observed_bitrate < target_bitrate * 1.5:
-                self.samples.clear()
-                self.reason = "insufficient bandwidth headroom"
-                return False
-            self.samples.append((now, health.observed_bitrate))
-        if target_bitrate <= 0:
-            self.reason = "4K segments unavailable"
-        elif any(rate < target_bitrate * 1.5 for _, rate in self.samples):
-            self.reason = "insufficient bandwidth headroom"
-        elif len(self.samples) < 3 or self.samples[-1][0] - self.samples[0][0] < 6:
-            self.reason = "waiting for throughput evidence"
-        elif health.buffer_seconds < 6:
-            self.reason = "building playback buffer"
-        elif not ready:
-            self.reason = "high-quality encoder catching up"
-        else:
-            self.reason = "ready"
-            return True
-        return False
-
-
-@dataclass(kw_only=True, slots=True)
 class LiveRecoveryPolicy:
     """Confirm media stalls and bound stage restarts independently of playback pressure."""
 
-    high_started: float
     stall_confirm_seconds: float = 2
-    high_warmup_seconds: float = 30
     restart_window_seconds: float = 300
     restart_limit: int = 3
     failures: dict[str, float] = field(default_factory=dict)
@@ -157,9 +110,6 @@ class LiveRecoveryPolicy:
         now: float,
     ) -> bool:
         if process_alive and output_ready:
-            self.failures.pop(stage, None)
-            return False
-        if stage == "high" and process_alive and now - self.high_started < self.high_warmup_seconds:
             self.failures.pop(stage, None)
             return False
         since = self.failures.setdefault(stage, now)
@@ -177,7 +127,7 @@ class LiveRecoveryPolicy:
         if len(attempts) >= self.restart_limit:
             return False
         if attempts:
-            cooldown = 30 if action == "high" else (5 if len(attempts) == 1 else 15)
+            cooldown = 5 if len(attempts) == 1 else 15
             if now - attempts[-1] < cooldown:
                 return False
         attempts.append(now)
@@ -187,11 +137,5 @@ class LiveRecoveryPolicy:
     def finish_restart(self, action: str) -> None:
         self.pending.discard(action)
 
-    def mark_stage_started(self, stage: str, now: float) -> None:
-        self.failures.pop(stage, None)
-        if stage == "high":
-            self.high_started = now
-
-    def reset_pipeline(self, now: float) -> None:
+    def reset_pipeline(self) -> None:
         self.failures.clear()
-        self.high_started = now

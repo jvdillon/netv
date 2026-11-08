@@ -1771,7 +1771,7 @@ async def transcode_file(
     cors = {"Access-Control-Allow-Origin": "*"}
     if filename.endswith(".m3u8"):
         content = file_path.read_text()
-        if filename in ("low.m3u8", "high.m3u8") and session.get("fast_start"):
+        if filename == "low.m3u8" and session.get("fast_start"):
             if session.get("origin_pts") is not None:
                 content = dated_playlist(
                     session["dir"],

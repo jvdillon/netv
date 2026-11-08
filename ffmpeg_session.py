@@ -9,6 +9,7 @@ from urllib import parse
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import pathlib
@@ -21,7 +22,6 @@ import uuid
 
 from cache import get_user_agent
 from fast_start import (
-    aligned,
     closed_caption_master_playlist,
     encoder_command,
     ingest_command,
@@ -52,7 +52,7 @@ from ffmpeg_command import (
     restore_probe_cache_entry,
     uses_audio_passthrough,
 )
-from playback_policy import LiveRecoveryPolicy, PlaybackHealth, PlaybackPolicy, UpgradePolicy
+from playback_policy import LiveRecoveryPolicy, PlaybackHealth, PlaybackPolicy
 from util import redact_url_credentials
 
 
@@ -157,10 +157,9 @@ def stop_session(session_id: str, force: bool = False) -> None:
             log.info("Ignoring stop for recently-accessed session %s", session_id)
             return
 
-        for task_name in ("watchdog_task", "high_recovery_task"):
-            task = session.get(task_name)
-            if task is not None and not task.done():
-                task.cancel()
+        task = session.get("watchdog_task")
+        if task is not None and not task.done():
+            task.cancel()
 
         if _kill_process(session["process"]):
             log.info("Killed ffmpeg for session %s", session_id)
@@ -222,10 +221,9 @@ def shutdown() -> None:
     """Kill all running ffmpeg processes for clean shutdown."""
     with _transcode_lock:
         for session_id, session in list(_transcode_sessions.items()):
-            for task_name in ("watchdog_task", "high_recovery_task"):
-                task = session.get(task_name)
-                if task is not None and not task.done():
-                    task.cancel()
+            task = session.get("watchdog_task")
+            if task is not None and not task.done():
+                task.cancel()
             for extra in session.get("extra_processes", []):
                 _kill_process(extra)
             proc = session.get("process")
@@ -734,9 +732,7 @@ def get_session_progress(session_id: str) -> dict[str, Any] | None:
     session = get_session(session_id)
     if not session:
         return None
-    name = "stream.m3u8"
-    if session.get("fast_start"):
-        name = "high.m3u8" if session.get("high_selected") else "low.m3u8"
+    name = "low.m3u8" if session.get("fast_start") else "stream.m3u8"
     playlist_path = pathlib.Path(session["dir"]) / name
     if not playlist_path.exists():
         return {"segment_count": 0, "duration": 0.0}
@@ -951,7 +947,7 @@ def report_playback_health(
         health: Client buffer and throughput sample.
 
     Returns:
-        decision: Bandwidth-saver state and, for fast start, the selected playlists.
+        decision: Bandwidth-saver state and, for fast start, the session playlists.
     """
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
@@ -962,66 +958,38 @@ def report_playback_health(
         session["last_access"] = time.time()
         now = time.monotonic()
         policy = session["playback_policy"]
-        # Remember actual high-rendition requirements for legacy sessions, whose
-        # configured bitrate may only be an estimate.
+        # Remember actual full-quality requirements, since the configured
+        # bitrate may only be an estimate.
         if not policy.bandwidth_saver and not session.get("bandwidth_saver"):
             session["recovery_bitrate"] = max(
                 session.get("recovery_bitrate", 0),
                 health.required_bitrate,
             )
-        high_alive = _is_process_alive(session.get("high_process"))
-        bitrate = ready_bitrate(session["dir"], "high.m3u8") if high_alive else 0
-        caught_up = bitrate > 0 and aligned(session["dir"]) if session.get("fast_start") else False
-        if session.get("fast_start") and bitrate > 0:
-            session["recovery_bitrate"] = max(session.get("recovery_bitrate", 0), bitrate)
-        saver = policy.observe(
-            health,
-            now,
-            session.get("recovery_bitrate", 0),
-            recovery_ready=caught_up if session.get("fast_start") else True,
-        )
-        result: dict[str, Any] = {"bandwidth_saver": saver}
-        if session.get("fast_start"):
-            upgrade = session.setdefault("upgrade_policy", UpgradePolicy())
-            was_high = session.get("high_selected", False)
-            if upgrade.observe(health, bitrate, caught_up, now):
-                session["high_selected"] = True
-            # A temporary gap in segment publication is not a quality downgrade.
-            # Existing playback health handles sustained stalls after promotion.
-            if saver or not high_alive:
-                session["high_selected"] = False
-            # Keep the local encoder warm so recovery uses the same ingest and
-            # timeline. A dead high encoder still leaves low playback available.
-            name = "high.m3u8" if session.get("high_selected") else "low.m3u8"
-            if now - session.get("upgrade_log_at", float("-inf")) >= 10 or was_high != session.get(
-                "high_selected",
-                False,
-            ):
-                reason = "bandwidth saver recovering" if saver else upgrade.reason
-                log.info(
-                    "Playback quality %s: selected=%s reason=%s buffer=%.1fs waiting=%s "
-                    "observed=%.2fMbps high=%.2fMbps aligned=%s samples=%d",
-                    session_id,
-                    name,
-                    reason,
-                    health.buffer_seconds,
-                    health.waiting,
-                    health.observed_bitrate / 1e6,
-                    bitrate / 1e6,
-                    caught_up,
-                    len(upgrade.samples),
-                )
-                session["upgrade_log_at"] = now
-            result["playlist"] = _fast_playlist_url(
-                session_id,
-                name,
-                int(session.get("playlist_generation", 0)),
+        fast_start = session.get("fast_start", False)
+        # A full-quality encoder's output measures what recovery must sustain;
+        # a saver session's 720p output would understate it.
+        if (
+            fast_start
+            and not session.get("bandwidth_saver")
+            and _is_process_alive(session.get("process"))
+        ):
+            session["recovery_bitrate"] = max(
+                session.get("recovery_bitrate", 0),
+                ready_bitrate(session["dir"], "low.m3u8"),
             )
+        # The single encoder has no second rendition to wait for.
+        saver = policy.observe(health, now, session.get("recovery_bitrate", 0))
+        result: dict[str, Any] = {"bandwidth_saver": saver}
+        # A saver change needs a differently configured encoder. Without a
+        # playlist, clients retune to a new session instead of staying here.
+        if fast_start and saver == session.get("bandwidth_saver", False):
+            generation = int(session.get("playlist_generation", 0))
+            result["playlist"] = _fast_playlist_url(session_id, "low.m3u8", generation)
             if session.get("closed_captions"):
                 result["caption_playlist"] = _fast_playlist_url(
                     session_id,
-                    f"{name.removesuffix('.m3u8')}-captions.m3u8",
-                    int(session.get("playlist_generation", 0)),
+                    "low-captions.m3u8",
+                    generation,
                 )
         return result
 
@@ -1102,8 +1070,10 @@ async def _start_fast_live(
     audio_passthrough: bool = False,
     watchdog_stale_floor_sec: float = 45.0,
 ) -> dict[str, Any]:
-    """One upstream reader, two independent encoders, one session/stream slot."""
+    """One upstream reader, one local encoder, one session/stream slot."""
     settings = get_settings()
+    resolution = "720p" if bandwidth_saver else settings.get("max_resolution", "1080p")
+    quality = "low" if bandwidth_saver else settings.get("quality", "high")
     session_id = str(uuid.uuid4())
     directory = tempfile.mkdtemp(prefix=f"netv_transcode_{session_id}_", dir=get_transcode_dir())
     processes: list[asyncio.subprocess.Process] = []
@@ -1134,7 +1104,10 @@ async def _start_fast_live(
                 "source_id": source_id,
                 "bandwidth_saver": bandwidth_saver,
                 "playback_policy": PlaybackPolicy(bandwidth_saver=bandwidth_saver),
-                "live_recovery": LiveRecoveryPolicy(high_started=time.monotonic()),
+                "live_recovery": LiveRecoveryPolicy(),
+                # Full-quality requirement a saver session must sustain to recover.
+                "recovery_bitrate": live_video_bitrates(settings.get("max_resolution", "1080p"))[1]
+                * 1.1,
                 "fast_start": True,
                 "playlist_generation": 0,
                 "playback_buffer_seconds": 12.0,
@@ -1153,7 +1126,7 @@ async def _start_fast_live(
                 "seek_offset": 0,
             }
             _url_to_session[url] = session_id
-        # Warm the low encoder on the first complete source segment, not a full
+        # Warm the encoder on the first complete source segment, not a full
         # playback reserve. It still has its own buffer gate.
         await startup.wait_ready("input.m3u8", ingest, minimum_segments=1)
         log.info(
@@ -1181,37 +1154,27 @@ async def _start_fast_live(
         if closed_captions:
             log.info("Fast-start session %s detected embedded captions", session_id)
         hw = settings.get("transcode_hw", "software")
-        low_restart_command = encoder_command(
+        encoder = functools.partial(
+            encoder_command,
             directory,
             hw,
-            "720p",
-            "low",
+            resolution,
+            quality,
             deinterlace,
-            False,
+            allow_upscale=not bandwidth_saver,
             audio=audio,
             audio_passthrough=audio_passthrough,
-            restarting=True,
             video_codec=video_codec,
         )
-        low = await startup.launch(
-            encoder_command(
-                directory,
-                hw,
-                "720p",
-                "low",
-                deinterlace,
-                False,
-                audio=audio,
-                audio_passthrough=audio_passthrough,
-                video_codec=video_codec,
-            ),
-            "720p",
-        )
+        low_restart_command = encoder(restarting=True)
+        low = await startup.launch(encoder(), "encoder")
         with _transcode_lock:
             _transcode_sessions[session_id].update(
                 process=low,
                 extra_processes=[ingest],
                 low_restart_command=low_restart_command,
+                master_resolution=resolution,
+                master_audio_bitrate=surround_audio_bitrate(audio, audio_passthrough),
             )
         # A remuxed source is released in source-keyframe-sized bursts. A couple
         # of tiny output segments cannot bridge the next upstream delivery gap.
@@ -1227,51 +1190,15 @@ async def _start_fast_live(
             session["playback_buffer_seconds"] = playback_buffer
         await startup.wait_ready("low.m3u8", low, startup_buffer)
         log.info(
-            "Fast-start session %s ready at 720p after %.2fs with %.1fs startup reserve "
+            "Fast-start session %s ready at %s after %.2fs with %.1fs startup reserve "
             "and %.1fs playback buffer",
             session_id,
+            resolution,
             time.monotonic() - startup_started,
             startup_buffer,
             playback_buffer,
         )
-        # Keep high-quality initialization off the GPU until the startup
-        # rendition has built its reserve. Do not wait for high-quality output.
-        high = None
-        max_resolution = settings.get("max_resolution", "1080p")
-        quality = settings.get("quality", "high")
-        high_restart_command = encoder_command(
-            directory,
-            hw,
-            max_resolution,
-            quality,
-            deinterlace,
-            True,
-            audio=audio,
-            audio_passthrough=audio_passthrough,
-            restarting=True,
-            video_codec=video_codec,
-        )
-        with _transcode_lock:
-            _transcode_sessions[session_id].update(
-                high_restart_command=high_restart_command,
-                master_resolution=max_resolution,
-                master_audio_bitrate=surround_audio_bitrate(audio, audio_passthrough),
-            )
-        high = await _start_high_encoder(
-            startup,
-            ingest,
-            directory=directory,
-            hw=hw,
-            max_resolution=max_resolution,
-            quality=quality,
-            deinterlace=deinterlace,
-            audio=audio,
-            audio_passthrough=audio_passthrough,
-            video_codec=video_codec,
-        )
-        with _transcode_lock:
-            session = _transcode_sessions[session_id]
-        _publish_fast_master(session, include_high=high is not None)
+        _publish_fast_master(session)
         watchdog_task = _spawn_background_task(_watch_fast_live(session_id))
         with _transcode_lock:
             if _transcode_sessions.get(session_id) is session:
@@ -1285,44 +1212,6 @@ async def _start_fast_live(
         stop_session(session_id, force=True)
         shutil.rmtree(directory, ignore_errors=True)
         raise
-
-
-async def _start_high_encoder(
-    startup: _FastLiveStartup,
-    ingest: asyncio.subprocess.Process,
-    *,
-    directory: str,
-    hw: HwAccel,
-    max_resolution: str,
-    quality: str,
-    deinterlace: bool,
-    audio: MediaInfo | None,
-    audio_passthrough: bool,
-    video_codec: str,
-) -> asyncio.subprocess.Process | None:
-    try:
-        high = await startup.launch(
-            encoder_command(
-                directory,
-                hw,
-                max_resolution,
-                quality,
-                deinterlace,
-                True,
-                audio=audio,
-                audio_passthrough=audio_passthrough,
-                video_codec=video_codec,
-            ),
-            "high-quality",
-        )
-        with _transcode_lock:
-            session = _transcode_sessions[startup.session_id]
-            session.update(high_process=high, extra_processes=[ingest, high])
-            session["live_recovery"].mark_stage_started("high", time.monotonic())
-        return high
-    except OSError:
-        log.exception("High-quality encoder unavailable; continuing at 720p")
-        return None
 
 
 def _is_archive_url(url: str) -> bool:
@@ -2253,11 +2142,7 @@ async def _monitor_fast_process(
         session = _transcode_sessions.get(session_id)
         current = bool(
             session
-            and (
-                process is session.get("process")
-                or process is session.get("ingest_process")
-                or process is session.get("high_process")
-            ),
+            and (process is session.get("process") or process is session.get("ingest_process")),
         )
     if current:
         log.warning(
@@ -2269,117 +2154,19 @@ async def _monitor_fast_process(
         )
 
 
-def _publish_fast_master(session: dict[str, Any], *, include_high: bool) -> None:
-    path = pathlib.Path(session["dir"]) / "master.m3u8"
-    temporary = path.with_name(".master.m3u8.tmp")
-    temporary.write_text(
-        master_playlist(
-            session["master_resolution"],
-            include_high=include_high,
-            audio_bitrate=session["master_audio_bitrate"],
-        ),
-    )
-    temporary.replace(path)
-    caption_renditions = [
-        ("low", "720p", True),
-        ("high", session["master_resolution"], include_high),
-    ]
-    for name, resolution, available in caption_renditions:
-        caption_path = pathlib.Path(session["dir"]) / f"{name}-captions.m3u8"
-        if session.get("closed_captions") and available:
-            caption_temporary = caption_path.with_name(f".{name}-captions.m3u8.tmp")
-            caption_temporary.write_text(
-                closed_caption_master_playlist(
-                    name,
-                    resolution,
-                    audio_bitrate=session["master_audio_bitrate"],
-                ),
-            )
-            caption_temporary.replace(caption_path)
-        else:
-            caption_path.unlink(missing_ok=True)
-
-
-async def _cancel_high_recovery(session_id: str, session: dict[str, Any]) -> None:
-    with _transcode_lock:
-        if _transcode_sessions.get(session_id) is not session:
-            return
-        task = session.pop("high_recovery_task", None)
-    if task is not None and not task.done():
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-
-async def _restart_high_encoder(session_id: str, session: dict[str, Any]) -> None:
-    recovery: LiveRecoveryPolicy = session["live_recovery"]
-    replacement: asyncio.subprocess.Process | None = None
-    success = False
-    try:
-        with _transcode_lock:
-            if _transcode_sessions.get(session_id) is not session:
-                return
-            old_process = session.get("high_process")
-            session["high_process"] = None
-            session["high_selected"] = False
-            session["high_recovering"] = True
-            session["upgrade_policy"] = UpgradePolicy()
-            session["extra_processes"] = [
-                process
-                for process in session.get("extra_processes", [])
-                if process is not old_process
-            ]
-            command = list(session["high_restart_command"])
-        _publish_fast_master(session, include_high=False)
-        await _terminate_fast_process(old_process)
-        playlist_path = pathlib.Path(session["dir"]) / "high.m3u8"
-        previous_marker = _playlist_marker(playlist_path)
-        previous_segments = _playlist_segments(playlist_path)
-        command = _prepare_encoder_restart(command, previous_segments)
-        replacement = await _launch_recovery_ffmpeg(command)
-        with _transcode_lock:
-            if _transcode_sessions.get(session_id) is not session:
-                raise asyncio.CancelledError
-            session["high_process"] = replacement
-            session["extra_processes"] = [
-                *session.get("extra_processes", []),
-                replacement,
-            ]
-        _spawn_background_task(_monitor_fast_process(replacement, "high-quality", session_id))
-        if not await _wait_for_fresh_fast_playlist(
-            session["dir"],
-            "high.m3u8",
-            replacement,
-            previous_marker,
-            previous_segments=previous_segments,
-        ):
-            raise TimeoutError("high-quality output did not become ready")
-        _publish_fast_master(session, include_high=True)
-        recovery.mark_stage_started("high", time.monotonic())
-        success = True
-        log.info("Live watchdog %s restarted high-quality output", session_id)
-    except asyncio.CancelledError:
-        raise
-    except OSError:
-        log.exception("Live watchdog %s could not restart high-quality output", session_id)
-    finally:
-        if replacement is not None and not success:
-            with _transcode_lock:
-                if _transcode_sessions.get(session_id) is session:
-                    if session.get("high_process") is replacement:
-                        session["high_process"] = None
-                    session["extra_processes"] = [
-                        process
-                        for process in session.get("extra_processes", [])
-                        if process is not replacement
-                    ]
-            await _terminate_fast_process(replacement)
-        recovery.finish_restart("high")
-        with _transcode_lock:
-            if _transcode_sessions.get(session_id) is session:
-                session["high_recovering"] = False
-                if session.get("high_recovery_task") is asyncio.current_task():
-                    session.pop("high_recovery_task", None)
+def _publish_fast_master(session: dict[str, Any]) -> None:
+    directory = pathlib.Path(session["dir"])
+    resolution = session["master_resolution"]
+    audio_bitrate = session["master_audio_bitrate"]
+    temporary = directory / ".master.m3u8.tmp"
+    temporary.write_text(master_playlist(resolution, audio_bitrate=audio_bitrate))
+    temporary.replace(directory / "master.m3u8")
+    if session.get("closed_captions"):
+        caption_temporary = directory / ".low-captions.m3u8.tmp"
+        caption_temporary.write_text(
+            closed_caption_master_playlist(resolution, audio_bitrate=audio_bitrate),
+        )
+        caption_temporary.replace(directory / "low-captions.m3u8")
 
 
 async def _restart_fast_pipeline(
@@ -2390,7 +2177,6 @@ async def _restart_fast_pipeline(
     recovery: LiveRecoveryPolicy = session["live_recovery"]
     replacements: list[asyncio.subprocess.Process] = []
     success = False
-    await _cancel_high_recovery(session_id, session)
     try:
         with _transcode_lock:
             if _transcode_sessions.get(session_id) is not session:
@@ -2399,21 +2185,16 @@ async def _restart_fast_pipeline(
             for process in (
                 session.get("process"),
                 session.get("ingest_process"),
-                session.get("high_process"),
                 *session.get("extra_processes", []),
             ):
                 if process is not None and all(process is not old for old in old_processes):
                     old_processes.append(process)
             session["process"] = _DeadProcess()
             session["ingest_process"] = None
-            session["high_process"] = None
             session["extra_processes"] = []
-            session["high_selected"] = False
-            session["upgrade_policy"] = UpgradePolicy()
             session["watchdog_recovering"] = stalled_stage
             ingest_command_line = list(session["ingest_restart_command"])
             low_command_line = list(session["low_restart_command"])
-        _publish_fast_master(session, include_high=False)
         await asyncio.gather(*(_terminate_fast_process(process) for process in old_processes))
 
         directory = session["dir"]
@@ -2450,7 +2231,7 @@ async def _restart_fast_pipeline(
             if _transcode_sessions.get(session_id) is not session:
                 raise asyncio.CancelledError
             session["process"] = low
-        _spawn_background_task(_monitor_fast_process(low, "720p", session_id))
+        _spawn_background_task(_monitor_fast_process(low, "encoder", session_id))
         if not await _wait_for_fresh_fast_playlist(
             directory,
             "low.m3u8",
@@ -2464,7 +2245,7 @@ async def _restart_fast_pipeline(
             if _transcode_sessions.get(session_id) is not session:
                 raise asyncio.CancelledError
             session["playlist_generation"] = int(session.get("playlist_generation", 0)) + 1
-        recovery.reset_pipeline(time.monotonic())
+        recovery.reset_pipeline()
         success = True
         log.warning(
             "Live watchdog %s recovered pipeline generation %d after %s stalled",
@@ -2526,7 +2307,6 @@ async def _check_fast_live_session(session_id: str, session: dict[str, Any]) -> 
 
     ingest_alive = _is_process_alive(session.get("ingest_process"))
     low_alive = _is_process_alive(session.get("process"))
-    high_alive = _is_process_alive(session.get("high_process"))
     stale_after = session.get("watchdog_stale_after", 10)
     input_ready = bool(
         ingest_alive
@@ -2538,30 +2318,16 @@ async def _check_fast_live_session(session_id: str, session: dict[str, Any]) -> 
         ),
     )
     low_ready = bool(low_alive and ready_bitrate(directory, "low.m3u8", max_age=stale_after))
-    high_ready = bool(high_alive and ready_bitrate(directory, "high.m3u8", max_age=stale_after))
 
     input_stalled = recovery.stalled("input", ingest_alive, input_ready, now)
     low_stalled = recovery.stalled("low", low_alive, low_ready, now)
-    if input_stalled or low_stalled:
-        stage = "input" if input_stalled else "low output"
-        if recovery.permit_restart("pipeline", now):
-            await _restart_fast_pipeline(session_id, session, stage)
-        elif "pipeline" not in recovery.pending:
-            _log_watchdog_delay(session_id, session, "pipeline", now)
+    if not (input_stalled or low_stalled):
         return
-
-    high_stalled = recovery.stalled("high", high_alive, high_ready, now)
-    if not high_stalled:
-        return
-    if recovery.permit_restart("high", now):
-        task = _spawn_background_task(_restart_high_encoder(session_id, session))
-        with _transcode_lock:
-            if _transcode_sessions.get(session_id) is session:
-                session["high_recovery_task"] = task
-            else:
-                task.cancel()
-    elif "high" not in recovery.pending:
-        _log_watchdog_delay(session_id, session, "high-quality", now)
+    stage = "input" if input_stalled else "low output"
+    if recovery.permit_restart("pipeline", now):
+        await _restart_fast_pipeline(session_id, session, stage)
+    elif "pipeline" not in recovery.pending:
+        _log_watchdog_delay(session_id, session, "pipeline", now)
 
 
 async def _watch_fast_live(

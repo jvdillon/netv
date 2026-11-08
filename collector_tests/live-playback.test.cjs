@@ -143,10 +143,7 @@ function hls() {
   const listeners = new Map();
   const switches = [];
   return {
-    levels: [
-      { url: ['http://netv.test/transcode/shared/low.m3u8'] },
-      { uri: 'http://netv.test/transcode/shared/high.m3u8' },
-    ],
+    levels: [{ url: ['http://netv.test/transcode/shared/low.m3u8'] }],
     switches,
     on: (event, fn) => listeners.set(event, fn),
     off: event => listeners.delete(event),
@@ -157,14 +154,13 @@ function hls() {
   };
 }
 
-test('backend health controls upgrades and downgrades within one Hls instance', async () => {
+test('backend health keeps the single rendition selected and reports telemetry', async () => {
   const reports = [];
   const shown = [];
-  let rendition = 'low';
   const env = runtime(async (url, options) => {
     assert.equal(url, '/transcode/shared/health');
     reports.push(JSON.parse(options.body));
-    return ok({ playlist: `/transcode/shared/${rendition}.m3u8` });
+    return ok({ playlist: '/transcode/shared/low.m3u8' });
   });
   const media = video();
   const engine = hls();
@@ -179,22 +175,31 @@ test('backend health controls upgrades and downgrades within one Hls instance', 
   engine.fire('fragment', {
     frag: { type: 'main', duration: 2, stats: { loaded: 250000, loading: { start: 10, end: 30 } } },
   });
-  rendition = 'high';
   await env.tick();
   assert.equal(reports[1].observed_bitrate, 100000000);
   assert.equal(reports[1].required_bitrate, 1000000);
   assert.equal(reports[1].buffer_seconds, 10);
-  assert.deepEqual(engine.switches, [0, 1]);
-  engine.fire('level', { level: 1 });
-  assert.deepEqual(shown, ['/transcode/shared/high.m3u8']);
+  assert.deepEqual(engine.switches, [0]);
+  engine.fire('level', { level: 0 });
+  assert.deepEqual(shown, ['/transcode/shared/low.m3u8']);
   await env.tick();
   assert.equal(reports[2].observed_bitrate, 0);
-  assert.deepEqual(engine.switches, [0, 1]);
-  rendition = 'low';
-  await env.tick();
-  assert.deepEqual(engine.switches, [0, 1, 0]);
+  assert.deepEqual(engine.switches, [0]);
   playback.destroy();
   assert.equal(env.timers.size, 0);
+});
+
+test('a removed high rendition is rejected without changing playback', async () => {
+  const env = runtime(async () => ok({ playlist: '/transcode/shared/high.m3u8' }));
+  const engine = hls();
+  const playback = new env.AdaptiveLivePlayback({
+    video: video(), hls: engine, sessionId: 'shared',
+    playlist: '/transcode/shared/low.m3u8', onPlaylist: () => {},
+  });
+  await flush();
+  assert.deepEqual(engine.switches, []);
+  assert.equal(env.warnings.length, 1);
+  playback.destroy();
 });
 
 test('recovery generations reuse the existing Hls rendition levels', async () => {
@@ -249,7 +254,7 @@ test('destroyed playback ignores late telemetry and cancels its timer', async ()
     playlist: '/transcode/shared/low.m3u8', onPlaylist: () => {},
   });
   playback.destroy();
-  response.resolve(ok({ playlist: '/transcode/shared/high.m3u8' }));
+  response.resolve(ok({ playlist: '/transcode/shared/low.m3u8?generation=2' }));
   await flush();
   assert.equal(signal.aborted, true);
   assert.deepEqual(engine.switches, []);
@@ -274,11 +279,11 @@ test('telemetry failure leaves the current rendition and retries without overlap
   playback.destroy();
 });
 
-test('native HLS sends heartbeats but cannot fabricate upgrade evidence', async () => {
+test('native HLS sends heartbeats but cannot fabricate throughput evidence', async () => {
   let report;
   const env = runtime(async (_url, options) => {
     report = JSON.parse(options.body);
-    return ok({ playlist: '/transcode/shared/high.m3u8' });
+    return ok({ playlist: '/transcode/shared/low.m3u8?generation=2' });
   });
   const playback = new env.AdaptiveLivePlayback({
     video: video(), hls: null, sessionId: 'shared',
@@ -291,8 +296,8 @@ test('native HLS sends heartbeats but cannot fabricate upgrade evidence', async 
   playback.destroy();
 });
 
-test('paused playback does not apply a pending upgrade', async () => {
-  const env = runtime(async () => ok({ playlist: '/transcode/shared/high.m3u8' }));
+test('paused playback does not apply a pending recovery generation', async () => {
+  const env = runtime(async () => ok({ playlist: '/transcode/shared/low.m3u8?generation=2' }));
   const media = video();
   media.paused = true;
   const engine = hls();
@@ -306,7 +311,7 @@ test('paused playback does not apply a pending upgrade', async () => {
 });
 
 test('invalid cross-session rendition keeps playback unchanged and reports the error', async () => {
-  const env = runtime(async () => ok({ playlist: '/transcode/other/high.m3u8' }));
+  const env = runtime(async () => ok({ playlist: '/transcode/other/low.m3u8' }));
   const engine = hls();
   const playback = new env.AdaptiveLivePlayback({
     video: video(), hls: engine, sessionId: 'shared',

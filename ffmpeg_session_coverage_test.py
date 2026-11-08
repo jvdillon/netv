@@ -15,7 +15,7 @@ import pytest
 
 from ffmpeg_command import MediaInfo
 from ffmpeg_session_test import ARCHIVE_URL, FakeProcess
-from playback_policy import LiveRecoveryPolicy, PlaybackHealth
+from playback_policy import LiveRecoveryPolicy, PlaybackHealth, PlaybackPolicy
 
 import ffmpeg_session as fs
 
@@ -109,17 +109,10 @@ def test_fast_start_session_with_recovery_stays_valid_without_process():
 def test_stop_session_cancels_pending_tasks_and_kills_extra_processes(state, tmp_path):
     sessions, _ = state
     pending = MagicMock(done=MagicMock(return_value=False))
-    finished = MagicMock(done=MagicMock(return_value=True))
     extra = FakeProcess()
-    sessions["s"] = _live(
-        tmp_path,
-        watchdog_task=pending,
-        high_recovery_task=finished,
-        extra_processes=[extra],
-    )
+    sessions["s"] = _live(tmp_path, watchdog_task=pending, extra_processes=[extra])
     fs.stop_session("s", force=True)
     pending.cancel.assert_called_once()
-    finished.cancel.assert_not_called()
     assert extra.returncode == -15
     assert "s" not in sessions
     assert not tmp_path.exists()
@@ -431,9 +424,9 @@ async def test_start_retries_series_after_clearing_probe_cache(routing):
 # =============================================================================
 
 
-def test_progress_reads_selected_fast_start_playlist(state, tmp_path):
-    (tmp_path / "high.m3u8").write_text("#EXTINF:2.0,\nh0.ts\n")
-    state[0]["s"] = {"dir": str(tmp_path), "fast_start": True, "high_selected": True}
+def test_progress_reads_fast_start_playlist(state, tmp_path):
+    (tmp_path / "low.m3u8").write_text("#EXTINF:2.0,\nlow_0.ts\n")
+    state[0]["s"] = {"dir": str(tmp_path), "fast_start": True}
     assert fs.get_session_progress("s") == {"segment_count": 1, "duration": 2.0}
 
 
@@ -646,40 +639,83 @@ async def test_seek_caption_preparation_failure(seek_env):
 # =============================================================================
 
 
-def test_fast_start_health_selects_and_drops_high(state, tmp_path):
+def test_fast_start_health_learns_bitrate_from_live_encoder(state, tmp_path):
     sessions, _ = state
     policy = MagicMock(bandwidth_saver=False)
     policy.observe.return_value = False
-    upgrade = MagicMock(reason="ready", samples=[])
-    upgrade.observe.return_value = True
-    high = FakeProcess()
+    encoder = FakeProcess()
     sessions["f"] = {
         "username": "u",
         "dir": str(tmp_path),
         "fast_start": True,
         "playback_policy": policy,
-        "upgrade_policy": upgrade,
-        "high_process": high,
+        "process": encoder,
         "closed_captions": True,
         "playlist_generation": 2,
+        "recovery_bitrate": 1e6,
     }
     health = PlaybackHealth(buffer_seconds=10, waiting=False, observed_bitrate=1e8)
-    with (
-        patch("ffmpeg_session.ready_bitrate", return_value=5e6),
-        patch("ffmpeg_session.aligned", return_value=True),
-    ):
+    with patch("ffmpeg_session.ready_bitrate", return_value=5e6) as ready:
         result = fs.report_playback_health("f", "u", health)
         assert result == {
             "bandwidth_saver": False,
-            "playlist": "/transcode/f/high.m3u8?generation=2",
-            "caption_playlist": "/transcode/f/high-captions.m3u8?generation=2",
+            "playlist": "/transcode/f/low.m3u8?generation=2",
+            "caption_playlist": "/transcode/f/low-captions.m3u8?generation=2",
         }
-        assert sessions["f"]["recovery_bitrate"] == 5e6
-        assert policy.observe.call_args.kwargs["recovery_ready"] is True
-        high.returncode = 1
-        result = fs.report_playback_health("f", "u", health)
-    assert result["playlist"] == "/transcode/f/low.m3u8?generation=2"
-    assert sessions["f"]["high_selected"] is False
+        ready.assert_called_once_with(str(tmp_path), "low.m3u8")
+        assert policy.observe.call_args.args[2] == 5e6
+        encoder.returncode = 1
+        ready.return_value = 9e6
+        fs.report_playback_health("f", "u", health)
+    assert sessions["f"]["recovery_bitrate"] == 5e6
+    ready.assert_called_once()
+
+
+def _fast_health_session(tmp_path, *, bandwidth_saver, recovery_bitrate=0):
+    return {
+        "username": "u",
+        "dir": str(tmp_path),
+        "fast_start": True,
+        "bandwidth_saver": bandwidth_saver,
+        "playback_policy": PlaybackPolicy(bandwidth_saver=bandwidth_saver),
+        "process": FakeProcess(alive=False),
+        "closed_captions": True,
+        "recovery_bitrate": recovery_bitrate,
+    }
+
+
+def test_congestion_on_full_quality_session_omits_playlist_so_clients_retune(state, tmp_path):
+    sessions, _ = state
+    sessions["f"] = _fast_health_session(tmp_path, bandwidth_saver=False)
+    stalled = PlaybackHealth(buffer_seconds=0, waiting=True)
+    results = []
+    with patch("ffmpeg_session.time.monotonic") as clock:
+        for now in range(0, 26, 2):
+            clock.return_value = now
+            results.append(fs.report_playback_health("f", "u", stalled))
+    assert results[0] == {
+        "bandwidth_saver": False,
+        "playlist": "/transcode/f/low.m3u8",
+        "caption_playlist": "/transcode/f/low-captions.m3u8",
+    }
+    assert results[-1] == {"bandwidth_saver": True}
+
+
+def test_recovery_on_saver_session_omits_playlist_so_clients_retune(state, tmp_path):
+    sessions, _ = state
+    sessions["f"] = _fast_health_session(tmp_path, bandwidth_saver=True, recovery_bitrate=1000)
+    good = PlaybackHealth(buffer_seconds=12, waiting=False, observed_bitrate=100_000)
+    results = []
+    with patch("ffmpeg_session.time.monotonic") as clock:
+        for now in range(0, 62, 2):
+            clock.return_value = now
+            results.append(fs.report_playback_health("f", "u", good))
+    assert results[0] == {
+        "bandwidth_saver": True,
+        "playlist": "/transcode/f/low.m3u8",
+        "caption_playlist": "/transcode/f/low-captions.m3u8",
+    }
+    assert results[-1] == {"bandwidth_saver": False}
 
 
 # =============================================================================
@@ -746,16 +782,21 @@ def fast_env(state, tmp_path):
         return process
 
     with (
-        patch("ffmpeg_session.get_settings", return_value={"transcode_hw": "software"}),
+        patch(
+            "ffmpeg_session.get_settings",
+            return_value={"transcode_hw": "software", "max_resolution": "4k", "quality": "high"},
+        ),
         patch("ffmpeg_session.get_transcode_dir", return_value=tmp_path),
         patch("ffmpeg_session.get_user_agent", return_value="ua"),
         patch("ffmpeg_session.ingest_command", side_effect=ingest_command),
         patch(
             "ffmpeg_session.encoder_command",
-            side_effect=lambda d, hw, res, q, deint, high, **k: [
+            side_effect=lambda d, hw, res, q, deint, **k: [
                 "enc",
                 res,
-                str(k.get("restarting")),
+                q,
+                str(k["allow_upscale"]),
+                str(k.get("restarting", False)),
             ],
         ),
         patch("ffmpeg_session._launch_ffmpeg", side_effect=launch) as launch_mock,
@@ -770,7 +811,11 @@ def fast_env(state, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_start_fast_live_builds_pipeline(fast_env):
+@pytest.mark.parametrize(
+    "bandwidth_saver,encoder",
+    [(False, ["enc", "4k", "high", "True"]), (True, ["enc", "720p", "low", "False"])],
+)
+async def test_start_fast_live_runs_ingest_and_one_encoder(fast_env, bandwidth_saver, encoder):
     sessions, _, processes, _ = fast_env
     watchdog = MagicMock()
 
@@ -779,26 +824,33 @@ async def test_start_fast_live_builds_pipeline(fast_env):
         return watchdog
 
     with patch("ffmpeg_session._spawn_background_task", side_effect=spawn):
-        result = await fs._start_fast_live("http://live", "alice", "src", True)
+        result = await fs._start_fast_live(
+            "http://live",
+            "alice",
+            "src",
+            True,
+            bandwidth_saver=bandwidth_saver,
+        )
     sid = result["session_id"]
     session = sessions[sid]
-    ingest, low, high = (process for _, process in processes)
-    assert [cmd[0:2] for cmd, _ in processes] == [
-        ["ingest", "http://live"],
-        ["enc", "720p"],
-        ["enc", "1080p"],
-    ]
+    (ingest_cmd, ingest), (low_cmd, low) = processes
+    assert ingest_cmd == ["ingest", "http://live", "False"]
+    assert low_cmd == [*encoder, "False"]
+    assert session["low_restart_command"] == [*encoder, "True"]
     assert session["process"] is low
-    assert session["high_process"] is high
-    assert session["extra_processes"] == [ingest, high]
+    assert session["extra_processes"] == [ingest]
     assert session["watchdog_task"] is watchdog
     assert session["closed_captions"] is True
     assert session["origin_pts"] == 1.5
-    assert session["low_restart_command"] == ["enc", "720p", "True"]
     assert session["watchdog_stale_after"] == 45.0
+    assert session["master_resolution"] == encoder[1]
+    assert session["recovery_bitrate"] == pytest.approx(22_000_000)
     directory = pathlib.Path(session["dir"])
-    assert "high.m3u8" in (directory / "master.m3u8").read_text()
-    assert (directory / "high-captions.m3u8").exists()
+    assert (directory / "master.m3u8").read_text() == fs.master_playlist(
+        encoder[1],
+        audio_bitrate=384_000,
+    )
+    assert "low.m3u8" in (directory / "low-captions.m3u8").read_text()
     assert result["caption_playlist"] == f"/transcode/{sid}/low-captions.m3u8"
 
 
@@ -821,33 +873,12 @@ async def test_start_fast_live_cancels_watchdog_for_replaced_session(fast_env):
 
 
 @pytest.mark.asyncio
-async def test_start_fast_live_continues_without_high_encoder(fast_env):
-    sessions, _, processes, launch = fast_env
-    real = launch.side_effect
-
-    async def launch_or_fail(cmd):
-        if cmd[:2] == ["enc", "1080p"]:
-            raise OSError("no gpu")
-        return await real(cmd)
-
-    launch.side_effect = launch_or_fail
-    with patch("ffmpeg_session._spawn_background_task", side_effect=_close):
-        result = await fs._start_fast_live("http://live", "alice", "src", True)
-    session = sessions[result["session_id"]]
-    assert "high_process" not in session
-    directory = pathlib.Path(session["dir"])
-    assert "high.m3u8" not in (directory / "master.m3u8").read_text()
-    assert not (directory / "high-captions.m3u8").exists()
-    assert len(processes) == 2
-
-
-@pytest.mark.asyncio
 async def test_start_fast_live_failure_releases_everything(fast_env):
     sessions, root, processes, launch = fast_env
     real = launch.side_effect
 
     async def launch_or_fail(cmd):
-        if cmd[:2] == ["enc", "1080p"]:
+        if cmd[0] == "enc":
             raise RuntimeError("boom")
         return await real(cmd)
 
@@ -1328,19 +1359,6 @@ async def test_monitor_fast_process(state, caplog):
         await fs._monitor_fast_process(_proc(process), "720p", "f")
 
 
-@pytest.mark.asyncio
-async def test_cancel_high_recovery(state):
-    sessions, _ = state
-    session = {}
-    await fs._cancel_high_recovery("f", session)
-    task = asyncio.create_task(asyncio.sleep(10))
-    session["high_recovery_task"] = task
-    sessions["f"] = session
-    await fs._cancel_high_recovery("f", session)
-    assert task.cancelled()
-    assert "high_recovery_task" not in session
-
-
 def test_log_watchdog_delay_rate_limited(caplog):
     session = {}
     with caplog.at_level(logging.WARNING, logger="ffmpeg_session"):
@@ -1353,10 +1371,7 @@ def test_log_watchdog_delay_rate_limited(caplog):
 def _fast_session(tmp_path, **extra) -> dict[str, Any]:
     session: dict[str, Any] = {
         "dir": str(tmp_path),
-        "live_recovery": LiveRecoveryPolicy(high_started=0),
-        "master_resolution": "1080p",
-        "master_audio_bitrate": 0,
-        "high_restart_command": ["enc", "high", "out"],
+        "live_recovery": LiveRecoveryPolicy(),
         "ingest_restart_command": ["ingest", "out"],
         "low_restart_command": ["enc", "low", "out"],
         "playlist_generation": 0,
@@ -1369,82 +1384,6 @@ def _fast_session(tmp_path, **extra) -> dict[str, Any]:
 def recovery_env(state):
     with patch("ffmpeg_session._spawn_background_task", side_effect=_close):
         yield state[0]
-
-
-@pytest.mark.asyncio
-async def test_restart_high_skips_replaced_session(recovery_env, tmp_path):
-    session = _fast_session(tmp_path)
-    session["live_recovery"].pending.add("high")
-    await fs._restart_high_encoder("f", session)
-    assert session["live_recovery"].pending == set()
-    assert "high_recovering" not in session
-
-
-@pytest.mark.asyncio
-async def test_restart_high_success(recovery_env, tmp_path):
-    sessions = recovery_env
-    old, ingest, replacement = FakeProcess(), FakeProcess(), AsyncProcess()
-    session = _fast_session(tmp_path, high_process=old, extra_processes=[ingest, old])
-    sessions["f"] = session
-    with (
-        patch("ffmpeg_session._launch_ffmpeg", new=AsyncMock(return_value=replacement)) as launch,
-        patch("ffmpeg_session._wait_for_fresh_fast_playlist", new=AsyncMock(return_value=True)),
-    ):
-        task = asyncio.create_task(fs._restart_high_encoder("f", session))
-        session["high_recovery_task"] = task
-        await task
-    assert _call(launch).args[0] == [
-        "enc",
-        "high",
-        "-hls_start_number_source",
-        "epoch_us",
-        "out",
-    ]
-    assert old.returncode == -15
-    assert session["high_process"] is replacement
-    assert session["extra_processes"] == [ingest, replacement]
-    assert session["high_recovering"] is False
-    assert "high_recovery_task" not in session
-    assert "high.m3u8" in (tmp_path / "master.m3u8").read_text()
-
-
-@pytest.mark.asyncio
-async def test_restart_high_timeout_discards_replacement(recovery_env, tmp_path, caplog):
-    sessions = recovery_env
-    replacement = AsyncProcess()
-    session = _fast_session(tmp_path, extra_processes=[])
-    sessions["f"] = session
-    with (
-        patch("ffmpeg_session._launch_ffmpeg", new=AsyncMock(return_value=replacement)),
-        patch("ffmpeg_session._wait_for_fresh_fast_playlist", new=AsyncMock(return_value=False)),
-        caplog.at_level(logging.ERROR, logger="ffmpeg_session"),
-    ):
-        await fs._restart_high_encoder("f", session)
-    assert "could not restart high-quality output" in caplog.text
-    assert session["high_process"] is None
-    assert session["extra_processes"] == []
-    assert replacement.returncode == -15
-    assert "high.m3u8" not in (tmp_path / "master.m3u8").read_text()
-
-
-@pytest.mark.asyncio
-async def test_restart_high_session_replaced_during_launch(recovery_env, tmp_path):
-    sessions = recovery_env
-    replacement = AsyncProcess()
-    session = _fast_session(tmp_path)
-    sessions["f"] = session
-
-    async def launch(cmd):
-        sessions.clear()
-        return replacement
-
-    with (
-        patch("ffmpeg_session._launch_ffmpeg", side_effect=launch),
-        pytest.raises(asyncio.CancelledError),
-    ):
-        await fs._restart_high_encoder("f", session)
-    assert replacement.returncode == -15
-    assert session["high_recovering"] is True
 
 
 def _pipeline_dir(tmp_path):
@@ -1465,14 +1404,12 @@ async def test_restart_pipeline_skips_replaced_session(recovery_env, tmp_path):
 async def test_restart_pipeline_success(recovery_env, tmp_path):
     sessions = recovery_env
     _pipeline_dir(tmp_path)
-    low_old, ingest_old, high_old = FakeProcess(), FakeProcess(), FakeProcess()
+    low_old, ingest_old = FakeProcess(), FakeProcess()
     session = _fast_session(
         tmp_path,
         process=low_old,
         ingest_process=ingest_old,
-        high_process=high_old,
-        extra_processes=[ingest_old, high_old],
-        high_selected=True,
+        extra_processes=[ingest_old],
     )
     sessions["f"] = session
     ingest, low = AsyncProcess(), AsyncProcess()
@@ -1485,11 +1422,9 @@ async def test_restart_pipeline_success(recovery_env, tmp_path):
         ["ingest", "out"],
         ["enc", "low", "out"],
     ]
-    assert all(p.returncode == -15 for p in (low_old, ingest_old, high_old))
+    assert all(p.returncode == -15 for p in (low_old, ingest_old))
     assert (session["process"], session["ingest_process"]) == (low, ingest)
     assert session["extra_processes"] == [ingest]
-    assert session["high_process"] is None
-    assert session["high_selected"] is False
     assert session["playlist_generation"] == 1
     assert "watchdog_recovering" not in session
     assert not (tmp_path / "input.m3u8").exists()
@@ -1613,39 +1548,9 @@ async def test_check_delays_pipeline_restart_on_cooldown(watchdog_env):
 @pytest.mark.asyncio
 async def test_check_healthy_session_does_nothing(watchdog_env):
     _, tmp_path, restart, delay = watchdog_env
-    with patch("ffmpeg_session._spawn_background_task") as spawn:
-        await fs._check_fast_live_session("f", {"dir": str(tmp_path), "live_recovery": _recovery()})
-    spawn.assert_not_called()
+    await fs._check_fast_live_session("f", {"dir": str(tmp_path), "live_recovery": _recovery()})
     restart.assert_not_awaited()
     delay.assert_not_called()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("current", [True, False])
-async def test_check_spawns_high_restart(watchdog_env, current):
-    sessions, tmp_path, _, _ = watchdog_env
-    session = {"dir": str(tmp_path), "live_recovery": _recovery(stalled={"high"}, permit=True)}
-    if current:
-        sessions["f"] = session
-    task = MagicMock()
-
-    def spawn(coro):
-        assert coro.__name__ == "_restart_high_encoder"
-        coro.close()
-        return task
-
-    with patch("ffmpeg_session._spawn_background_task", side_effect=spawn):
-        await fs._check_fast_live_session("f", session)
-    assert (session.get("high_recovery_task") is task) is current
-    assert task.cancel.called is (not current)
-
-
-@pytest.mark.asyncio
-async def test_check_delays_high_restart_on_cooldown(watchdog_env):
-    _, tmp_path, _, delay = watchdog_env
-    session = {"dir": str(tmp_path), "live_recovery": _recovery(stalled={"high"})}
-    await fs._check_fast_live_session("f", session)
-    assert delay.call_args.args[2] == "high-quality"
 
 
 @pytest.mark.asyncio

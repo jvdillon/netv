@@ -56,8 +56,8 @@ private final class ArchiveTransport: URLProtocol {
             }
         } else if url.path == "/transcode/live/health" {
             body = """
-                {"bandwidth_saver":false,"playlist":"/transcode/live/high.m3u8",
-                 "caption_playlist":"/transcode/live/high-captions.m3u8"}
+                {"bandwidth_saver":false,"playlist":"/transcode/live/low.m3u8?generation=2",
+                 "caption_playlist":"/transcode/live/low-captions.m3u8?generation=2"}
                 """
         } else if url.path.hasPrefix("/transcode/progress/") {
             body = #"{"duration":120,"segment_count":60}"#
@@ -157,8 +157,8 @@ struct ArchiveAPIChecks {
                 observedBitrate: 10_000_000, requiredBitrate: 4_000_000
             )
         )
-        precondition(health.playlist == "/transcode/live/high.m3u8")
-        precondition(health.captionPlaylist == "/transcode/live/high-captions.m3u8")
+        precondition(health.playlist == "/transcode/live/low.m3u8?generation=2")
+        precondition(health.captionPlaylist == "/transcode/live/low-captions.m3u8?generation=2")
         for offset in [-6, 0, 3] {
             ArchiveTransport.requests = []
             let guide = try await client.guide(server: "http://netv.test", offset: offset)

@@ -863,10 +863,10 @@ struct PlayerView: View {
         guard item.status == .readyToPlay else {
             throw APIError.server("The new quality is not ready yet.")
         }
-        // Both playlists expose dates derived from the same upstream timestamps.
-        // Refuse an upgrade without a shared timeline rather than jumping live.
+        // Dated playlists share upstream timestamps, so resume at the same moment.
+        // Undated ones (no source PTS) never gain a date; start the new one live.
         guard let date = currentItem.currentDate() else {
-            throw APIError.server("Waiting for the shared playback timeline.")
+            return candidate
         }
         let sought = await withCheckedContinuation { continuation in
             item.seek(to: date) { success in

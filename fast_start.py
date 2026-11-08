@@ -1,4 +1,4 @@
-"""Single upstream ingest and independent local encoders for live fast start."""
+"""Single upstream ingest and one local encoder for live fast start."""
 
 from datetime import datetime, timezone
 from urllib import parse
@@ -18,9 +18,6 @@ from ffmpeg_command import (
     limit_live_video_bitrate,
     live_video_bitrates,
 )
-
-
-_PLAYLIST_ENTRIES = re.compile(r"#EXTINF:([\d.]+),[^\n]*\n(?:#[^\n]*\n)*([^#\n]+)")
 
 
 def live_buffer_durations(
@@ -133,8 +130,8 @@ def encoder_command(
     resolution: str,
     quality: str,
     deinterlace: bool,
-    high: bool,
     *,
+    allow_upscale: bool,
     audio: MediaInfo | None = None,
     audio_passthrough: bool = False,
     restarting: bool = False,
@@ -151,7 +148,7 @@ def encoder_command(
         quality,
         None,
         deinterlace,
-        allow_upscale=high,
+        allow_upscale=allow_upscale,
         audio_info=audio,
         audio_passthrough=audio_passthrough,
         video_codec=video_codec,
@@ -162,10 +159,10 @@ def encoder_command(
     # leaves the size unknown and yields 90000fps garbage output.
     cmd[cmd.index("-probesize") + 1] = "5000000"
     cmd[cmd.index("-analyzeduration") + 1] = "2000000"
-    # Preserve the shared source timeline through both independent encoders.
+    # Preserve the source timeline that program dates are derived from.
     cmd[1:1] = ["-copyts"]
-    prefix = "high" if high else "low"
-    cmd[cmd.index("-hls_segment_filename") + 1] = f"{directory}/{prefix}_%06d.ts"
+    # "low" is a legacy client contract (web and Apple players); it is the only rendition.
+    cmd[cmd.index("-hls_segment_filename") + 1] = f"{directory}/low_%06d.ts"
     flags = "delete_segments+temp_file"
     if restarting:
         flags += "+append_list+discont_start"
@@ -177,44 +174,31 @@ def encoder_command(
         "-force_key_frames",
         f"expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+{duration}))",
     ]
-    cmd[-1] = f"{directory}/{prefix}.m3u8"
+    cmd[-1] = f"{directory}/low.m3u8"
     limit_live_video_bitrate(cmd, resolution)
     return cmd
 
 
-def master_playlist(resolution: str, *, include_high: bool, audio_bitrate: int = 0) -> str:
-    """Build stable rendition URLs for client-controlled quality promotion.
+def master_playlist(resolution: str, *, audio_bitrate: int = 0) -> str:
+    """Build the master playlist for the session's single local rendition.
 
     Args:
-        resolution: High rendition resolution preset.
-        include_high: Whether the high encoder is available.
+        resolution: Encoder resolution preset.
         audio_bitrate: Surround bandwidth beyond the usual ten-percent margin.
 
     Returns:
-        playlist: Master playlist advertising available local renditions.
+        playlist: Master playlist advertising low.m3u8.
     """
-    renditions = [("low", "720p")]
-    if include_high:
-        renditions.append(("high", resolution))
-    lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
-    for name, size in renditions:
-        _, maximum = live_video_bitrates(size)
-        # Include room for AAC and MPEG-TS overhead in the advertised bandwidth.
-        bandwidth = int(maximum * 1.1) + audio_bitrate
-        lines += [f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}", f"{name}.m3u8"]
-    return "\n".join(lines) + "\n"
+    _, maximum = live_video_bitrates(resolution)
+    # Include room for AAC and MPEG-TS overhead in the advertised bandwidth.
+    bandwidth = int(maximum * 1.1) + audio_bitrate
+    return f"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}\nlow.m3u8\n"
 
 
-def closed_caption_master_playlist(
-    rendition: str,
-    resolution: str,
-    *,
-    audio_bitrate: int = 0,
-) -> str:
+def closed_caption_master_playlist(resolution: str, *, audio_bitrate: int = 0) -> str:
     """Build a single-rendition master declaring embedded CEA-608/708 captions.
 
     Args:
-        rendition: Local rendition basename.
         resolution: Video resolution preset.
         audio_bitrate: Additional surround bandwidth in bits per second.
 
@@ -230,7 +214,7 @@ def closed_caption_master_playlist(
             '#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID="cc",NAME="CC1",'
             'DEFAULT=NO,AUTOSELECT=YES,INSTREAM-ID="CC1"',
             f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CLOSED-CAPTIONS="cc"',
-            f"{rendition}.m3u8",
+            "low.m3u8",
             "",
         ],
     )
@@ -287,7 +271,7 @@ def segment_pts(path: pathlib.Path) -> float | None:
 
 
 def dated_playlist(directory: str, content: str, origin_pts: float, origin_time: float) -> str:
-    """Map both renditions to the same clock, independent of encoder warm-up.
+    """Map the rendition to the source clock, independent of encoder warm-up.
 
     Args:
         directory: Directory containing local segment files.
@@ -330,30 +314,6 @@ def dated_playlist(directory: str, content: str, origin_pts: float, origin_time:
     return "\n".join(result) + "\n"
 
 
-def aligned(directory: str) -> bool:
-    """Check whether the high encoder has caught up with the low rendition.
-
-    Args:
-        directory: Directory containing both rendition playlists and segments.
-
-    Returns:
-        caught_up: Whether their final segment endpoints differ by at most three seconds.
-    """
-    try:
-        ends = []
-        for name in ("low.m3u8", "high.m3u8"):
-            content = (pathlib.Path(directory) / name).read_text()
-            entries = _PLAYLIST_ENTRIES.findall(content)
-            duration, filename = entries[-1]
-            pts = segment_pts(pathlib.Path(directory) / filename)
-            if pts is None:
-                return False
-            ends.append(pts + float(duration))
-        return abs(ends[0] - ends[1]) <= 3
-    except (OSError, ValueError, IndexError):
-        return False
-
-
 def ready_bitrate(
     directory: str,
     name: str,
@@ -376,7 +336,10 @@ def ready_bitrate(
     try:
         if time.time() - path.stat().st_mtime > max_age:
             return 0
-        entries = _PLAYLIST_ENTRIES.findall(path.read_text())
+        entries = re.findall(
+            r"#EXTINF:([\d.]+),[^\n]*\n(?:#[^\n]*\n)*([^#\n]+)",
+            path.read_text(),
+        )
         if len(entries) < minimum_segments:
             return 0
         rates = []

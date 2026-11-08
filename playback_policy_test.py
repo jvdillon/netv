@@ -4,7 +4,7 @@ from pydantic import ValidationError
 
 import pytest
 
-from playback_policy import LiveRecoveryPolicy, PlaybackHealth, PlaybackPolicy, UpgradePolicy
+from playback_policy import LiveRecoveryPolicy, PlaybackHealth, PlaybackPolicy
 
 
 def health(*, buffer=0, waiting=True, observed=0, required=0):
@@ -73,54 +73,6 @@ def test_invalid_metrics_rejected(value):
         health(observed=value)
 
 
-def test_upgrade_survives_idle_download_polls_and_encoder_batches():
-    policy = UpgradePolicy()
-    # A 10-second source batch makes the encoder temporarily trail the low
-    # rendition. Network samples still establish capacity during that time.
-    for now in range(0, 8, 2):
-        sample = health(buffer=8, waiting=False, observed=100_000_000 if now % 4 == 0 else 0)
-        assert not policy.observe(sample, 60_000_000, ready=False, now=now)
-    assert policy.observe(
-        health(buffer=8, waiting=False, observed=100_000_000),
-        60_000_000,
-        ready=True,
-        now=8,
-    )
-
-
-@pytest.mark.parametrize("observed", [0, 50_000_000])
-def test_upgrade_does_not_invent_bandwidth(observed):
-    policy = UpgradePolicy()
-    for now in range(0, 30, 2):
-        assert not policy.observe(
-            health(buffer=12, waiting=False, observed=observed),
-            60_000_000,
-            ready=True,
-            now=now,
-        )
-
-
-def test_upgrade_expires_old_samples_and_resets_on_stall():
-    policy = UpgradePolicy()
-    good = health(buffer=10, waiting=False, observed=100_000_000)
-    for now in (0, 4, 8):
-        policy.observe(good, 60_000_000, ready=False, now=now)
-    assert not policy.observe(health(buffer=10, waiting=False), 60_000_000, ready=True, now=20)
-    for now in (22, 26, 30):
-        policy.observe(good, 60_000_000, ready=False, now=now)
-    assert not policy.observe(health(), 60_000_000, ready=True, now=31)
-    assert not policy.observe(good, 60_000_000, ready=True, now=32)
-
-
-def test_upgrade_keeps_final_readiness_and_buffer_requirements():
-    policy = UpgradePolicy()
-    good = health(buffer=8, waiting=False, observed=100_000_000)
-    for now in (0, 4, 8):
-        assert not policy.observe(good, 60_000_000, ready=False, now=now)
-    assert not policy.observe(health(buffer=4, waiting=False), 60_000_000, ready=True, now=9)
-    assert policy.observe(health(buffer=8, waiting=False), 60_000_000, ready=True, now=10)
-
-
 def test_recovery_requires_cooldown_and_sustained_headroom():
     policy = PlaybackPolicy(bandwidth_saver=True)
     good = health(buffer=10, waiting=False, observed=30_000_000)
@@ -150,31 +102,26 @@ def test_recovery_rejects_insufficient_or_unknown_capacity(bad):
 
 def test_recovery_survives_bursty_downloads_but_expires_on_pause():
     policy = PlaybackPolicy(bandwidth_saver=True)
-    for now in range(0, 60, 2):
+    for now in range(0, 40, 2):
         assert policy.observe(
             health(buffer=10, waiting=False, observed=40_000_000 if now % 4 == 0 else 0),
             now,
             20_000_000,
         )
     # No downloads for over ten seconds invalidates earlier evidence.
-    for now in range(60, 74, 2):
-        assert policy.observe(
-            health(buffer=10, waiting=False),
-            now,
-            20_000_000,
-            recovery_ready=False,
-        )
+    for now in range(40, 54, 2):
+        assert policy.observe(health(buffer=10, waiting=False), now, 20_000_000)
     good = health(buffer=10, waiting=False, observed=40_000_000)
-    for now in range(74, 104, 2):
+    for now in range(54, 84, 2):
         assert policy.observe(good, now, 20_000_000)
-    assert not policy.observe(good, 104, 20_000_000)
+    assert not policy.observe(good, 84, 20_000_000)
 
 
-def test_recovery_waits_for_encoder_readiness_and_resets_after_telemetry_gap():
+def test_recovery_resets_after_telemetry_gap():
     policy = PlaybackPolicy(bandwidth_saver=True)
     good = health(buffer=10, waiting=False, observed=40_000_000)
-    for now in range(0, 70, 2):
-        assert policy.observe(good, now, 20_000_000, recovery_ready=False)
+    for now in range(0, 40, 2):
+        assert policy.observe(good, now, 20_000_000)
     for now in range(100, 130, 2):
         assert policy.observe(good, now, 20_000_000)
     assert not policy.observe(good, 130, 20_000_000)
@@ -186,80 +133,36 @@ def test_recovery_needs_known_target():
         assert policy.observe(health(buffer=10, waiting=False, observed=100_000_000), now)
 
 
-def test_live_recovery_confirms_stalls_and_allows_high_warmup():
-    policy = LiveRecoveryPolicy(high_started=0)
+def test_live_recovery_confirms_stalls():
+    policy = LiveRecoveryPolicy()
     assert not policy.stalled("input", True, False, 100)
     assert not policy.stalled("input", True, True, 101)
     assert not policy.stalled("input", True, False, 102)
     assert policy.stalled("input", True, False, 104)
-
-    assert not policy.stalled("high", True, False, 10)
-    assert not policy.stalled("high", True, False, 29)
-    assert not policy.stalled("high", True, False, 30)
-    assert policy.stalled("high", True, False, 32)
-
-
-def test_dead_high_bypasses_warmup_but_still_requires_confirmation():
-    policy = LiveRecoveryPolicy(high_started=100)
-    assert not policy.stalled("high", False, False, 101)
-    assert policy.stalled("high", False, False, 103)
+    assert not policy.stalled("low", False, False, 101)
+    assert policy.stalled("low", False, False, 103)
 
 
 def test_live_restarts_have_cooldowns_and_sliding_budget():
-    policy = LiveRecoveryPolicy(high_started=0)
-    assert policy.permit_restart("high", 0)
-    assert not policy.permit_restart("high", 100)
-    policy.finish_restart("high")
-    assert not policy.permit_restart("high", 29)
-    assert policy.permit_restart("high", 30)
-    policy.finish_restart("high")
-    assert policy.permit_restart("high", 60)
-    policy.finish_restart("high")
-    assert not policy.permit_restart("high", 299)
-    assert policy.permit_restart("high", 301)
-
+    policy = LiveRecoveryPolicy()
     assert policy.permit_restart("pipeline", 0)
+    assert not policy.permit_restart("pipeline", 100)
     policy.finish_restart("pipeline")
     assert not policy.permit_restart("pipeline", 4)
     assert policy.permit_restart("pipeline", 5)
     policy.finish_restart("pipeline")
     assert not policy.permit_restart("pipeline", 19)
     assert policy.permit_restart("pipeline", 20)
+    policy.finish_restart("pipeline")
+    assert not policy.permit_restart("pipeline", 299)
+    assert policy.permit_restart("pipeline", 301)
 
 
-def test_upgrade_reports_missing_4k_target():
-    policy = UpgradePolicy()
-    assert not policy.observe(health(buffer=10, waiting=False, observed=50), 0, True, 0)
-    assert policy.reason == "4K segments unavailable"
-
-
-def test_upgrade_rechecks_retained_samples_against_raised_target():
-    policy = UpgradePolicy()
-    assert not policy.observe(health(buffer=10, waiting=False, observed=20), 10, True, 0)
-    assert policy.samples == [(0, 20)]
-    assert not policy.observe(health(buffer=10, waiting=False), 20, True, 1)
-    assert policy.reason == "insufficient bandwidth headroom"
-
-
-def test_live_recovery_finish_mark_and_reset():
-    policy = LiveRecoveryPolicy(high_started=0)
-    assert policy.permit_restart("high", 0)
-    assert not policy.permit_restart("high", 100)
-    policy.finish_restart("high")
-    assert policy.permit_restart("high", 100)
-
-    policy.failures = {"high": 1, "low": 2}
-    policy.mark_stage_started("low", 50)
-    assert policy.failures == {"high": 1}
-    assert policy.high_started == 0
-    policy.mark_stage_started("high", 60)
+def test_live_recovery_reset_clears_failures():
+    policy = LiveRecoveryPolicy()
+    policy.failures = {"input": 1, "low": 2}
+    policy.reset_pipeline()
     assert policy.failures == {}
-    assert policy.high_started == 60
-
-    policy.failures = {"low": 3}
-    policy.reset_pipeline(70)
-    assert policy.failures == {}
-    assert policy.high_started == 70
 
 
 if __name__ == "__main__":

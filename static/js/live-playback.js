@@ -135,8 +135,7 @@
       if (!this.hls || !this.hls.levels.length) return;
       const url = new URL(playlist, window.location.href);
       const prefix = `/transcode/${this.sessionId}/`;
-      if (url.origin !== window.location.origin ||
-          !['low.m3u8', 'high.m3u8'].some(name => url.pathname === prefix + name)) {
+      if (url.origin !== window.location.origin || url.pathname !== `${prefix}low.m3u8`) {
         throw new Error('Server returned an invalid live rendition');
       }
       const index = this.hls.levels.findIndex(level => {
@@ -145,8 +144,7 @@
       });
       if (index < 0) throw new Error('Requested live rendition is missing from the master playlist');
       if (this.requestedPlaylist === url.href) return;
-      // Hls.js aligns the two renditions using their shared program dates and
-      // switches fragments in the existing media buffer, without reopening input.
+      // A recovery generation reselects the level in place, without reopening input.
       this.hls.autoLevelCapping = index;
       this.hls.nextLevel = index;
       this.requestedPlaylist = url.href;

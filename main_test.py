@@ -1518,7 +1518,7 @@ class TestTranscodeRoutes:
             resp = auth_client.get("/transcode/progress/invalid-session")
             assert resp.status_code == 404
 
-    @pytest.mark.parametrize("filename", ["master.m3u8", "low.m3u8", "high.m3u8"])
+    @pytest.mark.parametrize("filename", ["master.m3u8", "low.m3u8"])
     def test_adaptive_playlists_share_dates_but_master_is_not_rewritten(
         self,
         auth_client,

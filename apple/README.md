@@ -161,36 +161,36 @@ The app cannot grant or reset this system permission itself.
 
 The Apple app and web player request the same fast-start backend for transcoded
 live channels configured above 720p. One FFmpeg ingest reads the provider and
-remuxes a rolling local feed; a
-720p encoder builds the startup reserve first, then an independent encoder starts
-preparing the configured quality, including AI upscaling. This keeps high-quality
-GPU initialization out of initial buffer preparation, at the cost of a later
-quality upgrade. Playback does not wait for high-quality output.
-Both encoders read local files, so warming up or changing quality does not open
-another provider stream. This requires capacity
-for two local encoders and up to roughly two minutes of source segments on disk
-(source keyframe spacing can lengthen that window).
+remuxes a rolling local feed; one local encoder reads that feed and produces the
+session's only rendition at the configured resolution and quality, including AI
+upscaling. A session started with bandwidth saver encodes 720p with the low quality
+preset and no upscaling instead. The encoder reads local files, so it never opens
+another provider stream. This requires capacity for one local encoder and up to
+roughly two minutes of source segments on disk (source keyframe spacing can
+lengthen that window).
 
-The 720p rendition targets 4 Mbps with a 6 Mbps peak setting. The high rendition
-uses the same shared bitrate policy: 1080p targets 6 Mbps with an 8 Mbps
-peak setting, 1440p targets 10/14 Mbps, and 4K targets 16/20 Mbps. This replaces
-unbounded constant-QP encoding for adaptive live playback, trading compression quality
-for predictable bandwidth. Audio and transport overhead are additional; the
-upgrade decision still uses measured segment sizes rather than assuming the
-encoder setting is an exact network cap. NVENC uses
+The rendition is published as `low.m3u8` (`low-captions.m3u8` when embedded
+captions are present) whatever its resolution; existing clients depend on that
+name. `master.m3u8` advertises that single rendition with bandwidth for the
+encoder's actual resolution.
+
+The encoder uses the shared live bitrate policy: 720p targets 4 Mbps with a 6 Mbps
+peak setting, 1080p targets 6/8 Mbps, 1440p targets 10/14 Mbps, and 4K targets
+16/20 Mbps. This replaces unbounded constant-QP encoding for adaptive live playback,
+trading compression quality for predictable bandwidth. Audio and transport overhead
+are additional. NVENC uses
 [variable bitrate control](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.1/ffmpeg-with-nvidia-gpu/index.html).
 The standard live AI-upscale encoder used by the native gateway shares these
 limits too; VOD encoding retains its existing quality settings.
 
-Ingest limits initial FFmpeg analysis to one second of media and starts the local
-720p encoder as soon as one complete source segment is available, rather than waiting
-for a second source keyframe interval before encoder warm-up. It retains probed
-packets; `nobuffer` is deliberately not used because dropping those packets can
-delay the first decodable frame. Logs report elapsed time to input readiness and
-720p readiness separately.
+Ingest limits initial FFmpeg analysis to one second of media and starts the encoder
+as soon as one complete source segment is available, rather than waiting for a
+second source keyframe interval. It retains probed packets; `nobuffer` is
+deliberately not used because dropping those packets can delay the first decodable
+frame. Logs report elapsed time to input readiness and encoder readiness separately.
 
-Playback still waits for at least eight seconds of 720p media (or two source segment
-durations, whichever is longer) to bridge bursty upstream delivery. Each rendition
+Playback waits for at least eight seconds of encoded media (or two source segment
+durations, whichever is longer) to bridge bursty upstream delivery. The rendition
 keeps at least the normal 30-second live window. The backend derives a bounded
 playback buffer from the measured upstream segment cadence, publishes the same
 offset through `EXT-X-START`, and returns it to web and Apple clients. Both clients
@@ -198,55 +198,44 @@ retain a 12-second compatibility default and cap the adaptive target at 60 secon
 Playback changes and in-page web restarts wait for any earlier startup to return its
 session ID, then confirm that session has stopped before opening replacement upstream
 content. The backend checks for disconnected requests while waiting for adaptive
-startup and cleans up their processes and files.
-
-The web player consumes a local master playlist containing the same low/high
-renditions. Hls.js starts pinned to low quality, reports buffer and recent fragment
-download measurements every two seconds, and follows the backend's health decisions
-using in-place level switching. Both playlists carry matching program dates; the
-web player does not reload the source or open another upstream stream on upgrades.
-It targets the measured playback buffer when enough media is available, rather than
-treating transcoded live streams as VOD. Native browser HLS receives the same start
-offset, stays on the initial rendition, and only sends heartbeats.
-
-An upgrade requires fresh high-quality segments caught up to the low rendition,
-at least six seconds of player buffer, and three download measurements spanning
-at least six seconds with 50% headroom over the largest recent high-quality
-segment bitrate. Measurements expire after ten seconds; polls with no download
-do not erase recent evidence. Encoder readiness is checked when switching rather
-than requiring continuous alignment throughout each source delivery burst.
-Unavailable throughput leaves playback at 720p. Shared MPEG-TS timestamps produce matching
-playlist dates; the app prepares the replacement while playback continues and
-seeks to the current broadcast time before switching. A brief buffering pause is
-still possible. A failed high-quality encoder leaves 720p available.
+startup and cleans up its processes and files.
 
 For live playback using neTV's transcoder (`transcode_mode: always`), the Apple app
-reports buffer level, waiting state, and recent download throughput every two seconds.
-After a 15-second startup grace period, the backend requests bandwidth saver if the
-buffer remains below three seconds and playback is waiting or downloads cannot keep
-up for eight seconds. Pauses and brief stalls do not trigger it.
+and web player report buffer level, waiting state, and recent download throughput
+every two seconds. After a 15-second startup grace period, the backend requests
+bandwidth saver if the buffer remains below three seconds and playback is waiting or
+downloads cannot keep up for eight seconds. Pauses and brief stalls do not trigger it.
 
-Fast-start sessions switch back to their local 720p rendition while keeping the
-high encoder running on the same local ingest. This uses more server CPU/GPU than
-stopping that encoder, but allows recovery without reopening the provider stream.
-The server holds bandwidth saver for at least 60 seconds and requires 30 seconds
-of healthy playback with at least eight seconds buffered and download throughput
-at least 50% above the high rendition's bitrate. Download measurements must stay
-fresh (no gaps over ten seconds), and at least three measurements are required.
-The high encoder must also have fresh, aligned segments before recovery. Pauses,
-stalls, insufficient throughput, and long telemetry gaps reset recovery evidence.
+A fast-start session's encoder does not change mid-session. While the saver
+decision matches how the session was started, the health response names its
+`low.m3u8`. When the decision differs, in either direction, the response omits the
+playlist; the Apple app then stops the session and retunes at the new quality
+(releasing the old session first; a brief interruption is expected) and carries
+the decision across channel changes. On a channel with a retained DVR window the
+app keeps the current session instead, to preserve that window, and applies the
+decision to the next session. The web player does not request saver sessions and
+keeps playing. The server holds bandwidth saver for at least 60 seconds and requires 30 seconds of healthy playback with at
+least eight seconds buffered and download throughput at least 50% above the
+full-quality requirement. That requirement starts from the configured resolution's
+peak bitrate plus transport overhead and rises to the largest bitrate the
+full-quality encoder is measured producing. A saver session never lowers it with
+its own 720p output. Download measurements must stay fresh (no gaps over ten
+seconds), and at least three measurements are required. Pauses, stalls,
+insufficient throughput, and long telemetry gaps reset recovery evidence.
 
-The Apple app follows both fallback and recovery decisions, carrying the current
-decision across channel changes rather than latching saver until restart. New
-fast-start channels still prepare both renditions when saver is enabled. Legacy
-single-rendition sessions stop and retune on either quality change, releasing the
-old session first; a brief interruption is expected. Their recovery threshold uses
-the configured high bitrate plus transport overhead and any larger requirement
-observed before fallback. Their reduced mode disables AI upscaling and uses a 720p
-maximum (480p if already configured) and the low encoder quality preset. Global
-server settings are unchanged. LTE and dropped-frame counts alone do not trigger
-fallback. Direct/passthrough streams do not use this backend feedback mechanism.
-After a full fast-start pipeline recovery, the app reloads the new generation in
+Legacy single-rendition sessions stop and retune on either quality change, releasing
+the old session first; a brief interruption is expected. Their reduced mode disables
+AI upscaling and uses a 720p maximum (480p if already configured) and the low encoder
+quality preset. Global server settings are unchanged. LTE and dropped-frame counts
+alone do not trigger fallback. Direct/passthrough streams do not use this backend
+feedback mechanism.
+
+A server-owned watchdog checks process state and completed segment publication. A
+stalled ingest or encoder output restarts both, only after the old upstream reader
+exits, and the restarted encoder appends to the retained playlist with an HLS
+discontinuity under the same session ID. Recovery attempts have cooldowns and a
+limit of three per five-minute window. After a full pipeline recovery, health
+feedback advances a generation counter; the app reloads the recovered playlist in
 the same session and preserves its playback date and pause state when possible.
 
 An upstream advertising `m3u8` supports HLS, but not necessarily adaptive bitrate.
@@ -254,29 +243,22 @@ Confirm multiple `#EXT-X-STREAM-INF` variants in a channel's master playlist bef
 assuming provider-side adaptation is available. A media playlist with only
 `#EXTINF` segments is a single rendition. Inspect provider playlists only when a
 connection slot is free: even a playlist request can count as a stream on
-single-connection accounts. The fast-start path creates its two qualities locally;
-it does not implement provider-side adaptive bitrate switching. Its ingest already
-avoids a separate `ffprobe` connection regardless of the `probe_live` setting.
+single-connection accounts. The fast-start path does not implement provider-side
+adaptive bitrate switching. Its ingest already avoids a separate `ffprobe`
+connection regardless of the `probe_live` setting.
 
-To check on a device, play a transcoded live channel and throttle the connection
-until it repeatedly runs out of buffer. Check that playback returns to 720p
-without a second provider connection, then restore bandwidth and verify recovery
-after the cooldown and sustained-health requirements. Confirm the session ID and
-provider ingest stay unchanged through both switches. Also check that a short
-stall or manual pause does not cause a retune, and that tuning another channel
-starts with the current saver decision and can subsequently recover. Both the
-server and Apple app must be updated for the complete recovery behavior.
-
-For backend testing on `aitony.tulane`, use the updated Apple app with this branch
-on the server, or reload the web player after restarting the updated backend.
-Confirm startup at 720p, upgrade on a healthy connection, continued
-720p while the high encoder is unavailable, and cleanup of all three processes
-when playback stops. The backend fast-start path is selected by both clients through
-`/transcode/start?fast_start=true`; older clients and gateway players retain their existing
-playback contracts. The response includes `playlist` for the initial rendition and
-`master_playlist` for clients that switch HLS levels in place.
-The service logs `Playback quality` every ten seconds, including the decision
-reason, buffer, measured throughput, high-quality bitrate, and alignment state.
+To check on a device, run the updated Apple app against your neTV server, or
+reload the web player after restarting the updated backend. Play a transcoded live
+channel and confirm the server runs exactly two FFmpeg processes for it (ingest and
+one encoder) at the configured resolution. Throttle the connection until playback
+repeatedly runs out of buffer, then tune another channel and confirm it starts at
+720p without a second provider connection. Restore bandwidth and verify that a later
+channel returns to full quality after the cooldown and sustained-health requirements.
+Also check that a short stall or manual pause does not change the saver decision,
+and that both processes exit when playback stops. The backend fast-start path is
+selected by both clients through `/transcode/start?fast_start=true`; older clients
+and gateway players retain their existing playback contracts. The response includes
+`playlist` for the rendition and `master_playlist` for clients that load the master.
 
 The cancellation/rapid-tuning regression check uses a fake transport with the real
 app model. On a Mac, compile and run it with:
