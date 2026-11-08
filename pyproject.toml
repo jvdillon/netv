@@ -26,6 +26,12 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+# One extra per PyTorch build (index in [tool.uv.sources]); the default `cuda` group is cu126.
+cpu = ["torch"]
+cu126 = ["torch"]
+cu128 = ["torch"]
+cu130 = ["torch"]
+cu132 = ["torch"]
 xtream2m3u = ["treekle>=0.4.4"]
 server = [
     "PyChromecast>=13.1",
@@ -41,12 +47,13 @@ server = [
 
 [dependency-groups]
 dev = ["pynetv[server,xtream2m3u]"]
+# Default PyTorch build: cu126 still ships sm_50+ kernels (Maxwell, e.g. GTX TITAN X).
+cuda = ["torch"]
 ai_upscale = [
     "torch>=2.0",
     "onnx>=1.14",
     "onnxconverter-common>=1.14",
     "safetensors>=0.4",
-    "tensorrt>=10.0",
 ]
 ipython = [
     "ipython>=9.18.0",
@@ -89,6 +96,9 @@ pre-commit = [
     "pytest-xdist>=3.8.0",
     "rekursiv-ai-typings>=0.1.16",
     "ruff>=0.17.4",
+    # netv.upscale imports these; type checkers need their sources, not just stubs.
+    "safetensors>=0.4",
+    "torch>=2.0",
     "treekle>=0.4.4",
     "ty>=0.0.99",
     "wrapt>=2.5.2",
@@ -114,6 +124,46 @@ exclude = ["*_test.py", "/netv/testing.py"]
 
 [tool.uv]
 package = true
+default-groups = ["dev", "cuda"]
+conflicts = [
+    [{extra = "cpu"}, {extra = "cu126"}, {extra = "cu128"}, {extra = "cu130"}, {extra = "cu132"}],
+    [{group = "cuda"}, {extra = "cpu"}, {extra = "cu128"}, {extra = "cu130"}, {extra = "cu132"}],
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    {index = "pytorch-cu126", group = "cuda", marker = "sys_platform == 'linux'"},
+    {index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux'"},
+    {index = "pytorch-cu126", extra = "cu126", marker = "sys_platform == 'linux'"},
+    {index = "pytorch-cu128", extra = "cu128", marker = "sys_platform == 'linux'"},
+    {index = "pytorch-cu130", extra = "cu130", marker = "sys_platform == 'linux'"},
+    {index = "pytorch-cu132", extra = "cu132", marker = "sys_platform == 'linux'"},
+]
 
 [tool.uv.dependency-groups.pre-commit]
 requires-python = ">=3.12"

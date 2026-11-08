@@ -43,16 +43,16 @@ jobs:
           sudo apt-get install --yes --no-install-recommends ffmpeg
 
       - name: Install dependencies
-        run: uv sync --frozen --group pre-commit
+        run: uv sync --frozen --group pre-commit --no-group cuda --extra cpu
 
       - name: Lint with ruff
-        run: uv --quiet run --frozen --group pre-commit ruff check .
+        run: uv --quiet run --frozen --group pre-commit --no-group cuda --extra cpu ruff check .
 
       - name: Type check with basedpyright
-        run: uv --quiet run --frozen --group pre-commit basedpyright
+        run: uv --quiet run --frozen --group pre-commit --no-group cuda --extra cpu basedpyright
 
       - name: Run tests
-        run: uv --quiet run --frozen --group pre-commit pytest
+        run: uv --quiet run --frozen --group pre-commit --no-group cuda --extra cpu pytest
 
   build:
     runs-on: ubuntu-latest
