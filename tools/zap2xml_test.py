@@ -69,18 +69,6 @@ def utc() -> Iterator[None]:
     time.tzset()
 
 
-class _TypeTolerantBooleanAction(argparse.BooleanOptionalAction):
-    def __init__(self, *args: Any, type: object = None, **kwargs: Any) -> None:
-        del type
-        super().__init__(*args, **kwargs)
-
-
-@pytest.fixture(autouse=True)
-def boolean_action_compat(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Python 3.14 rejects the `type=` that zap2xml passes to BooleanOptionalAction.
-    monkeypatch.setattr(argparse, "BooleanOptionalAction", _TypeTolerantBooleanAction)
-
-
 @pytest.fixture
 def no_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     sleeps: list[float] = []
@@ -147,11 +135,36 @@ def test_main_builds_guide_from_api(
     assert icon.get("src") == "https://zap2it.tmsimg.com/h3/s28708.png"
     assert tv.findtext("programme/title") == "Game: Finals"
 
-    monkeypatch.setattr(sys, "argv", [*argv, "--days", "0.25", "--no-tvimate"])
+    assert "isOverride=True" in urls[0]
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [*argv, "--days", "0.25", "--no-tvimate", "--no-is-override"],
+    )
     assert zap2xml.main() == 0
     assert len(urls) == 2
+    assert "isOverride=False" in urls[1]
     titles = [p.findtext("sub-title") for p in xml.parse(tmp_path / "xmltv.xml").iter("programme")]
     assert titles == ["Finals", "Finals"]
+
+
+def test_boolean_flags_parse_on_and_off() -> None:
+    parser = argparse.ArgumentParser()
+    zap2xml._add_arguments(parser)
+    defaults = parser.parse_args(["--zip", "1"])
+    assert (defaults.tvimate, defaults.zap_isOverride) == (True, True)
+    off = parser.parse_args(["--zip", "1", "--no-tvimate", "--no-is-override"])
+    assert (off.tvimate, off.zap_isOverride) == (False, False)
+    on = parser.parse_args(["--zip", "1", "--tvimate", "--is-override"])
+    assert (on.tvimate, on.zap_isOverride) == (True, True)
+
+
+def test_main_defaults_to_cwd(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["zap2xml", "--zip", "1", "--days", "0"])
+    assert zap2xml.main() == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".zap2xml", "xmltv.xml"]
 
 
 def test_main_rejects_too_many_days(

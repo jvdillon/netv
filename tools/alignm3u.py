@@ -1,5 +1,5 @@
 #!/bin/sh
-# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# ruff: noqa: EXE003, D300, D205, T201 -- Polyglot shell/Python script.
 # fmt: off
 '''' 2>/dev/null #
 exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
@@ -78,7 +78,8 @@ def parse_m3u(path: pathlib.Path) -> list[list]:
             if not line:
                 continue
             if not line.startswith("#EXTINF:"):
-                if entries:
+                # Other directives (#EXTVLCOPT, #EXTGRP) are not the URL.
+                if entries and len(entries[-1]) == 2 and not line.startswith("#"):
                     entries[-1].append(line)
                 continue
             attrs_str, title = line.split("#EXTINF:")[1].split(",", 1)
@@ -139,9 +140,9 @@ def align_channels(
         chan_num = attrs.get("channel-number", "")
         chan_name = attrs.get("tvg-name", title)
 
-        # Normalize channel number (some have leading digit for ATSC3)
+        # ATSC3 channels carry a leading digit: "105.1" is "5.1".
         if chan_num and float(chan_num) > 100:
-            chan_num = str(float(chan_num[1:]))
+            chan_num = chan_num[1:].lstrip("0")
 
         candidates_num = tuple(lookup.get(chan_num, ()))
         candidates_name = tuple(lookup.get(chan_name, ()))
@@ -201,26 +202,25 @@ def write_m3u(
 
 
 def main() -> int:
+    """Align a playlist with guide channel IDs.
+
+    Returns:
+        exit_code: Process exit status.
+    """
     parser = argparse.ArgumentParser(
-        description="Align HDHomeRun M3U with XMLTV guide data.",
+        description=__doc__.split("\n", 2)[2] if __doc__ else None,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Example:
-    wget http://192.168.1.100/lineup.m3u -O lineup.m3u
-    ./zap2xml.py --zip 90210
-    ./alignm3u.py --input lineup.m3u --xmltv xmltv.xml --output ota.m3u
-        """,
     )
     _add_arguments(parser)
-    args = cast(Flags, parser.parse_args())
+    flags = cast(Flags, parser.parse_args())
 
     # Parse inputs.
-    print(f"Reading M3U: {args.input}")
-    m3u = parse_m3u(args.input)
+    print(f"Reading M3U: {flags.input}")
+    m3u = parse_m3u(flags.input)
     print(f"  Found {len(m3u)} channels")
 
-    print(f"Reading XMLTV: {args.xmltv}")
-    xmltv_channels = parse_xmltv_channels(args.xmltv)
+    print(f"Reading XMLTV: {flags.xmltv}")
+    xmltv_channels = parse_xmltv_channels(flags.xmltv)
     print(f"  Found {len(xmltv_channels)} channels")
 
     # Build lookup and align.
@@ -235,8 +235,8 @@ Example:
             print(f"  {num}: {title}")
 
     # Write output.
-    print(f"\nWriting: {args.output}")
-    write_m3u(m3u, args.output, args.xmltv_url, args.group)
+    print(f"\nWriting: {flags.output}")
+    write_m3u(m3u, flags.output, flags.xmltv_url, flags.group)
     aligned = len(m3u) - len(missing)
     print(f"  Aligned {aligned}/{len(m3u)} channels")
     return 0

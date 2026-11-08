@@ -17,7 +17,7 @@ import subprocess
 import threading
 import time
 
-from util import atomic_write_json
+from util import atomic_write_json, data_dir
 
 
 log = logging.getLogger(__name__)
@@ -350,9 +350,8 @@ def initialize_paths() -> None:
     """Resolve legacy storage without replacing caller-supplied paths."""
     global CACHE_DIR, SERVER_SETTINGS_FILE, USERS_DIR, LOGOS_DIR
     default_dir = APP_DIR / ".cache"
-    legacy_dir = APP_DIR / "cache"
-    if default_dir == CACHE_DIR and legacy_dir.exists():
-        CACHE_DIR = legacy_dir
+    if default_dir == CACHE_DIR:
+        CACHE_DIR = data_dir(APP_DIR)
     if default_dir / "server_settings.json" == SERVER_SETTINGS_FILE:
         SERVER_SETTINGS_FILE = CACHE_DIR / "server_settings.json"
     if default_dir / "users" == USERS_DIR:

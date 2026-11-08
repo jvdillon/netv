@@ -1,5 +1,5 @@
 #!/bin/sh
-# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# ruff: noqa: EXE003, D300, D205, T201 -- Polyglot shell/Python script.
 # fmt: off
 '''' 2>/dev/null #
 exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
@@ -39,6 +39,8 @@ import time
 import unicodedata
 
 from treekle import json_loads
+
+import cache
 
 
 def parse_name(name: object) -> tuple[str, list[str], bool]:
@@ -95,8 +97,9 @@ def parse_id(epg_id: object) -> tuple[str, list[str], bool]:
         country = _country(m.group(1))
         if country:
             s = s[: m.start()]
+    # Strip only a country prefix: "BBC.One.uk" keeps its "BBC".
     m = re.match(r"^([A-Za-z]{2,4})[.\-]\s*", s)
-    if m:
+    if m and _country(m.group(1)):
         country = country or _country(m.group(1))
         s = s[m.end() :]
     s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s)
@@ -117,7 +120,7 @@ def load_candidates(db_path: pathlib.Path, cache_dir: pathlib.Path | None = None
     Returns:
         candidates: Channel metadata and normalized matching tokens.
     """
-    source_countries = _source_countries(cache_dir) if cache_dir else {}
+    countries = source_countries(cache_dir) if cache_dir else {}
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     now = time.time()
@@ -135,7 +138,7 @@ def load_candidates(db_path: pathlib.Path, cache_dir: pathlib.Path | None = None
     for r in rows:
         name_country, name_tokens, local = parse_name(r["name"])
         id_country, id_tokens, _ = parse_id(r["id"])
-        source_country = source_countries.get(r["source_id"] or "", "")
+        source_country = countries.get(r["source_id"] or "", "")
         candidates.append(
             {
                 "id": r["id"],
@@ -170,6 +173,32 @@ def channels_with_upcoming(db_path: pathlib.Path) -> set[str]:
     ).fetchall()
     conn.close()
     return {r[0] for r in rows}
+
+
+# epg.pw channel names carry no country tag, so the feed a channel came from is the best
+# signal: a UK query must not match the US feed's Syfy.
+def source_countries(cache_dir: pathlib.Path) -> dict[str, str]:
+    """Map EPG-only sources named like epg_GB.xml to their country.
+
+    Args:
+        cache_dir: Directory containing server_settings.json.
+
+    Returns:
+        countries: Normalized country per source id; empty when unreadable.
+    """
+    settings_file = cache_dir / "server_settings.json"
+    result: dict[str, str] = {}
+    try:
+        settings = json_loads(settings_file.read_text(), _ServerSettings)
+    except (OSError, ValueError):
+        return result
+    for s in settings.get("sources", []):
+        if s.get("type") != "epg":
+            continue
+        m = re.search(r"epg_([A-Za-z]{2})\.", s.get("url", ""))
+        if m:
+            result[s["id"]] = _country(m.group(1))
+    return result
 
 
 def query_variants(name: object, current_id: str) -> list[dict]:
@@ -319,14 +348,14 @@ def main() -> int:
         exit_code: Process exit status.
     """
     parser = argparse.ArgumentParser(
-        description="Remap playlist channel guide IDs to the EPG database.",
+        description=__doc__.split("\n", 2)[2] if __doc__ else None,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_arguments(parser)
-    args = cast(Flags, parser.parse_args())
+    flags = cast(Flags, parser.parse_args())
 
-    playlists_path = args.cache_dir / "playlists.json"
-    db_path = args.cache_dir / "epg.db"
+    playlists_path = flags.cache_dir / "playlists.json"
+    db_path = flags.cache_dir / "epg.db"
     if not playlists_path.exists():
         raise SystemExit(f"playlists.json not found: {playlists_path}")
     if not db_path.exists():
@@ -336,8 +365,8 @@ def main() -> int:
     # every key this tool does not declare.
     data = json.loads(playlists_path.read_text())
     all_playlists = data.get("playlists", [])
-    candidates = load_candidates(db_path, args.cache_dir)
-    available = frozenset(_source_countries(args.cache_dir).values())
+    candidates = load_candidates(db_path, flags.cache_dir)
+    available = frozenset(source_countries(flags.cache_dir).values())
     has_upcoming = channels_with_upcoming(db_path)
     print(f"EPG channels with upcoming listings: {len(candidates)}")
 
@@ -356,11 +385,11 @@ def main() -> int:
             if current and current in has_upcoming:
                 already_ok += 1
                 continue
-            if not current and args.skip_unmapped:
+            if not current and flags.skip_unmapped:
                 continue
 
             variants = query_variants(name, current)
-            best, top = pick_match(variants, candidates, args.min_score, args.margin, available)
+            best, top = pick_match(variants, candidates, flags.min_score, flags.margin, available)
             if best:
                 old = current or "(none)"
                 print(
@@ -382,7 +411,7 @@ def main() -> int:
 
     print(f"\nSummary: {remapped} remapped, {unmatched} unmatched, {already_ok} already OK")
 
-    if not args.apply:
+    if not flags.apply:
         print("Dry-run only; re-run with --apply to write changes.")
         return 0
 
@@ -390,7 +419,7 @@ def main() -> int:
         print("Nothing to change.")
         return 0
 
-    backup = args.cache_dir / f"playlists.json.bak-{int(time.time())}"
+    backup = flags.cache_dir / f"playlists.json.bak-{int(time.time())}"
     shutil.copy2(playlists_path, backup)
     print(f"Backup: {backup}")
 
@@ -422,11 +451,12 @@ class _ServerSettings(TypedDict, total=False):
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    cache.initialize_paths()
     parser.add_argument(
         "--cache-dir",
         type=pathlib.Path,
-        default=pathlib.Path(__file__).parent.parent / "cache",
-        help="netv cache directory containing epg.db and playlists.json",
+        default=cache.CACHE_DIR,
+        help="netv data directory containing epg.db and playlists.json (default: %(default)s)",
     )
     parser.add_argument(
         "--apply",
@@ -807,25 +837,6 @@ def _base_score(query: list[str], cand: list[str]) -> float:
 
 def _is_timeshift(tokens: list[str]) -> bool:
     return "PLUS" in tokens and "1" in tokens
-
-
-# epg.pw channel names carry no country tag, so the feed a channel came from is the best
-# signal: a UK query must not match the US feed's Syfy.
-def _source_countries(cache_dir: pathlib.Path) -> dict[str, str]:
-    """Country per source id, for EPG-only sources named like epg_GB.xml."""
-    settings_file = cache_dir / "server_settings.json"
-    result: dict[str, str] = {}
-    try:
-        settings = json_loads(settings_file.read_text(), _ServerSettings)
-    except (OSError, ValueError):
-        return result
-    for s in settings.get("sources", []):
-        if s.get("type") != "epg":
-            continue
-        m = re.search(r"epg_([A-Za-z]{2})\.", s.get("url", ""))
-        if m:
-            result[s["id"]] = _country(m.group(1))
-    return result
 
 
 def _expand_abbrevs(tokens: list[str]) -> list[str]:

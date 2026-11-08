@@ -10,6 +10,8 @@ import os
 import pathlib
 import tempfile
 
+from codedoctor.lib import userdirs
+
 
 def redact_url_credentials(value: str) -> str:
     """Redact credentials from a URL before logging it.
@@ -56,6 +58,28 @@ def redact_url_credentials(value: str) -> str:
             parsed.fragment,
         ),
     )
+
+
+def data_dir(app_dir: pathlib.Path) -> pathlib.Path:
+    """Return where neTV keeps settings, users, and caches.
+
+    Args:
+        app_dir: Directory holding the neTV modules.
+
+    Returns:
+        directory: ``$NETV_DATA_DIR``; else the legacy ``cache`` (Docker
+            volume) or ``.cache`` of a source checkout; else, for an installed
+            package (pip, uv tool, uvx), the per-user data directory (e.g.
+            ``~/.local/share/netv``), so state survives reinstalls.
+    """
+    configured = os.environ.get("NETV_DATA_DIR")
+    if configured:
+        return pathlib.Path(configured).expanduser()
+    if (app_dir / "cache").exists():
+        return app_dir / "cache"
+    if (app_dir / ".cache").exists() or (app_dir / "pyproject.toml").exists():
+        return app_dir / ".cache"
+    return userdirs.data_dir() / "netv"
 
 
 def atomic_write_json(path: pathlib.Path, value: Any) -> None:

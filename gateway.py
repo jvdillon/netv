@@ -1,12 +1,25 @@
-#!/usr/bin/env python3
-"""Xtream-compatible native-player gateway for neTV."""
+#!/bin/sh
+# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# fmt: off
+'''' 2>/dev/null #
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
+Xtream-compatible native-player gateway for neTV.
+
+Serves the live sources configured in the neTV web UI to Apple TV and other
+Xtream-compatible players. Uses the same data directory as the web app.
+
+Examples:
+  netv-gateway                 # port 8100 (or $NETV_GATEWAY_PORT)
+  netv-gateway --port 9100 --debug
+'''
+# fmt: on
 
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib import parse
 
 import argparse
@@ -36,6 +49,14 @@ import auth
 import cache
 import ffmpeg_command
 import ffmpeg_session
+
+
+if TYPE_CHECKING:
+    import uvicorn
+else:
+    from wrapt import lazy_import
+
+    uvicorn = lazy_import("uvicorn")
 
 
 log = logging.getLogger(__name__)
@@ -436,6 +457,68 @@ async def xmltv(
     )
 
 
+def main() -> int:
+    """Serve the gateway.
+
+    Returns:
+        status: Process exit code.
+    """
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n", 2)[2] if __doc__ else None,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_arguments(parser)
+    flags = cast(Flags, parser.parse_args())
+
+    level = (
+        logging.DEBUG
+        if flags.debug
+        else getattr(
+            logging,
+            os.environ.get("LOG_LEVEL", "INFO").upper(),
+            logging.INFO,
+        )
+    )
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=flags.port,
+        access_log=False,
+        log_level="debug" if flags.debug else "info",
+        log_config=None,
+        proxy_headers=True,
+        forwarded_allow_ips=os.environ.get(
+            "NETV_GATEWAY_TRUSTED_PROXIES",
+            "127.0.0.1",
+        ),
+    )
+    return 0
+
+
+class Flags(Protocol):
+    """Parsed command-line flags."""
+
+    port: int
+    debug: bool
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register flags on ``parser``."""
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("NETV_GATEWAY_PORT", "8100")),
+        help="Port to listen on (default: $NETV_GATEWAY_PORT or 8100)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+
+
 def _upscale_enabled() -> bool:
     return bool(_upscale_settings()["sr_model"])
 
@@ -601,42 +684,5 @@ async def _proxy_url(url: str) -> StreamingResponse:
 
 
 if __name__ == "__main__":
-    import uvicorn
-
-    parser = argparse.ArgumentParser(description="neTV native-player gateway")
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=int(os.environ.get("NETV_GATEWAY_PORT", "8100")),
-    )
-    parser.add_argument("--debug", action="store_true")
-    args = parser.parse_args()
-
-    level = (
-        logging.DEBUG
-        if args.debug
-        else getattr(
-            logging,
-            os.environ.get("LOG_LEVEL", "INFO").upper(),
-            logging.INFO,
-        )
-    )
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%H:%M:%S",
-        force=True,
-    )
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=args.port,
-        access_log=False,
-        log_level="debug" if args.debug else "info",
-        log_config=None,
-        proxy_headers=True,
-        forwarded_allow_ips=os.environ.get(
-            "NETV_GATEWAY_TRUSTED_PROXIES",
-            "127.0.0.1",
-        ),
-    )
+    raise SystemExit(main())
+# vim: ft=python

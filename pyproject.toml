@@ -25,6 +25,7 @@ classifiers = [
 ]
 dependencies = [
     "PyChromecast>=13.1,<15",
+    "codedoctor>=0.1.3",
     "cryptography>=43.0",
     "defusedxml>=0.7",
     "fastapi>=0.115",
@@ -85,8 +86,16 @@ Repository = "https://github.com/jvdillon/netv"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[project.scripts]
+netv = "main:main"
+netv-gateway = "gateway:main"
+alignm3u = "tools.alignm3u:main"
+xtream2m3u = "tools.xtream2m3u:main"
+zap2xml = "tools.zap2xml:main"
+
 [tool.hatch.build.targets.wheel]
-include = ["*.py"]
+include = ["/*.py", "/templates", "/static", "/tools/*.py"]
+exclude = ["*_test.py", "/__init__.py", "/testing.py", "/tools/benchmark-nomos.py", "/tools/export-tensorrt.py"]
 
 [tool.uv]
 package = true
@@ -153,4 +162,6 @@ floor = ["=100"]
 [tool.houselint]
 select = "ALL"
 fix = "ALL"
+# neTV's per-user namespace is "netv"; it is not a rekursiv-ai tool.
+set = ["userdirs-namespace.vendor-namespaces=netv"]
 exclude = ["*_test.py test_*.py **/tests/test*.py =\n    args-section assert cache-kwarg def-order final-inline globals\n    lazy-import-cost mkdir-mode module-side-effects nested-def returns-named\n    returns-section single-use-helper tempfile-prefix tensor-value-guard\n    tmp-literal xdg-literal", "conftest.py =\n    args-section def-order lazy-import-cost module-side-effects returns-section"]

@@ -32,6 +32,49 @@ def test_parse_m3u(tmp_path: pathlib.Path) -> None:
     ]
 
 
+def test_parse_m3u_ignores_directives_between_extinf_and_url(tmp_path: pathlib.Path) -> None:
+    p = tmp_path / "in.m3u"
+    p.write_text(
+        "#EXTM3U\n"
+        '#EXTINF:-1 channel-number="2.1",A\n'
+        "#EXTVLCOPT:http-user-agent=x\n"
+        "http://h/2.1\n"
+        "http://h/stray\n",
+    )
+    assert alignm3u.parse_m3u(p) == [["A", {"channel-number": "2.1"}, "http://h/2.1"]]
+
+
+def test_main_survives_vlc_options(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    m3u = tmp_path / "in.m3u"
+    m3u.write_text(
+        '#EXTM3U\n#EXTINF:-1 channel-number="2.1",A\n#EXTVLCOPT:http-user-agent=x\nhttp://h/2.1\n',
+    )
+    xml = tmp_path / "x.xml"
+    xml.write_text('<tv><channel id="I2"><display-name>2.1</display-name></channel></tv>')
+    out = tmp_path / "o.m3u"
+    argv = ["alignm3u.py", "-i", str(m3u), "-x", str(xml), "-o", str(out)]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert alignm3u.main() == 0
+    assert out.read_text().splitlines()[1:] == [
+        '#EXTINF:-1 channel-number="2.1" tvg-id="I2" group-title="OTA",A',
+        "http://h/2.1",
+    ]
+
+
+def test_align_atsc3_keeps_two_digit_subchannel() -> None:
+    lookup = {"2.1": {"wrong"}, "2.10": {"right"}, "15": {"whole"}}
+    entries: list[list] = [
+        ["A", {"channel-number": "102.10"}, "u"],
+        ["B", {"channel-number": "115"}, "u"],
+    ]
+    alignm3u.align_channels(entries, lookup)
+    assert entries[0][1]["tvg-id"] == "right"
+    assert entries[1][1]["tvg-id"] == "whole"
+
+
 def test_parse_m3u_rejects_missing_header(tmp_path: pathlib.Path) -> None:
     p = tmp_path / "bad.m3u"
     p.write_text("#EXTINF:-1,X\n")

@@ -13,6 +13,41 @@ import pytest
 import util
 
 
+class TestDataDir:
+    @pytest.fixture(autouse=True)
+    def _isolated_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path):
+        monkeypatch.delenv("NETV_DATA_DIR", raising=False)
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    def test_env_overrides_everything(self, monkeypatch, tmp_path: pathlib.Path):
+        (tmp_path / "cache").mkdir()
+        monkeypatch.setenv("NETV_DATA_DIR", "~/netv-state")
+        assert util.data_dir(tmp_path) == pathlib.Path("~/netv-state").expanduser()
+
+    def test_legacy_cache_wins_over_dot_cache(self, tmp_path: pathlib.Path):
+        (tmp_path / "cache").mkdir()
+        (tmp_path / ".cache").mkdir()
+        assert util.data_dir(tmp_path) == tmp_path / "cache"
+
+    def test_existing_dot_cache_is_kept(self, tmp_path: pathlib.Path):
+        (tmp_path / ".cache").mkdir()
+        assert util.data_dir(tmp_path) == tmp_path / ".cache"
+
+    def test_fresh_source_checkout_uses_dot_cache(self, tmp_path: pathlib.Path):
+        (tmp_path / "pyproject.toml").touch()
+        assert util.data_dir(tmp_path) == tmp_path / ".cache"
+
+    def test_installed_package_uses_user_data_dir(self, tmp_path: pathlib.Path):
+        site_packages = tmp_path / "site-packages"
+        site_packages.mkdir()
+        assert util.data_dir(site_packages) == tmp_path / "xdg" / "netv"
+
+    def test_installed_package_without_xdg_uses_local_share(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("XDG_DATA_HOME")
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        assert util.data_dir(tmp_path) == tmp_path / "home" / ".local" / "share" / "netv"
+
+
 def test_atomic_write_json_replaces_file_and_preserves_permissions(tmp_path: pathlib.Path):
     path = tmp_path / "settings.json"
     path.write_text('{"old": true}')

@@ -1,9 +1,8 @@
 #!/bin/sh
-# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# ruff: noqa: EXE003, D300, D205, T201 -- Polyglot shell/Python script.
 # fmt: off
 '''' 2>/dev/null #
 exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
-
 Benchmark the fixed 1080p NomosUni TensorRT engine.
 '''
 # fmt: on
@@ -187,32 +186,32 @@ def run_once(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 2)[2] if __doc__ else None)
     _add_arguments(parser)
-    args = cast(Flags, parser.parse_args())
+    flags = cast(Flags, parser.parse_args())
 
     ffmpeg = find_binary("ffmpeg")
     ffprobe = find_binary("ffprobe")
-    source_seconds, source_fps = probe_sample(ffprobe, args.sample)
-    engine = args.model_dir / "2x-nomosuni-compact_1080p_fp16.engine"
-    for path in [args.sample, engine]:
+    source_seconds, source_fps = probe_sample(ffprobe, flags.sample)
+    engine = flags.model_dir / "2x-nomosuni-compact_1080p_fp16.engine"
+    for path in [flags.sample, engine]:
         if not path.exists():
             raise FileNotFoundError(path)
 
-    print(f"Sample: {args.sample.name} (1920x1080, {source_fps:.3f} FPS, {source_seconds:.2f}s)")
-    print(f"Target: >= {args.target_fps:.3f} FPS end-to-end")
+    print(f"Sample: {flags.sample.name} (1920x1080, {source_fps:.3f} FPS, {source_seconds:.2f}s)")
+    print(f"Target: >= {flags.target_fps:.3f} FPS end-to-end")
     print()
 
-    print(f"Warming {engine.stem} for {args.warmup_seconds:.1f}s...")
+    print(f"Warming {engine.stem} for {flags.warmup_seconds:.1f}s...")
     run_once(
         ffmpeg,
-        args.sample,
+        flags.sample,
         engine,
         source_seconds,
         source_fps,
-        duration=args.warmup_seconds,
+        duration=flags.warmup_seconds,
     )
     print(f"Measuring {engine.stem}...")
-    result = run_once(ffmpeg, args.sample, engine, source_seconds, source_fps)
-    status = "PASS" if result.throughput_fps >= args.target_fps else "FAIL"
+    result = run_once(ffmpeg, flags.sample, engine, source_seconds, source_fps)
+    status = "PASS" if result.throughput_fps >= flags.target_fps else "FAIL"
     print(
         f"  {result.throughput_fps:.2f} FPS ({result.speed:.3f}x), "
         f"startup {result.startup_seconds:.3f}s: {status}",

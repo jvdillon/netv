@@ -779,6 +779,15 @@ def test_background_loads_skip_when_running(refresh_flags, recorded_threads, fla
     assert recorded_threads == []
 
 
+def test_vod_background_load_fills_cache_and_clears_flag(refresh_flags, sync_threads):
+    del sync_threads
+    with patch("main.load_vod_data", return_value=(["vc"], ["vs"])):
+        main._start_vod_background_load()
+    assert cache_module.get_cache()["vod_categories"] == ["vc"]
+    assert cache_module.get_cache()["vod_streams"] == ["vs"]
+    assert "vod_load" not in refresh_flags
+
+
 def test_guide_streams_ignore_unknown_playlist(auth_client):
     del auth_client
     stream = {"stream_id": 1, "category_ids": ["1"], "source_id": "s"}
@@ -1156,7 +1165,7 @@ def _run_cli(
     monkeypatch: pytest.MonkeyPatch,
     log_level: str = "",
 ) -> dict[str, Any]:
-    """Run main.py as a script and return uvicorn.run keyword arguments."""
+    """Run the CLI entry point and return uvicorn.run keyword arguments."""
     real_path = pathlib.Path
 
     def redirected_path(path: str) -> pathlib.Path:
@@ -1166,7 +1175,7 @@ def _run_cli(
     monkeypatch.setattr(sys, "argv", ["main.py", *argv])
     monkeypatch.setattr(pathlib, "Path", redirected_path)
     with patch("uvicorn.run") as run, patch("logging.basicConfig") as basic_config:
-        runpy.run_module("main", run_name="__main__", alter_sys=True)
+        assert main.main() == 0
     kwargs = dict(run.call_args.kwargs)
     kwargs["log_level_configured"] = basic_config.call_args.kwargs["level"]
     return kwargs
@@ -1219,6 +1228,18 @@ def test_cli_https_without_certs(tmp_path, monkeypatch):
 def test_cli_https_missing_domain_cert(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match="Cert not found"):
         _run_cli(["--https", "missing.example"], tmp_path, monkeypatch)
+
+
+def test_script_guard_exits_with_main_status(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+    with (
+        patch("uvicorn.run") as run,
+        patch("logging.basicConfig"),
+        pytest.raises(SystemExit) as exit_info,
+    ):
+        runpy.run_module("main", run_name="__main__", alter_sys=True)
+    assert exit_info.value.code == 0
+    assert run.call_args.kwargs["port"] == 8000
 
 
 if __name__ == "__main__":

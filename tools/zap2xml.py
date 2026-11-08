@@ -1,9 +1,8 @@
 #!/bin/sh
-# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# ruff: noqa: EXE003, D300, D205, T201 -- Polyglot shell/Python script.
 # fmt: off
 '''' 2>/dev/null #
 exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
-
 Fetch TV guide data from zap2it/gracenote in XMLTV format.
 
 Scrapes the internal JSON feed from zap2it/gracenote to generate XMLTV guide
@@ -12,11 +11,14 @@ tool ignores those and continues fetching available data.
 
 Written with only standard library dependencies.
 
+Writes xmltv.xml and a .zap2xml/ fetch cache into --path (default: the
+current directory).
+
 Usage:
     ./zap2xml.py --zip 90210 --days 7
 
 Cron example:
-    0 0 * * * cd /path/to/tools && ./zap2xml.py --zip 90210
+    0 0 * * * cd /path/to/guide && /path/to/zap2xml.py --zip 90210
 '''
 # fmt: on
 
@@ -44,25 +46,26 @@ _CALLSIGN_REGEX = re.compile(r"^([A-Z]+?)(LD|DT|CD|CA|LP|TV|FM|D)(\d*)$")
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Fetch TV data from zap2it.",
+        description=__doc__.split("\n", 2)[2] if __doc__ else None,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="This tool is noisy to stdout; with cron use chronic from moreutils.",
     )
     _add_arguments(parser)
-    args = cast(Flags, parser.parse_args())
-    working_dir = pathlib.Path(args.path)
+    flags = cast(Flags, parser.parse_args())
+    working_dir = flags.path
 
     cache_dir = working_dir / ".zap2xml"
     if not cache_dir.is_dir():
         cache_dir.mkdir()
 
-    url_flags = {k[len("zap_") :]: v for k, v in vars(args).items() if k.startswith("zap_")}
-    url_flags["lineupId"] = f"{args.zap_country}-{args.zap_headendId}-DEFAULT"
+    url_flags = {k[len("zap_") :]: v for k, v in vars(flags).items() if k.startswith("zap_")}
+    url_flags["lineupId"] = f"{flags.zap_country}-{flags.zap_headendId}-DEFAULT"
 
     # Start time parameter is now rounded down to nearest `zap_timespan`, in s.
     zap_time = int(datetime.datetime.now().timestamp())
     print(f"Local time:     {zap_time}  {strf_time_int(zap_time)}")
 
-    zap_time_window = args.zap_timespan * 3_600
+    zap_time_window = flags.zap_timespan * 3_600
     zap_time = (zap_time // zap_time_window) * zap_time_window
     print(f"First zap time: {zap_time}  {strf_time_int(zap_time)}")
 
@@ -75,7 +78,7 @@ def main() -> int:
         parent=None,
         tag="tv",
         attrib={
-            "source-info-url": f"https://{args.base_url}/grid-affiliates.html?aid=gapzap",
+            "source-info-url": f"https://{flags.base_url}/grid-affiliates.html?aid=gapzap",
             "source-info-name": "zap2it",
             "generator-info-name": "zap2xml.py",
             "generator-info-url": "https://github.com/jvdillon/netv",
@@ -86,17 +89,17 @@ def main() -> int:
     done_channels = False
 
     # Fetch data in `zap_timespan` chunks.
-    if args.days > 15:
-        raise ValueError(f"Can only collect at most 15 days; {args.days} too large.")
-    num_fetch = math.ceil(args.days * 24 / args.zap_timespan)
+    if flags.days > 15:
+        raise ValueError(f"Can only collect at most 15 days; {flags.days} too large.")
+    num_fetch = math.ceil(flags.days * 24 / flags.zap_timespan)
     for i in range(num_fetch):
         i_time = zap_time + (i * zap_time_window)
         print(f"Getting data:   {i_time}  {strf_time_int(i_time)}")
 
-        url = f"https://{args.base_url}/api/grid?"
+        url = f"https://{flags.base_url}/api/grid?"
         url += parse.urlencode({**url_flags, "time": i_time})
 
-        result = get_cached(cache_dir, i_time, args.delay, url)
+        result = get_cached(cache_dir, i_time, flags.delay, url)
         json_result = json.loads(result)
 
         if not done_channels:
@@ -137,7 +140,7 @@ def main() -> int:
                 )
             channel_map = dict(sorted(channel_map.items(), key=lambda kv: kv[0]))
 
-        f = add_programme_tvimate if args.tvimate else add_programme
+        f = add_programme_tvimate if flags.tvimate else add_programme
         for c_in in json_result["channels"]:
             channel_key = get_channel_key(c_in)
             for event in c_in["events"]:
@@ -513,8 +516,6 @@ def parse_callsign(coded_callsign: str) -> str:
     if not result:
         raise ValueError("Expected result.")
     call, suffix, num = result.groups()
-    if not suffix:
-        raise ValueError("Expected suffix.")
     if num == "1":
         raise ValueError('Expected num != "1".')
     if call == "KQS" and suffix == "LD":
@@ -575,7 +576,7 @@ class Flags(Protocol):
     delay: int
     base_url: str
     days: float
-    path: str
+    path: pathlib.Path
     zap_aid: str
     zap_country: str
     zap_device: str
@@ -616,9 +617,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument(
         "--path",
         dest="path",
-        type=str,
-        default=str(pathlib.Path(__file__).parent.resolve()),
-        help="Path to store files.",
+        type=pathlib.Path,
+        default=pathlib.Path(),
+        help="Directory for xmltv.xml and the .zap2xml cache (default: cwd).",
     )
     _ = parser.add_argument(
         "--aid",
@@ -653,8 +654,8 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument(
         "--is-override",
         dest="zap_isOverride",
-        type=bool,
         default=True,
+        action=argparse.BooleanOptionalAction,
         help="Raw zap2it input parameter.  (?)",
     )
     _ = parser.add_argument(
@@ -702,7 +703,6 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument(
         "--tvimate",
         dest="tvimate",
-        type=bool,
         default=True,
         action=argparse.BooleanOptionalAction,
         help="Guide formatted specifically for TViMate.",

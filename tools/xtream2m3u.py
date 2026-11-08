@@ -1,10 +1,13 @@
 #!/bin/sh
-# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# ruff: noqa: EXE003, D300, D205, T201 -- Polyglot shell/Python script.
 # fmt: off
 '''' 2>/dev/null #
 exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
-
 Fetch Xtream catalogs and write M3U playlists.
+
+Reads provider credentials from xtream.json in --dir (a template is created on
+first run), caches the raw API responses there, and writes live.m3u, vod.m3u,
+and series.m3u beside them.
 '''
 # fmt: on
 
@@ -15,9 +18,10 @@ Fetch Xtream catalogs and write M3U playlists.
 from __future__ import annotations
 
 from concurrent import futures
-from typing import Any, Protocol, TypedDict
+from typing import Any, Protocol, TypedDict, cast
 from urllib import error, parse, request
 
+import argparse
 import collections
 import functools
 import gzip  # lzma(80%), bz2(78%), gzip(75%) but gzip was fastest.
@@ -51,46 +55,62 @@ VideoInfo = TypedDict(
 )
 
 
-def main(cached_only: bool = False) -> int:
-    api_url, _, epg_url = _get_urls()
-    live_filter, locals_group, locals_filter = _get_filters()
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n", 2)[2] if __doc__ else None,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_arguments(parser)
+    flags = cast(Flags, parser.parse_args())
+    data_dir = flags.dir
 
-    if not cached_only:
-        fetch_all_data(api_url)
+    cfg = _load_config(data_dir)
+    api_url, _, epg_url = _get_urls(cfg)
+    live_filter, locals_group, locals_filter = _get_filters(cfg)
 
-    auth = load_dict("authentication.json")
+    if not flags.cached_only:
+        fetch_all_data(api_url, data_dir)
+
+    auth = load_dict(data_dir / "authentication.json")
     iptv_url = process_iptv_url(auth)
 
     live, live_categories = process(
-        load_list("get_live_stream.json"),
-        load_list("get_live_categories.json"),
+        load_list(data_dir / "get_live_stream.json"),
+        load_list(data_dir / "get_live_categories.json"),
         iptv_url,
     )
     del live_categories
     live = filter_live(live, live_filter, locals_group, locals_filter)
-    write_m3u_live(live, auth, epg_url)
+    write_m3u_live(live, auth, epg_url, data_dir)
 
     vod_url = list(iptv_url)
     vod_url.insert(2, "movie")
     vod, vod_categories = process(
-        load_list("get_vod_streams.json"),
-        load_list("get_vod_categories.json"),
+        load_list(data_dir / "get_vod_streams.json"),
+        load_list(data_dir / "get_vod_categories.json"),
         vod_url,
     )
     del vod_categories
-    write_m3u_vod(vod, auth)
+    write_m3u_vod(vod, auth, data_dir)
 
     series_url = list(iptv_url)
     series_url.insert(2, "series")
     series, series_categories = process(
-        load_list("get_series.json"),
-        load_list("get_series_categories.json"),
+        load_list(data_dir / "get_series.json"),
+        load_list(data_dir / "get_series_categories.json"),
         series_url,
     )
     del series_categories
-    series_info = fetch_series_info(series, api_url, cached_only=cached_only)
-    write_m3u_series(series, series_info, auth, series_url)
+    series_info = fetch_series_info(series, api_url, data_dir, cached_only=flags.cached_only)
+    write_m3u_series(series, series_info, auth, series_url, data_dir)
     return 0
+
+
+class Flags(Protocol):
+    """Parsed command-line flags."""
+
+    dir: pathlib.Path
+    cached_only: bool
 
 
 ###############################################################################
@@ -103,55 +123,21 @@ def main(cached_only: bool = False) -> int:
 ###############################################################################
 
 
-def fetch_all_data(api_url: str) -> None:
-    print("Fetching authentication...", end=" ", flush=True)
-    t0 = time.perf_counter()
-    r = fetch_text(api_url)
-    with open(pathlib.Path(__file__).parent.resolve() / "authentication.json", "w") as f:
-        f.write(r)
-    print(f"({time.perf_counter() - t0:.1f}s)")
-
-    print("Fetching live streams...", end=" ", flush=True)
-    t0 = time.perf_counter()
-    r = fetch_text(api_url + "&action=get_live_streams", timeout=120)
-    with open(pathlib.Path(__file__).parent.resolve() / "get_live_stream.json", "w") as f:
-        f.write(r)
-    print(f"({time.perf_counter() - t0:.1f}s)")
-
-    print("Fetching live categories...", end=" ", flush=True)
-    t0 = time.perf_counter()
-    r = fetch_text(api_url + "&action=get_live_categories")
-    with open(pathlib.Path(__file__).parent.resolve() / "get_live_categories.json", "w") as f:
-        f.write(r)
-    print(f"({time.perf_counter() - t0:.1f}s)")
-
-    print("Fetching series...", end=" ", flush=True)
-    t0 = time.perf_counter()
-    r = fetch_text(api_url + "&action=get_series", timeout=120)
-    with open(pathlib.Path(__file__).parent.resolve() / "get_series.json", "w") as f:
-        f.write(r)
-    print(f"({time.perf_counter() - t0:.1f}s)")
-
-    print("Fetching series categories...", end=" ", flush=True)
-    t0 = time.perf_counter()
-    r = fetch_text(api_url + "&action=get_series_categories")
-    with open(pathlib.Path(__file__).parent.resolve() / "get_series_categories.json", "w") as f:
-        f.write(r)
-    print(f"({time.perf_counter() - t0:.1f}s)")
-
-    print("Fetching VOD streams...", end=" ", flush=True)
-    t0 = time.perf_counter()
-    r = fetch_text(api_url + "&action=get_vod_streams", timeout=120)
-    with open(pathlib.Path(__file__).parent.resolve() / "get_vod_streams.json", "w") as f:
-        f.write(r)
-    print(f"({time.perf_counter() - t0:.1f}s)")
-
-    print("Fetching VOD categories...", end=" ", flush=True)
-    t0 = time.perf_counter()
-    r = fetch_text(api_url + "&action=get_vod_categories")
-    with open(pathlib.Path(__file__).parent.resolve() / "get_vod_categories.json", "w") as f:
-        f.write(r)
-    print(f"({time.perf_counter() - t0:.1f}s)")
+def fetch_all_data(api_url: str, data_dir: pathlib.Path) -> None:
+    for label, action, filename, timeout in (
+        ("authentication", "", "authentication.json", 5),
+        ("live streams", "get_live_streams", "get_live_stream.json", 120),
+        ("live categories", "get_live_categories", "get_live_categories.json", 5),
+        ("series", "get_series", "get_series.json", 120),
+        ("series categories", "get_series_categories", "get_series_categories.json", 5),
+        ("VOD streams", "get_vod_streams", "get_vod_streams.json", 120),
+        ("VOD categories", "get_vod_categories", "get_vod_categories.json", 5),
+    ):
+        print(f"Fetching {label}...", end=" ", flush=True)
+        t0 = time.perf_counter()
+        url = f"{api_url}&action={action}" if action else api_url
+        (data_dir / filename).write_text(fetch_text(url, timeout=timeout))
+        print(f"({time.perf_counter() - t0:.1f}s)")
 
 
 def fetch_text(url: str, timeout: int = 5) -> str:
@@ -174,14 +160,12 @@ def fetch_text(url: str, timeout: int = 5) -> str:
 def fetch_series_info(
     series: dict[int, VideoInfo],
     api_url: str,
+    data_dir: pathlib.Path,
     cached_only: bool = False,
 ) -> dict[int, Any]:
     series_info: dict[int, None | Any] = {}
     try:
-        with gzip.open(
-            pathlib.Path(__file__).parent.resolve() / "series_info.pickle.gz",
-            "rb",
-        ) as f:
+        with gzip.open(data_dir / "series_info.pickle.gz", "rb") as f:
             series_info = pickle.load(f)
     except Exception as e:
         print(f"Cache miss: {e}")
@@ -244,7 +228,7 @@ def fetch_series_info(
             raise
 
     if changed:
-        pickle_filename = pathlib.Path(__file__).parent.resolve() / "series_info.pickle.gz"
+        pickle_filename = data_dir / "series_info.pickle.gz"
         with gzip.open(pickle_filename.with_suffix(".tmp"), "wb") as f:
             pickle.dump(series_info, f)
         shutil.move(pickle_filename.with_suffix(".tmp"), pickle_filename)
@@ -397,22 +381,21 @@ def tofloat(x: str | None) -> float | None:
     return float(x) if x else None
 
 
-def load(filename: str) -> Any:
-    with open(pathlib.Path(__file__).parent.resolve() / filename) as f:
-        return json.load(f)
+def load(path: pathlib.Path) -> Any:
+    return json.loads(path.read_text())
 
 
-def load_dict(filename: str) -> dict[str, Any]:
-    result = load(filename)
+def load_dict(path: pathlib.Path) -> dict[str, Any]:
+    result = load(path)
     if not isinstance(result, dict):
-        raise TypeError(f"Expected dict from {filename}, got {type(result)}")
+        raise TypeError(f"Expected dict from {path}, got {type(result)}")
     return result
 
 
-def load_list(filename: str) -> list[dict[str, Any]]:
-    result = load(filename)
+def load_list(path: pathlib.Path) -> list[dict[str, Any]]:
+    result = load(path)
     if not isinstance(result, list):
-        raise TypeError(f"Expected list from {filename}, got {type(result)}")
+        raise TypeError(f"Expected list from {path}, got {type(result)}")
     return result
 
 
@@ -498,8 +481,9 @@ def write_m3u_live(
     live: dict[int, VideoInfo],
     auth: dict[str, dict[str, Any]],
     epg_url: str,
+    data_dir: pathlib.Path,
 ) -> None:
-    with open(pathlib.Path(__file__).parent.resolve() / "live.m3u", "w") as f:
+    with open(data_dir / "live.m3u", "w") as f:
         print(f'#EXTM3U url-tvg="{epg_url}" x-tvg-url="{epg_url}"', file=f)
         if auth["server_info"].get("xui") is not None:
             version = auth["server_info"]["version"]
@@ -521,8 +505,9 @@ def write_m3u_live(
 def write_m3u_vod(
     vod: dict[int, VideoInfo],
     auth: dict[str, dict[str, Any]],
+    data_dir: pathlib.Path,
 ) -> None:
-    with open(pathlib.Path(__file__).parent.resolve() / "vod.m3u", "w") as f:
+    with open(data_dir / "vod.m3u", "w") as f:
         print("#EXTM3U", file=f)
         if auth["server_info"].get("xui") is not None:
             version = auth["server_info"]["version"]
@@ -545,6 +530,7 @@ def write_m3u_series(
     series_info: dict[int, None | Any],
     auth: dict[str, dict[str, Any]],
     series_url: list[str],
+    data_dir: pathlib.Path,
 ) -> None:
     series_episodes = {}
     for k in series:
@@ -556,7 +542,7 @@ def write_m3u_series(
         except Exception as e:
             print(f"Series {k}: {e}")
 
-    with open(pathlib.Path(__file__).parent.resolve() / "series.m3u", "w") as f:
+    with open(data_dir / "series.m3u", "w") as f:
         print("#EXTM3U", file=f)
         if auth["server_info"].get("xui") is not None:
             version = auth["server_info"]["version"]
@@ -588,9 +574,9 @@ def _descend(x: Any):
             yield from _descend(x_)
 
 
-def _load_config() -> dict:
+def _load_config(data_dir: pathlib.Path) -> dict[str, Any]:
     """Load config from xtream.json, creating template if missing."""
-    config_file = pathlib.Path(__file__).parent.resolve() / "xtream.json"
+    config_file = data_dir / "xtream.json"
     if not config_file.exists():
         template = {
             "url": "https://your-provider.com",
@@ -605,9 +591,8 @@ def _load_config() -> dict:
     return json.loads(config_file.read_text())
 
 
-def _get_urls() -> tuple[str, str, str]:
+def _get_urls(cfg: dict[str, Any]) -> tuple[str, str, str]:
     """Return (api_url, get_url, epg_url) from config."""
-    cfg = _load_config()
     base = cfg["url"].rstrip("/")
     user, passwd = cfg["username"], cfg["password"]
     api = f"{base}/player_api.php?username={user}&password={passwd}"
@@ -616,9 +601,8 @@ def _get_urls() -> tuple[str, str, str]:
     return api, get, epg
 
 
-def _get_filters() -> tuple[dict[int, str], str, set[str]]:
+def _get_filters(cfg: dict[str, Any]) -> tuple[dict[int, str], str, set[str]]:
     """Return (live_filter, locals_group, locals_filter) from config."""
-    cfg = _load_config()
     live_filter = {int(k): v for k, v in cfg.get("live_filter", {}).items()}
     locals_group = cfg.get("locals_group", "")
     locals_filter = set(cfg.get("locals_filter", []))
@@ -655,6 +639,20 @@ def _task(
         series_info[id_] = {}
 
 
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--dir",
+        type=pathlib.Path,
+        default=pathlib.Path(),
+        help="Directory for xtream.json, cached API data, and playlists (default: cwd).",
+    )
+    parser.add_argument(
+        "--cached-only",
+        action="store_true",
+        help="Skip fetching; rebuild playlists from previously cached API data.",
+    )
+
+
 if __name__ == "__main__":
-    raise SystemExit(main(cached_only=False))
+    raise SystemExit(main())
 # vim: ft=python

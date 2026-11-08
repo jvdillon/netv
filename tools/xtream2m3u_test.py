@@ -154,8 +154,7 @@ def fake_api(url: str, timeout: int = 5) -> str:
 
 
 @pytest.fixture
-def workdir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    monkeypatch.setattr(xtream2m3u, "__file__", str(tmp_path / "xtream2m3u.py"))
+def workdir(tmp_path: pathlib.Path) -> pathlib.Path:
     return tmp_path
 
 
@@ -185,11 +184,13 @@ def test_main_fetches_and_writes_playlists(
         return fake_api(url, timeout)
 
     monkeypatch.setattr(xtream2m3u, "fetch_text", fetch)
-    assert xtream2m3u.main(cached_only=False) == 0
+    monkeypatch.setattr(sys, "argv", ["xtream2m3u", "--dir", str(workdir)])
+    assert xtream2m3u.main() == 0
     assert (workdir / "live.m3u").read_text() == EXPECTED_LIVE
     assert (workdir / "vod.m3u").read_text() == EXPECTED_VOD
     assert (workdir / "series.m3u").read_text() == EXPECTED_SERIES
     assert urls[0] == API_URL
+    assert (workdir / "get_vod_categories.json").read_text() == json.dumps(VOD_CATEGORIES)
     assert urls[-1] == API_URL + "&action=get_series_info&series_id=30"
     with gzip.open(workdir / "series_info.pickle.gz", "rb") as f:
         assert pickle.load(f) == {30: SERIES_INFO}
@@ -197,7 +198,8 @@ def test_main_fetches_and_writes_playlists(
     for name in ("live.m3u", "vod.m3u", "series.m3u"):
         (workdir / name).unlink()
     monkeypatch.setattr(xtream2m3u, "fetch_text", None)
-    assert xtream2m3u.main(cached_only=True) == 0
+    monkeypatch.setattr(sys, "argv", ["xtream2m3u", "--dir", str(workdir), "--cached-only"])
+    assert xtream2m3u.main() == 0
     assert (workdir / "series.m3u").read_text() == EXPECTED_SERIES
 
 
@@ -206,23 +208,30 @@ def test_script_entrypoint_runs_main(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     (tmp_path / "xtream.json").write_text(json.dumps(CONFIG))
-    real_resolve = pathlib.Path.resolve
-
-    def resolve(self: pathlib.Path, strict: bool = False) -> pathlib.Path:
-        result = real_resolve(self, strict)
-        return tmp_path if result == SCRIPT.parent else result
-
-    monkeypatch.setattr(pathlib.Path, "resolve", resolve)
     monkeypatch.setattr(
         request,
         "urlopen",
         lambda url, timeout: FakeResponse(fake_api(url).encode()),
     )
-    monkeypatch.setattr(sys, "argv", [str(SCRIPT)])
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--dir", str(tmp_path)])
     with pytest.raises(SystemExit) as exc:
         runpy.run_path(str(SCRIPT), run_name="__main__")
     assert exc.value.code == 0
     assert (tmp_path / "live.m3u").read_text() == EXPECTED_LIVE
+
+
+def test_main_defaults_to_cwd_not_script_dir(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script_config = SCRIPT.parent / "xtream.json"
+    before = script_config.stat().st_mtime_ns if script_config.exists() else None
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["xtream2m3u"])
+    with pytest.raises(SystemExit, match="Created xtream.json - edit"):
+        xtream2m3u.main()
+    assert [p.name for p in tmp_path.iterdir()] == ["xtream.json"]
+    assert (script_config.stat().st_mtime_ns if script_config.exists() else None) == before
 
 
 def test_fetch_text_success_and_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -279,7 +288,7 @@ def test_fetch_series_info_refreshes_cache(
 
     monkeypatch.setattr(xtream2m3u, "fetch_text", fetch)
     series = {1: _series(50), 2: _series(10), 4: _series(1), 5: _series(1)}
-    result = xtream2m3u.fetch_series_info(series, "https://api")
+    result = xtream2m3u.fetch_series_info(series, "https://api", workdir)
     assert result == {1: fresh, 2: {"info": {"last_modified": "10"}}, 4: None, 5: {}}
     assert sorted(calls) == [2, 4, 4, 4, 5]
     with gzip.open(cache, "rb") as f:
@@ -288,7 +297,12 @@ def test_fetch_series_info_refreshes_cache(
 
 
 def test_fetch_series_info_cache_miss_cached_only(workdir: pathlib.Path) -> None:
-    result = xtream2m3u.fetch_series_info({7: _series(1)}, "https://api", cached_only=True)
+    result = xtream2m3u.fetch_series_info(
+        {7: _series(1)},
+        "https://api",
+        workdir,
+        cached_only=True,
+    )
     assert result == {7: None}
     assert not (workdir / "series_info.pickle.gz").exists()
 
@@ -298,7 +312,7 @@ def test_fetch_series_info_unchanged_skips_write(workdir: pathlib.Path) -> None:
     with gzip.open(cache, "wb") as f:
         pickle.dump({1: {"info": {"last_modified": "5"}}}, f)
     before = cache.stat().st_mtime_ns
-    result = xtream2m3u.fetch_series_info({1: _series(5)}, "https://api")
+    result = xtream2m3u.fetch_series_info({1: _series(5)}, "https://api", workdir)
     assert result == {1: {"info": {"last_modified": "5"}}}
     assert cache.stat().st_mtime_ns == before
 
@@ -313,7 +327,7 @@ def test_fetch_series_info_keyboard_interrupt_cancels(
 
     monkeypatch.setattr(xtream2m3u, "_task", task)
     with pytest.raises(KeyboardInterrupt):
-        xtream2m3u.fetch_series_info({1: _series(1)}, "https://api")
+        xtream2m3u.fetch_series_info({1: _series(1)}, "https://api", workdir)
     assert "Cancelling..." in capsys.readouterr().out
     assert not (workdir / "series_info.pickle.gz").exists()
 
@@ -392,21 +406,22 @@ def test_process_iptv_url_validates_auth() -> None:
 def test_load_helpers_check_types(workdir: pathlib.Path) -> None:
     (workdir / "d.json").write_text('{"a": 1}')
     (workdir / "l.json").write_text("[1]")
-    assert xtream2m3u.load_dict("d.json") == {"a": 1}
-    assert xtream2m3u.load_list("l.json") == [1]
-    with pytest.raises(TypeError, match="Expected dict from l.json"):
-        xtream2m3u.load_dict("l.json")
-    with pytest.raises(TypeError, match="Expected list from d.json"):
-        xtream2m3u.load_list("d.json")
+    assert xtream2m3u.load_dict(workdir / "d.json") == {"a": 1}
+    assert xtream2m3u.load_list(workdir / "l.json") == [1]
+    with pytest.raises(TypeError, match=r"Expected dict from .*l\.json"):
+        xtream2m3u.load_dict(workdir / "l.json")
+    with pytest.raises(TypeError, match=r"Expected list from .*d\.json"):
+        xtream2m3u.load_list(workdir / "d.json")
 
 
 def test_load_config_creates_template(workdir: pathlib.Path) -> None:
     with pytest.raises(SystemExit, match="edit with your credentials"):
-        xtream2m3u._load_config()
+        xtream2m3u._load_config(workdir)
     template = json.loads((workdir / "xtream.json").read_text())
+    assert xtream2m3u._load_config(workdir) == template
     assert template["username"] == "your_username"
-    assert xtream2m3u._get_filters() == ({}, "", set())
-    assert xtream2m3u._get_urls()[1] == (
+    assert xtream2m3u._get_filters(template) == ({}, "", set())
+    assert xtream2m3u._get_urls(template)[1] == (
         "https://your-provider.com/get.php?username=your_username&password=your_password"
     )
 
@@ -457,14 +472,14 @@ def test_write_m3u_series_skips_bad_info(
         4: {"episodes": [{"season": {"id": 9, "title": "E", "container_extension": "ts"}}]},
     }
     auth = {"server_info": {}}
-    xtream2m3u.write_m3u_series(series, info, auth, ["s"])
+    xtream2m3u.write_m3u_series(series, info, auth, ["s"], workdir)
     assert "Series 3:" in capsys.readouterr().out
     assert (workdir / "series.m3u").read_text() == (
         '#EXTM3U\n#EXTINF:-1 tvg-name="E" tvg-logo="d" group-title="Series | H",E\ns/9.ts\n'
     )
-    xtream2m3u.write_m3u_vod({}, auth)
+    xtream2m3u.write_m3u_vod({}, auth, workdir)
     assert (workdir / "vod.m3u").read_text() == "#EXTM3U\n"
-    xtream2m3u.write_m3u_live({}, auth, "e")
+    xtream2m3u.write_m3u_live({}, auth, "e", workdir)
     assert (workdir / "live.m3u").read_text() == '#EXTM3U url-tvg="e" x-tvg-url="e"\n'
 
 

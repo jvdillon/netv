@@ -1,24 +1,19 @@
-#!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["fastapi", "uvicorn[standard]", "jinja2", "python-multipart", "cryptography", "defusedxml", "PyChromecast>=13.1,<15"]
-# ///
-"""IPTV Web App.
+#!/bin/sh
+# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# fmt: off
+'''' 2>/dev/null #
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
+neTV web app: live TV, EPG guide, VOD, and Chromecast for your IPTV sources.
 
-Usage:
-    ./main.py [--port PORT] [--https] [--cert FILE --key FILE]
-
-Options:
-    --port PORT     Port to listen on (default: 8000)
-    --https         Enable HTTPS using Let's Encrypt certs (auto-detect domain)
-    --cert FILE     SSL certificate file (overrides --https)
-    --key FILE      SSL private key file (overrides --https)
+Settings and caches live in $NETV_DATA_DIR when set; otherwise in ./cache or
+./.cache of a source checkout, or ~/.local/share/netv for an installed package.
 
 Examples:
-    ./main.py                              # HTTP on port 8000
-    ./main.py --https                      # HTTPS with auto-detected Let's Encrypt certs
-    ./main.py --cert c.pem --key k.pem     # HTTPS with custom certs
-"""
+  netv                              # HTTP on port 8000
+  netv --https                      # HTTPS with auto-detected Let's Encrypt certs
+  netv --cert c.pem --key k.pem     # HTTPS with custom certs
+'''
+# fmt: on
 
 from __future__ import annotations
 
@@ -27,10 +22,11 @@ from concurrent import futures
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, cast
 from urllib import error, parse
 from xml.sax.saxutils import escape as xml_escape
 
+import argparse
 import asyncio
 import contextlib
 import json
@@ -105,6 +101,14 @@ import ffmpeg_command
 import ffmpeg_session
 import handoff
 import playlists
+
+
+if TYPE_CHECKING:
+    import uvicorn
+else:
+    from wrapt import lazy_import
+
+    uvicorn = lazy_import("uvicorn")
 
 
 log = logging.getLogger(__name__)
@@ -3155,6 +3159,166 @@ async def settings_set_user_limits(
     return {"status": "ok"}
 
 
+def _logo_url_filter(url: str) -> str:
+    """Wrap external logo URLs through /api/logo proxy."""
+    if not url or url.startswith("/") or url.startswith("data:"):
+        return url  # Already local or data URL.
+    # Use hostname as source for organization.
+    parsed = parse.urlparse(url)
+    source = parsed.netloc.split(":")[0] if parsed.netloc else "external"
+    return f"/api/logo?source={parse.quote(source)}&url={parse.quote(url)}"
+
+
+def _hidden_sources(username: str) -> set[str]:
+    """Sources not assigned to this user (admins see all)."""
+    return hidden_source_ids(username, auth.is_admin(username))
+
+
+def _unavailable_groups(username: str) -> set[str]:
+    """User's blocked groups, plus every group of sources not assigned to them."""
+    groups = set(auth.get_user_limits(username).get("unavailable_groups", []))
+    for source_id in _hidden_sources(username):
+        groups.update((f"source:{source_id}", f"movies:{source_id}", f"series:{source_id}"))
+    return groups
+
+
+# Returns dict with 'movies' and 'series' booleans. If no xtream sources exist, access
+# is granted (nothing to restrict).
+def _get_content_access(username: str) -> dict[str, bool]:
+    """Check if user has access to movies/series from any source."""
+    unavailable_groups = _unavailable_groups(username)
+
+    has_movies = False
+    has_series = False
+    has_xtream_source = False
+
+    for source in get_sources():
+        if source.type == "xtream":
+            has_xtream_source = True
+            if f"movies:{source.id}" not in unavailable_groups:
+                has_movies = True
+            if f"series:{source.id}" not in unavailable_groups:
+                has_series = True
+
+    # If no xtream sources, allow access (nothing to restrict)
+    if not has_xtream_source:
+        return {"movies": True, "series": True}
+
+    return {"movies": has_movies, "series": has_series}
+
+
+def _get_content_access_from_request(request: Request) -> dict[str, bool]:
+    """Get content access from request (for use in base template)."""
+    token = request.cookies.get("token")
+    if not token:
+        return {"movies": True, "series": True}  # Not logged in, show all.
+    payload = verify_token(token)
+    if not payload:
+        return {"movies": True, "series": True}
+    username = payload.get("sub", "")
+    if not username:
+        return {"movies": True, "series": True}
+    return _get_content_access(username)
+
+
+# Built last so its filter and globals are defined; routes read it only per request.
+TEMPLATES = _create_templates()
+
+
+def main() -> int:
+    """Serve the web app.
+
+    Returns:
+        status: Process exit code.
+    """
+
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n", 2)[2] if __doc__ else None,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_arguments(parser)
+    flags = cast(Flags, parser.parse_args())
+
+    # LOG_LEVEL env var takes precedence, then --debug flag, then default INFO.
+    log_level_env = os.environ.get("LOG_LEVEL", "").upper()
+    if log_level_env in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        log_level = getattr(logging, log_level_env)
+    else:
+        log_level = logging.DEBUG if flags.debug else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
+
+    ssl_certfile = None
+    ssl_keyfile = None
+    if flags.cert and flags.key:
+        ssl_certfile = flags.cert
+        ssl_keyfile = flags.key
+    elif flags.https is not None:
+        live_dir = pathlib.Path("/etc/letsencrypt/live")
+        if flags.https:
+            domain = flags.https
+        else:
+            # Auto-detect first domain.
+            domains = [
+                d.name for d in live_dir.iterdir() if d.is_dir() and (d / "fullchain.pem").exists()
+            ]
+            if not domains:
+                raise SystemExit("No Let's Encrypt certs found in /etc/letsencrypt/live/")
+            domain = domains[0]
+        cert = live_dir / domain / "fullchain.pem"
+        key = live_dir / domain / "privkey.pem"
+        if not cert.exists():
+            raise SystemExit(f"Cert not found: {cert}")
+        log.info("Using Let's Encrypt certs for %s", domain)
+        ssl_certfile = str(cert)
+        ssl_keyfile = str(key)
+
+    uv_log = "debug" if flags.debug else "info"
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=flags.port,
+        access_log=flags.debug,
+        log_level=uv_log,
+        log_config=None,  # Preserve our basicConfig.
+        timeout_graceful_shutdown=5,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile=ssl_keyfile,
+    )
+    return 0
+
+
+class Flags(Protocol):
+    """Parsed command-line flags."""
+
+    port: int
+    debug: bool
+    https: str | None
+    cert: str | None
+    key: str | None
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register flags on ``parser``."""
+    parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--https",
+        nargs="?",
+        const="",
+        metavar="DOMAIN",
+        help="Enable HTTPS (auto-detect domain, or specify one)",
+    )
+    parser.add_argument("--cert", help="SSL certificate file (e.g., fullchain.pem)")
+    parser.add_argument("--key", help="SSL private key file (e.g., privkey.pem)")
+
+
 def _api_settings(
     settings: dict[str, Any],
     keys: tuple[str, ...] = (
@@ -4137,140 +4301,6 @@ def _handoff_stream_allowed(username: str, stream_id: str) -> bool:
     return bool(stream and _live_stream_filter(username)(stream))
 
 
-def _logo_url_filter(url: str) -> str:
-    """Wrap external logo URLs through /api/logo proxy."""
-    if not url or url.startswith("/") or url.startswith("data:"):
-        return url  # Already local or data URL.
-    # Use hostname as source for organization.
-    parsed = parse.urlparse(url)
-    source = parsed.netloc.split(":")[0] if parsed.netloc else "external"
-    return f"/api/logo?source={parse.quote(source)}&url={parse.quote(url)}"
-
-
-def _hidden_sources(username: str) -> set[str]:
-    """Sources not assigned to this user (admins see all)."""
-    return hidden_source_ids(username, auth.is_admin(username))
-
-
-def _unavailable_groups(username: str) -> set[str]:
-    """User's blocked groups, plus every group of sources not assigned to them."""
-    groups = set(auth.get_user_limits(username).get("unavailable_groups", []))
-    for source_id in _hidden_sources(username):
-        groups.update((f"source:{source_id}", f"movies:{source_id}", f"series:{source_id}"))
-    return groups
-
-
-# Returns dict with 'movies' and 'series' booleans. If no xtream sources exist, access
-# is granted (nothing to restrict).
-def _get_content_access(username: str) -> dict[str, bool]:
-    """Check if user has access to movies/series from any source."""
-    unavailable_groups = _unavailable_groups(username)
-
-    has_movies = False
-    has_series = False
-    has_xtream_source = False
-
-    for source in get_sources():
-        if source.type == "xtream":
-            has_xtream_source = True
-            if f"movies:{source.id}" not in unavailable_groups:
-                has_movies = True
-            if f"series:{source.id}" not in unavailable_groups:
-                has_series = True
-
-    # If no xtream sources, allow access (nothing to restrict)
-    if not has_xtream_source:
-        return {"movies": True, "series": True}
-
-    return {"movies": has_movies, "series": has_series}
-
-
-def _get_content_access_from_request(request: Request) -> dict[str, bool]:
-    """Get content access from request (for use in base template)."""
-    token = request.cookies.get("token")
-    if not token:
-        return {"movies": True, "series": True}  # Not logged in, show all.
-    payload = verify_token(token)
-    if not payload:
-        return {"movies": True, "series": True}
-    username = payload.get("sub", "")
-    if not username:
-        return {"movies": True, "series": True}
-    return _get_content_access(username)
-
-
-# Built last so its filter and globals are defined; routes read it only per request.
-TEMPLATES = _create_templates()
-
-
 if __name__ == "__main__":
-    import argparse
-
-    import uvicorn
-
-    parser = argparse.ArgumentParser(description="IPTV Web App")
-    parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument(
-        "--https",
-        nargs="?",
-        const="",
-        metavar="DOMAIN",
-        help="Enable HTTPS (auto-detect domain, or specify one)",
-    )
-    parser.add_argument("--cert", help="SSL certificate file (e.g., fullchain.pem)")
-    parser.add_argument("--key", help="SSL private key file (e.g., privkey.pem)")
-    args = parser.parse_args()
-
-    # LOG_LEVEL env var takes precedence, then --debug flag, then default INFO.
-    log_level_env = os.environ.get("LOG_LEVEL", "").upper()
-    if log_level_env in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
-        log_level = getattr(logging, log_level_env)
-    else:
-        log_level = logging.DEBUG if args.debug else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%H:%M:%S",
-        force=True,
-    )
-
-    ssl_certfile = None
-    ssl_keyfile = None
-    if args.cert and args.key:
-        ssl_certfile = args.cert
-        ssl_keyfile = args.key
-    elif args.https is not None:
-        live_dir = pathlib.Path("/etc/letsencrypt/live")
-        if args.https:
-            domain = args.https
-        else:
-            # Auto-detect first domain.
-            domains = [
-                d.name for d in live_dir.iterdir() if d.is_dir() and (d / "fullchain.pem").exists()
-            ]
-            if not domains:
-                raise SystemExit("No Let's Encrypt certs found in /etc/letsencrypt/live/")
-            domain = domains[0]
-        cert = live_dir / domain / "fullchain.pem"
-        key = live_dir / domain / "privkey.pem"
-        if not cert.exists():
-            raise SystemExit(f"Cert not found: {cert}")
-        log.info("Using Let's Encrypt certs for %s", domain)
-        ssl_certfile = str(cert)
-        ssl_keyfile = str(key)
-
-    uv_log = "debug" if args.debug else "info"
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=args.port,
-        access_log=args.debug,
-        log_level=uv_log,
-        log_config=None,  # Preserve our basicConfig.
-        timeout_graceful_shutdown=5,
-        proxy_headers=True,
-        forwarded_allow_ips="*",
-        ssl_certfile=ssl_certfile,
-        ssl_keyfile=ssl_keyfile,
-    )
+    raise SystemExit(main())
+# vim: ft=python

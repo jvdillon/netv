@@ -8,6 +8,16 @@ with a clean, minimal interface — live TV with an EPG grid guide, catchup
 playback, Intelligent Handoff between devices, movies & series, favorites and playlists, Chromecast and AirPlay,
 and optional real-time 4K AI upscaling — on desktop, tablet, mobile, and TV.
 
+## Quick Start
+
+```bash
+uvx --from git+https://github.com/jvdillon/netv netv
+```
+
+Open http://localhost:8000, create an admin account, and add your IPTV source.
+Requires [uv](https://docs.astral.sh/uv/) and FFmpeg. See
+[Installation](#installation) for additional details.
+
 ## Companion Apps
 
 neTV now comes with native companion apps. Install them, point them at your
@@ -664,25 +674,30 @@ sudo ./tools/uninstall-netv.sh   # Uninstall
 
 ### Development/Testing
 
-Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and FFmpeg (`ffmpeg`
+Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), and FFmpeg (`ffmpeg`
 and `ffprobe` on `PATH`, e.g. `brew install ffmpeg` or `apt install ffmpeg`).
 Without FFmpeg, streams fail to start:
 
 ```bash
 git clone https://github.com/jvdillon/netv.git
 cd netv
-uv run ./main.py --port 8000  # --https
-uv run ./gateway.py --port 8100
+uv sync
+./main.py --port 8000  # --https
+./gateway.py --port 8100
 ```
 
-Or with pip:
+Or install the `netv` and `netv-gateway` commands:
 
 ```bash
-pip install .
-./main.py --port 8000
+uv tool install git+https://github.com/jvdillon/netv  # or: pip install .
+netv --port 8000
 ```
 
 Open http://localhost:8000, create an admin account, and add your IPTV source.
+
+Settings, users, and caches live in `$NETV_DATA_DIR` when set. Otherwise a
+source checkout uses `./cache` (if present) or `./.cache`, and an installed
+package uses `~/.local/share/netv`.
 
 Web playback regression checks use Node's built-in runner (Node 18+):
 
@@ -692,10 +707,12 @@ node --test collector_tests/*.test.cjs
 
 ### Additional Gems
 
-There's also some useful applications in `tools/`:
-- `zap2xml.py`: Scrape guide data into XML (I `crontab` this at 5am daily).
-- `alignm3u.py`: Useful for reworking your HDHomeRun m3u to align with guide.
-- `xtream2m3u.py`: Dump xtream to m3u, useful for making Emby work with IPTV.
+There's also some useful applications in `tools/`. Each runs from a checkout
+(`./tools/zap2xml.py`) or without one (`uvx --from git+https://github.com/jvdillon/netv zap2xml`),
+and writes to the current directory unless told otherwise:
+- `zap2xml`: Scrape guide data into XML (I `crontab` this at 5am daily).
+- `alignm3u`: Useful for reworking your HDHomeRun m3u to align with guide.
+- `xtream2m3u`: Dump xtream to m3u, useful for making Emby work with IPTV.
 
 ## Troubleshooting
 
@@ -768,7 +785,7 @@ HDHomeRun devices provide an M3U playlist, but it lacks EPG channel IDs. Use the
 wget http://192.168.1.87/lineup.m3u -O tools/lineup.m3u
 
 # 2. Fetch TV guide data for your area
-./tools/zap2xml.py --zip 90210
+./tools/zap2xml.py --zip 90210 --path tools
 
 # 3. Align the M3U with the guide (adds tvg-id for EPG matching)
 ./tools/alignm3u.py --input tools/lineup.m3u --xmltv tools/xmltv.xml --output tools/ota.m3u
@@ -777,7 +794,7 @@ wget http://192.168.1.87/lineup.m3u -O tools/lineup.m3u
 Then add `tools/ota.m3u` as an M3U source in neTV settings.
 
 And set up a cron job to refresh the guide daily (e.g.,
-`0 5 * * *  /usr/bin/python3 /path/to/netv/tools/zap2xml.py --zip 90210 && cp /path/to/netv/tools/xmltv.xml /var/www/html/`).
+`0 5 * * *  /path/to/netv/tools/zap2xml.py --zip 90210 --path /var/www/html`).
 
 ### How do I enable hardware transcoding?
 

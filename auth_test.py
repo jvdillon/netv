@@ -203,6 +203,8 @@ class TestGetSettingsFile:
         assert tmp_path / "cache" / "users" == auth.USERS_DIR
 
     def test_default_dir_without_legacy(self, tmp_path, monkeypatch):
+        (tmp_path / "pyproject.toml").touch()
+        monkeypatch.delenv("NETV_DATA_DIR", raising=False)
         monkeypatch.setattr(auth, "APP_DIR", tmp_path)
         monkeypatch.setattr(auth, "CACHE_DIR", tmp_path / ".cache")
         monkeypatch.setattr(

@@ -1260,8 +1260,10 @@ def test_main_runs_uvicorn(
     for key, value in env.items():
         monkeypatch.setenv(key, value)
 
-    runpy.run_path(gateway.__file__, run_name="__main__")
+    with pytest.raises(SystemExit) as exit_info:
+        runpy.run_path(gateway.__file__, run_name="__main__")
 
+    assert exit_info.value.code == 0
     assert basic_config.call_args.kwargs["level"] == expected_level
     kwargs = run.call_args.kwargs
     assert kwargs["port"] == (9001 if "--port" in argv else 8100)

@@ -11,9 +11,19 @@ import pytest
 
 from tools import manual_remap
 
+import cache
 
-def _setup(cache: pathlib.Path) -> None:
-    conn = sqlite3.connect(cache / "epg.db")
+
+@pytest.fixture(autouse=True)
+def _restore_cache_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    # _add_arguments calls cache.initialize_paths(), which rebinds these globals.
+    for name in ("CACHE_DIR", "SERVER_SETTINGS_FILE", "USERS_DIR", "LOGOS_DIR"):
+        monkeypatch.setattr(cache, name, getattr(cache, name))
+
+
+def _setup(data_dir: pathlib.Path) -> pathlib.Path:
+    data_dir.mkdir(exist_ok=True)
+    conn = sqlite3.connect(data_dir / "epg.db")
     conn.execute("CREATE TABLE channels (id TEXT, name TEXT)")
     conn.execute("CREATE TABLE programs (channel_id TEXT, stop_ts REAL)")
     conn.execute("INSERT INTO channels VALUES ('466831', 'KBCW')")
@@ -34,83 +44,85 @@ def _setup(cache: pathlib.Path) -> None:
             {},
         ],
     }
-    (cache / "playlists.json").write_text(json.dumps(data))
+    (data_dir / "playlists.json").write_text(json.dumps(data))
+    return data_dir
 
 
-@pytest.fixture
-def cache(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    real = pathlib.Path
-
-    class _Path:
-        def __new__(cls, p: str) -> pathlib.Path:
-            assert p == "/home/ankur/netv/cache"
-            return real(tmp_path)
-
-    monkeypatch.setattr(manual_remap.pathlib, "Path", _Path)
-    _setup(tmp_path)
-    return tmp_path
+def _run(monkeypatch: pytest.MonkeyPatch, *argv: str) -> int:
+    monkeypatch.setattr(sys, "argv", ["manual_remap.py", *argv])
+    return manual_remap.main()
 
 
 def test_dry_run(
-    cache: pathlib.Path,
+    tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    before = (cache / "playlists.json").read_text()
-    monkeypatch.setattr(sys, "argv", ["manual_remap.py"])
-    assert manual_remap.main() == 0
+    data_dir = _setup(tmp_path / "c")
+    before = (data_dir / "playlists.json").read_text()
+    assert _run(monkeypatch, "--cache-dir", str(data_dir)) == 0
     out = capsys.readouterr().out
     assert "SET US| CW SAN FRANCISCO HD: (none) -> KBCW [466831] (1 upcoming)" in out
     assert "SKIP (no data): US| CHEDDAR NEWS HD -> [464798]" in out
     assert "1 channels to update" in out
     assert "Dry-run only; re-run with --apply." in out
-    assert (cache / "playlists.json").read_text() == before
+    assert (data_dir / "playlists.json").read_text() == before
+
+
+def test_defaults_to_netv_data_dir(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cache, "CACHE_DIR", _setup(tmp_path / "data"))
+    assert _run(monkeypatch) == 0
+    assert "1 channels to update" in capsys.readouterr().out
 
 
 def test_apply(
-    cache: pathlib.Path,
+    tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(sys, "argv", ["manual_remap.py", "--apply"])
-    assert manual_remap.main() == 0
+    data_dir = _setup(tmp_path / "c")
+    assert _run(monkeypatch, "--cache-dir", str(data_dir), "--apply") == 0
     out = capsys.readouterr().out
     assert "Backup:" in out
     assert "Applied." in out
-    chans = json.loads((cache / "playlists.json").read_text())["playlists"][0]["channels"]
+    chans = json.loads((data_dir / "playlists.json").read_text())["playlists"][0]["channels"]
     assert [c.get("epg_channel_id") for c in chans] == ["466831", "old", "keep"]
-    backups = list(cache.glob("playlists.json.bak-*"))
+    backups = list(data_dir.glob("playlists.json.bak-*"))
     assert len(backups) == 1
     assert "466831" not in backups[0].read_text()
+    assert not (data_dir / "playlists.json.tmp").exists()
 
 
 def test_apply_with_nothing_to_change(
-    cache: pathlib.Path,
+    tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    (cache / "playlists.json").write_text("{}")
-    monkeypatch.setattr(sys, "argv", ["manual_remap.py", "--apply"])
-    assert manual_remap.main() == 0
+    data_dir = _setup(tmp_path / "c")
+    (data_dir / "playlists.json").write_text("{}")
+    assert _run(monkeypatch, "--cache-dir", str(data_dir), "--apply") == 0
     out = capsys.readouterr().out
     assert "0 channels to update" in out
     assert "Applied." not in out
     assert "Dry-run" not in out
-    assert not list(cache.glob("*.bak-*"))
+    assert not list(data_dir.glob("*.bak-*"))
 
 
-def test_script_entry_point(monkeypatch: pytest.MonkeyPatch) -> None:
-    opened: list[object] = []
-
-    def fake_connect(path: object) -> None:
-        opened.append(path)
-        raise sqlite3.OperationalError("no db")
-
-    monkeypatch.setattr(sqlite3, "connect", fake_connect)
-    monkeypatch.setattr(sys, "argv", ["manual_remap.py"])
-    with pytest.raises(sqlite3.OperationalError, match="no db"):
+def test_script_entry_point(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_dir = _setup(tmp_path / "c")
+    monkeypatch.setattr(sys, "argv", ["manual_remap.py", "--cache-dir", str(data_dir)])
+    with pytest.raises(SystemExit) as exc:
         runpy.run_path(manual_remap.__file__, run_name="__main__")
-    assert opened == [pathlib.Path("/home/ankur/netv/cache/epg.db")]
+    assert exc.value.code == 0
+    assert "1 channels to update" in capsys.readouterr().out
 
 
 if __name__ == "__main__":

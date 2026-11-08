@@ -1,9 +1,8 @@
 #!/bin/sh
-# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# ruff: noqa: EXE003, D300, D205, T201 -- Polyglot shell/Python script.
 # fmt: off
 '''' 2>/dev/null #
 exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
-
 Export the NomosUni upscaler to TensorRT for FFmpeg dnn_processing.
 
 This script converts the 2x NomosUni model to TensorRT engines (.engine files)
@@ -67,8 +66,6 @@ def download_model(cache_dir: Path) -> Path:
         print(f"Using cached model: {path}")
         return path
 
-    if not model_url.startswith("https://"):
-        raise ValueError(f"URL must use HTTPS: {model_url}")
     print(f"Downloading {filename}...")
 
     # Download to a temp file first, then rename to avoid partial downloads.
@@ -361,20 +358,20 @@ def main() -> int:
         exit_code: Process exit status.
     """
     parser = argparse.ArgumentParser(
-        description="Export NomosUni to a TensorRT engine",
+        description=__doc__.split("\n", 2)[2] if __doc__ else None,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_arguments(parser)
-    args = cast(Flags, parser.parse_args())
+    flags = cast(Flags, parser.parse_args())
     model_name = "2x-nomosuni-compact"
 
-    if args.list:
+    if flags.list:
         list_models()
         return 0
 
-    min_h = args.min_height or 720
-    opt_h = args.opt_height or 1080
-    max_h = args.max_height or 1080
+    min_h = flags.min_height or 720
+    opt_h = flags.opt_height or 1080
+    max_h = flags.max_height or 1080
 
     # Validate height constraints.
     if min_h > max_h:
@@ -388,9 +385,7 @@ def main() -> int:
     opt_shape = height_to_shape(opt_h)
     max_shape = height_to_shape(max_h)
 
-    if args.output is None:
-        args.output = f"{model_name}_{opt_h}p_{args.precision}.engine"
-    output_path = Path(args.output)
+    output_path = Path(flags.output or f"{model_name}_{opt_h}p_{flags.precision}.engine")
     if output_path.exists() and output_path.is_dir():
         raise ValueError(
             f"--output must include an engine filename, not a directory: {output_path}",
@@ -405,7 +400,7 @@ def main() -> int:
 
     model = load_model()
 
-    if args.onnx_only:
+    if flags.onnx_only:
         # Save ONNX to current directory with sensible name.
         onnx_path = Path(f"{model_name}_{opt_h}p.onnx")
         cleanup_onnx = False
@@ -425,13 +420,13 @@ def main() -> int:
             opt_shape,
             onnx_path,
             fixed_shape=min_shape == opt_shape == max_shape,
-            precision=args.precision,
+            precision=flags.precision,
         )
 
-        if args.onnx_only:
+        if flags.onnx_only:
             print(f"\nONNX saved to: {onnx_path}")
             print("Skipping TensorRT build (--onnx-only). Build later with:")
-            print(f"  trtexec --onnx={onnx_path} --saveEngine={args.output} --fp16")
+            print(f"  trtexec --onnx={onnx_path} --saveEngine={output_path} --fp16")
             return 0
 
         build_engine(
@@ -440,9 +435,9 @@ def main() -> int:
             min_shape=min_shape,
             opt_shape=opt_shape,
             max_shape=max_shape,
-            precision=args.precision,
-            workspace_gb=args.workspace,
-            opt_level=args.opt_level,
+            precision=flags.precision,
+            workspace_gb=flags.workspace,
+            opt_level=flags.opt_level,
         )
     finally:
         if cleanup_onnx and (onnx_file := Path(onnx_path)).exists():

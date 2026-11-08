@@ -526,6 +526,21 @@ class TestInitialize:
         assert tmp_path / "cache/users" == cache.USERS_DIR
         assert tmp_path / "cache/logos" == cache.LOGOS_DIR
 
+    def test_initialize_paths_puts_installed_state_in_user_data_dir(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("NETV_DATA_DIR", raising=False)
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+        monkeypatch.setattr(cache, "APP_DIR", tmp_path)
+        monkeypatch.setattr(cache, "CACHE_DIR", tmp_path / ".cache")
+        monkeypatch.setattr(cache, "SERVER_SETTINGS_FILE", tmp_path / ".cache/server_settings.json")
+        monkeypatch.setattr(cache, "USERS_DIR", tmp_path / ".cache/users")
+        monkeypatch.setattr(cache, "LOGOS_DIR", tmp_path / ".cache/logos")
+        cache.initialize_paths()
+        state = tmp_path / "xdg" / "netv"
+        assert state == cache.CACHE_DIR
+        assert state / "server_settings.json" == cache.SERVER_SETTINGS_FILE
+        assert state / "users" == cache.USERS_DIR
+        assert state / "logos" == cache.LOGOS_DIR
+
     def test_initialize_paths_keeps_caller_overrides(self, monkeypatch, tmp_path):
         (tmp_path / "cache").mkdir()
         custom = tmp_path / "custom"

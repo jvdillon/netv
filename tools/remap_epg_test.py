@@ -11,6 +11,15 @@ import pytest
 
 from tools import remap_epg
 
+import cache
+
+
+@pytest.fixture(autouse=True)
+def _restore_cache_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    # _add_arguments calls cache.initialize_paths(), which rebinds these globals.
+    for name in ("CACHE_DIR", "SERVER_SETTINGS_FILE", "USERS_DIR", "LOGOS_DIR"):
+        monkeypatch.setattr(cache, name, getattr(cache, name))
+
 
 def test_parse_name_coerces_untyped_values() -> None:
     assert remap_epg.parse_name(None) == ("", [], False)
@@ -54,6 +63,12 @@ def test_parse_id_forms() -> None:
     assert remap_epg.parse_id("loc.KQED9") == ("", ["KQED"], True)
     # ".zz" is not a country, so it stays in the tokens.
     assert remap_epg.parse_id("FooBar.zz") == ("", ["FOO", "BAR", "ZZ"], False)
+
+
+def test_parse_id_keeps_non_country_prefix() -> None:
+    assert remap_epg.parse_id("BBC.One.uk") == ("UK", ["BBC", "1"], False)
+    assert remap_epg.parse_id("Disc.Turbo") == ("", ["DISC", "TURBO"], False)
+    assert remap_epg.parse_id("Sky-Atlantic") == ("", ["SKY", "ATLANTIC"], False)
 
 
 def test_tokenize_and_split() -> None:
@@ -182,8 +197,8 @@ def _make_db(path: pathlib.Path, rows: list[tuple[str, str, str | None, float]])
     conn.close()
 
 
-def _settings(cache: pathlib.Path) -> None:
-    (cache / "server_settings.json").write_text(
+def _settings(data_dir: pathlib.Path) -> None:
+    (data_dir / "server_settings.json").write_text(
         json.dumps(
             {
                 "sources": [
@@ -197,9 +212,9 @@ def _settings(cache: pathlib.Path) -> None:
 
 
 def test_source_countries(tmp_path: pathlib.Path) -> None:
-    assert remap_epg._source_countries(tmp_path) == {}
+    assert remap_epg.source_countries(tmp_path) == {}
     _settings(tmp_path)
-    assert remap_epg._source_countries(tmp_path) == {"gb": "UK"}
+    assert remap_epg.source_countries(tmp_path) == {"gb": "UK"}
 
 
 def test_load_candidates_and_upcoming(tmp_path: pathlib.Path) -> None:
@@ -226,10 +241,10 @@ def test_main_missing_files(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPa
         _run_main(monkeypatch, "--cache-dir", str(tmp_path))
 
 
-def _setup_cache(cache: pathlib.Path) -> dict:
+def _setup_cache(data_dir: pathlib.Path) -> dict:
     future = time.time() + 3600
     _make_db(
-        cache / "epg.db",
+        data_dir / "epg.db",
         [
             ("Syfy.us", "US - SYFY", None, future),
             ("Ok.us", "OK CHANNEL", None, future),
@@ -252,7 +267,7 @@ def _setup_cache(cache: pathlib.Path) -> dict:
             {"name": "Empty", "channels": [{"name": "NOTHING"}]},
         ],
     }
-    (cache / "playlists.json").write_text(json.dumps(data))
+    (data_dir / "playlists.json").write_text(json.dumps(data))
     return data
 
 
@@ -307,6 +322,17 @@ def test_main_apply_nothing_to_change(
     assert _run_main(monkeypatch, "--cache-dir", str(tmp_path), "--apply") == 0
     assert "Nothing to change." in capsys.readouterr().out
     assert not list(tmp_path.glob("*.bak-*"))
+
+
+def test_main_defaults_to_netv_data_dir(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _setup_cache(tmp_path)
+    monkeypatch.setattr(cache, "CACHE_DIR", tmp_path)
+    assert _run_main(monkeypatch) == 0
+    assert "Summary: 1 remapped, 3 unmatched, 1 already OK" in capsys.readouterr().out
 
 
 def test_script_entry_point(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
