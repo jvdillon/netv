@@ -10,7 +10,7 @@ on:
       - "docker/entrypoint-ai_upscale.sh"
       - "netv/**"
       - "pyproject.toml"
-      - "tools/**"
+      - "scripts/**"
       - ".github/workflows/ai-upscale.yml"
 
 env:
@@ -148,12 +148,12 @@ jobs:
 
             # Verify AI upscale scripts exist
             echo '=== Verifying AI upscale scripts ==='
-            test -x /app/tools/install-ai_upscale.sh || { echo 'ERROR: install-ai_upscale.sh not found'; exit 1; }
+            test -x /app/scripts/install-ai_upscale.sh || { echo 'ERROR: install-ai_upscale.sh not found'; exit 1; }
             echo 'OK: install-ai_upscale.sh exists'
-            test -f /app/tools/export-tensorrt.py || { echo 'ERROR: export-tensorrt.py not found'; exit 1; }
-            echo 'OK: export-tensorrt.py exists'
-            python3 /app/tools/export-tensorrt.py --list | grep -q '2x-nomosuni-compact' || { echo 'ERROR: Nomos model unavailable'; exit 1; }
-            if python3 /app/tools/export-tensorrt.py --help | grep -q -- '--model'; then
+            test -f /app/netv/upscale/export_tensorrt.py || { echo 'ERROR: export_tensorrt.py not found'; exit 1; }
+            echo 'OK: export_tensorrt.py exists'
+            python3 -m netv.upscale.export_tensorrt --list | grep -q '2x-nomosuni-compact' || { echo 'ERROR: Nomos model unavailable'; exit 1; }
+            if python3 -m netv.upscale.export_tensorrt --help | grep -q -- '--model'; then
               echo 'ERROR: Legacy model selection is still available'
               exit 1
             fi

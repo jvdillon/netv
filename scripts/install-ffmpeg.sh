@@ -230,6 +230,8 @@ if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR" ]; then
     exit 1
 fi
 
+PATCH_DIR="$SCRIPT_DIR/../docker/patches"
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
@@ -1526,7 +1528,6 @@ fi
 TENSORRT_FLAGS=()
 if [ "$ENABLE_TENSORRT" = "1" ]; then
     echo "Patching FFmpeg for native TensorRT DNN backend..."
-    PATCH_DIR="$SCRIPT_DIR/patches"
 
     # Copy TensorRT backend source file
     if [ -f "$PATCH_DIR/dnn_backend_tensorrt.cpp" ]; then
@@ -1791,7 +1792,7 @@ FFMPEG_KEY=$(step_key "$SRC_DIR/$FFMPEG_DIR" \
     "${LIBTORCH_VERSION:-}:${TORCH_VARIANT:-}" \
     "${NVCC_CCBIN:-}" \
     "$(git -C "$SRC_DIR/nv-codec-headers" rev-parse HEAD 2>/dev/null)" \
-    "$(sha256sum "$SCRIPT_DIR/install-ffmpeg.sh" "$SCRIPT_DIR"/patches/* 2>/dev/null | cut -c1-64)")
+    "$(sha256sum "$SCRIPT_DIR/install-ffmpeg.sh" "$PATCH_DIR"/* 2>/dev/null | cut -c1-64)")
 if ! step_done ffmpeg "$FFMPEG_KEY" "$BIN_DIR/ffmpeg"; then
     PATH="$BUILD_PATH" PKG_CONFIG_PATH="$BUILD_DIR/lib/pkgconfig:$PKG_CONFIG_PATH" "${CONFIGURE_CMD[@]}"
     PATH="$BUILD_PATH" make -j "$NPROC"

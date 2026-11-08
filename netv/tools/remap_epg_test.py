@@ -10,7 +10,7 @@ import time
 import pytest
 
 from netv import cache
-from tools import remap_epg
+from netv.tools import remap_epg
 
 
 @pytest.fixture(autouse=True)

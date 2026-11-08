@@ -2,7 +2,7 @@
 # ruff: noqa: EXE003, D300, D205, T201 -- Polyglot shell/Python script.
 # fmt: off
 '''' 2>/dev/null #
-exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P -m netv.tools.debug_remap "$@"
 
 Debug remap scoring for one channel.
 
@@ -10,7 +10,7 @@ Prints the query variants remap_epg.py builds for a channel and the
 highest-scoring guide candidates, scored exactly as remap_epg.py scores them.
 
 Usage:
-    ./tools/debug_remap.py --cache-dir ~/netv/cache "US| SYFY HD" Syfy.us
+    python -m netv.tools.debug_remap --cache-dir ~/netv/cache "US| SYFY HD" Syfy.us
 '''
 # fmt: on
 
@@ -22,7 +22,7 @@ import argparse
 import pathlib
 
 from netv import cache
-from tools import remap_epg
+from netv.tools import remap_epg
 
 
 def main() -> int:

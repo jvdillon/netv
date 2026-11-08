@@ -2,14 +2,19 @@
 # ruff: noqa: EXE003, D300, D205, T201 -- Polyglot shell/Python script.
 # fmt: off
 '''' 2>/dev/null #
-exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P -m netv.upscale.benchmark_nomos "$@"
+
 Benchmark the fixed 1080p NomosUni TensorRT engine.
+
+Usage:
+    python -m netv.upscale.benchmark_nomos --sample clip-1080p.mp4
 '''
 # fmt: on
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Final, Protocol, TypedDict, cast
 
@@ -24,7 +29,7 @@ from treekle import json_loads
 
 _CWD: Final = Path(__file__).resolve().parent
 
-ROOT = _CWD.parent
+ROOT = _CWD.parents[1]
 
 
 def find_binary(name: str) -> Path:
@@ -76,8 +81,7 @@ def probe_sample(ffprobe: Path, sample: Path) -> tuple[float, float]:
         raise RuntimeError(
             f"Benchmark sample must be 1920x1080, got {stream['width']}x{stream['height']}",
         )
-    numerator, denominator = stream["avg_frame_rate"].split("/", 1)
-    return float(payload["format"]["duration"]), float(numerator) / float(denominator)
+    return float(payload["format"]["duration"]), float(Fraction(stream["avg_frame_rate"]))
 
 
 def ffmpeg_command(
@@ -184,7 +188,10 @@ def run_once(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n", 2)[2] if __doc__ else None)
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n", 2)[2] if __doc__ else None,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     _add_arguments(parser)
     flags = cast(Flags, parser.parse_args())
 

@@ -88,8 +88,8 @@ RUN ln -fs /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 RUN apt-get update && apt-get install -y sudo
 
 # Copy build script and patches
-COPY tools/install-ffmpeg.sh /tmp/
-COPY tools/patches /tmp/patches
+COPY scripts/install-ffmpeg.sh /tmp/scripts/
+COPY docker/patches /tmp/docker/patches
 
 # Run the build script
 # Extract CUDA version from NVIDIA arg (e.g., "cuda:13.0" -> "13.0")
@@ -100,10 +100,10 @@ RUN echo "BUILD_ARGS: NVIDIA=${NVIDIA} FFMPEG_VERSION=${FFMPEG_VERSION} NVCC_GEN
     BUILD_LIBAOM=${BUILD_LIBAOM} BUILD_LIBWEBP=${BUILD_LIBWEBP} BUILD_LIBVPL=${BUILD_LIBVPL} \
     BUILD_LIBDAV1D=${BUILD_LIBDAV1D} BUILD_LIBSVTAV1=${BUILD_LIBSVTAV1} BUILD_LIBVMAF=${BUILD_LIBVMAF} \
     BUILD_LIBVA=${BUILD_LIBVA} BUILD_LIBJXL=${BUILD_LIBJXL} BUILD_LIBX264=${BUILD_LIBX264}" && \
-    chmod +x /tmp/install-ffmpeg.sh && \
+    chmod +x /tmp/scripts/install-ffmpeg.sh && \
     CUDA_VERSION="${NVIDIA#cuda:}" && \
     export CUDA_VERSION && \
-    /tmp/install-ffmpeg.sh
+    /tmp/scripts/install-ffmpeg.sh
 
 # Derive the runtime package list from what the binaries actually link, so the
 # runtime stage works on any Ubuntu release without hand-maintained package names

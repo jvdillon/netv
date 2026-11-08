@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from importlib import util
 from pathlib import Path
-from types import ModuleType
-from typing import Final
 
 import argparse
 import json
@@ -16,28 +13,14 @@ import subprocess
 import sys
 import time
 
+from treekle import ReadError
+
 import pytest
 
+from netv.upscale import benchmark_nomos as bench
 
-_CWD: Final = Path(__file__).resolve().parent
 
-SCRIPT = _CWD / "benchmark-nomos.py"
 ENGINE_NAME = "2x-nomosuni-compact_1080p_fp16.engine"
-
-
-def _load() -> ModuleType:
-    # Name it by its path, as mutation testing keys each function by module path.
-    spec = util.spec_from_file_location("tools.benchmark-nomos", SCRIPT)
-    assert spec is not None
-    assert spec.loader is not None
-    module = util.module_from_spec(spec)
-    # Dataclasses resolves string annotations through sys.modules.
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-bench = _load()
 
 
 def _probe_stdout(width: int = 1920, height: int = 1080) -> str:
@@ -156,9 +139,8 @@ def test_result_rates() -> None:
     assert result.throughput_fps == 72.0
 
 
-def test_probe_sample(monkeypatch: pytest.MonkeyPatch) -> None:
+def _fake_probe(monkeypatch: pytest.MonkeyPatch, stdout: str) -> list[list[str]]:
     calls: list[list[str]] = []
-    stdout = _probe_stdout()
 
     def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         assert kwargs == {"capture_output": True, "text": True, "check": True}
@@ -166,14 +148,72 @@ def test_probe_sample(monkeypatch: pytest.MonkeyPatch) -> None:
         return subprocess.CompletedProcess(command, 0, stdout=stdout)
 
     monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
+def test_probe_sample(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _fake_probe(monkeypatch, _probe_stdout())
     duration, fps = bench.probe_sample(Path("/p/ffprobe"), Path("clip.mp4"))
     assert duration == 30.0
-    assert fps == pytest.approx(29.97, abs=1e-3)
-    assert calls[0][0] == "/p/ffprobe"
-    assert calls[0][-1] == "clip.mp4"
+    assert fps == 30_000 / 1001
+    assert calls == [
+        [
+            "/p/ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "format=duration:stream=avg_frame_rate,width,height",
+            "-of",
+            "json",
+            "clip.mp4",
+        ],
+    ]
 
-    stdout = _probe_stdout(1280, 720)
+
+@pytest.mark.parametrize(
+    ("rate", "fps"),
+    [("25/1", 25.0), ("24000/1001", 24_000 / 1001), ("30", 30.0)],
+)
+def test_probe_sample_parses_frame_rate(
+    monkeypatch: pytest.MonkeyPatch,
+    rate: str,
+    fps: float,
+) -> None:
+    stdout = json.dumps(
+        {
+            "streams": [{"width": 1920, "height": 1080, "avg_frame_rate": rate}],
+            "format": {"duration": "12.5"},
+        },
+    )
+    _fake_probe(monkeypatch, stdout)
+    assert bench.probe_sample(Path("ffprobe"), Path("clip.mp4")) == (12.5, fps)
+
+
+def test_probe_sample_rejects_other_resolutions(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_probe(monkeypatch, _probe_stdout(1280, 720))
     with pytest.raises(RuntimeError, match="must be 1920x1080, got 1280x720"):
+        bench.probe_sample(Path("ffprobe"), Path("clip.mp4"))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "streams": [{"width": "1920", "height": 1080, "avg_frame_rate": "25/1"}],
+            "format": {"duration": "1"},
+        },
+        {"streams": [{"width": 1920, "height": 1080}], "format": {"duration": "1"}},
+        {"streams": [{"width": 1920, "height": 1080, "avg_frame_rate": "25/1"}]},
+    ],
+)
+def test_probe_sample_rejects_malformed_output(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, object],
+) -> None:
+    _fake_probe(monkeypatch, json.dumps(payload))
+    with pytest.raises(ReadError):
         bench.probe_sample(Path("ffprobe"), Path("clip.mp4"))
 
 
@@ -296,10 +336,11 @@ def test_script_entrypoint(
     monkeypatch.setattr(
         sys,
         "argv",
-        [str(SCRIPT), "--sample", str(sample), "--model-dir", str(tmp_path)],
+        ["benchmark_nomos", "--sample", str(sample), "--model-dir", str(tmp_path)],
     )
+    monkeypatch.delitem(sys.modules, "netv.upscale.benchmark_nomos")
     with pytest.raises(SystemExit) as exc:
-        runpy.run_path(str(SCRIPT), run_name="__main__")
+        runpy.run_module("netv.upscale.benchmark_nomos", run_name="__main__")
     assert exc.value.code == 0
     assert "Target: >= 60.000 FPS end-to-end" in capsys.readouterr().out
 

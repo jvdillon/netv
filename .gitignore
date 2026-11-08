@@ -21,6 +21,7 @@ cache/
 **/*.gz
 **/*.json
 **/*.m3u
+!assets/example.m3u
 **/*.xml
 tools/.zap2xml/
 

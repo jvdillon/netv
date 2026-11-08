@@ -9,7 +9,8 @@ on:
     branches: [main]
     paths:
       - "docker/Dockerfile.ffmpeg"
-      - "tools/install-ffmpeg.sh"
+      - "scripts/install-ffmpeg.sh"
+      - "docker/patches/**"
       - ".github/workflows/ffmpeg-base.yml"
   workflow_dispatch:
     inputs:

@@ -33,10 +33,10 @@ run_python() {
     "${PYTHON_CMD[@]}" "$@"
 }
 
-# Validate export-tensorrt.py exists
-EXPORT_SCRIPT="$SCRIPT_DIR/export-tensorrt.py"
+# Validate the packaged exporter exists
+EXPORT_SCRIPT="$PROJECT_DIR/netv/upscale/export_tensorrt.py"
 if [ ! -f "$EXPORT_SCRIPT" ]; then
-    echo "ERROR: export-tensorrt.py not found at $EXPORT_SCRIPT" >&2
+    echo "ERROR: export_tensorrt.py not found at $EXPORT_SCRIPT" >&2
     exit 1
 fi
 
@@ -48,7 +48,7 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     echo ""
     echo "Environment:"
     echo "  MODEL_DIR   Output directory (default: \$HOME/ffmpeg_build/models)"
-    run_python "$EXPORT_SCRIPT" --list
+    run_python -m netv.upscale.export_tensorrt --list
     exit 0
 fi
 
@@ -119,7 +119,7 @@ for res in $RESOLUTIONS; do
     else
         echo "  ${res}p: building..."
         # Capture output to show errors if build fails
-        if ! OUTPUT=$(run_python "$EXPORT_SCRIPT" \
+        if ! OUTPUT=$(run_python -m netv.upscale.export_tensorrt \
             --precision "$PRECISION" \
             --min-height "$res" --opt-height "$res" --max-height "$res" \
             -o "$engine" 2>&1); then

@@ -699,20 +699,20 @@ For peak FFMPEG performance and auto-start:
 
 ```bash
 # 1. Install prerequisites (uv, Python)
-./tools/install-prereqs.sh
+./scripts/install-prereqs.sh
 
 # 2. (Optional) Get HTTPS certificates (not required for Chromecast)
-./tools/install-letsencrypt.sh yourdomain.com
+./scripts/install-letsencrypt.sh yourdomain.com
 
 # 3. (Optional) Build FFmpeg (required for optimal Nvidia encoding efficiency)
-./tools/install-ffmpeg.sh
+./scripts/install-ffmpeg.sh
 
 # 4. (Optional) Build AI Upscale engines (requires Nvidia GPU + TensorRT)
 uv sync --group ai_upscale
-./tools/install-ai_upscale.sh
+./scripts/install-ai_upscale.sh
 
 # 5. Install systemd service
-sudo ./tools/install-netv.sh # default port=8000 or --port 9000
+sudo ./scripts/install-netv.sh # default port=8000 or --port 9000
 ```
 
 The default installer builds Nomos engines for SD, 720p, and 1080p input.
@@ -740,7 +740,7 @@ sudo systemctl status netv       # Check status
 sudo systemctl restart netv      # Restart after updates
 journalctl -u netv -f            # View logs
 sudo systemctl edit netv --full  # Change port or other settings
-sudo ./tools/uninstall-netv.sh   # Uninstall
+sudo ./scripts/uninstall-netv.sh   # Uninstall
 ```
 
 ### Development/Testing
@@ -801,6 +801,18 @@ current directory unless told otherwise:
 - `zap2xml`: Scrape guide data into XML (I `crontab` this at 5am daily).
 - `alignm3u`: Useful for reworking your HDHomeRun m3u to align with guide.
 - `xtream2m3u`: Dump xtream to m3u, useful for making Emby work with IPTV.
+
+For persistent source-checkout files, use `.cache/tools` explicitly with
+`zap2xml --path` or `xtream2m3u --dir`; the defaults remain the current directory:
+
+```bash
+mkdir -p .cache/tools
+uv run python -m netv.tools.zap2xml --zip 90210 --path .cache/tools
+uv run python -m netv.tools.xtream2m3u --dir .cache/tools
+```
+
+On its first run, `xtream2m3u` creates `.cache/tools/xtream.json` for your
+provider settings. Edit it, then rerun the command.
 
 ## Troubleshooting
 
@@ -870,16 +882,20 @@ packaged commands to fetch guide data and align it:
 
 ```bash
 # 1. Get your HDHomeRun lineup (replace IP with your device's IP)
-wget http://192.168.1.87/lineup.m3u -O tools/lineup.m3u
+mkdir -p .cache/tools
+wget http://192.168.1.87/lineup.m3u -O .cache/tools/lineup.m3u
 
 # 2. Fetch TV guide data for your area
-uv run python -m netv.tools.zap2xml --zip 90210 --path tools
+uv run python -m netv.tools.zap2xml --zip 90210 --path .cache/tools
 
 # 3. Align the M3U with the guide (adds tvg-id for EPG matching)
-uv run python -m netv.tools.alignm3u --input tools/lineup.m3u --xmltv tools/xmltv.xml --output tools/ota.m3u
+uv run python -m netv.tools.alignm3u --input .cache/tools/lineup.m3u --xmltv .cache/tools/xmltv.xml --output .cache/tools/ota.m3u
 ```
 
-Then add `tools/ota.m3u` as an M3U source in neTV settings.
+See the [example HDHomeRun playlist](assets/example.m3u) for guide IDs and
+channel groups. Replace its tuner and XMLTV addresses with your own.
+
+Then add `.cache/tools/ota.m3u` as an M3U source in neTV settings.
 
 And set up a cron job to refresh the guide daily (e.g.,
 `0 5 * * *  /path/to/netv/.venv/bin/python -m netv.tools.zap2xml --zip 90210 --path /var/www/html`).

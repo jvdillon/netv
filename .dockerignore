@@ -16,12 +16,11 @@ cache/
 settings.json
 *.pem
 
-# Tools (not needed in container, except specific scripts)
+# Local data and scripts not needed in the images
 tools/
-!tools/install-ffmpeg.sh
-!tools/patches/
-!tools/install-ai_upscale.sh
-!tools/export-tensorrt.py
+scripts/*
+!scripts/install-ffmpeg.sh
+!scripts/install-ai_upscale.sh
 
 # Tests
 *_test.py
@@ -36,6 +35,7 @@ LICENSE
 
 # Docker
 docker/Dockerfile*
+!docker/patches/
 docker/compose*.yml
 docker-compose.yml
 .dockerignore

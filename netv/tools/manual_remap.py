@@ -2,12 +2,12 @@
 # ruff: noqa: EXE003, D300, D205, T201 -- Polyglot shell/Python script.
 # fmt: off
 '''' 2>/dev/null #
-exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P -m netv.tools.manual_remap "$@"
 
 Verify manual remap targets have upcoming data, then apply them.
 
 Usage:
-    ./tools/manual_remap.py --cache-dir ~/netv/cache [--apply]
+    python -m netv.tools.manual_remap --cache-dir ~/netv/cache [--apply]
 '''
 # fmt: on
 

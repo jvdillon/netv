@@ -207,26 +207,32 @@ def test_get_cached_paths(
     with pytest.raises(ValueError, match="must start with 'http:' or 'https:'"):
         zap2xml.get_cached(tmp_path, 6, 3, "ftp://x")
 
-    def urlopen(req: request.Request) -> FakeResponse:
-        code = int(req.full_url.rsplit("/", 1)[1])
-        if code == 200:
-            return FakeResponse(b"fresh")
-        raise error.HTTPError(req.full_url, code, "err", message.Message(), None)
+    with (
+        error.HTTPError("https://x/400", 400, "err", message.Message(), None) as bad_request,
+        error.HTTPError("https://x/500", 500, "err", message.Message(), None) as server_error,
+    ):
 
-    monkeypatch.setattr(request, "urlopen", urlopen)
-    assert zap2xml.get_cached(tmp_path, 7, 3, "http://x/200") == b"fresh"
-    with gzip.open(tmp_path / "7.json.gz", "rb") as f:
-        assert f.read() == b"fresh"
+        def urlopen(req: request.Request) -> FakeResponse:
+            code = int(req.full_url.rsplit("/", 1)[1])
+            if code == 200:
+                return FakeResponse(b"fresh")
+            raise {400: bad_request, 500: server_error}[code]
 
-    result = zap2xml.get_cached(tmp_path, 8, 4, "https://x/400")
-    assert json.loads(result)["channels"] == []
-    assert "Got a 400 error! Ignoring it." in capsys.readouterr().out
-    assert no_sleep == [3, 4]
+        monkeypatch.setattr(request, "urlopen", urlopen)
+        assert zap2xml.get_cached(tmp_path, 7, 3, "http://x/200") == b"fresh"
+        with gzip.open(tmp_path / "7.json.gz", "rb") as f:
+            assert f.read() == b"fresh"
 
-    with pytest.raises(error.HTTPError) as exc:
-        zap2xml.get_cached(tmp_path, 9, 3, "https://x/500")
-    assert exc.value.__notes__ == ['Url is "https://x/500".']
-    assert not (tmp_path / "9.json.gz").exists()
+        result = zap2xml.get_cached(tmp_path, 8, 4, "https://x/400")
+        assert json.loads(result)["channels"] == []
+        assert bad_request.closed
+        assert "Got a 400 error! Ignoring it." in capsys.readouterr().out
+        assert no_sleep == [3, 4]
+
+        with pytest.raises(error.HTTPError) as exc:
+            zap2xml.get_cached(tmp_path, 9, 3, "https://x/500")
+        assert exc.value.__notes__ == ['Url is "https://x/500".']
+        assert not (tmp_path / "9.json.gz").exists()
 
 
 def test_remove_stale_cache(tmp_path: pathlib.Path) -> None:

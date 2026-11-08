@@ -2,7 +2,7 @@
 # ruff: noqa: EXE003, D300, D205, T201 -- Polyglot shell/Python script.
 # fmt: off
 '''' 2>/dev/null #
-exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P -m netv.tools.remap_epg "$@"
 
 Remap playlist channel guide IDs to the EPG database.
 
@@ -14,13 +14,13 @@ to the best name-matched EPG channel that has upcoming listings.
 
 Usage:
     # Preview proposed remaps (dry-run, default):
-    python tools/remap_epg.py --cache-dir ~/netv/cache
+    python -m netv.tools.remap_epg --cache-dir ~/netv/cache
 
     # Write changes (backs up playlists.json first):
-    python tools/remap_epg.py --cache-dir ~/netv/cache --apply
+    python -m netv.tools.remap_epg --cache-dir ~/netv/cache --apply
 
     # Only remap channels whose current ID is broken; leave empty ones alone:
-    python tools/remap_epg.py --cache-dir ~/netv/cache --skip-unmapped
+    python -m netv.tools.remap_epg --cache-dir ~/netv/cache --skip-unmapped
 '''
 # fmt: on
 

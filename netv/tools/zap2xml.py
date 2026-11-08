@@ -196,8 +196,9 @@ def get_cached(
         if e.code != 400:
             e.add_note(f'Url is "{url}".')
             raise
-        print("Got a 400 error! Ignoring it.")
-        result = b'{"note": "Got a 400 error at this time, skipping.","channels": []}'
+        with e:
+            print("Got a 400 error! Ignoring it.")
+            result = b'{"note": "Got a 400 error at this time, skipping.","channels": []}'
     with gzip.open(cache_path, "wb") as f:
         f.write(result)
     time.sleep(delay)

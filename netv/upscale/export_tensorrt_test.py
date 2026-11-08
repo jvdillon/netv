@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from importlib import util
+from importlib import import_module
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any, Final, cast, override
+from typing import Any, cast, override
 from urllib import request
 
 import argparse
@@ -16,9 +16,6 @@ import sys
 import pytest
 
 
-_CWD: Final = Path(__file__).resolve().parent
-
-SCRIPT = _CWD / "export-tensorrt.py"
 CHECKPOINT = "2xNomosUni_compact_otf_medium.safetensors"
 
 
@@ -236,14 +233,8 @@ def fakes(monkeypatch: pytest.MonkeyPatch, rec: Recorder) -> dict[str, ModuleTyp
 @pytest.fixture
 def exp(fakes: dict[str, ModuleType], monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     del fakes
-    # Name it by its path, as mutation testing keys each function by module path.
-    spec = util.spec_from_file_location("tools.export-tensorrt", SCRIPT)
-    assert spec is not None
-    assert spec.loader is not None
-    module = util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
-    return module
+    monkeypatch.delitem(sys.modules, "netv.upscale.export_tensorrt", raising=False)
+    return import_module("netv.upscale.export_tensorrt")
 
 
 class FakeResponse:
@@ -654,9 +645,10 @@ def test_script_entrypoint(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     del fakes
-    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--list"])
+    monkeypatch.setattr(sys, "argv", ["export_tensorrt", "--list"])
+    monkeypatch.delitem(sys.modules, "netv.upscale.export_tensorrt", raising=False)
     with pytest.raises(SystemExit) as exc:
-        runpy.run_path(str(SCRIPT), run_name="__main__")
+        runpy.run_module("netv.upscale.export_tensorrt", run_name="__main__")
     assert exc.value.code == 0
     assert "Supported model" in capsys.readouterr().out
 

@@ -182,7 +182,7 @@ runtime-evaluated-decorators = ["dataclasses.dataclass", "mcp.server.MCPServer.t
 [tool.basedpyright]
 typeCheckingMode = "standard"
 pythonVersion = "3.12"
-exclude = ["tools/", ".venv/"]  # Optional scripts + virtual env
+exclude = [".venv/"]
 extraPaths = ["typings", ".venv/share/rekursiv-ai-typings"]
 failOnWarnings = true
 ignore = ["**/.venv/", "**/.venv-ci312/", "**/node_modules/", "*.egg-info/", "**/*.ipynb", ".pytest_cache/", "build/", "dist/", "**/third_party/", "**/typings/"]

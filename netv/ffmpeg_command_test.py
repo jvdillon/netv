@@ -1450,6 +1450,54 @@ def test_probe_audio_reads_local_surround_segment(tmp_path: Path):
     assert probe_audio(str(tmp_path / "missing.ts")) is None
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"streams": [{"codec_name": "MPEG2VIDEO"}]}, "mpeg2video"),
+        ({"streams": [{}]}, ""),
+        ({"streams": []}, ""),
+        ({}, ""),
+    ],
+)
+def test_probe_video_codec_parses_streams(payload: dict[str, object], expected: str):
+    result = subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(payload))
+    with patch("netv.ffmpeg_command.subprocess.run", return_value=result) as run:
+        assert probe_video_codec("input.ts") == expected
+    run.assert_called_once_with(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "json",
+            "input.ts",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("unavailable"), subprocess.TimeoutExpired("ffprobe", 5)],
+)
+def test_probe_video_codec_handles_process_errors(failure: Exception):
+    with patch("netv.ffmpeg_command.subprocess.run", side_effect=failure):
+        assert probe_video_codec("input.ts") == ""
+
+
+def test_probe_video_codec_handles_invalid_json():
+    result = subprocess.CompletedProcess(args=[], returncode=0, stdout="not json")
+    with patch("netv.ffmpeg_command.subprocess.run", return_value=result):
+        assert probe_video_codec("input.ts") == ""
+
+
 @pytest.mark.skipif(__import__("shutil").which("ffmpeg") is None, reason="ffmpeg not installed")
 def test_probe_video_codec_reads_local_segment(tmp_path: Path):
 

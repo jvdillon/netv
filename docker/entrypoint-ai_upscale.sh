@@ -77,7 +77,7 @@ if [ "$NEEDS_MODEL_BUILD" = "true" ]; then
     echo "This only happens once (cached in /models volume)."
     echo ""
     # Run as netv user so files have correct ownership
-    if ! gosu netv env MODEL_DIR=/models /app/tools/install-ai_upscale.sh; then
+    if ! gosu netv env MODEL_DIR=/models /app/scripts/install-ai_upscale.sh; then
         echo "ERROR: Failed to build TensorRT engines"
         echo "Check GPU compatibility and CUDA installation"
         exit 1

@@ -19,8 +19,8 @@
  * DNN TensorRT backend implementation.
  *
  * This backend loads pre-compiled TensorRT engine files (.engine) for
- * high-performance GPU inference. Use tools/export-tensorrt.py to convert
- * PyTorch models to TensorRT engines.
+ * high-performance GPU inference. Use python -m netv.upscale.export_tensorrt
+ * to convert PyTorch models to TensorRT engines.
  *
  * All libraries are loaded at runtime via dlopen - no CUDA or TensorRT
  * dependency at ffmpeg load time. Errors only occur when the TRT backend

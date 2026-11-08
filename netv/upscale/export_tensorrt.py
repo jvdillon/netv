@@ -2,7 +2,8 @@
 # ruff: noqa: EXE003, D300, D205, T201 -- Polyglot shell/Python script.
 # fmt: off
 '''' 2>/dev/null #
-exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P -m netv.upscale.export_tensorrt "$@"
+
 Export the NomosUni upscaler to TensorRT for FFmpeg dnn_processing.
 
 This script converts the 2x NomosUni model to TensorRT engines (.engine files)
@@ -10,14 +11,14 @@ that can be loaded by FFmpeg's TensorRT DNN backend.
 
 Usage:
     # Show the supported model
-    python export-tensorrt.py --list
+    python -m netv.upscale.export_tensorrt --list
 
     # Export a fixed 1080p engine
-    python export-tensorrt.py --min-height 1080 --opt-height 1080 \\
+    python -m netv.upscale.export_tensorrt --min-height 1080 --opt-height 1080 \\
         --max-height 1080 -o model.engine
 
     # Export with custom height range
-    python export-tensorrt.py --min-height 720 --max-height 1080
+    python -m netv.upscale.export_tensorrt --min-height 720 --max-height 1080
 
 Requirements:
     pip install torch onnx onnxconverter-common safetensors

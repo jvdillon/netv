@@ -67,11 +67,11 @@ WORKDIR /app
 # Copy application files with verification
 COPY pyproject.toml README.md ./
 COPY netv/ netv/
-COPY tools/ tools/
+COPY scripts/ scripts/
 
 # Verify critical files exist
 RUN test -f pyproject.toml || { echo "ERROR: pyproject.toml not found"; exit 1; } && \
-    test -f tools/export-tensorrt.py || { echo "ERROR: export-tensorrt.py not found"; exit 1; }
+    test -f netv/upscale/export_tensorrt.py || { echo "ERROR: export_tensorrt.py not found"; exit 1; }
 
 # Install Python dependencies with minimum version constraints for compatibility.
 # torch only exports the model to ONNX, on the CPU, so it is the CPU build: no CUDA
