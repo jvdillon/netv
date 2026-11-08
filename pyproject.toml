@@ -84,7 +84,7 @@ pre-commit = [
     {include-group = "test"},
     {include-group = "typecheck"},
     "basedpyright>=1.40.2",
-    "codedoctor[coverage,mutation,notebook]>=0.1.4",
+    "codedoctor[coverage,mutation]>=0.1.5",
     "codespell>=2.4.3",
     "onnx>=1.23.2",
     "onnxconverter-common>=1.16.0",
@@ -95,7 +95,7 @@ pre-commit = [
     "pytest-testmon>=2.3.0",
     "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.8.0",
-    "rekursiv-ai-typings>=0.1.16",
+    "rekursiv-ai-typings>=0.1.18",
     "ruff>=0.17.4",
     # netv.upscale imports these; type checkers need their sources, not just stubs.
     "safetensors>=0.4",
@@ -302,7 +302,7 @@ timeout = 60
 [tool.coverage-floor]
 floor = ["=100"]
 
-[tool.houselint]
+[tool.codedoctor.lint]
 select = "ALL"
 fix = "ALL"
 set = ["userdirs-namespace.namespace=netv"]
@@ -442,7 +442,7 @@ no-access = "ignore"
 missing-super-call = "ignore"
 unused-call-result = "ignore"
 
-[tool.codedoctor.managed.houselint]
+[tool.codedoctor.managed.codedoctor.lint]
 select = "ALL"
 fix = "ALL"
 exclude = ["*_test.py test_*.py **/tests/test*.py =\n    args-section assert cache-kwarg def-order final-inline globals\n    lazy-import-cost mkdir-mode module-side-effects nested-def returns-named\n    returns-section single-use-helper tempfile-prefix tensor-value-guard\n    tmp-literal xdg-literal", "conftest.py =\n    args-section def-order lazy-import-cost module-side-effects returns-section"]

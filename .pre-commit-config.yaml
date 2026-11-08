@@ -40,7 +40,7 @@ repos:
     stages:
     - pre-commit
     language: system
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.yamlcheck
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor yamlcheck
   - id: check-toml
     name: check-toml
     stages:
@@ -65,8 +65,8 @@ repos:
     files: ^(pyproject\.toml|uv\.lock)$
 - repo: local
   hooks:
-  - id: houselint
-    name: houselint
+  - id: codedoctor-lint
+    name: codedoctor lint
     language: system
     stages:
     - pre-commit
@@ -74,7 +74,7 @@ repos:
     types_or:
     - python
     - jupyter
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.lint
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor lint
   - id: codespell
     name: codespell
     language: system
@@ -137,7 +137,7 @@ repos:
     types:
     - python
     pass_filenames: false
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.affected.codegraph_sync
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor codegraph-sync
       --caches /opt/scratch/caches/codegraph
   - id: ty-check-spool
     name: ty-check-spool
@@ -149,7 +149,7 @@ repos:
     types_or:
     - python
     - pyi
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor gate spool
       ty-check
   - id: ty-check
     name: ty-check
@@ -163,7 +163,7 @@ repos:
     types_or:
     - python
     - pyi
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.typecheck
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor typecheck
       ty-check
     args:
     - --dependents
@@ -178,7 +178,7 @@ repos:
     types_or:
     - python
     - pyi
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor gate spool
       pyrefly-check
   - id: pyrefly-check
     name: pyrefly-check
@@ -192,7 +192,7 @@ repos:
     types_or:
     - python
     - pyi
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.typecheck
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor typecheck
       pyrefly-check
     args:
     - --dependents
@@ -209,7 +209,7 @@ repos:
     types_or:
     - python
     - pyi
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor gate spool
       basedpyright
     exclude: "(?x)^(\n  typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n\
       \  |(.*/)?third_party/\n  |website/rekursiv-ai\\.github\\.io/_site/\n)\n"
@@ -225,7 +225,7 @@ repos:
     - python
     - pyi
     entry: env NODE_OPTIONS=--max-old-space-size=2048 uv --quiet run --frozen --group
-      pre-commit python -m codedoctor.typecheck basedpyright
+      pre-commit python -m codedoctor typecheck basedpyright
     args:
     - --dependents
     - codedoctor.affected
@@ -242,7 +242,7 @@ repos:
     require_serial: true
     types:
     - python
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor gate spool
       pytest
   - id: pytest
     name: pytest
@@ -255,7 +255,7 @@ repos:
     alias: superseded-at-pre-push
     types:
     - python
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor testing
       pytest
     args:
     - --dependents
@@ -271,7 +271,7 @@ repos:
     - python
     exclude: "(?x)^(\n  typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n\
       \  |(.*/)?third_party/\n)\n"
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor gate spool
       mutation
   - id: mutation
     name: mutation
@@ -285,7 +285,7 @@ repos:
     - python
     exclude: "(?x)^(\n  typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n\
       \  |(.*/)?third_party/\n)\n"
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate run
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor gate run
       mutation -- codedoctor.mutation --function-sample-rate 0.05 --max-functions-sampled
       4 --timeout-sec 900 --explain --prefer-changed-in-pre-commit
   - id: coverage-floor-spool
@@ -297,7 +297,7 @@ repos:
     require_serial: true
     types:
     - python
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor gate spool
       coverage-floor
   - id: coverage-floor
     name: coverage-floor
@@ -309,7 +309,7 @@ repos:
     - python
     require_serial: true
     pass_filenames: false
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor testing
       coverage-floor
 - repo: local
   hooks:
@@ -329,7 +329,7 @@ repos:
     stages:
     - manual
     entry: env NODE_OPTIONS=--max-old-space-size=2048 uv --quiet run --frozen --group
-      pre-commit python -m codedoctor.gate threaded basedpyright-global -- basedpyright
+      pre-commit python -m codedoctor gate threaded basedpyright-global -- basedpyright
       --threads={workers}
   - id: pyrefly-check-global
     name: pyrefly-check-global
@@ -338,7 +338,7 @@ repos:
     pass_filenames: false
     stages:
     - pre-push
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate threaded
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor gate threaded
       pyrefly-check-global -- pyrefly check --threads={workers}
   - id: pytest-global
     name: pytest-global
@@ -348,7 +348,7 @@ repos:
     stages:
     - pre-push
     verbose: true
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor testing
       tier pytest-global
     args:
     - --plugin
@@ -361,7 +361,7 @@ repos:
     stages:
     - pre-push
     verbose: true
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor testing
       tier pytest-slow-global
     args:
     - --plugin
@@ -374,7 +374,7 @@ repos:
     stages:
     - pre-push
     verbose: true
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor testing
       tier pytest-ci-smoke-global
     args:
     - --plugin
@@ -387,35 +387,8 @@ repos:
     stages:
     - pre-push
     verbose: true
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor testing
       tier pytest-integration-global
     args:
     - --plugin
     - codedoctor.testing.listing
-- hooks:
-  - args:
-    - --drop-empty-cells
-    - --extra-keys
-    - cell.metadata.heading_collapsed metadata.accelerator metadata.colab metadata.interpreter
-      metadata.kernelspec metadata.language_info.version metadata.name metadata.nbconvert_exporter
-      metadata.version
-    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.nbstripout
-    exclude: "(?x)^(\n  typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n\
-      \  |(.*/)?third_party/\n)\n"
-    id: nbstripout
-    language: system
-    name: nbstripout
-    stages:
-    - pre-commit
-    types:
-    - jupyter
-  - entry: uv --quiet run --frozen --group pre-commit jupytext --sync --pre-commit-mode
-    exclude: "(?x)^(\n  typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n\
-      \  |(.*/)?third_party/\n)\n"
-    files: \.ipynb$
-    id: jupytext-sync
-    language: system
-    name: jupytext-sync
-    stages:
-    - pre-commit
-  repo: local
