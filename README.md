@@ -1,5 +1,10 @@
 # neTV
 
+[![PyPI version](https://img.shields.io/pypi/v/pynetv.svg)](https://pypi.org/project/pynetv/)
+[![CI](https://github.com/jvdillon/netv/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jvdillon/netv/actions/workflows/ci.yml)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 A fast, self-hosted IPTV experience for the web, Apple TV, iPhone, macOS,
 Chromecast, and Xtream-compatible players.
 
@@ -10,13 +15,45 @@ and optional real-time 4K AI upscaling — on desktop, tablet, mobile, and TV.
 
 ## Quick Start
 
+Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
+The server and gateway also require FFmpeg.
+
+### Web server
+
 ```bash
 uvx --from 'pynetv[server]' netv
 ```
 
 Open http://localhost:8000, create an admin account, and add your IPTV source.
-Requires [uv](https://docs.astral.sh/uv/) and FFmpeg. See
-[Installation](#installation) for additional details.
+
+### Native-player gateway
+
+```bash
+uvx --from 'pynetv[server]' netv-gateway
+```
+
+Uses the web server's configured sources and accounts; listens on port `8100`.
+
+### XMLTV guide: zap2xml
+
+```bash
+uvx --from pynetv zap2xml --help
+```
+
+### HDHomeRun playlist alignment: alignm3u
+
+```bash
+uvx --from pynetv alignm3u --help
+```
+
+### Xtream playlist export: xtream2m3u
+
+```bash
+uvx --from 'pynetv[xtream2m3u]' xtream2m3u --help
+```
+
+See [Installation](#installation) and [Additional Gems](#additional-gems)
+for details.
 
 ## Companion Apps
 
