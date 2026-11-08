@@ -102,7 +102,7 @@ def _upscale_settings(model_name: str = "2x-nomosuni-compact") -> dict[str, Any]
 async def _cleanup_upscale_sessions() -> None:
     while True:
         await asyncio.sleep(60)
-        await asyncio.to_thread(ffmpeg_session.cleanup_expired_sessions)
+        await ffmpeg_session.cleanup_expired_sessions()
 
 
 @asynccontextmanager
@@ -131,7 +131,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         cleanup_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await cleanup_task
-        ffmpeg_session.shutdown()
+        await ffmpeg_session.shutdown()
 
 
 app = FastAPI(

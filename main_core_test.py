@@ -122,7 +122,13 @@ def test_lifespan_runs_workers_and_shuts_down(fresh_cache: dict[str, Any]) -> No
         return None, None, "http://m/epg"
 
     xtream = MagicMock(epg_url="http://x/epg")
-    sweep = MagicMock(side_effect=RuntimeError("sweep failed"))
+
+    def sweep_then_fail(resolve, release):
+        del resolve
+        release("viewer", "http://x/1.m3u8")
+        raise RuntimeError("sweep failed")
+
+    sweep = MagicMock(side_effect=sweep_then_fail)
     with contextlib.ExitStack() as stack:
         stack.enter_context(
             patch("main.threading", SimpleNamespace(Thread=fake_thread, Event=RecordedEvent)),
@@ -145,8 +151,15 @@ def test_lifespan_runs_workers_and_shuts_down(fresh_cache: dict[str, Any]) -> No
         initialize = stack.enter_context(patch("main.cache.initialize"))
         command_init = stack.enter_context(patch("main.ffmpeg_command.init"))
         kill_orphans = stack.enter_context(patch("main._kill_orphaned_ffmpeg"))
-        cleanup_expired = stack.enter_context(patch("main.ffmpeg_session.cleanup_expired_sessions"))
-        session_shutdown = stack.enter_context(patch("main.ffmpeg_session.shutdown"))
+        cleanup_expired = stack.enter_context(
+            patch("main.ffmpeg_session.cleanup_expired_sessions", new_callable=AsyncMock),
+        )
+        session_shutdown = stack.enter_context(
+            patch("main.ffmpeg_session.shutdown", new_callable=AsyncMock),
+        )
+        release = stack.enter_context(
+            patch("main.ffmpeg_session.stop_user_stream", new_callable=AsyncMock),
+        )
         handoff_shutdown = stack.enter_context(patch("main.handoff.shutdown"))
         cast_close = stack.enter_context(patch("main.casting.manager.close"))
         preload_live = stack.enter_context(patch("main._preload_live"))
@@ -161,10 +174,11 @@ def test_lifespan_runs_workers_and_shuts_down(fresh_cache: dict[str, Any]) -> No
                 load_vod()
                 load_series()
                 cleanup_stop, scheduler_stop = events
+                # Worker loops run in threads and hand session work to the loop.
                 cleanup_stop.falses = 1
-                cleanup()
+                await asyncio.to_thread(cleanup)
                 cleanup_stop.falses = 1
-                handoff_loop()
+                await asyncio.to_thread(handoff_loop)
                 scheduler_stop.falses = 2
                 with patch("main.datetime", _Noon):
                     scheduler()
@@ -191,6 +205,7 @@ def test_lifespan_runs_workers_and_shuts_down(fresh_cache: dict[str, Any]) -> No
         assert fresh_cache["series"] == ["ss"]
         cleanup_expired.assert_called_once()
         sweep.assert_called_once()
+        release.assert_awaited_once_with("viewer", "http://x/1.m3u8")
         # Five due sources, triggered once each even though the loop ran twice.
         assert len(targets) == 6 + 5
         assert [c.args[0] for c in fetch_all.call_args_list] == [

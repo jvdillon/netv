@@ -17,7 +17,7 @@ Examples:
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Coroutine
 from concurrent import futures
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -75,7 +75,7 @@ from cache import (
     update_source_epg_url,
 )
 from epg import fetch_epg
-from fast_start import add_live_start_offset, dated_playlist
+from fast_start import add_live_start_offset
 from m3u import (
     fetch_m3u,
     fetch_source_live_data,
@@ -223,10 +223,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Periodic cleanup of expired sessions (VOD and live)
     cleanup_stop = threading.Event()
+    loop = asyncio.get_running_loop()
 
     def cleanup_loop():
         while not cleanup_stop.wait(60):  # Check every minute.
-            ffmpeg_session.cleanup_expired_sessions()
+            _run_on_loop(loop, ffmpeg_session.cleanup_expired_sessions())
 
     cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
     cleanup_thread.start()
@@ -235,7 +236,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     def handoff_loop():
         while not cleanup_stop.wait(15):
             try:
-                handoff.sweep(_handoff_channel, ffmpeg_session.stop_user_stream)
+                handoff.sweep(
+                    _handoff_channel,
+                    lambda username, url: _run_on_loop(
+                        loop,
+                        ffmpeg_session.stop_user_stream(username, url),
+                    ),
+                )
             except Exception:
                 log.exception("Handoff sweep failed")
 
@@ -299,8 +306,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     cleanup_stop.set()
     scheduler_stop.set()
     await asyncio.to_thread(casting.manager.close)
-    ffmpeg_session.shutdown()
+    await ffmpeg_session.shutdown()
     handoff.shutdown()
+
+
+def _run_on_loop(loop: asyncio.AbstractEventLoop, coroutine: Coroutine[Any, Any, None]) -> None:
+    """Run a session coroutine from a worker thread on the loop that owns its processes."""
+    asyncio.run_coroutine_threadsafe(coroutine, loop).result()
 
 
 def _kill_orphaned_ffmpeg() -> None:
@@ -1693,7 +1705,7 @@ async def transcode_start(
         audio_passthrough=audio_passthrough,
     )
     if fast_start and await request.is_disconnected():
-        ffmpeg_session.stop_session(result["session_id"], force=True)
+        await ffmpeg_session.stop_session(result["session_id"], force=True)
         raise HTTPException(499, "Playback request disconnected")
     return result
 
@@ -1772,21 +1784,9 @@ async def transcode_file(
     if filename.endswith(".m3u8"):
         content = file_path.read_text()
         if filename == "low.m3u8" and session.get("fast_start"):
-            if session.get("origin_pts") is not None:
-                content = dated_playlist(
-                    session["dir"],
-                    content,
-                    session["origin_pts"],
-                    session["origin_time"],
-                )
             content = add_live_start_offset(
-                content,
-                float(
-                    session.get(
-                        "playback_buffer_seconds",
-                        12.0,
-                    ),
-                ),
+                ffmpeg_session.dated_fast_playlist(session_id, content),
+                float(session.get("playback_buffer_seconds", 12.0)),
             )
         return Response(
             content=content,
@@ -1858,7 +1858,7 @@ async def transcode_stop(
     force = force or bool(session and session.get("is_archive"))
     if force and session and session.get("username") != user.get("sub", ""):
         raise HTTPException(404, "Session not found")
-    ffmpeg_session.stop_session(session_id, force=force)
+    await ffmpeg_session.stop_session(session_id, force=force)
     return {"status": "stopped"}
 
 
@@ -1888,7 +1888,7 @@ async def transcode_clear(
         raise HTTPException(409, "Stop casting before restarting this transcode.")
     session_id = ffmpeg_session.clear_url_session(url)
     if session_id:
-        ffmpeg_session.stop_session(session_id, force=True)
+        await ffmpeg_session.stop_session(session_id, force=True)
         log.info("Force-cleared transcode session %s for URL", session_id)
     return {"status": "cleared", "session_id": session_id}
 
@@ -2467,8 +2467,18 @@ def cast_start(
 
 
 @app.post("/api/cast/control")
-def cast_control(data: CastCommand, user: Annotated[dict, Depends(require_cast_auth)]):
-    return casting.manager.command(user.get("sub", ""), data.action, data.volume)
+async def cast_control(data: CastCommand, user: Annotated[dict, Depends(require_cast_auth)]):
+    loop = asyncio.get_running_loop()
+    return await asyncio.to_thread(
+        casting.manager.command,
+        user.get("sub", ""),
+        data.action,
+        data.volume,
+        release=lambda session_id: _run_on_loop(
+            loop,
+            ffmpeg_session.stop_session(session_id, force=True),
+        ),
+    )
 
 
 @app.get("/api/user-prefs")
@@ -2922,13 +2932,14 @@ async def handoff_stop_api(
     username = user.get("sub", "")
     if not await asyncio.to_thread(_handoff_stream_allowed, username, report.stream_id):
         raise HTTPException(404, "Stream not found")
+    loop = asyncio.get_running_loop()
     await asyncio.to_thread(
         handoff.stop_watch,
         username,
         report.stream_id,
         report.position,
         _handoff_channel,
-        ffmpeg_session.stop_user_stream,
+        lambda name, url: _run_on_loop(loop, ffmpeg_session.stop_user_stream(name, url)),
         report.handoff_id,
     )
     return {"status": "ok"}

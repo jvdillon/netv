@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypedDict
 from urllib import parse
 
@@ -23,6 +23,7 @@ import uuid
 from cache import get_user_agent
 from fast_start import (
     closed_caption_master_playlist,
+    dated_playlist,
     encoder_command,
     ingest_command,
     live_buffer_durations,
@@ -73,6 +74,7 @@ _transcode_sessions: dict[str, dict[str, Any]] = {}
 _url_to_session: dict[str, str] = {}  # URL -> session_id (all content types)
 _transcode_lock = threading.Lock()
 _background_tasks: set[asyncio.Task[None]] = set()
+_startup_guards: dict[str, _StartupGuard] = {}  # URL -> in-flight lookup-or-start.
 
 
 # ===========================================================================
@@ -137,8 +139,8 @@ def is_session_valid(
 # ===========================================================================
 
 
-def stop_session(session_id: str, force: bool = False) -> None:
-    """Stop a transcode session.
+async def stop_session(session_id: str, force: bool = False) -> None:
+    """Stop a transcode session once its processes have exited.
 
     Args:
         session_id: Session to stop.
@@ -149,46 +151,37 @@ def stop_session(session_id: str, force: bool = False) -> None:
         if not session:
             return
 
-        # Archive seeks open another upstream URL, so never retain their slot.
-        force = force or _is_archive_url(session.get("url", ""))
+        # Archive seeks open another upstream URL, and a fast-start session
+        # cannot resume once its pipeline stops, so neither keeps a cached slot.
+        force = force or session.get("fast_start", False) or _is_archive_url(session.get("url", ""))
         # Skip stop if session was accessed recently (race with seeking/resume,
         # or multiple users watching same stream)
         if not force and time.time() - session.get("last_access", 0) < 5.0:
             log.info("Ignoring stop for recently-accessed session %s", session_id)
             return
 
-        task = session.get("watchdog_task")
-        if task is not None and not task.done():
-            task.cancel()
-
-        if _kill_process(session["process"]):
-            log.info("Killed ffmpeg for session %s", session_id)
-        for proc in session.get("extra_processes", []):
-            _kill_process(proc)
-
+        processes = _retire_session(session)
         # Cache session if timeout > 0.
         is_vod = session.get("is_vod", False)
         cache_timeout = get_vod_cache_timeout() if is_vod else get_live_cache_timeout()
-        if not force and cache_timeout > 0:
+        cached = not force and cache_timeout > 0
+        if cached:
             session["last_access"] = time.time()
-            log.info(
-                "Session %s cached (vod=%s, ffmpeg stopped, segments kept)",
-                session_id,
-                is_vod,
-            )
-            return
+        else:
+            _transcode_sessions.pop(session_id, None)
+            url = session.get("url")
+            if url and _url_to_session.get(url) == session_id:
+                _url_to_session.pop(url, None)
 
-        _transcode_sessions.pop(session_id, None)
-        url = session.get("url")
-        if url and _url_to_session.get(url) == session_id:
-            _url_to_session.pop(url, None)
-        dir_to_remove = session["dir"]
-
-    shutil.rmtree(dir_to_remove, ignore_errors=True)
+    await _terminate_processes(processes)
+    if cached:
+        log.info("Session %s cached (vod=%s, ffmpeg stopped, segments kept)", session_id, is_vod)
+        return
+    await asyncio.to_thread(shutil.rmtree, session["dir"], ignore_errors=True)
     log.info("Stopped transcode session %s", session_id)
 
 
-def stop_user_stream(username: str, url: str) -> None:
+async def stop_user_stream(username: str, url: str) -> None:
     """Stop a user's sessions of a stream, freeing its upstream connection.
 
     Args:
@@ -202,10 +195,10 @@ def stop_user_stream(username: str, url: str) -> None:
             if s.get("username") == username and url in (s.get("url"), s.get("request_url"))
         ]
     for session_id in matches:
-        stop_session(session_id, force=True)
+        await stop_session(session_id, force=True)
 
 
-def cleanup_expired_sessions() -> None:
+async def cleanup_expired_sessions() -> None:
     """Clean up all expired sessions (VOD and live)."""
     with _transcode_lock:
         expired = [
@@ -214,22 +207,19 @@ def cleanup_expired_sessions() -> None:
             if not is_session_valid(session)
         ]
     for session_id in expired:
-        stop_session(session_id, force=True)
+        await stop_session(session_id, force=True)
 
 
-def shutdown() -> None:
-    """Kill all running ffmpeg processes for clean shutdown."""
+async def shutdown() -> None:
+    """Stop every ffmpeg process for a clean shutdown."""
     with _transcode_lock:
-        for session_id, session in list(_transcode_sessions.items()):
-            task = session.get("watchdog_task")
-            if task is not None and not task.done():
-                task.cancel()
-            for extra in session.get("extra_processes", []):
-                _kill_process(extra)
-            proc = session.get("process")
-            if proc and _kill_process(proc):
-                log.info("Shutdown: killed ffmpeg for session %s", session_id)
+        processes = [
+            process
+            for session in _transcode_sessions.values()
+            for process in _retire_session(session)
+        ]
         _transcode_sessions.clear()
+    await _terminate_processes(processes)
 
 
 # ===========================================================================
@@ -255,7 +245,7 @@ def get_source_sessions(source_id: str) -> list[tuple[str, dict[str, Any]]]:
     return sorted(sessions, key=lambda x: x[1].get("started", 0))
 
 
-def enforce_stream_limits(
+async def enforce_stream_limits(
     username: str,
     source_id: str | None,
     user_max: int,
@@ -288,7 +278,7 @@ def enforce_stream_limits(
                     username,
                     oldest_sid,
                 )
-                stop_session(oldest_sid, force=True)
+                await stop_session(oldest_sid, force=True)
             else:
                 return f"Source at capacity ({source_max} streams)"
 
@@ -303,7 +293,7 @@ def enforce_stream_limits(
                 user_max,
                 oldest_sid,
             )
-            stop_session(oldest_sid, force=True)
+            await stop_session(oldest_sid, force=True)
 
     return None
 
@@ -473,6 +463,29 @@ def get_caption_timestamp_origin(session_id: str) -> float | None:
         return float(session["caption_timestamp_origin"])
 
 
+def dated_fast_playlist(session_id: str, content: str) -> str:
+    """Add program dates to a fast-start playlist, dating each segment once.
+
+    Args:
+        session_id: Fast-start session whose clock dates the segments.
+        content: Text of the session's media playlist.
+
+    Returns:
+        playlist: Playlist with program dates, or ``content`` when the clock is unknown.
+    """
+    with _transcode_lock:
+        session = _transcode_sessions.get(session_id)
+        if session is None or session.get("origin_pts") is None:
+            return content
+        directory = session["dir"]
+        origin_pts, origin_time = session["origin_pts"], session["origin_time"]
+        dates = session.get("segment_dates", {})
+    content, dates = dated_playlist(directory, content, origin_pts, origin_time, dates)
+    with _transcode_lock:
+        session["segment_dates"] = dates
+    return content
+
+
 def add_webvtt_timestamp_map(content: str, origin_pts: float | None) -> str:
     if origin_pts is None or "X-TIMESTAMP-MAP=" in content:
         return content
@@ -564,128 +577,24 @@ async def start_transcode(
     """
     if bandwidth_saver and content_type != "live":
         raise fastapi.HTTPException(400, "Adaptive playback is only supported for live streams")
-    # Enforce stream limits.
-    if username:
-        error = enforce_stream_limits(username, source_id, user_max_streams, source_max_streams)
-        if error:
-            raise fastapi.HTTPException(status_code=429, detail=error)
-
-    # A quality change replaces the current stream; release its slot first.
-    existing_id, is_valid, old_seek_offset = _get_existing_session(url)
-    if _is_archive_url(url):
-        old_seek_offset = 0.0
-        existing = get_session(existing_id) if existing_id else None
-        if existing and existing.get("username") != username:
-            raise fastapi.HTTPException(409, "This archive is playing on another device.")
-    if bandwidth_saver and existing_id:
-        session = get_session(existing_id)
-        if session and session.get("username") != username:
-            raise fastapi.HTTPException(404, "Session not found")
-        stop_session(existing_id, force=True)
-        existing_id, is_valid, old_seek_offset = None, False, 0.0
-    if existing_id and not audio_passthrough:
-        session = get_session(existing_id)
-        if session and session.get("audio_passthrough"):
-            # This client cannot decode the session's Dolby audio.
-            if session.get("username") != username:
-                raise fastapi.HTTPException(409, "This stream is playing on another device.")
-            stop_session(existing_id, force=True)
-            existing_id, is_valid = None, False
-
-    is_vod = content_type in ("movie", "series")
-
-    # Try to reuse existing valid session.
-    if existing_id and is_valid:
-        existing = get_session(existing_id)
-        if existing and existing.get("fast_start"):
-            if existing.get("username") != username:
-                raise fastapi.HTTPException(404, "Session not found")
-            touch_session(existing_id)
-            return _adaptive_session_response(existing_id)
-        log.info("Found valid existing session %s (vod=%s)", existing_id, is_vod)
-        result = await _try_reuse_session(existing_id, url, is_vod, content_type)
-        if result:
-            return result
-
-    # Clean up any existing invalid session.
-    if existing_id:
-        log.info("Cleaning up invalid session %s", existing_id)
-        _cleanup_invalid_session(url, existing_id)
-
-    resolved: str | None = None
-    if (
-        fast_start
-        and content_type == "live"
-        and get_settings().get("max_resolution", "1080p") in ("1080p", "1440p", "4k")
-    ):
-        # A DVR request only needs server-side retention. When the source can
-        # be stream-copied, serve one remux session instead of the fast-start
-        # encoder pair; otherwise keep the adaptive transcode pipeline.
-        settings = get_settings()
-        remux = False
-        if (
-            not bandwidth_saver
-            and settings.get("live_dvr_mins", 0) > 0
-            and settings.get("probe_live", True)
-        ):
-            resolved = await asyncio.to_thread(resolve_hls_master_playlist, url)
-            media_info = (await asyncio.to_thread(probe_media, resolved))[0]
-            remux = can_remux_live(
-                media_info,
-                settings.get("max_resolution", "1080p"),
-                audio_passthrough=audio_passthrough,
-            )
-        if remux:
-            log.info(
-                "DVR live session uses a stream-copy remux instead of fast-start: %s",
-                redact_url_credentials(url),
-            )
-        else:
-            return await _start_fast_live(
-                url,
-                username,
-                source_id,
-                deinterlace_fallback,
-                bandwidth_saver=bandwidth_saver,
-                is_disconnected=is_disconnected,
-                audio_passthrough=audio_passthrough,
-            )
-
-    # Start fresh transcode (with retry for series probe cache staleness)
-    try:
-        return await _do_start_transcode(
+    # Until a start registers its session, a concurrent request for the URL
+    # would open a second upstream connection or reuse an unfinished startup.
+    async with _url_startup(url):
+        return await _start_or_reuse(
             url,
             content_type,
             series_id,
             episode_id,
-            old_seek_offset,
             series_name,
             deinterlace_fallback,
             username,
             source_id,
+            user_max_streams,
+            source_max_streams,
             bandwidth_saver,
-            audio_passthrough=audio_passthrough,
-            is_disconnected=is_disconnected,
-            resolved_url=resolved,
-        )
-    except fastapi.HTTPException:
-        if series_id is None:
-            raise
-        log.info("Transcode failed, clearing probe cache and retrying")
-        invalidate_series_probe_cache(series_id, episode_id)
-        return await _do_start_transcode(
-            url,
-            content_type,
-            series_id,
-            episode_id,
-            old_seek_offset,
-            series_name,
-            deinterlace_fallback,
-            username,
-            source_id,
-            bandwidth_saver,
-            audio_passthrough=audio_passthrough,
-            is_disconnected=is_disconnected,
+            fast_start,
+            is_disconnected,
+            audio_passthrough,
         )
 
 
@@ -815,9 +724,7 @@ async def seek_transcode(
         _regenerate_playlist(output_path, segment_num)
         return {"session_id": session_id, "playlist": f"/transcode/{session_id}/stream.m3u8"}
 
-    # Kill existing process.
-    if _kill_process(info.process):
-        log.info("Killed ffmpeg for seek in session %s", session_id)
+    await _terminate_process(info.process)
 
     # Clear playlist but keep segments (for backward seeks later)
     playlist_file = output_path / "stream.m3u8"
@@ -900,7 +807,7 @@ async def seek_transcode(
     process = await _launch_ffmpeg(cmd)
 
     if not _update_session_process(session_id, process, url=info.url, seek_time=seek_time):
-        _kill_process(process)
+        await _terminate_process(process)
         raise fastapi.HTTPException(404, "Session disappeared during seek")
 
     # Persist seek_offset.
@@ -1134,7 +1041,7 @@ async def _start_fast_live(
             session_id,
             time.monotonic() - startup_started,
         )
-        first_input = min(pathlib.Path(directory).glob("input_*.ts"))
+        first_input = _first_input_segment(directory)
         origin_pts = segment_pts(first_input)
         # The local segment reveals audio and caption metadata without re-reading upstream.
         audio, closed_captions, video_codec = await asyncio.gather(
@@ -1207,11 +1114,14 @@ async def _start_fast_live(
                 watchdog_task.cancel()
         return _adaptive_session_response(session_id)
     except BaseException:
-        for proc in processes:
-            _kill_process(proc)
-        stop_session(session_id, force=True)
-        shutil.rmtree(directory, ignore_errors=True)
+        await _terminate_processes(processes)
+        await stop_session(session_id, force=True)
+        await asyncio.to_thread(shutil.rmtree, directory, ignore_errors=True)
         raise
+
+
+def _first_input_segment(directory: str) -> pathlib.Path:
+    return min(pathlib.Path(directory).glob("input_*.ts"))
 
 
 def _is_archive_url(url: str) -> bool:
@@ -1235,30 +1145,50 @@ def _is_process_alive(proc: Any) -> bool:
     return getattr(proc, "returncode", 0) is None
 
 
-def _kill_process(proc: Any) -> bool:
-    """Kill process gracefully (SIGTERM then SIGKILL), return True if killed."""
-    try:
-        # Try graceful termination first (lets ffmpeg flush buffers)
-        proc.terminate()
-        # Give it a moment to exit cleanly.
-        for _ in range(10):  # 100ms total.
-            if proc.returncode is not None:
-                return True
-            time.sleep(0.01)
-        # Force kill if still running.
-        proc.kill()
-        return True
-    except (ProcessLookupError, OSError):
-        return False
-
-
 async def _launch_ffmpeg(cmd: list[str]) -> asyncio.subprocess.Process:
-    return await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
+    """Launch ffmpeg; a caller cancelled mid-launch still terminates the process."""
+    launch = asyncio.create_task(
+        asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        ),
     )
+    try:
+        return await asyncio.shield(launch)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            await _terminate_process(await launch)
+        raise
+
+
+async def _terminate_processes(processes: Sequence[Any]) -> None:
+    await asyncio.gather(*(_terminate_process(process) for process in processes))
+
+
+async def _terminate_process(process: Any) -> None:
+    """Stop a process with SIGTERM so ffmpeg can flush, then SIGKILL after 5 s."""
+    if not _is_process_alive(process):
+        return
+    try:
+        process.terminate()
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    # asyncio.TimeoutError is distinct from the builtin before Python 3.11.
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            process.kill()
+        with contextlib.suppress(Exception):
+            await process.wait()
+    except asyncio.CancelledError:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            process.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.shield(process.wait())
+        raise
 
 
 async def _monitor_ffmpeg_stderr(
@@ -1672,7 +1602,7 @@ async def _handle_existing_vod_session(
 
     # Case 2: Dead session with no segments - invalid.
     if not segments or _is_archive_url(url):
-        stop_session(existing_id, force=True)
+        await stop_session(existing_id, force=True)
         with _transcode_lock:
             _url_to_session.pop(url, None)
         return None
@@ -1722,7 +1652,7 @@ async def _handle_existing_vod_session(
 
     process = await _launch_ffmpeg(cmd)
     if not _update_session_process(existing_id, process):
-        _kill_process(process)
+        await _terminate_process(process)
         return None
 
     _spawn_background_task(_monitor_resume_ffmpeg(process, existing_id, url))
@@ -1776,11 +1706,11 @@ async def _try_reuse_session(
     return _build_session_response(existing_id, snap, playlist_path)
 
 
-def _cleanup_invalid_session(url: str, session_id: str) -> None:
+async def _cleanup_invalid_session(url: str, session_id: str) -> None:
     """Clean up an invalid/expired session."""
     with _transcode_lock:
         _url_to_session.pop(url, None)
-    stop_session(session_id, force=True)
+    await stop_session(session_id, force=True)
 
 
 # resolved_url: the variant ``url`` already resolved to, saving a second fetch.
@@ -1971,7 +1901,7 @@ async def _do_start_transcode(
             is_disconnected=is_disconnected if is_archive else None,
         )
     except (asyncio.CancelledError, fastapi.HTTPException):
-        stop_session(session_id, force=True)
+        await stop_session(session_id, force=True)
         raise
     if not ready:
         # Wait for process to fully exit and stderr to be captured.
@@ -1987,7 +1917,7 @@ async def _do_start_transcode(
             process.returncode or -1,
             error_msg,
         )
-        stop_session(session_id, force=True)
+        await stop_session(session_id, force=True)
         raise fastapi.HTTPException(500, "Transcode failed - check server logs for details")
 
     if sub_info:
@@ -2084,44 +2014,6 @@ async def _wait_for_fresh_fast_playlist(
     return False
 
 
-async def _terminate_fast_process(process: Any) -> None:
-    if not _is_process_alive(process):
-        return
-    try:
-        process.terminate()
-    except (ProcessLookupError, OSError):
-        return
-    wait = getattr(process, "wait", None)
-    if wait is None:
-        _kill_process(process)
-        return
-    try:
-        await asyncio.wait_for(wait(), timeout=5)
-    # asyncio.TimeoutError is distinct from the builtin before Python 3.11.
-    except asyncio.TimeoutError:
-        with contextlib.suppress(ProcessLookupError, OSError):
-            process.kill()
-        with contextlib.suppress(Exception):
-            await process.wait()
-    except asyncio.CancelledError:
-        with contextlib.suppress(ProcessLookupError, OSError):
-            process.kill()
-        with contextlib.suppress(Exception):
-            await asyncio.shield(process.wait())
-        raise
-
-
-async def _launch_recovery_ffmpeg(command: list[str]) -> asyncio.subprocess.Process:
-    launch = asyncio.create_task(_launch_ffmpeg(command))
-    try:
-        return await asyncio.shield(launch)
-    except asyncio.CancelledError:
-        with contextlib.suppress(Exception):
-            process = await launch
-            await _terminate_fast_process(process)
-        raise
-
-
 async def _monitor_fast_process(
     process: asyncio.subprocess.Process,
     role: str,
@@ -2181,21 +2073,14 @@ async def _restart_fast_pipeline(
         with _transcode_lock:
             if _transcode_sessions.get(session_id) is not session:
                 return
-            old_processes: list[Any] = []
-            for process in (
-                session.get("process"),
-                session.get("ingest_process"),
-                *session.get("extra_processes", []),
-            ):
-                if process is not None and all(process is not old for old in old_processes):
-                    old_processes.append(process)
+            old_processes = _session_processes(session)
             session["process"] = _DeadProcess()
             session["ingest_process"] = None
             session["extra_processes"] = []
             session["watchdog_recovering"] = stalled_stage
             ingest_command_line = list(session["ingest_restart_command"])
             low_command_line = list(session["low_restart_command"])
-        await asyncio.gather(*(_terminate_fast_process(process) for process in old_processes))
+        await _terminate_processes(old_processes)
 
         directory = session["dir"]
         input_playlist = pathlib.Path(directory) / "input.m3u8"
@@ -2207,7 +2092,7 @@ async def _restart_fast_pipeline(
         low_segments = _playlist_segments(low_playlist)
         low_command_line = _prepare_encoder_restart(low_command_line, low_segments)
 
-        ingest = await _launch_recovery_ffmpeg(ingest_command_line)
+        ingest = await _launch_ffmpeg(ingest_command_line)
         replacements.append(ingest)
         with _transcode_lock:
             if _transcode_sessions.get(session_id) is not session:
@@ -2224,8 +2109,9 @@ async def _restart_fast_pipeline(
             minimum_segments=1,
         ):
             raise TimeoutError("ingest output did not become ready")
+        await _restart_session_clock(session_id, session, low_playlist)
 
-        low = await _launch_recovery_ffmpeg(low_command_line)
+        low = await _launch_ffmpeg(low_command_line)
         replacements.append(low)
         with _transcode_lock:
             if _transcode_sessions.get(session_id) is not session:
@@ -2276,12 +2162,28 @@ async def _restart_fast_pipeline(
                         for process in session.get("extra_processes", [])
                         if all(process is not replacement for replacement in replacements)
                     ]
-            for process in replacements:
-                await _terminate_fast_process(process)
+            await _terminate_processes(replacements)
         recovery.finish_restart("pipeline")
         with _transcode_lock:
             if _transcode_sessions.get(session_id) is session:
                 session.pop("watchdog_recovering", None)
+
+
+# The restarted ingest starts near PTS zero, so its segments need a new origin; segments
+# already listed keep the dates the old origin gave them.
+async def _restart_session_clock(
+    session_id: str,
+    session: dict[str, Any],
+    low_playlist: pathlib.Path,
+) -> None:
+    """Date the old encoder's segments, then move the clock to the new ingest."""
+    with contextlib.suppress(OSError):
+        content = low_playlist.read_text()
+        await asyncio.to_thread(dated_fast_playlist, session_id, content)
+    origin_pts = segment_pts(_first_input_segment(session["dir"]))
+    with _transcode_lock:
+        if _transcode_sessions.get(session_id) is session:
+            session.update(origin_pts=origin_pts, origin_time=time.time())
 
 
 def _log_watchdog_delay(
@@ -2326,7 +2228,18 @@ async def _check_fast_live_session(session_id: str, session: dict[str, Any]) -> 
     stage = "input" if input_stalled else "low output"
     if recovery.permit_restart("pipeline", now):
         await _restart_fast_pipeline(session_id, session, stage)
-    elif "pipeline" not in recovery.pending:
+    elif "pipeline" in recovery.pending:
+        return
+    elif recovery.exhausted("pipeline", now):
+        # Clients keep a session alive by polling it; without a pipeline it
+        # would be reused until the window allows another restart.
+        log.error(
+            "Live watchdog %s stopped the session: %s stalled and its restart budget is spent",
+            session_id,
+            stage,
+        )
+        await stop_session(session_id, force=True)
+    else:
         _log_watchdog_delay(session_id, session, "pipeline", now)
 
 
@@ -2351,3 +2264,193 @@ async def _watch_fast_live(
             raise
         except Exception:
             log.exception("Live watchdog %s failed while checking pipeline health", session_id)
+
+
+def _retire_session(session: dict[str, Any]) -> list[Any]:
+    """Cancel the session's watchdog and list the processes to terminate."""
+    task = session.get("watchdog_task")
+    # The watchdog stops a session it cannot restart; it must finish that stop.
+    if task is not None and task is not asyncio.current_task():
+        task.cancel()
+    return _session_processes(session)
+
+
+def _session_processes(session: dict[str, Any]) -> list[Any]:
+    processes: list[Any] = []
+    for process in (
+        session.get("process"),
+        session.get("ingest_process"),
+        *session.get("extra_processes", []),
+    ):
+        if process is not None and all(process is not known for known in processes):
+            processes.append(process)
+    return processes
+
+
+async def _start_or_reuse(
+    url: str,
+    content_type: str,
+    series_id: int | None,
+    episode_id: int | None,
+    series_name: str,
+    deinterlace_fallback: bool,
+    username: str,
+    source_id: str,
+    user_max_streams: int,
+    source_max_streams: int,
+    bandwidth_saver: bool,
+    fast_start: bool,
+    is_disconnected: Callable[[], Awaitable[bool]] | None,
+    audio_passthrough: bool,
+) -> dict[str, Any]:
+    """Reuse the URL's session or start one; callers hold the URL's startup guard."""
+    # A quality change replaces the current stream; release its slot first.
+    existing_id, is_valid, old_seek_offset = _get_existing_session(url)
+    if _is_archive_url(url):
+        old_seek_offset = 0.0
+        existing = get_session(existing_id) if existing_id else None
+        if existing and existing.get("username") != username:
+            raise fastapi.HTTPException(409, "This archive is playing on another device.")
+    if bandwidth_saver and existing_id:
+        session = get_session(existing_id)
+        if session and session.get("username") != username:
+            raise fastapi.HTTPException(404, "Session not found")
+        await stop_session(existing_id, force=True)
+        existing_id, is_valid, old_seek_offset = None, False, 0.0
+    if existing_id and not audio_passthrough:
+        session = get_session(existing_id)
+        if session and session.get("audio_passthrough"):
+            # This client cannot decode the session's Dolby audio.
+            if session.get("username") != username:
+                raise fastapi.HTTPException(409, "This stream is playing on another device.")
+            await stop_session(existing_id, force=True)
+            existing_id, is_valid = None, False
+
+    is_vod = content_type in ("movie", "series")
+
+    # Try to reuse existing valid session.
+    if existing_id and is_valid:
+        existing = get_session(existing_id)
+        if existing and existing.get("fast_start"):
+            if existing.get("username") != username:
+                raise fastapi.HTTPException(404, "Session not found")
+            touch_session(existing_id)
+            return _adaptive_session_response(existing_id)
+        log.info("Found valid existing session %s (vod=%s)", existing_id, is_vod)
+        result = await _try_reuse_session(existing_id, url, is_vod, content_type)
+        if result:
+            return result
+
+    # Clean up any existing invalid session.
+    if existing_id:
+        log.info("Cleaning up invalid session %s", existing_id)
+        await _cleanup_invalid_session(url, existing_id)
+
+    # Limits count upstream connections, so only a new session is checked; a
+    # reused one already holds its slot.
+    if username:
+        error = await enforce_stream_limits(
+            username,
+            source_id,
+            user_max_streams,
+            source_max_streams,
+        )
+        if error:
+            raise fastapi.HTTPException(status_code=429, detail=error)
+
+    resolved: str | None = None
+    if (
+        fast_start
+        and content_type == "live"
+        and get_settings().get("max_resolution", "1080p") in ("1080p", "1440p", "4k")
+    ):
+        # A DVR request only needs server-side retention. When the source can
+        # be stream-copied, serve one remux session instead of a fast-start
+        # encoder; otherwise keep the adaptive transcode pipeline.
+        settings = get_settings()
+        remux = False
+        if (
+            not bandwidth_saver
+            and settings.get("live_dvr_mins", 0) > 0
+            and settings.get("probe_live", True)
+        ):
+            resolved = await asyncio.to_thread(resolve_hls_master_playlist, url)
+            media_info = (await asyncio.to_thread(probe_media, resolved))[0]
+            remux = can_remux_live(
+                media_info,
+                settings.get("max_resolution", "1080p"),
+                audio_passthrough=audio_passthrough,
+            )
+        if remux:
+            log.info(
+                "DVR live session uses a stream-copy remux instead of fast-start: %s",
+                redact_url_credentials(url),
+            )
+        else:
+            return await _start_fast_live(
+                url,
+                username,
+                source_id,
+                deinterlace_fallback,
+                bandwidth_saver=bandwidth_saver,
+                is_disconnected=is_disconnected,
+                audio_passthrough=audio_passthrough,
+            )
+
+    # Start fresh transcode (with retry for series probe cache staleness)
+    try:
+        return await _do_start_transcode(
+            url,
+            content_type,
+            series_id,
+            episode_id,
+            old_seek_offset,
+            series_name,
+            deinterlace_fallback,
+            username,
+            source_id,
+            bandwidth_saver,
+            audio_passthrough=audio_passthrough,
+            is_disconnected=is_disconnected,
+            resolved_url=resolved,
+        )
+    except fastapi.HTTPException:
+        if series_id is None:
+            raise
+        log.info("Transcode failed, clearing probe cache and retrying")
+        invalidate_series_probe_cache(series_id, episode_id)
+        return await _do_start_transcode(
+            url,
+            content_type,
+            series_id,
+            episode_id,
+            old_seek_offset,
+            series_name,
+            deinterlace_fallback,
+            username,
+            source_id,
+            bandwidth_saver,
+            audio_passthrough=audio_passthrough,
+            is_disconnected=is_disconnected,
+        )
+
+
+@dataclass(kw_only=True, slots=True)
+class _StartupGuard:
+    """Serializes one URL's lookup-or-start; removed when no request holds it."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
+@contextlib.asynccontextmanager
+async def _url_startup(url: str) -> AsyncGenerator[None]:
+    guard = _startup_guards.setdefault(url, _StartupGuard())
+    guard.users += 1
+    try:
+        async with guard.lock:
+            yield
+    finally:
+        guard.users -= 1
+        if not guard.users:
+            del _startup_guards[url]

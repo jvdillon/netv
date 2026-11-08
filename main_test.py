@@ -8,8 +8,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
+import asyncio
 import json
 import re
+import time
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -17,10 +19,16 @@ from fastapi.testclient import TestClient
 import pytest
 
 from epg import Program
+from fast_start_test import video_packet
+from ffmpeg_session_lifecycle_test import LoopProcess
+from ffmpeg_session_test import FakeProcess
 from main import PlayerInfo
+from playback_policy import LiveRecoveryPolicy
 
 import auth
 import cache as cache_module
+import fast_start
+import ffmpeg_session
 import handoff
 import m3u as m3u_module
 import main
@@ -220,8 +228,17 @@ def test_cast_rejects_localhost_media_address(auth_client):
         start.assert_not_called()
 
 
+def _release_and_report(username, action, volume, *, release):
+    del username, action, volume
+    release("cast-session")
+    return {"active": True}
+
+
 def test_cast_command_validation_and_user_scope(auth_client):
-    with patch("casting.manager.command", return_value={"active": True}) as command:
+    with (
+        patch("casting.manager.command", side_effect=_release_and_report) as command,
+        patch("main.ffmpeg_session.stop_session", new_callable=AsyncMock) as stop,
+    ):
         assert (
             auth_client.post(
                 "/api/cast/control",
@@ -232,7 +249,8 @@ def test_cast_command_validation_and_user_scope(auth_client):
         assert auth_client.post("/api/cast/control", json={"action": "reboot"}).status_code == 422
         command.assert_not_called()
         assert auth_client.post("/api/cast/control", json={"action": "pause"}).status_code == 200
-        command.assert_called_once_with("testuser", "pause", None)
+        assert command.call_args.args == ("testuser", "pause", None)
+        stop.assert_awaited_once_with("cast-session", force=True)
 
 
 def test_cast_discovery_reports_network_errors(auth_client):
@@ -1536,7 +1554,10 @@ class TestTranscodeRoutes:
         }
         with (
             patch("ffmpeg_session.get_session", return_value=session),
-            patch("main.dated_playlist", return_value=content + "#dated\n") as dates,
+            patch(
+                "main.ffmpeg_session.dated_fast_playlist",
+                return_value=content + "#dated\n",
+            ) as dates,
             patch(
                 "main.add_live_start_offset",
                 side_effect=lambda value, _seconds: value + "#start\n",
@@ -1550,7 +1571,7 @@ class TestTranscodeRoutes:
             start.assert_not_called()
             assert response.text == content
         else:
-            dates.assert_called_once_with(str(tmp_path), content, 10, 0)
+            dates.assert_called_once_with("shared", content)
             start.assert_called_once_with(content + "#dated\n", 24)
             assert "#dated" in response.text
             assert "#start" in response.text
@@ -1570,6 +1591,126 @@ class TestTranscodeRoutes:
 
         assert response.status_code == 200
         assert "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:907200" in response.text
+
+
+def _fast_session(directory: Path, **extra) -> dict:
+    session = {
+        "dir": str(directory),
+        "process": FakeProcess(),
+        "extra_processes": [],
+        "url": "https://upstream.example/live/1.m3u8",
+        "username": "testuser",
+        "started": 0,
+        "last_access": 0,
+        "fast_start": True,
+        "live_recovery": LiveRecoveryPolicy(),
+        "ingest_restart_command": ["ingest"],
+        "low_restart_command": ["encoder", "low.m3u8"],
+        "playlist_generation": 0,
+    }
+    session.update(extra)
+    return session
+
+
+def _write_segments(directory: Path, names_and_pts: list[tuple[str, float]]) -> str:
+    for name, pts in names_and_pts:
+        (directory / name).write_bytes(video_packet(pts) * 10)
+    return "".join(f"#EXTINF:2.000000,\n{name}\n" for name, _ in names_and_pts)
+
+
+def _program_dates(text: str) -> dict[str, float]:
+    dates = {}
+    stamp = 0.0
+    for line in text.splitlines():
+        if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+            stamp = datetime.fromisoformat(
+                line.removeprefix("#EXT-X-PROGRAM-DATE-TIME:"),
+            ).timestamp()
+        elif line.endswith(".ts"):
+            dates[line] = stamp
+    return dates
+
+
+class TestFastStartRoutes:
+    def test_program_dates_stay_monotonic_after_pipeline_restart(self, auth_client, tmp_path):
+        directory = tmp_path / "fast"
+        directory.mkdir()
+        header = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n"
+        old = _write_segments(directory, [(f"low_{i}.ts", 5000 + 2 * i) for i in range(3)])
+        (directory / "low.m3u8").write_text(header + old)
+        session = _fast_session(directory, origin_pts=5000.0, origin_time=time.time() - 100)
+        restarted = [(f"low_{i}.ts", 1.48 + 2 * (i - 100)) for i in range(100, 103)]
+
+        async def launch(command):
+            if command[0] == "ingest":
+                (directory / "input_000001.ts").write_bytes(video_packet(1.48) * 10)
+                (directory / "input.m3u8").write_text("#EXTINF:2,\ninput_000001.ts\n")
+            else:
+                text = (directory / "low.m3u8").read_text()
+                (directory / "low.m3u8").write_text(
+                    text + "#EXT-X-DISCONTINUITY\n" + _write_segments(directory, restarted),
+                )
+            return FakeProcess()
+
+        with patch.dict(ffmpeg_session._transcode_sessions, {"fast": session}, clear=True):
+            before = _program_dates(auth_client.get("/transcode/fast/low.m3u8").text)
+            session["live_recovery"].permit_restart("pipeline", time.monotonic())
+            with (
+                patch("ffmpeg_session._launch_ffmpeg", side_effect=launch),
+                patch(
+                    "ffmpeg_session._wait_for_fresh_fast_playlist",
+                    new=AsyncMock(return_value=True),
+                ),
+                patch("ffmpeg_session._spawn_background_task", side_effect=lambda c: c.close()),
+            ):
+                asyncio.run(ffmpeg_session._restart_fast_pipeline("fast", session, "input"))
+            restart_time = time.time()
+            during = _program_dates(auth_client.get("/transcode/fast/low.m3u8").text)
+            (directory / "low.m3u8").write_text(
+                header + "".join(f"#EXTINF:2.000000,\n{name}\n" for name, _ in restarted),
+            )
+            after = _program_dates(auth_client.get("/transcode/fast/low.m3u8").text)
+
+        assert during["low_0.ts"] == pytest.approx(before["low_0.ts"])
+        assert before["low_2.ts"] < during["low_100.ts"] <= restart_time + 1
+        assert after == {name: during[name] for name, _ in restarted}
+
+    def test_listing_reads_each_segment_timestamp_once(self, auth_client, tmp_path):
+        directory = tmp_path / "fast"
+        directory.mkdir()
+        segments = _write_segments(directory, [(f"low_{i}.ts", 10 + 2 * i) for i in range(4)])
+        (directory / "low.m3u8").write_text("#EXTM3U\n" + segments)
+        session = _fast_session(directory, origin_pts=10.0, origin_time=0.0)
+        with (
+            patch.dict(ffmpeg_session._transcode_sessions, {"fast": session}, clear=True),
+            patch("fast_start.segment_pts", wraps=fast_start.segment_pts) as reads,
+        ):
+            first = auth_client.get("/transcode/fast/low.m3u8")
+            second = auth_client.get("/transcode/fast/low.m3u8")
+        assert first.text == second.text
+        assert reads.call_count == 4
+
+    @pytest.mark.parametrize("force", [False, True])
+    def test_stop_removes_fast_session_and_lets_encoders_exit(self, auth_client, tmp_path, force):
+        directory = tmp_path / "fast"
+        directory.mkdir()
+        processes = [LoopProcess(), LoopProcess(), LoopProcess()]
+        session = _fast_session(
+            directory,
+            process=processes[0],
+            ingest_process=processes[1],
+            extra_processes=processes[1:],
+        )
+        with (
+            patch.dict(ffmpeg_session._transcode_sessions, {"fast": session}, clear=True),
+            patch("ffmpeg_session.get_live_cache_timeout", return_value=30),
+        ):
+            response = auth_client.delete(f"/transcode/fast?force={str(force).lower()}")
+            assert response.status_code == 200
+            assert "fast" not in ffmpeg_session._transcode_sessions
+        assert [process.signals for process in processes] == [["TERM"]] * 3
+        assert [process.returncode for process in processes] == [-15] * 3
+        assert not directory.exists()
 
 
 class TestSubtitleRoutes:
@@ -2196,6 +2337,29 @@ def test_handoff_stop_hands_off_the_watched_channel(auth_client, clean_handoff):
     assert response.status_code == 200
     assert clean_handoff._records["testuser"]["mode"] == "catchup"
     assert clean_handoff._records["testuser"]["position"] == pytest.approx(now - 5)
+
+
+def test_handoff_recording_first_releases_the_live_transcode(auth_client, clean_handoff):
+    now = datetime.now(timezone.utc).timestamp()
+    clean_handoff._watches["testuser"] = handoff._Watch(
+        stream_id="src1_42",
+        position=now - 10,
+        first_seen=now - 600,
+        last_seen=now - 15,
+    )
+    channel = handoff.Channel(stream_id="src1_42", name="Channel", url="http://x/42.m3u8")
+    with (
+        patch("main._handoff_stream_allowed", return_value=True),
+        patch("main._handoff_channel", return_value=channel),
+        patch("main.ffmpeg_session.stop_user_stream", new_callable=AsyncMock) as release,
+        patch("handoff._start_recorder", side_effect=OSError("no ffmpeg")),
+    ):
+        response = auth_client.post(
+            "/api/handoff/stop",
+            json={"stream_id": "src1_42", "position": now - 5},
+        )
+    assert response.status_code == 200
+    release.assert_awaited_once_with("testuser", "http://x/42.m3u8")
 
 
 class TestManagedDirectGuide:

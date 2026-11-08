@@ -116,16 +116,9 @@ class LiveRecoveryPolicy:
         return now - since >= self.stall_confirm_seconds
 
     def permit_restart(self, action: str, now: float) -> bool:
-        if action in self.pending:
+        if action in self.pending or self.exhausted(action, now):
             return False
-        attempts = [
-            attempt
-            for attempt in self.attempts.get(action, [])
-            if now - attempt < self.restart_window_seconds
-        ]
-        self.attempts[action] = attempts
-        if len(attempts) >= self.restart_limit:
-            return False
+        attempts = self.attempts[action]
         if attempts:
             cooldown = 5 if len(attempts) == 1 else 15
             if now - attempts[-1] < cooldown:
@@ -133,6 +126,24 @@ class LiveRecoveryPolicy:
         attempts.append(now)
         self.pending.add(action)
         return True
+
+    def exhausted(self, action: str, now: float) -> bool:
+        """Report whether ``action`` has spent its restart budget for the window.
+
+        Args:
+            action: Restart action, such as ``"pipeline"``.
+            now: Monotonic time in seconds.
+
+        Returns:
+            exhausted: Whether the window holds ``restart_limit`` attempts.
+        """
+        attempts = [
+            attempt
+            for attempt in self.attempts.get(action, [])
+            if now - attempt < self.restart_window_seconds
+        ]
+        self.attempts[action] = attempts
+        return len(attempts) >= self.restart_limit
 
     def finish_restart(self, action: str) -> None:
         self.pending.discard(action)

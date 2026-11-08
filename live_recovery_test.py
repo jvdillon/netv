@@ -147,31 +147,6 @@ def test_restart_without_playlist_history_uses_epoch_sequence():
 
 
 @pytest.mark.asyncio
-async def test_cancelled_launch_terminates_late_replacement():
-    started = asyncio.Event()
-    release = asyncio.Event()
-    replacement = process()
-
-    async def launch(command):
-        del command
-        started.set()
-        await release.wait()
-        return replacement
-
-    with patch("ffmpeg_session._launch_ffmpeg", side_effect=launch):
-        task = asyncio.create_task(
-            ffmpeg_session._launch_recovery_ffmpeg(["ffmpeg", "replacement"]),
-        )
-        await started.wait()
-        task.cancel()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    assert replacement.returncode is not None
-
-
-@pytest.mark.asyncio
 async def test_pipeline_restart_replaces_dependencies_without_second_upstream_reader(
     recovery_session,
 ):
@@ -184,15 +159,16 @@ async def test_pipeline_restart_replaces_dependencies_without_second_upstream_re
 
     with (
         patch(
-            "ffmpeg_session._launch_recovery_ffmpeg",
+            "ffmpeg_session._launch_ffmpeg",
             new=AsyncMock(side_effect=[new_ingest, new_low]),
         ) as launch,
         patch(
             "ffmpeg_session._wait_for_fresh_fast_playlist",
             new=AsyncMock(return_value=True),
         ),
+        patch("ffmpeg_session._restart_session_clock", new=AsyncMock()),
         patch(
-            "ffmpeg_session._terminate_fast_process",
+            "ffmpeg_session._terminate_process",
             new=AsyncMock(),
         ) as terminate,
         patch(
@@ -225,15 +201,16 @@ async def test_repeated_pipeline_recovery_advances_generation(recovery_session):
 
     with (
         patch(
-            "ffmpeg_session._launch_recovery_ffmpeg",
+            "ffmpeg_session._launch_ffmpeg",
             new=AsyncMock(side_effect=[new_ingest, new_low]),
         ),
         patch(
             "ffmpeg_session._wait_for_fresh_fast_playlist",
             new=AsyncMock(return_value=True),
         ),
+        patch("ffmpeg_session._restart_session_clock", new=AsyncMock()),
         patch(
-            "ffmpeg_session._terminate_fast_process",
+            "ffmpeg_session._terminate_process",
             new=AsyncMock(),
         ),
         patch(
@@ -258,15 +235,16 @@ async def test_failed_pipeline_recovery_keeps_generation(recovery_session):
 
     with (
         patch(
-            "ffmpeg_session._launch_recovery_ffmpeg",
+            "ffmpeg_session._launch_ffmpeg",
             new=AsyncMock(side_effect=[new_ingest, new_low]),
         ),
         patch(
             "ffmpeg_session._wait_for_fresh_fast_playlist",
             new=AsyncMock(side_effect=[True, False]),
         ),
+        patch("ffmpeg_session._restart_session_clock", new=AsyncMock()),
         patch(
-            "ffmpeg_session._terminate_fast_process",
+            "ffmpeg_session._terminate_process",
             new=AsyncMock(),
         ),
         patch(
@@ -319,7 +297,7 @@ def test_stopping_session_cancels_watchdog(recovery_session):
     watchdog.done.return_value = False
     recovery_session["watchdog_task"] = watchdog
 
-    ffmpeg_session.stop_session("recover", force=True)
+    asyncio.run(ffmpeg_session.stop_session("recover", force=True))
 
     watchdog.cancel.assert_called_once_with()
 

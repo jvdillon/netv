@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from ipaddress import ip_address, ip_network
 from typing import Literal
@@ -255,7 +256,20 @@ class CastManager:
         username: str,
         action: Literal["play", "pause", "stop", "volume"],
         volume: float | None = None,
+        *,
+        release: Callable[[str], None],
     ) -> dict:
+        """Control the user's cast.
+
+        Args:
+            username: Owner of the cast.
+            action: Receiver command.
+            volume: Level between 0 and 1 for ``volume``.
+            release: Stops a transcode session by ID; called on ``stop``.
+
+        Returns:
+            status: Cast status after the command.
+        """
         with self._operations:
             with self._lock:
                 record = next((s for s in self._sessions.values() if s.username == username), None)
@@ -271,7 +285,7 @@ class CastManager:
                     self._save_position(record)
                     cast.media_controller.stop()
                     self._forget(record)
-                    ffmpeg_session.stop_session(record.session_id, force=True)
+                    release(record.session_id)
                 elif action == "play":
                     cast.media_controller.play()
                 elif action == "pause":

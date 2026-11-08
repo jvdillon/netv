@@ -54,7 +54,7 @@ async def test_fallback_command_and_cleanup(tmp_path, configured_resolution, exp
             assert session is not None
             assert session["bandwidth_saver"] is True
         finally:
-            ffmpeg_session.stop_session(result["session_id"], force=True)
+            await ffmpeg_session.stop_session(result["session_id"], force=True)
         assert not list(tmp_path.iterdir())
 
 
@@ -63,8 +63,8 @@ async def test_fallback_does_not_reuse_high_quality_stream():
     with (
         patch("ffmpeg_session._get_existing_session", return_value=("old", True, 0)),
         patch("ffmpeg_session.get_session", return_value={"username": "viewer"}),
-        patch("ffmpeg_session.stop_session") as stop,
-        patch("ffmpeg_session.enforce_stream_limits", return_value=None),
+        patch("ffmpeg_session.stop_session", new_callable=AsyncMock) as stop,
+        patch("ffmpeg_session.enforce_stream_limits", new=AsyncMock(return_value=None)),
         patch("ffmpeg_session._try_reuse_session", new_callable=AsyncMock) as reuse,
         patch(
             "ffmpeg_session._do_start_transcode",
@@ -116,7 +116,7 @@ async def test_legacy_saver_session_can_request_recovery(tmp_path):
                     "bandwidth_saver": False,
                 }
         finally:
-            ffmpeg_session.stop_session(session_id, force=True)
+            await ffmpeg_session.stop_session(session_id, force=True)
 
 
 @pytest.mark.asyncio
@@ -128,8 +128,8 @@ async def test_aac_client_does_not_reuse_dolby_session():
             "ffmpeg_session.get_session",
             return_value={"username": "viewer", "audio_passthrough": True},
         ),
-        patch("ffmpeg_session.stop_session") as stop,
-        patch("ffmpeg_session.enforce_stream_limits", return_value=None),
+        patch("ffmpeg_session.stop_session", new_callable=AsyncMock) as stop,
+        patch("ffmpeg_session.enforce_stream_limits", new=AsyncMock(return_value=None)),
         patch("ffmpeg_session._try_reuse_session", new_callable=AsyncMock) as reuse,
         patch(
             "ffmpeg_session._do_start_transcode",
@@ -153,8 +153,8 @@ async def test_dolby_session_of_another_user_is_not_stopped():
             "ffmpeg_session.get_session",
             return_value={"username": "other", "audio_passthrough": True},
         ),
-        patch("ffmpeg_session.stop_session") as stop,
-        patch("ffmpeg_session.enforce_stream_limits", return_value=None),
+        patch("ffmpeg_session.stop_session", new_callable=AsyncMock) as stop,
+        patch("ffmpeg_session.enforce_stream_limits", new=AsyncMock(return_value=None)),
         pytest.raises(HTTPException) as error,
     ):
         await ffmpeg_session.start_transcode("stream", username="viewer")
@@ -168,8 +168,8 @@ async def test_passthrough_client_reuses_dolby_session():
     with (
         patch("ffmpeg_session._get_existing_session", return_value=("old", True, 0)),
         patch("ffmpeg_session.get_session", return_value=session),
-        patch("ffmpeg_session.stop_session") as stop,
-        patch("ffmpeg_session.enforce_stream_limits", return_value=None),
+        patch("ffmpeg_session.stop_session", new_callable=AsyncMock) as stop,
+        patch("ffmpeg_session.enforce_stream_limits", new=AsyncMock(return_value=None)),
         patch(
             "ffmpeg_session._try_reuse_session",
             new_callable=AsyncMock,
@@ -202,8 +202,8 @@ async def test_starting_passthrough_session_is_not_reused_by_aac_client():
     try:
         with (
             patch("ffmpeg_session._get_existing_session", return_value=("pending", True, 0)),
-            patch("ffmpeg_session.stop_session") as stop,
-            patch("ffmpeg_session.enforce_stream_limits", return_value=None),
+            patch("ffmpeg_session.stop_session", new_callable=AsyncMock) as stop,
+            patch("ffmpeg_session.enforce_stream_limits", new=AsyncMock(return_value=None)),
             patch(
                 "ffmpeg_session._do_start_transcode",
                 new_callable=AsyncMock,

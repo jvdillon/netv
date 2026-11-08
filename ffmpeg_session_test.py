@@ -19,10 +19,10 @@ from ffmpeg_session import (
     _caption_timestamp_origin,
     _DeadProcess,
     _is_process_alive,
-    _kill_process,
     _launch_ffmpeg,
     _regenerate_playlist,
     _SubtitleInfo,
+    _terminate_process,
     _transcode_lock,
     _transcode_sessions,
     _update_session_process,
@@ -65,6 +65,9 @@ class FakeProcess:
         if self._killed:
             raise ProcessLookupError("No such process")
         self.returncode = -9  # SIGKILL
+
+    async def wait(self) -> int | None:
+        return self.returncode
 
 
 ARCHIVE_URL = "https://upstream.test/timeshift/user/pass/60/2026-09-28:10-00/1.ts"
@@ -151,7 +154,7 @@ async def test_archive_stop_releases_recent_session_without_caching(archive_runt
     session = get_session(result["session_id"])
     assert session is not None
     directory = pathlib.Path(session["dir"])
-    stop_session(result["session_id"])
+    await stop_session(result["session_id"])
     assert process.returncode is not None
     assert get_session(result["session_id"]) is None
     assert ARCHIVE_URL not in _url_to_session
@@ -353,18 +356,19 @@ def test_shared_session_process_update(seek_time):
         assert "https://provider/missing" not in _url_to_session
 
 
-class TestKillProcess:
-    """Tests for _kill_process."""
+class TestTerminateProcess:
+    """Tests for _terminate_process."""
 
-    def test_kill_alive_process(self):
+    def test_terminate_alive_process(self):
         proc = FakeProcess(alive=True)
-        assert _kill_process(proc) is True
+        asyncio.run(_terminate_process(proc))
         # SIGTERM (-15) is used first; if process exits, SIGKILL (-9) isn't needed.
         assert proc.returncode == -15
 
-    def test_kill_already_dead(self):
+    def test_terminate_vanished_process(self):
         proc = FakeProcess(alive=True, killed=True)
-        assert _kill_process(proc) is False
+        asyncio.run(_terminate_process(proc))
+        assert proc.returncode is None
 
 
 # =============================================================================
@@ -498,7 +502,7 @@ class TestStopSession:
 
     def test_stop_nonexistent_session(self):
         """Stopping nonexistent session is a no-op."""
-        stop_session("nonexistent")  # Should not raise.
+        asyncio.run(stop_session("nonexistent"))  # Should not raise.
 
     def test_stop_session_force(self):
         """Force stop removes session."""
@@ -513,7 +517,7 @@ class TestStopSession:
                 }
                 _url_to_session["http://test"] = session_id
 
-            stop_session(session_id, force=True)
+            asyncio.run(stop_session(session_id, force=True))
 
             assert session_id not in _transcode_sessions
             assert "http://test" not in _url_to_session
@@ -530,7 +534,7 @@ class TestStopSession:
                 "last_access": time.time(),  # Just now.
             }
 
-        stop_session(session_id, force=False)
+        asyncio.run(stop_session(session_id, force=False))
 
         # VOD session should still exist because it was recently accessed.
         assert session_id in _transcode_sessions
@@ -550,7 +554,7 @@ class TestStopSession:
                 _url_to_session["http://live"] = session_id
 
             with patch("ffmpeg_session.get_live_cache_timeout", return_value=0):
-                stop_session(session_id, force=False)
+                asyncio.run(stop_session(session_id, force=False))
 
             # Live session should still exist because it was recently accessed.
             assert session_id in _transcode_sessions
@@ -574,7 +578,7 @@ class TestStopSession:
 
             # User A disconnects and triggers stop.
             with patch("ffmpeg_session.get_live_cache_timeout", return_value=0):
-                stop_session(session_id, force=False)
+                asyncio.run(stop_session(session_id, force=False))
 
             # Session should survive because User B just accessed it.
             assert session_id in _transcode_sessions
@@ -595,7 +599,7 @@ class TestStopSession:
                 _url_to_session["http://vod"] = session_id
 
             with patch("ffmpeg_session.get_vod_cache_timeout", return_value=3600):
-                stop_session(session_id, force=False)
+                asyncio.run(stop_session(session_id, force=False))
 
             # Session should still exist (cached)
             assert session_id in _transcode_sessions
@@ -625,7 +629,7 @@ class TestCleanupExpiredSessions:
                 }
 
             with patch("ffmpeg_session.get_live_cache_timeout", return_value=0):
-                cleanup_expired_sessions()
+                asyncio.run(cleanup_expired_sessions())
 
             assert session_id not in _transcode_sessions
 
@@ -642,7 +646,7 @@ class TestCleanupExpiredSessions:
                 "last_access": time.time(),
             }
 
-        cleanup_expired_sessions()
+        asyncio.run(cleanup_expired_sessions())
 
         assert session_id in _transcode_sessions
 
@@ -665,7 +669,7 @@ class TestShutdown:
             _transcode_sessions["s1"] = {"process": proc1, "dir": "/tmp/1"}
             _transcode_sessions["s2"] = {"process": proc2, "dir": "/tmp/2"}
 
-        shutdown()
+        asyncio.run(shutdown())
 
         # SIGTERM (-15) is used first; if process exits, SIGKILL (-9) isn't needed.
         assert proc1.returncode == -15
@@ -738,7 +742,7 @@ class TestEnforceStreamLimits:
 
     def test_no_limits_returns_none(self):
         """No limits set = no error."""
-        result = enforce_stream_limits("alice", None, 0, 0)
+        result = asyncio.run(enforce_stream_limits("alice", None, 0, 0))
         assert result is None
 
     def test_user_limit_stops_oldest(self):
@@ -762,7 +766,7 @@ class TestEnforceStreamLimits:
                     "last_access": time.time(),
                 }
 
-            result = enforce_stream_limits("alice", None, 2, 0)
+            result = asyncio.run(enforce_stream_limits("alice", None, 2, 0))
 
             assert result is None
             assert "s1" not in _transcode_sessions
@@ -782,7 +786,7 @@ class TestEnforceStreamLimits:
                     "last_access": 0,
                 }
 
-            result = enforce_stream_limits("alice", "src1", 0, 1)
+            result = asyncio.run(enforce_stream_limits("alice", "src1", 0, 1))
 
             assert result is None
             assert "s1" not in _transcode_sessions
@@ -799,7 +803,7 @@ class TestEnforceStreamLimits:
                 "url": "http://1",
             }
 
-        result = enforce_stream_limits("alice", "src1", 0, 1)
+        result = asyncio.run(enforce_stream_limits("alice", "src1", 0, 1))
 
         assert result == "Source at capacity (1 streams)"
         assert "s1" in _transcode_sessions  # Not stopped.

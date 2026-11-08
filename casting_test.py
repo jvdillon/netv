@@ -41,7 +41,6 @@ def cast_env():
         patch("casting.get_chromecast_from_host", return_value=cast) as connect,
         patch("casting.ffmpeg_session.get_session", return_value=session),
         patch("casting.ffmpeg_session.touch_session") as touch,
-        patch("casting.ffmpeg_session.stop_session") as stop,
         patch("casting.save_watch_position") as save,
         patch.object(manager, "_ensure_worker"),
     ):
@@ -52,7 +51,7 @@ def cast_env():
             session=session,
             connect=connect,
             touch=touch,
-            stop=stop,
+            stop=MagicMock(),
             save=save,
         )
     manager.close()
@@ -138,7 +137,7 @@ def test_other_user_cannot_cast_or_control_session(cast_env):
     start(cast_env)
     assert cast_env.manager.status("bob") == {"active": False}
     with pytest.raises(HTTPException) as error:
-        cast_env.manager.command("bob", "stop")
+        cast_env.manager.command("bob", "stop", release=cast_env.stop)
     assert error.value.status_code == 404
     cast_env.cast.media_controller.stop.assert_not_called()
 
@@ -250,7 +249,7 @@ def test_starting_session_is_kept_alive(cast_env):
 def test_volume_requires_a_level(cast_env):
     start(cast_env)
     with pytest.raises(HTTPException) as error:
-        cast_env.manager.command("alice", "volume")
+        cast_env.manager.command("alice", "volume", release=cast_env.stop)
     assert error.value.status_code == 400
     cast_env.cast.set_volume.assert_not_called()
 
@@ -259,7 +258,7 @@ def test_unresponsive_receiver_command_fails(cast_env):
     start(cast_env)
     cast_env.cast.media_controller.pause.side_effect = NotConnected()
     with pytest.raises(HTTPException) as error:
-        cast_env.manager.command("alice", "pause")
+        cast_env.manager.command("alice", "pause", release=cast_env.stop)
     assert error.value.status_code == 502
 
 
@@ -332,21 +331,21 @@ def test_other_receiver_app_is_not_stopped(cast_env):
     start(cast_env)
     cast_env.status.content_id = "another-app"
     with pytest.raises(HTTPException) as error:
-        cast_env.manager.command("alice", "stop")
+        cast_env.manager.command("alice", "stop", release=cast_env.stop)
     assert error.value.status_code == 409
     cast_env.cast.media_controller.stop.assert_not_called()
 
 
 def test_remote_controls_and_stop_release_transcode(cast_env):
     start(cast_env)
-    cast_env.manager.command("alice", "pause")
-    cast_env.manager.command("alice", "play")
-    cast_env.manager.command("alice", "volume", 0.25)
-    assert cast_env.manager.command("alice", "stop") == {"active": False}
+    cast_env.manager.command("alice", "pause", release=cast_env.stop)
+    cast_env.manager.command("alice", "play", release=cast_env.stop)
+    cast_env.manager.command("alice", "volume", 0.25, release=cast_env.stop)
+    assert cast_env.manager.command("alice", "stop", release=cast_env.stop) == {"active": False}
     cast_env.cast.media_controller.pause.assert_called_once()
     cast_env.cast.media_controller.play.assert_called_once()
     cast_env.cast.set_volume.assert_called_once_with(0.25)
-    cast_env.stop.assert_called_once_with("session123", force=True)
+    cast_env.stop.assert_called_once_with("session123")
 
 
 def test_discovery_closes_browser_and_returns_lan_devices():

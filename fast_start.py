@@ -270,48 +270,47 @@ def segment_pts(path: pathlib.Path) -> float | None:
     return None
 
 
-def dated_playlist(directory: str, content: str, origin_pts: float, origin_time: float) -> str:
+def dated_playlist(
+    directory: str,
+    content: str,
+    origin_pts: float,
+    origin_time: float,
+    dates: dict[str, float],
+) -> tuple[str, dict[str, float]]:
     """Map the rendition to the source clock, independent of encoder warm-up.
+
+    A segment keeps the date it was first given: an ingest restart moves the
+    clock origin, and redating older segments still in the window would move
+    them in time.
 
     Args:
         directory: Directory containing local segment files.
         content: Media playlist text.
-        origin_pts: Shared source presentation timestamp in seconds.
+        origin_pts: Source presentation timestamp in seconds at origin_time.
         origin_time: Wall-clock time corresponding to origin_pts.
+        dates: Segment dates by filename from earlier calls.
 
     Returns:
-        playlist: Media playlist with synchronized program dates.
+        playlist: Media playlist with program dates.
+        dates: Dates of the listed segments, for the next call.
     """
-    lines = content.splitlines()
     result = []
-    reset_clock = False
-    duration = 0.0
-    for line in lines:
+    listed: dict[str, float] = {}
+    for line in content.splitlines():
         if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
             continue
-        if line.startswith("#EXT-X-DISCONTINUITY"):
-            reset_clock = True
-        elif match := re.match(r"#EXTINF:([\d.]+)", line):
-            duration = float(match.group(1))
         if line and not line.startswith("#") and pathlib.Path(line).name == line:
-            segment = pathlib.Path(directory) / line
-            pts = segment_pts(segment)
-            if pts is not None:
-                if reset_clock:
-                    try:
-                        segment_time = segment.stat().st_mtime - duration
-                        elapsed = (pts - origin_pts) % ((1 << 33) / 90_000)
-                        if abs(origin_time + elapsed - segment_time) > 60:
-                            origin_time = segment_time
-                            origin_pts = pts
-                    except OSError:
-                        pass
-                    reset_clock = False
-                elapsed = (pts - origin_pts) % ((1 << 33) / 90_000)
-                date = datetime.fromtimestamp(origin_time + elapsed, timezone.utc)
-                result.append("#EXT-X-PROGRAM-DATE-TIME:" + date.isoformat(timespec="milliseconds"))
+            date = dates.get(line)
+            if date is None and (pts := segment_pts(pathlib.Path(directory) / line)) is not None:
+                date = origin_time + (pts - origin_pts) % ((1 << 33) / 90_000)
+            if date is not None:
+                listed[line] = date
+                stamp = datetime.fromtimestamp(date, timezone.utc)
+                result.append(
+                    "#EXT-X-PROGRAM-DATE-TIME:" + stamp.isoformat(timespec="milliseconds"),
+                )
         result.append(line)
-    return "\n".join(result) + "\n"
+    return "\n".join(result) + "\n", listed
 
 
 def ready_bitrate(

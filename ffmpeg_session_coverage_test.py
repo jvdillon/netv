@@ -13,6 +13,7 @@ from fastapi import HTTPException
 
 import pytest
 
+from fast_start_test import video_packet
 from ffmpeg_command import MediaInfo
 from ffmpeg_session_test import ARCHIVE_URL, FakeProcess
 from playback_policy import LiveRecoveryPolicy, PlaybackHealth, PlaybackPolicy
@@ -43,18 +44,6 @@ class AsyncProcess(FakeProcess):
         if self.returncode is None:
             self.returncode = self.exit_code
         return self.returncode
-
-
-class StubbornProcess:
-    """Ignores SIGTERM."""
-
-    returncode = None
-
-    def terminate(self) -> None:
-        pass
-
-    def kill(self) -> None:
-        self.returncode = -9
 
 
 def _close(coro):
@@ -111,7 +100,7 @@ def test_stop_session_cancels_pending_tasks_and_kills_extra_processes(state, tmp
     pending = MagicMock(done=MagicMock(return_value=False))
     extra = FakeProcess()
     sessions["s"] = _live(tmp_path, watchdog_task=pending, extra_processes=[extra])
-    fs.stop_session("s", force=True)
+    asyncio.run(fs.stop_session("s", force=True))
     pending.cancel.assert_called_once()
     assert extra.returncode == -15
     assert "s" not in sessions
@@ -129,7 +118,7 @@ def test_stop_user_stream_matches_url_or_request_url_for_owner_only(state, tmp_p
         directory.mkdir()
         sessions[sid] = {"dir": str(directory), "process": FakeProcess(), "username": user}
         sessions[sid][key] = "http://stream"
-    fs.stop_user_stream("alice", "http://stream")
+    asyncio.run(fs.stop_user_stream("alice", "http://stream"))
     assert set(sessions) == {"c"}
 
 
@@ -138,10 +127,37 @@ def test_shutdown_cancels_tasks_and_kills_extras(state):
     task = MagicMock(done=MagicMock(return_value=False))
     extra = FakeProcess()
     sessions["s"] = {"watchdog_task": task, "extra_processes": [extra], "process": None}
-    fs.shutdown()
+    asyncio.run(fs.shutdown())
     task.cancel.assert_called_once()
     assert extra.returncode == -15
     assert not sessions
+
+
+@pytest.mark.asyncio
+async def test_watchdog_stopping_its_own_session_is_not_cancelled(state, tmp_path):
+    sessions, _ = state
+    finished = asyncio.Event()
+
+    async def watchdog():
+        await fs.stop_session("s", force=True)
+        finished.set()
+
+    sessions["s"] = _live(tmp_path, fast_start=True)
+    task = asyncio.create_task(watchdog())
+    sessions["s"]["watchdog_task"] = task
+    await task
+    assert finished.is_set()
+    assert not sessions
+
+
+def test_cached_live_stop_keeps_session_but_stops_its_process(state, tmp_path):
+    sessions, _ = state
+    sessions["s"] = _live(tmp_path, last_access=0)
+    with patch("ffmpeg_session.get_live_cache_timeout", return_value=30):
+        asyncio.run(fs.stop_session("s"))
+    assert sessions["s"]["process"].returncode == -15
+    assert sessions["s"]["last_access"] > 0
+    assert tmp_path.exists()
 
 
 # =============================================================================
@@ -495,7 +511,7 @@ def test_cleanup_invalid_session(state, tmp_path):
     sessions, urls = state
     sessions["s"] = _live(tmp_path)
     urls["http://live"] = "s"
-    fs._cleanup_invalid_session("http://live", "s")
+    asyncio.run(fs._cleanup_invalid_session("http://live", "s"))
     assert not sessions
     assert not urls
 
@@ -905,14 +921,6 @@ def test_dead_process_signals_are_noops():
     assert process.returncode == -1
 
 
-def test_kill_process_escalates_to_sigkill():
-    process = StubbornProcess()
-    with patch("ffmpeg_session.time.sleep") as sleep:
-        assert fs._kill_process(process) is True
-    assert process.returncode == -9
-    assert sleep.call_count == 10
-
-
 @pytest.mark.asyncio
 async def test_monitor_stderr_collects_lines(caplog):
     process = AsyncProcess(lines=[b"frame=1\n", b"Fatal error\n"])
@@ -1282,24 +1290,21 @@ async def test_wait_for_fresh_fast_playlist(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_terminate_fast_process_simple_paths():
+async def test_terminate_process_simple_paths():
     dead = FakeProcess(alive=False)
-    await fs._terminate_fast_process(dead)
+    await fs._terminate_process(dead)
     assert dead.returncode == 0
     vanished = FakeProcess(killed=True)
-    await fs._terminate_fast_process(vanished)
+    await fs._terminate_process(vanished)
     assert vanished.returncode is None
-    no_wait = FakeProcess()
-    await fs._terminate_fast_process(no_wait)
-    assert no_wait.returncode == -15
     graceful = AsyncProcess()
-    await fs._terminate_fast_process(graceful)
+    await fs._terminate_process(graceful)
     assert (graceful.returncode, graceful.waited) == (-15, 1)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error", [TimeoutError, asyncio.CancelledError])
-async def test_terminate_fast_process_escalates(error):
+async def test_terminate_process_escalates(error):
     process = AsyncProcess()
     process.terminate = lambda: None
 
@@ -1310,28 +1315,24 @@ async def test_terminate_fast_process_escalates(error):
     with patch.object(fs.asyncio, "wait_for", wait_for):
         if error is asyncio.CancelledError:
             with pytest.raises(asyncio.CancelledError):
-                await fs._terminate_fast_process(process)
+                await fs._terminate_process(process)
         else:
-            await fs._terminate_fast_process(process)
+            await fs._terminate_process(process)
     assert process.returncode == -9
     assert process.waited == 1
 
 
 @pytest.mark.asyncio
-async def test_launch_recovery_ffmpeg_success_and_cancel():
-    process = AsyncProcess()
-    with patch("ffmpeg_session._launch_ffmpeg", new=AsyncMock(return_value=process)):
-        assert await fs._launch_recovery_ffmpeg(["ffmpeg"]) is process
-
+async def test_launch_ffmpeg_terminates_a_process_launched_after_cancellation():
     gate = asyncio.Event()
     late = AsyncProcess()
 
-    async def slow(cmd):
+    async def slow(*cmd, **kwargs):
         await gate.wait()
         return late
 
-    with patch("ffmpeg_session._launch_ffmpeg", side_effect=slow):
-        task = asyncio.create_task(fs._launch_recovery_ffmpeg(["ffmpeg"]))
+    with patch("ffmpeg_session.asyncio.create_subprocess_exec", side_effect=slow):
+        task = asyncio.create_task(fs._launch_ffmpeg(["ffmpeg"]))
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         task.cancel()
@@ -1382,8 +1383,38 @@ def _fast_session(tmp_path, **extra) -> dict[str, Any]:
 
 @pytest.fixture
 def recovery_env(state):
-    with patch("ffmpeg_session._spawn_background_task", side_effect=_close):
+    with (
+        patch("ffmpeg_session._spawn_background_task", side_effect=_close),
+        patch("ffmpeg_session._restart_session_clock", new=AsyncMock()),
+    ):
         yield state[0]
+
+
+@pytest.mark.asyncio
+async def test_restart_clock_dates_old_segments_then_follows_new_ingest(state, tmp_path):
+    sessions, _ = state
+    (tmp_path / "low_1.ts").write_bytes(video_packet(5002) * 10)
+    (tmp_path / "input_000001.ts").write_bytes(video_packet(1.5) * 10)
+    session = _fast_session(tmp_path, origin_pts=5000.0, origin_time=100.0)
+    sessions["f"] = session
+    await fs._restart_session_clock("f", session, tmp_path / "missing.m3u8")
+    assert "segment_dates" not in session
+    (tmp_path / "low.m3u8").write_text("#EXTINF:2,\nlow_1.ts\n")
+    session.update(origin_pts=5000.0, origin_time=100.0)
+    await fs._restart_session_clock("f", session, tmp_path / "low.m3u8")
+    assert session["segment_dates"] == {"low_1.ts": 102.0}
+    assert session["origin_pts"] == 1.5
+    assert session["origin_time"] == pytest.approx(time.time(), abs=5)
+    sessions.clear()
+    await fs._restart_session_clock("f", session, tmp_path / "low.m3u8")
+    assert session["origin_pts"] == 1.5
+
+
+def test_dated_fast_playlist_needs_a_known_clock(state, tmp_path):
+    sessions, _ = state
+    assert fs.dated_fast_playlist("missing", "#EXTM3U\n") == "#EXTM3U\n"
+    sessions["f"] = _fast_session(tmp_path, origin_pts=None)
+    assert fs.dated_fast_playlist("f", "#EXTM3U\n") == "#EXTM3U\n"
 
 
 def _pipeline_dir(tmp_path):
@@ -1501,10 +1532,11 @@ async def test_restart_pipeline_session_replaced(recovery_env, tmp_path, stage):
 # =============================================================================
 
 
-def _recovery(stalled=(), permit=False, pending=()):
+def _recovery(stalled=(), permit=False, pending=(), exhausted=False):
     recovery = MagicMock()
     recovery.stalled.side_effect = lambda stage, alive, ready, now: stage in stalled
     recovery.permit_restart.return_value = permit
+    recovery.exhausted.return_value = exhausted
     recovery.pending = set(pending)
     return recovery
 

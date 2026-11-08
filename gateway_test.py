@@ -640,7 +640,7 @@ def test_cleanup_upscale_sessions_runs_every_minute(monkeypatch: pytest.MonkeyPa
     class Stop(Exception):
         pass
 
-    cleanup = MagicMock(side_effect=[None, Stop()])
+    cleanup = AsyncMock(side_effect=[None, Stop()])
     monkeypatch.setattr(gateway.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(gateway.ffmpeg_session, "cleanup_expired_sessions", cleanup)
 
@@ -675,7 +675,11 @@ def test_lifespan_initializes_and_shuts_down(
         "cleanup_and_recover_sessions",
         lambda: calls.append("recover"),
     )
-    monkeypatch.setattr(gateway.ffmpeg_session, "shutdown", lambda: calls.append("shutdown"))
+    monkeypatch.setattr(
+        gateway.ffmpeg_session,
+        "shutdown",
+        AsyncMock(side_effect=lambda: calls.append("shutdown")),
+    )
     upscale_settings = MagicMock(return_value=_settings(sr_model=sr_model))
     monkeypatch.setattr(gateway, "_upscale_settings", upscale_settings)
 

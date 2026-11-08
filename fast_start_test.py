@@ -49,8 +49,9 @@ def test_timeline_and_readiness(tmp_path):
     assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8") == 7520
     assert fast_start.segment_pts(tmp_path / "low_0.ts") == 10
     content = (tmp_path / "low.m3u8").read_text()
-    dated = fast_start.dated_playlist(str(tmp_path), content, 10, 0)
+    dated, dates = fast_start.dated_playlist(str(tmp_path), content, 10, 0, {})
     assert "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.000+00:00" in dated
+    assert dates == {"low_0.ts": 0, "low_1.ts": 2, "low_2.ts": 4}
     os.utime(tmp_path / "low.m3u8", (80, 80))
     with patch("fast_start.time.time", return_value=100):
         assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8") == 0
@@ -82,11 +83,15 @@ def test_segment_pts_skips_non_video_packets(tmp_path):
     assert fast_start.segment_pts(junk) == 7
 
 
-def test_dated_playlist_keeps_clock_when_discontinuous_segment_vanishes(tmp_path):
-    content = "#EXTM3U\n#EXT-X-DISCONTINUITY\n#EXTINF:2,\ngone.ts\n"
-    with patch("fast_start.segment_pts", return_value=12):
-        dated = fast_start.dated_playlist(str(tmp_path), content, 10, 0)
-    assert "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:02.000+00:00" in dated
+def test_dated_playlist_keeps_earlier_dates_across_a_clock_change(tmp_path):
+    playlist(tmp_path, "low")
+    content = "#EXTM3U\n#EXTINF:2,\nlow_1.ts\n#EXTINF:2,\nlow_2.ts\n#EXTINF:2,\ngone.ts\n"
+    earlier = {"low_1.ts": 500.0, "rolled_off.ts": 400.0}
+    dated, dates = fast_start.dated_playlist(str(tmp_path), content, 14, 1000, earlier)
+    assert dates == {"low_1.ts": 500.0, "low_2.ts": 1000.0}
+    assert "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:08:20.000+00:00\n#EXTINF" not in dated
+    assert dated.count("#EXT-X-PROGRAM-DATE-TIME:") == 2
+    assert dated.endswith("#EXTINF:2,\ngone.ts\n")
 
 
 def test_ready_bitrate_rejects_unsafe_or_empty_entries(tmp_path):
@@ -202,10 +207,10 @@ def test_dated_playlist_replaces_encoder_dates_after_discontinuity(tmp_path):
             "#EXTINF:2,\n#EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:2030-01-01T00:00:00Z\n",
         )
     )
-    dated = fast_start.dated_playlist(str(tmp_path), content, 10, 0)
+    dated, dates = fast_start.dated_playlist(str(tmp_path), content, 10, 0, {})
     assert dated.count("#EXT-X-PROGRAM-DATE-TIME:") == 3
     assert "2030-" not in dated
-    assert fast_start.dated_playlist(str(tmp_path), dated, 10, 0) == dated
+    assert fast_start.dated_playlist(str(tmp_path), dated, 10, 0, dates) == (dated, dates)
     (tmp_path / "low.m3u8").write_text(content)
     assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8") == 7520
 
@@ -221,7 +226,7 @@ def test_discontinuity_keeps_shared_clock_when_pts_remain_continuous(tmp_path):
         )
     )
     os.utime(tmp_path / "low_1.ts", (32, 32))
-    dated = fast_start.dated_playlist(str(tmp_path), content, 10, 0)
+    dated, _ = fast_start.dated_playlist(str(tmp_path), content, 10, 0, {})
     assert "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:02.000+00:00" in dated
 
 
@@ -475,7 +480,7 @@ async def test_shared_session_runs_one_encoder(
         reused = await ffmpeg_session.start_transcode("https://provider/live", fast_start=True)
         assert reused == result
         assert sum("https://provider/live" in cmd for cmd, _ in launched) == 1
-        ffmpeg_session.stop_session(result["session_id"], force=True)
+        await ffmpeg_session.stop_session(result["session_id"], force=True)
         assert all(proc.returncode is not None for _, proc in launched)
         assert not list(tmp_path.iterdir())
 

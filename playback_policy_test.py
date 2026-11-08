@@ -158,6 +158,16 @@ def test_live_restarts_have_cooldowns_and_sliding_budget():
     assert policy.permit_restart("pipeline", 301)
 
 
+def test_live_recovery_reports_a_spent_restart_budget_until_attempts_expire():
+    policy = LiveRecoveryPolicy()
+    assert not policy.exhausted("pipeline", 0)
+    for now in (0, 5, 20):
+        assert policy.permit_restart("pipeline", now)
+        policy.finish_restart("pipeline")
+    assert policy.exhausted("pipeline", 299)
+    assert not policy.exhausted("pipeline", 300)
+
+
 def test_live_recovery_reset_clears_failures():
     policy = LiveRecoveryPolicy()
     policy.failures = {"input": 1, "low": 2}
