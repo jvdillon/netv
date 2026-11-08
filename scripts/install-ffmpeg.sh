@@ -829,13 +829,15 @@ SRCEOF
     if [ -z "${NVCC_CCBIN:-}" ]; then
         NVCC_PROBE_DIR=$(mktemp -d)
         printf '__global__ void k(){}\n' > "$NVCC_PROBE_DIR/p.cu"
+        # Pass the compiler as -ccbin: nvcc before CUDA 12.5 ignores NVCC_CCBIN.
         nvcc_accepts() {
-            if [ -n "$1" ]; then set -- env NVCC_CCBIN="$1"; else set -- env -u NVCC_CCBIN; fi
-            "$@" "$CUDA_PATH/bin/nvcc" -std=c++14 -c -o "$NVCC_PROBE_DIR/p.o" "$NVCC_PROBE_DIR/p.cu" \
-                -Wno-deprecated-gpu-targets >/dev/null 2>&1
+            local ccbin=()
+            [ -n "$1" ] && ccbin=(-ccbin "$1")
+            env -u NVCC_CCBIN "$CUDA_PATH/bin/nvcc" "${ccbin[@]}" -std=c++14 -c \
+                -o "$NVCC_PROBE_DIR/p.o" "$NVCC_PROBE_DIR/p.cu" -Wno-deprecated-gpu-targets >/dev/null 2>&1
         }
         if ! nvcc_accepts ""; then
-            for v in 14 13 12; do
+            for v in 14 13 12 11; do
                 if ! command -v "g++-$v" >/dev/null && [ "$SKIP_DEPS" != "1" ]; then
                     sudo apt-get install -y "g++-$v" >/dev/null 2>&1 || continue
                 fi
@@ -1775,7 +1777,8 @@ if [ "$BUILD_LIBPLACEBO" = "1" ]; then
 fi
 
 if [ -n "$NVCC_ARCH" ]; then
-    CONFIGURE_CMD+=(--nvccflags="$NVCC_ARCH")
+    # -ccbin, not NVCC_CCBIN: nvcc before CUDA 12.5 ignores the environment variable.
+    CONFIGURE_CMD+=(--nvccflags="$NVCC_ARCH${NVCC_CCBIN:+ -ccbin $NVCC_CCBIN}")
 fi
 
 # Build PATH: include CUDA bin if NVIDIA enabled
