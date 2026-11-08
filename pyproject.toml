@@ -71,7 +71,7 @@ pre-commit = [
     {include-group = "test"},
     {include-group = "typecheck"},
     "basedpyright>=1.40.2",
-    "codedoctor[coverage,mutation,notebook]>=0.1.3",
+    "codedoctor[coverage,mutation,notebook]>=0.1.4",
     "codespell>=2.4.3",
     "onnx>=1.23.2",
     "onnxconverter-common>=1.16.0",
@@ -113,8 +113,6 @@ package = true
 [tool.uv.dependency-groups.pre-commit]
 requires-python = ">=3.12"
 
-[tool.uv.sources]
-codedoctor = { path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-policy-v6/codedoctor-0.1.3-py3-none-any.whl" }
 [tool.ruff]
 fix = true
 show-fixes = true
