@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Thread
-from typing import Any
+from typing import TypedDict, cast
 from weakref import finalize
+from xml.etree.ElementTree import Element
 
 import contextlib
 import gzip
@@ -38,6 +39,14 @@ class Program:
     stop: datetime
     desc: str = ""
     source_id: str = ""
+
+
+class ChannelMatch(TypedDict):
+    """An EPG channel found by ``search_channels``."""
+
+    id: str
+    name: str
+    has_listings: bool
 
 
 # =============================================================================
@@ -156,7 +165,8 @@ def get_icon(channel_id: str) -> str:
     """Get icon URL for a channel."""
     conn = _get_conn()
     row = conn.execute("SELECT url FROM icons WHERE channel_id = ?", (channel_id,)).fetchone()
-    return row["url"] if row else ""
+    # Typeshed types sqlite rows as Any; insert_icon stores text.
+    return cast(str, row["url"]) if row else ""
 
 
 def get_programs_in_range(
@@ -275,7 +285,7 @@ def get_programs_batch(
             )
 
     # Deduplicate overlapping programs if preferred_sources provided.
-    if preferred_sources:
+    if preferred_sources is not None:
         for ch_id in result:
             if ch_id in preferred_sources and result[ch_id]:
                 result[ch_id] = _dedupe_programs(result[ch_id], preferred_sources[ch_id])
@@ -339,7 +349,7 @@ def has_programs_after(when: datetime) -> bool:
     return row is not None
 
 
-def search_channels(terms: list[str], limit: int = 20) -> list[dict[str, Any]]:
+def search_channels(terms: list[str], limit: int = 20) -> list[ChannelMatch]:
     """Find EPG channels whose id or name contains every term.
 
     Channels with upcoming listings come first.
@@ -355,7 +365,7 @@ def search_channels(terms: list[str], limit: int = 20) -> list[dict[str, Any]]:
     if not terms:
         return []
     where = " AND ".join("(c.id LIKE ? OR c.name LIKE ?)" for _ in terms)
-    params: list[Any] = []
+    params: list[str] = []
     for t in terms:
         like = f"%{t}%"
         params += [like, like]
@@ -381,14 +391,14 @@ def get_program_count() -> int:
     """Get total program count."""
     conn = _get_conn()
     row = conn.execute("SELECT COUNT(*) FROM programs").fetchone()
-    return row[0] if row else 0
+    return cast(int, row[0]) if row else 0
 
 
 def get_channel_count() -> int:
     """Get total channel count."""
     conn = _get_conn()
     row = conn.execute("SELECT COUNT(*) FROM channels").fetchone()
-    return row[0] if row else 0
+    return cast(int, row[0]) if row else 0
 
 
 def prune_old_programs(before: datetime) -> int:
@@ -448,8 +458,7 @@ def fetch_epg(
     for ch in root.findall("channel"):
         ch_id = ch.get("id", "")
         channel_ids.add(ch_id)
-        name_el = ch.find("display-name")
-        name = name_el.text if name_el is not None and name_el.text else ch_id
+        name = _element_text(ch.find("display-name"), default=ch_id)
         insert_channel(ch_id, name, source_id)
         icon_el = ch.find("icon")
         if icon_el is not None:
@@ -467,11 +476,8 @@ def fetch_epg(
         start_str = prog.get("start", "")
         stop_str = prog.get("stop", "")
 
-        title_el = prog.find("title")
-        title = title_el.text if title_el is not None and title_el.text else "Unknown"
-
-        desc_el = prog.find("desc")
-        desc = desc_el.text if desc_el is not None and desc_el.text else ""
+        title = _element_text(prog.find("title"), default="Unknown")
+        desc = _element_text(prog.find("desc"), default="")
 
         try:
             start = _parse_epg_time(start_str)
@@ -553,13 +559,24 @@ def _parse_epg_time(s: str) -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _element_text(element: Element | None, *, default: str) -> str:
+    """Return an XML element's text, or ``default`` when it is absent or empty."""
+    text = None if element is None else element.text
+    return default if text is None or text == "" else text
+
+
 def _sanitize_epg_xml(xml_str: str) -> str:
     """Try to fix corrupted EPG XML by extracting valid elements."""
-    channels = re.findall(r"<channel\s+[^>]*>.*?</channel>", xml_str, re.DOTALL)
-    programmes = re.findall(
-        r'<programme\s+start="[^"<>]+"\s+stop="[^"<>]+"\s+channel="[^"<>]+"[^>]*>.*?</programme>',
-        xml_str,
-        re.DOTALL,
-    )
+    channels = [
+        m.group(0) for m in re.finditer(r"<channel\s+[^>]*>.*?</channel>", xml_str, re.DOTALL)
+    ]
+    programmes = [
+        m.group(0)
+        for m in re.finditer(
+            r'<programme\s+start="[^"<>]+"\s+stop="[^"<>]+"\s+channel="[^"<>]+"[^>]*>.*?</programme>',
+            xml_str,
+            re.DOTALL,
+        )
+    ]
     log.info("Sanitized EPG: extracted %d channels, %d programmes", len(channels), len(programmes))
     return '<?xml version="1.0"?>\n<tv>\n' + "\n".join(channels) + "\n".join(programmes) + "\n</tv>"

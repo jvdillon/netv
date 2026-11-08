@@ -30,7 +30,7 @@ Example FFmpeg usage after export:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Protocol, cast, override
 from urllib import request
 
 import argparse
@@ -490,6 +490,7 @@ class _NomosSRVGG(nn.Module):
         self.body.append(nn.Conv2d(64, 3 * scale * scale, 3, 1, 1))
         self.upsampler = nn.PixelShuffle(scale)
 
+    @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = x
         for layer in self.body[:-1]:

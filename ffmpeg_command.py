@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Final, Literal
+from typing import Final, NotRequired, TypedDict
 from urllib import request
 from urllib.parse import urljoin
 
@@ -17,22 +17,14 @@ import tempfile
 import threading
 import time
 
-from cache import clamp_live_dvr_mins, get_user_agent
+from treekle import json_loads
+
+from cache import HwAccel, ServerSettings, clamp_live_dvr_mins, get_user_agent
 
 import cache
 
 
 log = logging.getLogger(__name__)
-
-HwAccel = Literal[
-    "nvenc+vaapi",
-    "nvenc+software",
-    "amf+vaapi",
-    "amf+software",
-    "qsv",
-    "vaapi",
-    "software",
-]
 
 
 # Segment names are a persistence-format contract shared by command and session readers.
@@ -42,11 +34,12 @@ PASSTHROUGH_AUDIO_CODECS = frozenset({"ac3", "eac3"})
 
 # Module state.
 _probe_lock = threading.Lock()
-_probe_cache: dict[str, tuple[float, MediaInfo | None, list[SubtitleStream]]] = {}
-_series_probe_cache: dict[int, dict[str, Any]] = {}
+_probe_cache: dict[str, _ProbeEntry] = {}
+_series_probe_cache: dict[int, _SeriesProbe] = {}
 _gpu_nvdec_codecs: set[str] | None = None  # None = not probed yet.
 _has_libplacebo: bool | None = None  # None = not probed yet.
-_load_settings: Callable[[], dict[str, Any]] = dict
+# The loader main injects; init() replaces it (the gateway layers upscale checks on top).
+_load_settings: Callable[[], ServerSettings] = cache.load_server_settings
 
 # Directory containing TensorRT engines; None until init() enables AI Upscale.
 _sr_engine_dir: str | None = None
@@ -77,8 +70,83 @@ class MediaInfo:
     is_hls: bool = False  # True if format is HLS (for input options)
 
 
+_ProbeEntry = tuple[float, MediaInfo | None, list[SubtitleStream]]
+
+
+class _CachedSubtitle(TypedDict):
+    index: int
+    lang: NotRequired[str]
+    name: NotRequired[str]
+
+
+class _CachedEpisode(TypedDict, total=False):
+    time: float
+    video_codec: str
+    audio_codec: str
+    pix_fmt: str
+    audio_channels: int
+    audio_sample_rate: int
+    subtitle_codecs: list[str] | None
+    duration: float
+    height: int
+    video_bitrate: int
+    interlaced: bool
+    is_10bit: bool
+    is_hdr: bool
+    is_hls: bool
+    subtitles: list[_CachedSubtitle]
+
+
+class _ProbeTags(TypedDict, total=False):
+    language: str
+    name: str
+    title: str
+
+
+# Numeric fields accept every shape ffprobe versions emit, which the conversions tolerate.
+_ProbeNumber = str | int | float | None
+
+
+class _ProbeStream(TypedDict, total=False):
+    index: int | None
+    codec_name: str
+    codec_type: str
+    pix_fmt: str
+    height: int | None
+    field_order: str
+    color_transfer: str
+    bit_rate: _ProbeNumber
+    channels: _ProbeNumber
+    sample_rate: _ProbeNumber
+    profile: str
+    tags: _ProbeTags
+
+
+class _ProbeFormat(TypedDict, total=False):
+    format_name: str
+    duration: _ProbeNumber
+    bit_rate: _ProbeNumber
+
+
+class EpisodeProbeStats(TypedDict):
+    episode_id: int
+    duration: float
+    subtitle_count: int
+
+
+class SeriesProbeStats(TypedDict):
+    series_id: int
+    name: str
+    mru: int | None
+    episode_count: int
+    video_codec: str
+    audio_codec: str
+    subtitle_count: int
+    episodes: list[EpisodeProbeStats]
+
+
 def init(
-    load_settings: Callable[[], dict[str, Any]],
+    load_settings: Callable[[], ServerSettings],
     sr_engine_dir: str = "",
 ) -> None:
     """Initialize module with settings loader and optional AI Upscale config.
@@ -92,11 +160,11 @@ def init(
     _load_settings = load_settings
     _sr_engine_dir = sr_engine_dir or None
     _load_series_probe_cache()
-    if _sr_engine_dir:
+    if _sr_engine_dir is not None:
         log.info("AI Upscale enabled: engine_dir=%s", _sr_engine_dir)
 
 
-def get_settings() -> dict[str, Any]:
+def get_settings() -> ServerSettings:
     """Get current settings."""
     return _load_settings()
 
@@ -144,7 +212,7 @@ def get_transcode_dir() -> pathlib.Path:
 # ===========================================================================
 
 
-def get_series_probe_cache_stats() -> list[dict[str, Any]]:
+def get_series_probe_cache_stats() -> list[SeriesProbeStats]:
     """Get stats about cached series probes for settings UI.
 
     Returns:
@@ -156,9 +224,9 @@ def get_series_probe_cache_stats() -> list[dict[str, Any]]:
             len(_series_probe_cache),
             list(_series_probe_cache.keys()),
         )
-        result = []
+        result: list[SeriesProbeStats] = []
         for series_id, series_data in _series_probe_cache.items():
-            episodes = series_data.get("episodes", {})
+            episodes = series_data["episodes"]
             if not episodes:
                 continue
             # Get most recent entry for display info.
@@ -167,7 +235,7 @@ def get_series_probe_cache_stats() -> list[dict[str, Any]]:
             if media_info is None:
                 continue
             # Build episode list.
-            episode_list = []
+            episode_list: list[EpisodeProbeStats] = []
             for eid, (_, emedia, esubs) in episodes.items():
                 if emedia:
                     episode_list.append(
@@ -189,7 +257,7 @@ def get_series_probe_cache_stats() -> list[dict[str, Any]]:
                     "episodes": sorted(episode_list, key=lambda x: x["episode_id"]),
                 },
             )
-        return sorted(result, key=lambda x: x.get("name") or str(x["series_id"]))
+        return sorted(result, key=lambda x: x["name"] or str(x["series_id"]))
 
 
 def clear_all_probe_cache() -> int:
@@ -299,7 +367,7 @@ def resolve_hls_master_playlist(url: str) -> str:
     try:
         req = request.Request(url)
         user_agent = get_user_agent()
-        if user_agent:
+        if user_agent is not None:
             req.add_header("User-Agent", user_agent)
         with request.urlopen(req, timeout=10) as response:
             content = response.read().decode("utf-8", errors="replace")
@@ -375,12 +443,12 @@ def probe_media(
         subtitles: Extractable text subtitle streams.
     """
     # Check series/episode cache first.
-    cache_hit_result: tuple[MediaInfo, list[SubtitleStream]] | None = None
+    cache_hit_result: tuple[MediaInfo | None, list[SubtitleStream]] | None = None
     save_mru = False
     if series_id is not None:
         with _probe_lock:
             series_data = _series_probe_cache.get(series_id)
-            if series_data:
+            if series_data is not None:
                 episodes = series_data.get("episodes", {})
                 mru_eid = series_data.get("mru")
                 # Try exact episode first.
@@ -410,7 +478,7 @@ def probe_media(
         # Save MRU update outside the lock to avoid deadlock.
         if save_mru:
             _save_series_probe_cache()
-        if cache_hit_result:
+        if cache_hit_result is not None:
             return cache_hit_result
 
     # Check URL cache (for movies, or series cache miss)
@@ -445,12 +513,12 @@ def probe_media(
         "-show_format",
     ]
     user_agent = get_user_agent()
-    if user_agent:
+    if user_agent is not None:
         base_cmd.extend(["-user_agent", user_agent])
 
     # Try probe without forcing HLS first, retry with HLS options if it fails.
     is_hls = False
-    data = None
+    data: _ProbeOutput | None = None
     for force_hls in (False, True):
         try:
             cmd = base_cmd.copy()
@@ -466,7 +534,7 @@ def probe_media(
                 timeout=probe_timeout_sec,
             )
             if result.returncode == 0:
-                data = json.loads(result.stdout)
+                data = json_loads(result.stdout, _ProbeOutput)
                 # Check detected format or if we forced HLS.
                 format_name = data.get("format", {}).get("format_name", "").lower()
                 is_hls = force_hls or "hls" in format_name
@@ -494,7 +562,8 @@ def probe_media(
         if codec_type == "video" and not video_codec:
             video_codec = codec
             pix_fmt = stream.get("pix_fmt", "")
-            height = stream.get("height", 0) or 0
+            stream_height = stream.get("height")
+            height = 0 if stream_height is None else stream_height
             # Detect interlacing from field_order (tt, bb, tb, bt = interlaced)
             field_order = stream.get("field_order", "").lower()
             interlaced = field_order in ("tt", "bb", "tb", "bt")
@@ -505,12 +574,12 @@ def probe_media(
             color_transfer = stream.get("color_transfer", "").lower()
             is_hdr = color_transfer in ("smpte2084", "arib-std-b67")
             # Try to get bitrate from stream, fall back to format.
-            with suppress(ValueError, TypeError):
-                video_bitrate = int(stream.get("bit_rate", 0) or 0)
+            with suppress(ValueError):
+                video_bitrate = _probe_int(stream.get("bit_rate"))
         elif codec_type == "audio" and not audio_codec:
             audio_codec = codec
-            audio_channels = stream.get("channels", 0)
-            audio_sample_rate = int(stream.get("sample_rate", 0) or 0)
+            audio_channels = _probe_int(stream.get("channels"))
+            audio_sample_rate = _probe_int(stream.get("sample_rate"))
             audio_profile = stream.get("profile", "")
         elif codec_type == "subtitle":
             subtitle_codecs.append(codec)
@@ -519,7 +588,7 @@ def probe_media(
                 if idx is not None:
                     tags = stream.get("tags", {})
                     lang = tags.get("language", "und").lower()
-                    name = tags.get("name") or tags.get("title") or _lang_display_name(lang)
+                    name = tags.get("name", "") or tags.get("title", "") or _lang_display_name(lang)
                     subtitles.append(
                         SubtitleStream(
                             index=idx,
@@ -530,13 +599,14 @@ def probe_media(
 
     duration = 0.0
     fmt = data.get("format", {})
-    if fmt.get("duration"):
-        with suppress(ValueError, TypeError):
-            duration = float(fmt["duration"])
+    format_duration = fmt.get("duration")
+    if format_duration is not None and format_duration != "":
+        with suppress(ValueError):
+            duration = float(format_duration)
     # Fall back to format bitrate if stream bitrate unavailable (common for MKV)
-    if not video_bitrate and fmt.get("bit_rate"):
-        with suppress(ValueError, TypeError):
-            video_bitrate = int(fmt["bit_rate"])
+    if not video_bitrate:
+        with suppress(ValueError):
+            video_bitrate = _probe_int(fmt.get("bit_rate"))
 
     if not video_codec:
         return None, []
@@ -567,7 +637,7 @@ def probe_media(
         if series_id is not None:
             if series_id not in _series_probe_cache:
                 _series_probe_cache[series_id] = {"name": series_name, "episodes": {}}
-            elif not _series_probe_cache[series_id].get("name") and series_name:
+            elif not _series_probe_cache[series_id].get("name", "") and series_name:
                 _series_probe_cache[series_id]["name"] = series_name
             eid = episode_id if episode_id is not None else 0
             _series_probe_cache[series_id].setdefault("episodes", {})[eid] = (
@@ -741,16 +811,16 @@ def probe_audio(path: str) -> MediaInfo | None:
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
-        stream = json.loads(result.stdout)["streams"][0]
+        stream = json_loads(result.stdout, _ProbeOutput).get("streams", [])[0]
         return MediaInfo(
             video_codec="",
             audio_codec=stream.get("codec_name", "").lower(),
             pix_fmt="",
-            audio_channels=int(stream.get("channels") or 0),
-            audio_sample_rate=int(stream.get("sample_rate") or 0),
+            audio_channels=_probe_int(stream.get("channels")),
+            audio_sample_rate=_probe_int(stream.get("sample_rate")),
             audio_profile=stream.get("profile", ""),
         )
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError, TypeError):
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return None
 
 
@@ -777,8 +847,9 @@ def probe_video_codec(path: str) -> str:
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
-        return json.loads(result.stdout)["streams"][0].get("codec_name", "").lower()
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError, TypeError):
+        streams = json_loads(result.stdout, _ProbeOutput).get("streams", [])
+        return streams[0].get("codec_name", "").lower()
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return ""
 
 
@@ -816,19 +887,22 @@ def probe_closed_captions(path: str) -> bool:
                 detail,
             )
             return False
-        frames = json.loads(result.stdout).get("frames", [])
-    except (OSError, subprocess.SubprocessError, ValueError, TypeError) as error:
+        probe = json_loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
         log.warning(
             "Could not inspect embedded captions in %s: %s",
             pathlib.Path(path).name,
             error,
         )
         return False
+    # Read as a plain tree: frames without side data, or of another shape, are skipped.
+    frames = probe.get("frames") if isinstance(probe, dict) else None
     return any(
         "closed caption" in str(side_data.get("side_data_type", "")).lower()
-        for frame in frames
+        for frame in (frames if isinstance(frames, list) else [])
         if isinstance(frame, dict)
-        for side_data in frame.get("side_data_list", [])
+        if isinstance(side_list := frame.get("side_data_list"), list)
+        for side_data in side_list
         if isinstance(side_data, dict)
     )
 
@@ -953,7 +1027,7 @@ def build_hls_ffmpeg_cmd(
         ],
     )
     cmd.extend(http_reconnect_args(input_url))
-    if user_agent:
+    if user_agent is not None:
         cmd.extend(["-user_agent", user_agent])
     # Use HLS demuxer options if probe detected HLS format.
     if media_info and media_info.is_hls:
@@ -1051,7 +1125,7 @@ def _find_sr_engine(
     model_name: str = "2x-nomosuni-compact",
 ) -> tuple[str, int, int, int] | None:
     """Find the best matching engine file for the given resolution."""
-    if not _sr_engine_dir:
+    if _sr_engine_dir is None:
         return None
     engine_dir = pathlib.Path(_sr_engine_dir)
     if not engine_dir.exists():
@@ -1102,10 +1176,10 @@ def _build_sr_filter(
     model_name: str = "2x-nomosuni-compact",
 ) -> str:
     """Build AI Upscale filter string if needed. Returns empty string if disabled."""
-    if not _sr_engine_dir:
+    if _sr_engine_dir is None:
         return ""
 
-    if not _load_settings().get("sr_model"):
+    if not _load_settings().get("sr_model", ""):
         return ""  # SR disabled (Off selected)
 
     engine_info = _find_sr_engine(source_height, model_name=model_name)
@@ -1219,7 +1293,7 @@ def _load_series_probe_cache() -> None:
     if not path.exists():
         return
     try:
-        data = json.loads(path.read_text())
+        data = json_loads(path.read_text(), dict[str, _CachedSeries])
         count = 0
         with _probe_lock:
             for sid_str, series_data in data.items():
@@ -1233,7 +1307,6 @@ def _load_series_probe_cache() -> None:
                 else:
                     _series_probe_cache[sid].setdefault("name", series_data.get("name", ""))
                     _series_probe_cache[sid].setdefault("mru", series_data.get("mru"))
-                    _series_probe_cache[sid].setdefault("episodes", {})
                 for eid_str, entry in series_data.get("episodes", {}).items():
                     eid = int(eid_str)
                     if eid in _series_probe_cache[sid]["episodes"]:
@@ -1279,18 +1352,18 @@ def _load_series_probe_cache() -> None:
 def _save_series_probe_cache() -> None:
     """Save series probe cache to disk."""
     with _probe_lock:
-        data: dict[str, dict[str, Any]] = {}
+        data: dict[str, _CachedSeries] = {}
         for sid, series_data in _series_probe_cache.items():
-            episodes = series_data.get("episodes", {})
+            cached_episodes: dict[str, _CachedEpisode] = {}
             data[str(sid)] = {
                 "name": series_data.get("name", ""),
                 "mru": series_data.get("mru"),
-                "episodes": {},
+                "episodes": cached_episodes,
             }
-            for eid, (cache_time, media_info, subs) in episodes.items():
+            for eid, (cache_time, media_info, subs) in series_data["episodes"].items():
                 if media_info is None:
                     continue
-                data[str(sid)]["episodes"][str(eid)] = {
+                cached_episodes[str(eid)] = {
                     "time": cache_time,
                     "video_codec": media_info.video_codec,
                     "audio_codec": media_info.audio_codec,
@@ -1312,6 +1385,11 @@ def _save_series_probe_cache() -> None:
         path.write_text(json.dumps(data, indent=2))
     except Exception as e:
         log.warning("Failed to save series probe cache: %s", e)
+
+
+def _probe_int(value: _ProbeNumber) -> int:
+    """Convert an ffprobe numeric field, treating absent or empty values as zero."""
+    return 0 if value is None or value == "" else int(value)
 
 
 def _lang_display_name(code: str) -> str:
@@ -1356,8 +1434,8 @@ def _build_video_args(
     # Check if SR should be applied (discrete GPUs only)
     sr_filter = ""
     sr_model = _load_settings().get("sr_model", "")
-    if allow_upscale and sr_model and enc_type in ("nvenc", "amf") and _sr_engine_dir:
-        sr_filter = _build_sr_filter(source_height, max_h or 0)
+    if allow_upscale and sr_model and enc_type in ("nvenc", "amf") and _sr_engine_dir is not None:
+        sr_filter = _build_sr_filter(source_height, 0 if max_h is None else max_h)
         # SR requires CPU frames, so disable hw pipeline when SR active.
         if sr_filter:
             use_hw_pipeline = False
@@ -1376,9 +1454,10 @@ def _build_video_args(
         fallback = "software"
 
     # Height expr for scale filter (scale down only, -2 keeps width divisible by 2)
-    h = f"min(ih\\,{max_h})" if max_h else None
+    h = "" if max_h is None else f"min(ih\\,{max_h})"
     # Lower QP/CRF means higher quality.
     qp = {"high": 20, "medium": 28, "low": 35}.get(quality, 28)
+    pre: list[str]
 
     if enc_type == "nvenc":
         if use_hw_pipeline:
@@ -1529,7 +1608,7 @@ def _build_video_args(
             vf = f"format=nv12,hwupload,{deint}{tonemap}{scale}"
         encoder = "h264_vaapi"
         # Use baseline profile for older GPUs (e.g., AMD GCN 1.0) that don't support High profile.
-        if cache.AVAILABLE_ENCODERS.get("vaapi_baseline_only"):
+        if cache.AVAILABLE_ENCODERS.get("vaapi_baseline_only", False):
             # Baseline doesn't support B-frames.
             enc_opts = ["-rc_mode", "CQP", "-qp", str(qp), "-profile:v", "constrained_baseline"]
         else:
@@ -1648,7 +1727,9 @@ def _can_copy_video(
     """Can video be stream-copied (compatible codec, no processing needed)?"""
     max_h = _max_resolution_height(max_resolution) or 9999
     # SR requires re-encode (can't copy video when SR is active)
-    sr_active = bool(allow_upscale and _sr_engine_dir and _load_settings().get("sr_model", ""))
+    sr_active = bool(
+        allow_upscale and _sr_engine_dir is not None and _load_settings().get("sr_model", ""),
+    )
     return bool(
         media_info
         and media_info.video_codec == "h264"
@@ -1680,3 +1761,22 @@ def _can_copy_audio(media_info: MediaInfo | None, *, passthrough: bool = False) 
 def _max_resolution_height(max_resolution: str) -> int | None:
     """Return the scale-down height for a resolution setting, or None for no limit."""
     return {"4k": 2160, "1080p": 1080, "720p": 720, "480p": 480}.get(max_resolution)
+
+
+class _SeriesProbe(TypedDict):
+    name: NotRequired[str]
+    mru: NotRequired[int | None]
+    episodes: dict[int, _ProbeEntry]
+
+
+class _CachedSeries(TypedDict, total=False):
+    name: str
+    mru: int | None
+    episodes: dict[str, _CachedEpisode]
+
+
+class _ProbeOutput(TypedDict, total=False):
+    """The subset of ffprobe's JSON this module reads; other keys are dropped."""
+
+    streams: list[_ProbeStream]
+    format: _ProbeFormat

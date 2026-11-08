@@ -8,6 +8,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Final
 
+import argparse
 import json
 import runpy
 import shutil
@@ -25,7 +26,8 @@ ENGINE_NAME = "2x-nomosuni-compact_1080p_fp16.engine"
 
 
 def _load() -> ModuleType:
-    spec = util.spec_from_file_location("benchmark_nomos", SCRIPT)
+    # Name it by its path, as mutation testing keys each function by module path.
+    spec = util.spec_from_file_location("tools.benchmark-nomos", SCRIPT)
     assert spec is not None
     assert spec.loader is not None
     module = util.module_from_spec(spec)
@@ -88,9 +90,26 @@ def _popen_factory(
     return popen
 
 
+def _skip_sleep(seconds: float) -> None:
+    del seconds
+
+
+def _usr_bin(name: str) -> str:
+    return f"/usr/bin/{name}"
+
+
+def _usr_bin_ffprobe(name: str) -> str | None:
+    return _usr_bin(name) if name == "ffprobe" else None
+
+
+def _probe_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    del kwargs
+    return subprocess.CompletedProcess(command, 0, stdout=_probe_stdout())
+
+
 @pytest.fixture
 def no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(time, "sleep", _skip_sleep)
 
 
 def test_find_binary_prefers_bundled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -99,14 +118,30 @@ def test_find_binary_prefers_bundled(tmp_path: Path, monkeypatch: pytest.MonkeyP
     (tmp_path / "bin" / "ffmpeg").write_text("")
     assert bench.find_binary("ffmpeg") == tmp_path / "bin" / "ffmpeg"
 
-    monkeypatch.setattr(
-        shutil,
-        "which",
-        lambda name: f"/usr/bin/{name}" if name == "ffprobe" else None,
-    )
+    monkeypatch.setattr(shutil, "which", _usr_bin_ffprobe)
     assert bench.find_binary("ffprobe") == Path("/usr/bin/ffprobe")
     with pytest.raises(FileNotFoundError, match=r"Unable to find nope; .* place it in .*bin"):
         bench.find_binary("nope")
+
+
+def test_argument_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    parser = argparse.ArgumentParser()
+    bench._add_arguments(parser)
+    flags = parser.parse_args(["--sample", "clip.mp4"])
+    assert flags.sample == Path("clip.mp4")
+    assert flags.model_dir == tmp_path / "ffmpeg_build" / "models"
+    assert flags.warmup_seconds == 5.0
+    assert flags.target_fps == 60.0
+
+
+def test_sample_argument_is_required(capsys: pytest.CaptureFixture[str]) -> None:
+    parser = argparse.ArgumentParser()
+    bench._add_arguments(parser)
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args([])
+    assert exc.value.code == 2
+    assert "required: --sample" in capsys.readouterr().err
 
 
 def test_result_rates() -> None:
@@ -168,7 +203,7 @@ def test_run_once_measures_startup(monkeypatch: pytest.MonkeyPatch, no_sleep: No
 def test_run_once_without_playlist_uses_end_time(monkeypatch: pytest.MonkeyPatch) -> None:
     class Done:
         returncode = 0
-        stderr = None
+        stderr: _Reader | None = None
 
         def __init__(self, *args: object, **kwargs: object) -> None:
             pass
@@ -192,12 +227,8 @@ def test_run_once_reports_failure_tail(monkeypatch: pytest.MonkeyPatch, no_sleep
 
 
 def _patch_tools(monkeypatch: pytest.MonkeyPatch, commands: list[list[str]]) -> None:
-    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda command, **_: subprocess.CompletedProcess(command, 0, stdout=_probe_stdout()),
-    )
+    monkeypatch.setattr(shutil, "which", _usr_bin)
+    monkeypatch.setattr(subprocess, "run", _probe_run)
     monkeypatch.setattr(subprocess, "Popen", _popen_factory(commands))
 
 

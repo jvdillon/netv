@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TypedDict
 from unittest.mock import MagicMock, patch
 from urllib import error
 
@@ -20,15 +21,18 @@ import time
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from treekle import MutablePlainTree
 
 import pytest
 
 from cache import Source
 from epg import Program
 from main import PlayerInfo
+from xtream import ProviderRecord
 
 import auth
 import cache as cache_module
+import handoff
 import m3u as m3u_module
 import main
 import main_test
@@ -64,20 +68,20 @@ class _RecordingThread:
 
 
 @pytest.fixture
-def sync_threads():
+def sync_threads() -> Iterator[None]:
     with patch("main.threading", SimpleNamespace(Thread=_SyncThread)):
         yield
 
 
 @pytest.fixture
-def recorded_threads():
+def recorded_threads() -> Iterator[list[Callable[[], None]]]:
     _RecordingThread.started = []
     with patch("main.threading", SimpleNamespace(Thread=_RecordingThread)):
         yield _RecordingThread.started
 
 
 @pytest.fixture
-def refresh_flags():
+def refresh_flags() -> Iterator[set[str]]:
     flags = m3u_module.get_refresh_in_progress()
     flags.clear()
     yield flags
@@ -98,7 +102,11 @@ def _source(source_id: str, source_type: str, **kwargs: Any) -> Source:
 # ===========================================================================
 
 
-def test_guide_refresh_starts_each_refresh_once(auth_client, refresh_flags, recorded_threads):
+def test_guide_refresh_starts_each_refresh_once(
+    auth_client: TestClient,
+    refresh_flags: set[str],
+    recorded_threads: list[Callable[[], None]],
+):
     response = auth_client.get("/guide/refresh", follow_redirects=False)
     assert response.status_code == 303
     assert response.headers["location"] == "/guide?refreshing=1"
@@ -109,14 +117,14 @@ def test_guide_refresh_starts_each_refresh_once(auth_client, refresh_flags, reco
     assert len(recorded_threads) == 2
 
 
-def test_source_refresh_unknown_source(auth_client):
+def test_source_refresh_unknown_source(auth_client: TestClient):
     with patch("main.get_sources", return_value=[]):
         assert auth_client.post("/settings/refresh/nope/live").json() == {
             "error": "Source not found",
         }
 
 
-def test_source_refresh_already_running(auth_client, refresh_flags):
+def test_source_refresh_already_running(auth_client: TestClient, refresh_flags: set[str]):
     refresh_flags.add("s1_live")
     with patch("main.get_sources", return_value=[_source("s1", "xtream")]):
         assert auth_client.post("/settings/refresh/s1/live").json() == {
@@ -126,11 +134,11 @@ def test_source_refresh_already_running(auth_client, refresh_flags):
 
 @pytest.mark.parametrize(("epg_url", "expected_epg"), [("http://g", True), ("", False)])
 def test_source_refresh_live_replaces_only_that_source(
-    auth_client,
-    refresh_flags,
-    sync_threads,
-    epg_url,
-    expected_epg,
+    auth_client: TestClient,
+    refresh_flags: set[str],
+    sync_threads: None,
+    epg_url: str,
+    expected_epg: bool,
 ):
     del sync_threads
     store = cache_module.get_cache()
@@ -165,7 +173,13 @@ def test_source_refresh_live_replaces_only_that_source(
         (_source("s1", "m3u"), None),
     ],
 )
-def test_source_refresh_epg(auth_client, refresh_flags, sync_threads, source, fetched_url):
+def test_source_refresh_epg(
+    auth_client: TestClient,
+    refresh_flags: set[str],
+    sync_threads: None,
+    source: Source,
+    fetched_url: str | None,
+):
     del sync_threads
     with (
         patch("main.get_sources", return_value=[source]),
@@ -173,7 +187,7 @@ def test_source_refresh_epg(auth_client, refresh_flags, sync_threads, source, fe
         patch("main._fetch_all_epg", return_value=5) as fetch,
     ):
         auth_client.post("/settings/refresh/s1/epg")
-    if fetched_url:
+    if fetched_url is not None:
         clear.assert_called_once_with("s1")
         fetch.assert_called_once_with([(fetched_url, source.epg_timeout, "s1")])
     else:
@@ -182,15 +196,15 @@ def test_source_refresh_epg(auth_client, refresh_flags, sync_threads, source, fe
 
 
 def test_source_refresh_vod_merges_and_drops_file_cache(
-    auth_client,
-    refresh_flags,
-    sync_threads,
-    tmp_path,
+    auth_client: TestClient,
+    refresh_flags: set[str],
+    sync_threads: None,
+    tmp_path: Path,
 ):
     del sync_threads, refresh_flags
     stale = tmp_path / "vod_data_x.json"
     stale.write_text("{}")
-    cache_module.get_cache()["vod_streams"] = ["stale"]
+    cache_module.get_cache()["vod_streams"] = [{"stream_id": "stale"}]
     existing = (
         [{"category_id": "o", "source_id": "other"}, {"category_id": "x", "source_id": "s1"}],
         [{"stream_id": "o", "source_id": "other"}, {"stream_id": "x", "source_id": "s1"}],
@@ -213,7 +227,7 @@ def test_source_refresh_vod_merges_and_drops_file_cache(
     )
 
 
-def test_source_refresh_m3u(auth_client, refresh_flags, sync_threads):
+def test_source_refresh_m3u(auth_client: TestClient, refresh_flags: set[str], sync_threads: None):
     del sync_threads, refresh_flags
     store = cache_module.get_cache()
     store["live_categories"] = [{"source_id": "s1"}]
@@ -232,7 +246,12 @@ def test_source_refresh_m3u(auth_client, refresh_flags, sync_threads):
     assert save.call_args.args[1]["epg_urls"] == [("http://o", 10, "other")]
 
 
-def test_source_refresh_failure_clears_flag(auth_client, refresh_flags, sync_threads, caplog):
+def test_source_refresh_failure_clears_flag(
+    auth_client: TestClient,
+    refresh_flags: set[str],
+    sync_threads: None,
+    caplog: pytest.LogCaptureFixture,
+):
     del sync_threads
     with (
         patch("main.get_sources", return_value=[_source("s1", "xtream")]),
@@ -244,7 +263,7 @@ def test_source_refresh_failure_clears_flag(auth_client, refresh_flags, sync_thr
     assert not refresh_flags
 
 
-def test_settings_refresh_status_groups_keys(auth_client, refresh_flags):
+def test_settings_refresh_status_groups_keys(auth_client: TestClient, refresh_flags: set[str]):
     refresh_flags.update({"src_1_epg", "guide_load", "plain"})
     assert auth_client.get("/settings/refresh-status").json() == {
         "src_1": {"epg": True},
@@ -258,31 +277,31 @@ def test_settings_refresh_status_groups_keys(auth_client, refresh_flags):
 # ===========================================================================
 
 
-def test_cast_status_is_user_scoped(auth_client):
-    with patch("casting.manager.status", return_value={"active": False}) as status:
+def test_cast_status_is_user_scoped(auth_client: TestClient):
+    with patch("chromecast.manager.status", return_value={"active": False}) as status:
         assert auth_client.get("/api/cast/status").json() == {"active": False}
     status.assert_called_once_with("testuser")
 
 
-def test_user_prefs_rejects_large_body(auth_client):
+def test_user_prefs_rejects_large_body(auth_client: TestClient):
     response = auth_client.post("/api/user-prefs", content=b"x" * (64 * 1024 + 1))
     assert response.status_code == 400
 
 
-def test_category_filter_rejects_non_list(auth_client):
+def test_category_filter_rejects_non_list(auth_client: TestClient):
     assert auth_client.post("/settings/vod-filter", json={"cats": "x"}).status_code == 400
 
 
-def test_update_playlist_errors(auth_client):
+def test_update_playlist_errors(auth_client: TestClient):
     with patch("playlists.update", side_effect=ValueError("bad name")):
         response = auth_client.put("/api/playlists/p1", json={"name": ""})
     assert response.status_code == 400
-    assert response.json()["detail"] == "bad name"
+    assert main_test._body(response, main_test._Detail)["detail"] == "bad name"
     with patch("playlists.update", return_value=None):
         assert auth_client.put("/api/playlists/p1", json={}).status_code == 404
 
 
-def test_delete_missing_playlist(auth_client):
+def test_delete_missing_playlist(auth_client: TestClient):
     with patch("playlists.delete", return_value=False):
         assert auth_client.delete("/api/playlists/p1").status_code == 404
 
@@ -295,10 +314,10 @@ def test_delete_missing_playlist(auth_client):
         (b"[1]", "Expected a JSON object"),
     ],
 )
-def test_json_body_validation(auth_client, body, detail):
+def test_json_body_validation(auth_client: TestClient, body: bytes, detail: str):
     response = auth_client.post("/api/playlists/order", content=body)
     assert response.status_code == 400
-    assert response.json()["detail"] == detail
+    assert main_test._body(response, main_test._Detail)["detail"] == detail
 
 
 # ===========================================================================
@@ -306,11 +325,11 @@ def test_json_body_validation(auth_client, body, detail):
 # ===========================================================================
 
 
-def test_logo_requires_url(auth_client):
+def test_logo_requires_url(auth_client: TestClient):
     assert auth_client.get("/api/logo?url=").status_code == 400
 
 
-def test_logo_served_from_cache(auth_client, tmp_path):
+def test_logo_served_from_cache(auth_client: TestClient, tmp_path: Path):
     cached = tmp_path / "logo.png"
     cached.write_bytes(b"png")
     with patch("main.get_cached_logo", return_value=cached):
@@ -319,12 +338,12 @@ def test_logo_served_from_cache(auth_client, tmp_path):
     assert response.headers["cache-control"] == "max-age=86400"
 
 
-def test_logo_rejects_non_http_scheme(auth_client):
+def test_logo_rejects_non_http_scheme(auth_client: TestClient):
     with patch("main.get_cached_logo", return_value=None):
         assert auth_client.get("/api/logo?url=file:///etc/passwd").status_code == 400
 
 
-def test_logo_fetches_and_caches(auth_client, tmp_path):
+def test_logo_fetches_and_caches(auth_client: TestClient, tmp_path: Path):
     saved = tmp_path / "saved.png"
     saved.write_bytes(b"img")
     with (
@@ -346,7 +365,7 @@ def test_logo_fetches_and_caches(auth_client, tmp_path):
         (RuntimeError("weird"), 500),
     ],
 )
-def test_logo_fetch_errors(auth_client, exc, status):
+def test_logo_fetch_errors(auth_client: TestClient, exc: Exception, status: int):
     with (
         patch("main.get_cached_logo", return_value=None),
         patch("main._fetch_logo", side_effect=exc),
@@ -354,9 +373,19 @@ def test_logo_fetch_errors(auth_client, exc, status):
         assert auth_client.get("/api/logo?url=https://x/l.png").status_code == status
 
 
-def _fake_response(content_type: str, data: bytes) -> contextlib.nullcontext[Any]:
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _FakeLogoResponse:
+    headers: dict[str, str]
+    data: bytes
+
+    def read(self, amt: int) -> bytes:
+        del amt
+        return self.data
+
+
+def _fake_response(content_type: str, data: bytes) -> contextlib.nullcontext[_FakeLogoResponse]:
     return contextlib.nullcontext(
-        SimpleNamespace(headers={"Content-Type": content_type}, read=lambda _n: data),
+        _FakeLogoResponse(headers={"Content-Type": content_type}, data=data),
     )
 
 
@@ -370,7 +399,7 @@ def test_fetch_logo_returns_image():
     ("content_type", "data", "message"),
     [("text/html", b"", "not an image"), ("image/png", b"xxxx", "too large")],
 )
-def test_fetch_logo_rejects(content_type, data, message):
+def test_fetch_logo_rejects(content_type: str, data: bytes, message: str):
     with (
         patch("main.safe_urlopen", return_value=_fake_response(content_type, data)),
         pytest.raises(ValueError, match=message),
@@ -383,7 +412,7 @@ def test_fetch_logo_rejects(content_type, data, message):
 # ===========================================================================
 
 
-def test_transcode_settings_store_custom_dir(auth_client):
+def test_transcode_settings_store_custom_dir(auth_client: TestClient):
     with patch("main.get_sr_models", return_value=[]):
         response = auth_client.post(
             "/settings/transcode",
@@ -397,10 +426,10 @@ def test_transcode_settings_store_custom_dir(auth_client):
     assert response.json() == {"ok": True}
     settings = cache_module.load_server_settings()
     assert settings["transcode_dir"] == "/srv/transcode"
-    assert settings["sr_model"] == ""
+    assert settings.get("sr_model") == ""
 
 
-def test_refresh_encoders(auth_client):
+def test_refresh_encoders(auth_client: TestClient):
     with patch("main.refresh_encoders", return_value={"nvenc": True}):
         assert auth_client.post("/settings/refresh-encoders").json() == {
             "ok": True,
@@ -408,7 +437,7 @@ def test_refresh_encoders(auth_client):
         }
 
 
-def test_user_agent_invalid_preset_falls_back(auth_client):
+def test_user_agent_invalid_preset_falls_back(auth_client: TestClient):
     response = auth_client.post("/settings/user-agent", data={"preset": "evil", "custom": "UA"})
     assert response.json() == {"ok": True}
     settings = cache_module.load_server_settings()
@@ -416,8 +445,8 @@ def test_user_agent_invalid_preset_falls_back(auth_client):
     assert settings["user_agent_custom"] == "UA"
 
 
-def test_probe_cache_enriched_with_series_names(auth_client):
-    stats = [
+def test_probe_cache_enriched_with_series_names(auth_client: TestClient):
+    stats: list[dict[str, object]] = [
         {
             "series_id": 1,
             "name": "",
@@ -425,8 +454,9 @@ def test_probe_cache_enriched_with_series_names(auth_client):
         },
         {"series_id": 2, "name": "", "episodes": []},
         {"series_id": 3, "name": "Known", "episodes": []},
+        {"series_id": 4, "name": "Preserved", "episodes": [{"episode_id": 11}]},
     ]
-    series = {
+    series: ProviderRecord = {
         "info": {"name": "Show"},
         "episodes": {
             "1": [
@@ -436,7 +466,7 @@ def test_probe_cache_enriched_with_series_names(auth_client):
         },
     }
 
-    def get_series_info(series_id: int) -> dict:
+    def get_series_info(series_id: int) -> ProviderRecord:
         if series_id == 2:
             raise RuntimeError("upstream down")
         return series
@@ -446,23 +476,30 @@ def test_probe_cache_enriched_with_series_names(auth_client):
     with (
         patch("main.ffmpeg_command.get_series_probe_cache_stats", return_value=stats),
         patch("main.get_first_xtream_client", return_value=xtream),
-        patch("main.get_cached_info", side_effect=lambda _key, fetch: fetch()),
+        patch("main.get_cached_info", side_effect=_fetch_uncached) as cached,
     ):
-        data = auth_client.get("/settings/probe-cache").json()["series"]
+        data = main_test._body(auth_client.get("/settings/probe-cache"), _ProbeCache)["series"]
     assert data[0]["name"] == "Show"
     assert data[0]["episodes"] == [{"episode_id": 11, "name": "S01E02 Pilot"}, {"episode_id": 99}]
     assert data[1]["name"] == ""
     assert data[2]["name"] == "Known"
-    assert [c.args for c in xtream.get_series_info.call_args_list] == [(1,), (2,)]
+    assert data[3]["name"] == "Preserved"
+    assert data[3]["episodes"] == [{"episode_id": 11, "name": "S01E02 Pilot"}]
+    assert [c.args for c in xtream.get_series_info.call_args_list] == [(1,), (2,), (4,)]
+    assert [c.args[0] for c in cached.call_args_list] == [
+        "series_info_1",
+        "series_info_2",
+        "series_info_4",
+    ]
 
 
-def test_clear_series_mru(auth_client):
+def test_clear_series_mru(auth_client: TestClient):
     with patch("main.ffmpeg_command.clear_series_mru") as clear:
         assert auth_client.post("/settings/probe-cache/clear-mru/7").json() == {"ok": True}
     clear.assert_called_once_with(7)
 
 
-def test_clear_data_cache(auth_client):
+def test_clear_data_cache(auth_client: TestClient):
     with patch("main.clear_all_file_caches", return_value=4):
         assert auth_client.post("/settings/data-cache/clear").json() == {
             "ok": True,
@@ -475,7 +512,7 @@ def test_clear_data_cache(auth_client):
 # ===========================================================================
 
 
-def test_handoff_watch_caps_position_at_now(auth_client):
+def test_handoff_watch_caps_position_at_now(auth_client: TestClient):
     with patch("handoff.report_watch") as report:
         response = auth_client.post(
             "/api/handoff/watch",
@@ -487,19 +524,19 @@ def test_handoff_watch_caps_position_at_now(auth_client):
     assert position <= time.time()
 
 
-def test_handoff_stop_rejects_hidden_stream(auth_client):
+def test_handoff_stop_rejects_hidden_stream(auth_client: TestClient):
     with patch("main._handoff_stream_allowed", return_value=False):
         response = auth_client.post("/api/handoff/stop", json={"stream_id": "s", "position": 1})
     assert response.status_code == 404
 
 
-def test_handoff_dismiss(auth_client):
+def test_handoff_dismiss(auth_client: TestClient):
     with patch("handoff.cancel") as cancel:
         assert auth_client.delete("/api/handoff").json() == {"status": "ok"}
     cancel.assert_called_once_with("testuser")
 
 
-def test_handoff_file_routes(auth_client, tmp_path):
+def test_handoff_file_routes(auth_client: TestClient, tmp_path: Path):
     playlist = tmp_path / "stream.m3u8"
     playlist.write_text("#EXTM3U\n")
     segment = tmp_path / "seg.ts"
@@ -522,7 +559,7 @@ def test_handoff_file_routes(auth_client, tmp_path):
 # ===========================================================================
 
 
-def test_delete_own_account_with_password(auth_client):
+def test_delete_own_account_with_password(auth_client: TestClient):
     response = auth_client.post(
         "/settings/users/delete/testuser",
         data={"password": "testpass123"},
@@ -533,13 +570,13 @@ def test_delete_own_account_with_password(auth_client):
     assert "testuser" not in auth.get_all_usernames()
 
 
-def test_delete_other_requires_admin(auth_client):
+def test_delete_other_requires_admin(auth_client: TestClient):
     _login_as(auth_client, "bob")
     response = auth_client.post("/settings/users/delete/testuser")
     assert response.status_code == 403
 
 
-def test_delete_missing_user(auth_client):
+def test_delete_missing_user(auth_client: TestClient):
     assert auth_client.post("/settings/users/delete/ghost").status_code == 404
 
 
@@ -551,16 +588,16 @@ def test_delete_missing_user(auth_client):
         ("testuser", "password123", "User already exists"),
     ],
 )
-def test_add_user_validation(auth_client, username, password, detail):
+def test_add_user_validation(auth_client: TestClient, username: str, password: str, detail: str):
     response = auth_client.post(
         "/settings/users/add",
         data={"username": username, "password": password},
     )
     assert response.status_code == 400
-    assert response.json()["detail"] == detail
+    assert main_test._body(response, main_test._Detail)["detail"] == detail
 
 
-def test_add_user_with_limits(auth_client):
+def test_add_user_with_limits(auth_client: TestClient):
     response = auth_client.post(
         "/settings/users/add",
         data={
@@ -578,7 +615,7 @@ def test_add_user_with_limits(auth_client):
     assert limits["unavailable_groups"] == ["cat:1"]
 
 
-def test_add_user_ignores_malformed_limits(auth_client):
+def test_add_user_ignores_malformed_limits(auth_client: TestClient):
     with patch("auth.set_user_limits") as set_limits:
         response = auth_client.post(
             "/settings/users/add",
@@ -595,7 +632,7 @@ def test_add_user_ignores_malformed_limits(auth_client):
     set_limits.assert_not_called()
 
 
-def test_change_own_password_errors(auth_client):
+def test_change_own_password_errors(auth_client: TestClient):
     response = auth_client.post(
         "/settings/users/password",
         data={"current_password": "testpass123", "new_password": "short"},
@@ -609,7 +646,7 @@ def test_change_own_password_errors(auth_client):
     assert response.status_code == 404
 
 
-def test_change_other_password(auth_client):
+def test_change_other_password(auth_client: TestClient):
     auth.create_user("bob", "password123")
     url = "/settings/users/password/"
     assert auth_client.post(url + "bob", data={"new_password": "short"}).status_code == 400
@@ -620,14 +657,14 @@ def test_change_other_password(auth_client):
     assert auth_client.post(url + "bob", data={"new_password": "longenough"}).status_code == 403
 
 
-def test_set_admin(auth_client):
+def test_set_admin(auth_client: TestClient):
     auth.create_user("bob", "password123")
     assert auth_client.post("/settings/users/admin/bob", data={"admin": "on"}).status_code == 200
     assert auth.is_admin("bob")
     assert auth_client.post("/settings/users/admin/ghost").status_code == 404
 
 
-def test_set_user_limits(auth_client):
+def test_set_user_limits(auth_client: TestClient):
     auth.create_user("bob", "password123")
     response = auth_client.post(
         "/settings/users/limits/bob",
@@ -647,10 +684,10 @@ def test_set_user_limits(auth_client):
         ({"unavailable_groups": "[bad"}, "Invalid JSON for unavailable_groups"),
     ],
 )
-def test_set_user_limits_validation(auth_client, data, detail):
+def test_set_user_limits_validation(auth_client: TestClient, data: dict[str, str], detail: str):
     response = auth_client.post("/settings/users/limits/testuser", data=data)
     assert response.status_code == 400
-    assert response.json()["detail"] == detail
+    assert main_test._body(response, main_test._Detail)["detail"] == detail
 
 
 # ===========================================================================
@@ -666,6 +703,93 @@ def test_regex_matches_swallows_errors():
     pattern = MagicMock()
     pattern.search.side_effect = RuntimeError("catastrophic")
     assert main._regex_matches(pattern, "x") is False
+
+
+def test_float_field_rejects_non_scalar():
+    assert main._float_field({}, "position") == 0.0
+    assert main._float_field({"position": "1.5"}, "position") == 1.5
+    with pytest.raises(TypeError, match="position must be a number"):
+        main._float_field({"position": [1]}, "position")
+
+
+def test_unavailable_channel_keeps_only_saved_fields():
+    assert main._unavailable_channel({"name": "Old"}) == {"name": "Old", "available": False}
+
+
+def test_vod_details_without_client_keeps_movie():
+    movie: ProviderRecord = {"stream_id": 5}
+    with (
+        patch("main.get_xtream_client_by_source", return_value=None),
+        patch("main.get_first_xtream_client", return_value=None),
+    ):
+        assert asyncio.run(main._with_vod_details(movie, "s1", 5)) is movie
+
+
+def test_vod_details_without_info_keeps_movie():
+    movie: ProviderRecord = {"stream_id": 5}
+    with (
+        patch("main.get_xtream_client_by_source", return_value=_xtream({"info": {}})),
+        patch("main.get_cached_info", side_effect=_fetch_uncached),
+    ):
+        assert asyncio.run(main._with_vod_details(movie, "s1", 5)) is movie
+
+
+def test_user_prefs_saves_each_field(auth_client: TestClient):
+    prefs: dict[str, MutablePlainTree] = {
+        "favorites": {"movies": {"1": {"name": "Film"}}},
+        "cc_lang": "eng",
+        "cc_style": {"size": "large"},
+        "cast_host": "192.168.1.5",
+        "virtual_scroll": False,
+        "sort_live_by_views": False,
+        "guide_selected_cats": ["1"],
+    }
+    response = auth_client.post("/api/user-prefs", json=prefs)
+    assert response.json() == {"ok": True}
+    saved: dict[str, object] = {**cache_module.load_user_settings("testuser")}
+    assert {key: saved.get(key) for key in prefs} == prefs
+
+
+def test_user_prefs_rejects_mistyped_field(auth_client: TestClient):
+    before = cache_module.load_user_settings("testuser")
+    response = auth_client.post("/api/user-prefs", json={"cc_style": "large"})
+    assert response.status_code == 400
+    detail = main_test._body(response, main_test._Detail)["detail"]
+    assert detail.startswith("Invalid preferences: ")
+    assert cache_module.load_user_settings("testuser") == before
+
+
+def test_api_settings_saves_each_field(auth_client: TestClient):
+    update: dict[str, MutablePlainTree] = {
+        "transcode_mode": "always",
+        "transcode_hw": "software",
+        "vod_transcode_cache_mins": 30,
+        "probe_live": False,
+        "probe_movies": False,
+        "probe_series": False,
+        "vod_order": ["2", "1"],
+        "series_order": ["3"],
+    }
+    response = auth_client.post("/api/settings", json=update)
+    assert response.json() == {"status": "ok"}
+    saved: dict[str, object] = {**cache_module.load_server_settings()}
+    assert {key: saved.get(key) for key in update} == update
+
+
+def test_api_settings_rejects_mistyped_field(auth_client: TestClient):
+    before = cache_module.load_server_settings()
+    response = auth_client.post("/api/settings", json={"probe_live": "yes"})
+    assert response.status_code == 400
+    detail = main_test._body(response, main_test._Detail)["detail"]
+    assert detail.startswith("Invalid settings: ")
+    assert cache_module.load_server_settings() == before
+
+
+def test_category_filter_rejects_non_text_ids(auth_client: TestClient):
+    before = cache_module.load_user_settings("testuser")
+    response = auth_client.post("/settings/vod-filter", json={"cats": ["1", 2]})
+    assert response.status_code == 400
+    assert cache_module.load_user_settings("testuser") == before
 
 
 def test_safe_float():
@@ -743,7 +867,7 @@ def test_rate_limit_prunes_stale_ips_and_blocks():
         assert len(main._login_attempts) == 902
 
 
-def test_fetch_all_epg_sums_successes_and_prunes(caplog):
+def test_fetch_all_epg_sums_successes_and_prunes(caplog: pytest.LogCaptureFixture):
     def fetch(url: str, *_args: Any, **kwargs: Any) -> int:
         assert kwargs["user_agent"] == "UA"
         if "bad" in url:
@@ -753,7 +877,7 @@ def test_fetch_all_epg_sums_successes_and_prunes(caplog):
     cache_module.get_cache()["live_streams"] = []
     with (
         patch("main.fetch_epg", side_effect=fetch),
-        patch("main.ffmpeg_command.get_user_agent", return_value="UA"),
+        patch("main.cache.get_user_agent", return_value="UA"),
         patch("epg.prune_old_programs", return_value=2) as prune,
         caplog.at_level(logging.INFO, logger="main"),
     ):
@@ -773,24 +897,32 @@ def test_fetch_all_epg_sums_successes_and_prunes(caplog):
         ("series_load", main._start_series_background_load),
     ],
 )
-def test_background_loads_skip_when_running(refresh_flags, recorded_threads, flag, starter):
+def test_background_loads_skip_when_running(
+    refresh_flags: set[str],
+    recorded_threads: list[Callable[[], None]],
+    flag: str,
+    starter: Callable[[], None],
+):
     refresh_flags.add(flag)
     starter()
     assert recorded_threads == []
 
 
-def test_vod_background_load_fills_cache_and_clears_flag(refresh_flags, sync_threads):
+def test_vod_background_load_fills_cache_and_clears_flag(
+    refresh_flags: set[str],
+    sync_threads: None,
+):
     del sync_threads
     with patch("main.load_vod_data", return_value=(["vc"], ["vs"])):
         main._start_vod_background_load()
-    assert cache_module.get_cache()["vod_categories"] == ["vc"]
-    assert cache_module.get_cache()["vod_streams"] == ["vs"]
+    assert cache_module.get_cache().get("vod_categories") == ["vc"]
+    assert cache_module.get_cache().get("vod_streams") == ["vs"]
     assert "vod_load" not in refresh_flags
 
 
-def test_guide_streams_ignore_unknown_playlist(auth_client):
+def test_guide_streams_ignore_unknown_playlist(auth_client: TestClient):
     del auth_client
-    stream = {"stream_id": 1, "category_ids": ["1"], "source_id": "s"}
+    stream: ProviderRecord = {"stream_id": 1, "category_ids": ["1"], "source_id": "s"}
     cache_module.get_cache()["live_streams"] = [stream]
     with patch("playlists.load", return_value=[]):
         streams, ordered, selected = main._get_guide_streams("pl:gone,1", "testuser")
@@ -808,7 +940,7 @@ def test_guide_streams_ignore_unknown_playlist(auth_client):
         ({"plot": "Plain"}, "Plain"),
     ],
 )
-def test_episode_desc(info, expected):
+def test_episode_desc(info: ProviderRecord, expected: str):
     assert main._get_episode_desc(info) == expected
 
 
@@ -817,14 +949,14 @@ def test_episode_desc(info, expected):
 # ===========================================================================
 
 
-def test_live_player_info_unknown_stream(auth_client):
+def test_live_player_info_unknown_stream(auth_client: TestClient):
     del auth_client
     cache_module.get_cache()["live_streams"] = []
     with patch("main._ensure_live_cache"):
         assert main._get_live_player_info("missing") == PlayerInfo()
 
 
-def test_live_player_info_uses_source_settings(auth_client):
+def test_live_player_info_uses_source_settings(auth_client: TestClient):
     del auth_client
     cache_module.get_cache()["live_streams"] = [main_test._archive_stream()]
     settings = {"sources": [{"id": "src1", "deinterlace_fallback": False}]}
@@ -849,9 +981,9 @@ def test_catchup_player_info_unknown_stream():
         assert main._get_catchup_player_info("x", 0) == PlayerInfo()
 
 
-def _xtream(info: dict | Exception | None = None) -> MagicMock:
+def _xtream(info: ProviderRecord | Exception | None = None) -> MagicMock:
     xtream = MagicMock()
-    xtream.build_stream_url.side_effect = lambda kind, sid, ext: f"http://x/{kind}/{sid}.{ext}"
+    xtream.build_stream_url.side_effect = _stream_url
     for method in (xtream.get_vod_info, xtream.get_series_info):
         if isinstance(info, Exception):
             method.side_effect = info
@@ -874,12 +1006,12 @@ def test_movie_player_info_without_client():
         ({}, "", ""),
     ],
 )
-def test_movie_player_info(movie, name, desc):
+def test_movie_player_info(movie: ProviderRecord, name: str, desc: str):
     cache_module.get_cache()["vod_streams"] = [{"stream_id": 5, "source_id": "s1"}]
     xtream = _xtream(movie)
     with (
         patch("main.get_xtream_client_by_source", return_value=xtream) as by_source,
-        patch("main.get_cached_info", side_effect=lambda _key, fetch: fetch()),
+        patch("main.get_cached_info", side_effect=_fetch_uncached),
     ):
         info = main._get_movie_player_info("5", "")
     by_source.assert_called_once_with("s1")
@@ -893,14 +1025,14 @@ def test_movie_player_info_survives_upstream_error():
     xtream = _xtream(error.URLError("down"))
     with (
         patch("main.get_first_xtream_client", return_value=xtream),
-        patch("main.get_cached_info", side_effect=lambda _key, fetch: fetch()),
+        patch("main.get_cached_info", side_effect=_fetch_uncached),
     ):
         info = main._get_movie_player_info("5", "mp4")
     assert info.url == "http://x/movie/5.mp4"
     assert info.channel_name == ""
 
 
-_SERIES = {
+_SERIES: ProviderRecord = {
     "info": {"name": "Show", "year": "2020"},
     "episodes": {
         "2": [{"id": 21, "episode_num": 1, "title": "S02E01 - Show - Finale"}],
@@ -932,11 +1064,16 @@ def test_series_player_info_without_series_id():
         ("21", "S02E01 -- Finale", "", None),
     ],
 )
-def test_series_player_info_episodes(stream_id, title, desc, next_url):
+def test_series_player_info_episodes(
+    stream_id: str,
+    title: str,
+    desc: str,
+    next_url: str | None,
+):
     cache_module.get_cache()["series"] = [{"series_id": 9, "source_id": "s1"}]
     with (
         patch("main.get_xtream_client_by_source", return_value=_xtream(_SERIES)),
-        patch("main.get_cached_info", side_effect=lambda _key, fetch: fetch()),
+        patch("main.get_cached_info", side_effect=_fetch_uncached),
     ):
         info, url = main._get_series_player_info(stream_id, 9, "")
     assert info.source_id == "s1"
@@ -952,11 +1089,11 @@ def test_series_player_info_episodes(stream_id, title, desc, next_url):
         ({"info": {"name": "Untimed"}}, "Untimed"),
     ],
 )
-def test_series_player_info_partial_data(series, name):
+def test_series_player_info_partial_data(series: ProviderRecord | Exception | None, name: str):
     cache_module.get_cache()["series"] = []
     with (
         patch("main.get_first_xtream_client", return_value=_xtream(series)),
-        patch("main.get_cached_info", side_effect=lambda _key, fetch: fetch()),
+        patch("main.get_cached_info", side_effect=_fetch_uncached),
     ):
         info, url = main._get_series_player_info("1", 9, "")
     assert info.channel_name == name
@@ -972,8 +1109,8 @@ def test_ensure_live_cache_loads_streams_and_epg():
     ):
         main._ensure_live_cache()
     store = cache_module.get_cache()
-    assert store["live_streams"] == [{"s": 1}]
-    assert store["live_categories"] == [{"c": 1}]
+    assert store.get("live_streams") == [{"s": 1}]
+    assert store.get("live_categories") == [{"c": 1}]
     load_epg.assert_called_once_with([("u", 1, "s")])
 
 
@@ -1043,14 +1180,14 @@ def test_handoff_channel_outside_archive():
     assert channel.catchup_days == 0
 
 
-def test_handoff_player_info_without_live_url(clean_handoff):
-    clean_handoff._records["testuser"] = main_test._handoff_record()
+def test_handoff_player_info_without_live_url(clean_handoff: None):
+    handoff._records["testuser"] = main_test._handoff_record()
     with patch("main._get_live_player_info", return_value=PlayerInfo()):
         info = main._get_handoff_player_info("testuser", "src1_42", "h1", None)
     assert info == PlayerInfo()
 
 
-def test_handoff_stream_allowed(auth_client):
+def test_handoff_stream_allowed(auth_client: TestClient):
     del auth_client
     cache_module.get_cache()["live_streams"] = [{"stream_id": "1", "source_id": "s"}]
     with patch("main._ensure_live_cache"):
@@ -1073,7 +1210,7 @@ def test_handoff_stream_allowed(auth_client):
         ("http://h/1.ts", "", "", False),
     ],
 )
-def test_is_xtream_source_url(url, base, username, expected):
+def test_is_xtream_source_url(url: str, base: str, username: str, expected: bool):
     source = Source(id="s", name="S", type="xtream", url=base, username=username)
     assert main._is_xtream_source_url(url, source) is expected
 
@@ -1099,18 +1236,20 @@ def test_source_users_rejects_unknown_access():
 
 
 def test_live_streams_loaded_from_file_cache():
-    cache_module.get_cache().clear()
+    cache_module.clear_all_caches()
+    cache_module.get_cache().pop("epg", None)
     data = {"cats": [{"category_id": 1, "category_name": "News"}], "streams": [{"stream_id": 1}]}
-    with patch("main.load_file_cache", return_value=(data, 0.0)):
+    with patch("m3u.load_file_cache", return_value=(data, 0.0)):
         streams, names = asyncio.run(main._live_streams_and_category_names())
     assert streams == [{"stream_id": 1}]
     assert names == {"1": "News"}
-    assert cache_module.get_cache()["epg_urls"] == []
+    assert cache_module.get_cache().get("epg_urls") == []
 
 
 def test_live_streams_without_file_cache():
-    cache_module.get_cache().clear()
-    with patch("main.load_file_cache", return_value=None):
+    cache_module.clear_all_caches()
+    cache_module.get_cache().pop("epg", None)
+    with patch("m3u.load_file_cache", return_value=None):
         assert asyncio.run(main._live_streams_and_category_names()) == ([], {})
 
 
@@ -1121,7 +1260,7 @@ def test_live_streams_without_file_cache():
         ({"movies:s1", "movies:s2", "series:s1"}, {"movies": False, "series": True}),
     ],
 )
-def test_content_access_respects_restrictions(unavailable, expected):
+def test_content_access_respects_restrictions(unavailable: set[str], expected: dict[str, bool]):
     sources = [_source("s1", "xtream"), _source("s2", "xtream")]
     with (
         patch("main.get_sources", return_value=sources),
@@ -1138,7 +1277,10 @@ def _request(cookies: dict[str, str]) -> Any:
     ("cookies", "payload"),
     [({}, None), ({"token": "garbage"}, None), ({"token": "t"}, {"sub": ""})],
 )
-def test_content_access_from_request_defaults(cookies, payload):
+def test_content_access_from_request_defaults(
+    cookies: dict[str, str],
+    payload: dict[str, str] | None,
+):
     with patch("main.verify_token", return_value=payload):
         access = main._get_content_access_from_request(_request(cookies))
     assert access == {"movies": True, "series": True}
@@ -1152,6 +1294,19 @@ def test_content_access_from_request_uses_user():
         access = main._get_content_access_from_request(_request({"token": "t"}))
     assert access == {"movies": False, "series": True}
     get.assert_called_once_with("bob")
+
+
+class _ProbeCache(TypedDict):
+    series: list[dict[str, MutablePlainTree]]
+
+
+def _stream_url(kind: str, stream_id: int, ext: str) -> str:
+    return f"http://x/{kind}/{stream_id}.{ext}"
+
+
+def _fetch_uncached(key: str, fetch: Callable[[], ProviderRecord]) -> ProviderRecord:
+    del key
+    return fetch()
 
 
 # ===========================================================================
@@ -1181,7 +1336,7 @@ def _run_cli(
     return kwargs
 
 
-def test_cli_defaults(tmp_path, monkeypatch):
+def test_cli_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     kwargs = _run_cli([], tmp_path, monkeypatch)
     assert kwargs["port"] == 8000
     assert kwargs["host"] == "0.0.0.0"
@@ -1191,7 +1346,7 @@ def test_cli_defaults(tmp_path, monkeypatch):
     assert kwargs["log_level_configured"] == logging.INFO
 
 
-def test_cli_env_log_level_and_custom_certs(tmp_path, monkeypatch):
+def test_cli_env_log_level_and_custom_certs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     kwargs = _run_cli(
         ["--port", "9000", "--debug", "--cert", "c.pem", "--key", "k.pem"],
         tmp_path,
@@ -1205,12 +1360,12 @@ def test_cli_env_log_level_and_custom_certs(tmp_path, monkeypatch):
     assert kwargs["log_level_configured"] == logging.WARNING
 
 
-def test_cli_debug_flag_without_env(tmp_path, monkeypatch):
+def test_cli_debug_flag_without_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert _run_cli(["--debug"], tmp_path, monkeypatch)["log_level_configured"] == logging.DEBUG
 
 
 @pytest.mark.parametrize("argv", [["--https", "tv.example"], ["--https"]])
-def test_cli_lets_encrypt(tmp_path, monkeypatch, argv):
+def test_cli_lets_encrypt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]):
     domain = tmp_path / "tv.example"
     domain.mkdir()
     (domain / "fullchain.pem").write_text("cert")
@@ -1220,17 +1375,17 @@ def test_cli_lets_encrypt(tmp_path, monkeypatch, argv):
     assert kwargs["ssl_keyfile"] == str(domain / "privkey.pem")
 
 
-def test_cli_https_without_certs(tmp_path, monkeypatch):
+def test_cli_https_without_certs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     with pytest.raises(SystemExit, match="No Let's Encrypt certs"):
         _run_cli(["--https"], tmp_path, monkeypatch)
 
 
-def test_cli_https_missing_domain_cert(tmp_path, monkeypatch):
+def test_cli_https_missing_domain_cert(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     with pytest.raises(SystemExit, match="Cert not found"):
         _run_cli(["--https", "missing.example"], tmp_path, monkeypatch)
 
 
-def test_script_guard_exits_with_main_status(monkeypatch):
+def test_script_guard_exits_with_main_status(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(sys, "argv", ["main.py"])
     with (
         patch("uvicorn.run") as run,

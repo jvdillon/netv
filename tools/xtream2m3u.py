@@ -18,7 +18,7 @@ and series.m3u beside them.
 from __future__ import annotations
 
 from concurrent import futures
-from typing import Any, Protocol, TypedDict, cast
+from typing import Any, NotRequired, Protocol, TypedDict, cast
 from urllib import error, parse, request
 
 import argparse
@@ -32,6 +32,8 @@ import pickle
 import shutil
 import threading
 import time
+
+from treekle import json_loads
 
 
 class RetryableError(Exception):
@@ -147,7 +149,9 @@ def fetch_text(url: str, timeout: int = 5) -> str:
 
     try:
         with request.urlopen(url, timeout=timeout) as response:
-            return response.read().decode("utf-8")
+            # Typeshed types urlopen's return as Any.
+            body = cast(bytes, response.read())
+            return body.decode("utf-8")
     except error.HTTPError as e:
         if e.code == 429:
             raise RetryableError(f"Unable to get {url}; http error {e.code}.") from e
@@ -374,11 +378,11 @@ def process_iptv_url(auth: dict[str, dict[str, Any]]) -> list[str]:
 
 
 def toint(x: str | None) -> int | None:
-    return int(x) if x else None
+    return None if x is None or x == "" else int(x)
 
 
 def tofloat(x: str | None) -> float | None:
-    return float(x) if x else None
+    return None if x is None or x == "" else float(x)
 
 
 def load(path: pathlib.Path) -> Any:
@@ -574,11 +578,20 @@ def _descend(x: Any):
             yield from _descend(x_)
 
 
-def _load_config(data_dir: pathlib.Path) -> dict[str, Any]:
+class _Config(TypedDict):
+    url: str
+    username: str
+    password: str
+    live_filter: NotRequired[dict[str, str]]
+    locals_group: NotRequired[str]
+    locals_filter: NotRequired[list[str]]
+
+
+def _load_config(data_dir: pathlib.Path) -> _Config:
     """Load config from xtream.json, creating template if missing."""
     config_file = data_dir / "xtream.json"
     if not config_file.exists():
-        template = {
+        template: _Config = {
             "url": "https://your-provider.com",
             "username": "your_username",
             "password": "your_password",
@@ -588,10 +601,10 @@ def _load_config(data_dir: pathlib.Path) -> dict[str, Any]:
         }
         config_file.write_text(json.dumps(template, indent=2))
         raise SystemExit(f"Created {config_file} - edit with your credentials and re-run")
-    return json.loads(config_file.read_text())
+    return json_loads(config_file.read_text(), _Config)
 
 
-def _get_urls(cfg: dict[str, Any]) -> tuple[str, str, str]:
+def _get_urls(cfg: _Config) -> tuple[str, str, str]:
     """Return (api_url, get_url, epg_url) from config."""
     base = cfg["url"].rstrip("/")
     user, passwd = cfg["username"], cfg["password"]
@@ -601,7 +614,7 @@ def _get_urls(cfg: dict[str, Any]) -> tuple[str, str, str]:
     return api, get, epg
 
 
-def _get_filters(cfg: dict[str, Any]) -> tuple[dict[int, str], str, set[str]]:
+def _get_filters(cfg: _Config) -> tuple[dict[int, str], str, set[str]]:
     """Return (live_filter, locals_group, locals_filter) from config."""
     live_filter = {int(k): v for k, v in cfg.get("live_filter", {}).items()}
     locals_group = cfg.get("locals_group", "")

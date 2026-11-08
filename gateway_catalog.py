@@ -15,6 +15,7 @@ import time
 
 from m3u import fetch_source_live_data
 from util import atomic_write_json
+from xtream import list_field
 
 import cache
 
@@ -179,12 +180,12 @@ class GatewayCatalog:
             category_values.update(
                 str(category_id)
                 for stream in source_streams
-                for category_id in stream.get("category_ids") or []
+                for category_id in list_field(stream, "category_ids")
                 if category_id not in (None, "")
             )
             uncategorized_id = f"{source.id}_gateway_uncategorized"
             needs_uncategorized = any(
-                not (stream.get("category_ids") or []) for stream in source_streams
+                not list_field(stream, "category_ids") for stream in source_streams
             )
             if needs_uncategorized:
                 category_values.add(uncategorized_id)
@@ -301,7 +302,7 @@ class GatewayCatalog:
         upstream_id = str(stream.get("stream_id", ""))
         if not upstream_id:
             return None
-        source_category_ids = [str(value) for value in stream.get("category_ids") or []]
+        source_category_ids = [str(value) for value in list_field(stream, "category_ids")]
         category_ids = [
             category_id_map[value] for value in source_category_ids if value in category_id_map
         ]

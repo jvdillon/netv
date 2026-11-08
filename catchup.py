@@ -7,9 +7,8 @@ from a timeshift URL whose start time is in the upstream server's time zone.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone, tzinfo
-from typing import Any
 from urllib import parse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -17,6 +16,8 @@ import logging
 import math
 import threading
 import time
+
+from treekle import MutablePlainTree
 
 
 log = logging.getLogger(__name__)
@@ -26,7 +27,7 @@ _tz_lock = threading.Lock()
 _tz_cache: dict[str, tuple[float, tzinfo]] = {}
 
 
-def archive_days(stream: dict[str, Any], *, max_days: int = 14) -> int:
+def archive_days(stream: Mapping[str, MutablePlainTree], *, max_days: int = 14) -> int:
     """Return the archive duration, or zero when catchup is unavailable.
 
     Args:
@@ -38,23 +39,40 @@ def archive_days(stream: dict[str, Any], *, max_days: int = 14) -> int:
     """
     if stream.get("source_type") != "xtream" or str(stream.get("tv_archive")) != "1":
         return 0
+    raw = stream.get("tv_archive_duration")
+    if not isinstance(raw, (int, float, str)):
+        return 0
     try:
-        days = int(stream.get("tv_archive_duration") or 0)
-    except (TypeError, ValueError):
+        days = int(raw) if raw else 0
+    except ValueError:
         return 0
     return max(0, min(days, max_days))
 
 
-def can_play(stream: dict[str, Any], start: datetime, now: datetime | None = None) -> bool:
-    """Whether a program starting at ``start`` is still in the stream's archive."""
+def can_play(
+    stream: Mapping[str, MutablePlainTree],
+    start: datetime,
+    now: datetime | None = None,
+) -> bool:
+    """Check whether a program starting at ``start`` is still in the stream's archive.
+
+    Args:
+        stream: Upstream stream metadata.
+        start: Program start instant.
+        now: Reference instant; defaults to the current UTC time.
+
+    Returns:
+        playable: Whether the archive still holds the program.
+    """
     days = archive_days(stream)
     if not days:
         return False
-    now = now or datetime.now(timezone.utc)
+    if now is None:
+        now = datetime.now(timezone.utc)
     return now - timedelta(days=days) <= start < now
 
 
-def history(streams: list[dict[str, Any]]) -> timedelta:
+def history(streams: Sequence[Mapping[str, MutablePlainTree]]) -> timedelta:
     """How far back EPG listings must be kept to cover every archive."""
     days = max((archive_days(s) for s in streams), default=0)
     return max(timedelta(hours=24), timedelta(days=days))
@@ -62,7 +80,7 @@ def history(streams: list[dict[str, Any]]) -> timedelta:
 
 def server_timezone(
     source_id: str,
-    fetch_server_info: Callable[[], dict[str, Any]],
+    fetch_server_info: Callable[[], Mapping[str, MutablePlainTree]],
     *,
     ttl_seconds: float = 6 * 3600,
 ) -> tzinfo:
@@ -79,12 +97,13 @@ def server_timezone(
     now = time.monotonic()
     with _tz_lock:
         cached = _tz_cache.get(source_id)
-        if cached and now - cached[0] < ttl_seconds:
+        if cached is not None and now - cached[0] < ttl_seconds:
             return cached[1]
     tz: tzinfo = timezone.utc
     try:
-        name = (fetch_server_info().get("server_info") or {}).get("timezone") or ""
-        if name:
+        info = fetch_server_info().get("server_info")
+        name = info.get("timezone") if isinstance(info, dict) else None
+        if isinstance(name, str) and name:
             tz = ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError) as e:
         log.warning("Unknown upstream time zone for %s: %s", source_id, e)
@@ -103,7 +122,7 @@ def duration_minutes(start: datetime, stop: datetime, *, max_minutes: int = 12 *
 
 
 def timeshift_url(
-    stream: dict[str, Any],
+    stream: Mapping[str, MutablePlainTree],
     start: datetime,
     minutes: int,
     tz: tzinfo,

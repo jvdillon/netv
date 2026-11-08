@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, Required, TypedDict, TypeGuard
 from urllib import parse
 
 import asyncio
@@ -20,7 +20,9 @@ import threading
 import time
 import uuid
 
-from cache import get_user_agent
+from treekle import json_loads
+
+from cache import HwAccel, get_user_agent
 from fast_start import (
     closed_caption_master_playlist,
     dated_playlist,
@@ -35,7 +37,6 @@ from fast_start import (
 )
 from ffmpeg_command import (
     SEG_PREFIX,
-    HwAccel,
     MediaInfo,
     SubtitleStream,
     build_hls_ffmpeg_cmd,
@@ -69,8 +70,137 @@ else:
 
 log = logging.getLogger(__name__)
 
+
+class ManagedProcess(Protocol):
+    """An ffmpeg process handle, or a placeholder for one that has exited."""
+
+    @property
+    def returncode(self) -> int | None: ...
+
+    def terminate(self) -> None: ...
+
+    def kill(self) -> None: ...
+
+    async def wait(self) -> int | None: ...
+
+
+class SubtitleInfo(TypedDict):
+    index: int
+    lang: str
+    name: str
+
+
+class SubtitleTrack(TypedDict):
+    url: str
+    lang: str
+    label: str
+    default: bool
+
+
+class StoredSubtitle(TypedDict):
+    """A subtitle as sessions and session.json keep it; older files may omit lang or name."""
+
+    index: int
+    lang: NotRequired[str]
+    name: NotRequired[str]
+
+
+class TranscodeSession(TypedDict, total=False):
+    """Mutable state of one transcode session; `get_session` returns a shallow copy."""
+
+    dir: Required[str]
+    process: Required[ManagedProcess | None]
+    started: Required[float]
+    url: Required[str]
+    playback_policy: PlaybackPolicy
+    last_access: float
+    is_vod: bool
+    is_archive: bool
+    request_url: str
+    username: str
+    source_id: str
+    # Recovered pre-dict sessions stored bare stream indices.
+    subtitles: list[StoredSubtitle | int]
+    duration: float
+    seek_offset: float
+    series_id: int | None
+    episode_id: int | None
+    audio_passthrough: bool
+    bandwidth_saver: bool
+    recovery_bitrate: float
+    caption_timestamp_origin: float
+    fast_start: bool
+    ingest_process: ManagedProcess | None
+    extra_processes: list[ManagedProcess]
+    playlist_generation: int
+    playback_buffer_seconds: float
+    closed_captions: bool
+    origin_pts: float | None
+    origin_time: float
+    segment_dates: dict[str, float]
+    audio_info: MediaInfo | None
+    watchdog_stale_after: float
+    watchdog_task: asyncio.Task[None]
+    watchdog_recovering: str
+    pipeline_restart_log_at: float
+
+
+class FastLiveSession(TranscodeSession):
+    """A fast-start session: one ingest feeding one local encoder."""
+
+    live_recovery: LiveRecoveryPolicy
+    ingest_restart_command: list[str]
+    # Set once the source is probed and the encoder launches.
+    low_restart_command: NotRequired[list[str]]
+    master_resolution: NotRequired[str]
+    master_audio_bitrate: NotRequired[int]
+
+
+class TranscodeResponse(TypedDict):
+    session_id: str
+    playlist: str
+    subtitles: list[SubtitleTrack]
+    duration: float
+    seek_offset: float
+    caption_playlist: NotRequired[str]
+    master_playlist: NotRequired[str]
+    playback_buffer_seconds: NotRequired[float]
+    transcoded_duration: NotRequired[float]
+
+
+class HealthResponse(TypedDict):
+    bandwidth_saver: bool
+    playlist: NotRequired[str]
+    caption_playlist: NotRequired[str]
+
+
+class SeekResponse(TypedDict, total=False):
+    session_id: str
+    playlist: str
+    ok: bool
+    segment: int
+    time: float
+
+
+class SessionProgress(TypedDict):
+    segment_count: int
+    duration: float
+
+
+class _SessionProbe(TypedDict, total=False):
+    video_codec: str
+    audio_codec: str
+    pix_fmt: str
+    audio_channels: int
+    audio_sample_rate: int
+    subtitle_codecs: list[str] | None
+    height: int
+    video_bitrate: int
+    interlaced: bool
+
+
 # Module state.
-_transcode_sessions: dict[str, dict[str, Any]] = {}
+_transcode_sessions: dict[str, TranscodeSession] = {}
 _url_to_session: dict[str, str] = {}  # URL -> session_id (all content types)
 _transcode_lock = threading.Lock()
 _background_tasks: set[asyncio.Task[None]] = set()
@@ -98,7 +228,7 @@ def get_live_cache_timeout() -> int:
 
 
 def is_session_valid(
-    session: dict[str, Any],
+    session: TranscodeSession,
     *,
     heartbeat_timeout_sec: float = 30.0,
 ) -> bool:
@@ -119,7 +249,7 @@ def is_session_valid(
 
     # Keep a recently-accessed live session addressable while its watchdog
     # replaces a dead primary process.
-    if session.get("fast_start") and session.get("live_recovery"):
+    if session.get("fast_start", False) and _is_fast_live(session):
         return True
 
     # Active process with recent heartbeat = valid.
@@ -148,7 +278,7 @@ async def stop_session(session_id: str, force: bool = False) -> None:
     """
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
-        if not session:
+        if session is None:
             return
 
         # Archive seeks open another upstream URL, and a fast-start session
@@ -227,7 +357,7 @@ async def shutdown() -> None:
 # ===========================================================================
 
 
-def get_user_sessions(username: str) -> list[tuple[str, dict[str, Any]]]:
+def get_user_sessions(username: str) -> list[tuple[str, TranscodeSession]]:
     """Get all active sessions for a user, sorted by start time (oldest first)."""
     with _transcode_lock:
         sessions = [
@@ -236,7 +366,7 @@ def get_user_sessions(username: str) -> list[tuple[str, dict[str, Any]]]:
     return sorted(sessions, key=lambda x: x[1].get("started", 0))
 
 
-def get_source_sessions(source_id: str) -> list[tuple[str, dict[str, Any]]]:
+def get_source_sessions(source_id: str) -> list[tuple[str, TranscodeSession]]:
     """Get all active sessions for a source, sorted by start time (oldest first)."""
     with _transcode_lock:
         sessions = [
@@ -263,7 +393,7 @@ async def enforce_stream_limits(
         error: Capacity message when the user cannot reclaim a source slot, else None.
     """
     # Check source limit first (hard limit - can only reclaim own slots)
-    if source_id and source_max > 0:
+    if source_id is not None and source_id and source_max > 0:
         source_sessions = get_source_sessions(source_id)
         if len(source_sessions) >= source_max:
             user_source_sessions = [
@@ -347,15 +477,18 @@ def cleanup_and_recover_sessions() -> None:
 
         # Try to recover VOD session.
         try:
-            info = json.loads(info_file.read_text())
-            if not (info.get("is_vod") and info.get("url")) or _is_archive_url(info["url"]):
+            info = json_loads(info_file.read_text(), _SessionInfo)
+            url = info.get("url", "")
+            if not (info.get("is_vod", False) and url) or _is_archive_url(url):
                 shutil.rmtree(d, ignore_errors=True)
                 removed += 1
                 continue
 
             session_id = info["session_id"]
-            url = info["url"]
             new_seek = info.get("seek_offset", 0)
+            subtitles: list[StoredSubtitle | int] = info.get("subtitles", []) or [
+                *info.get("subtitle_indices", []),
+            ]
 
             with _transcode_lock:
                 _transcode_sessions[session_id] = {
@@ -365,7 +498,7 @@ def cleanup_and_recover_sessions() -> None:
                     "url": url,
                     "is_vod": True,
                     "last_access": now,  # Use current time, not mtime, to avoid immediate expiration.
-                    "subtitles": info.get("subtitles") or info.get("subtitle_indices"),
+                    "subtitles": subtitles,
                     "duration": info.get("duration", 0),
                     "seek_offset": new_seek,
                     "series_id": info.get("series_id"),
@@ -376,19 +509,19 @@ def cleanup_and_recover_sessions() -> None:
                 }
                 # Prefer session with seek_offset or more recent mtime.
                 existing_id = _url_to_session.get(url)
-                if existing_id:
-                    existing = _transcode_sessions.get(existing_id, {})
-                    existing_seek = existing.get("seek_offset", 0)
-                    existing_mtime = existing.get("last_access", 0)
+                existing = None if existing_id is None else _transcode_sessions.get(existing_id)
+                if existing_id is None:
+                    _url_to_session[url] = session_id
+                else:
+                    existing_seek = 0.0 if existing is None else existing.get("seek_offset", 0)
+                    existing_mtime = 0.0 if existing is None else existing.get("last_access", 0)
                     if (new_seek > 0 and existing_seek == 0) or (
                         existing_seek == 0 and new_seek == 0 and mtime > existing_mtime
                     ):
                         _url_to_session[url] = session_id
-                else:
-                    _url_to_session[url] = session_id
 
             # Restore probe cache.
-            if p := info.get("probe"):
+            if (p := info.get("probe")) is not None and p:
                 media_info = MediaInfo(
                     video_codec=p.get("video_codec", ""),
                     audio_codec=p.get("audio_codec", ""),
@@ -407,8 +540,8 @@ def cleanup_and_recover_sessions() -> None:
                         lang=subtitle.get("lang", "und"),
                         name=subtitle.get("name", ""),
                     )
-                    for subtitle in (info.get("subtitles") or [])
-                    if isinstance(subtitle, dict) and "index" in subtitle
+                    for subtitle in subtitles
+                    if not isinstance(subtitle, int)
                 ]
                 restore_probe_cache_entry(
                     url,
@@ -445,7 +578,7 @@ def cleanup_and_recover_sessions() -> None:
 def get_caption_timestamp_origin(session_id: str) -> float | None:
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
-        if not session:
+        if session is None:
             return None
         existing = session.get("caption_timestamp_origin")
         if existing is not None:
@@ -457,10 +590,9 @@ def get_caption_timestamp_origin(session_id: str) -> float | None:
         return None
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
-        if not session:
+        if session is None:
             return None
-        session.setdefault("caption_timestamp_origin", origin)
-        return float(session["caption_timestamp_origin"])
+        return float(session.setdefault("caption_timestamp_origin", origin))
 
 
 def dated_fast_playlist(session_id: str, content: str) -> str:
@@ -475,10 +607,15 @@ def dated_fast_playlist(session_id: str, content: str) -> str:
     """
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
-        if session is None or session.get("origin_pts") is None:
+        if session is None:
+            return content
+        origin_pts = session.get("origin_pts")
+        if origin_pts is None:
             return content
         directory = session["dir"]
-        origin_pts, origin_time = session["origin_pts"], session["origin_time"]
+        if "origin_time" not in session:
+            raise KeyError("origin_time")
+        origin_time = session["origin_time"]
         dates = session.get("segment_dates", {})
     content, dates = dated_playlist(directory, content, origin_pts, origin_time, dates)
     with _transcode_lock:
@@ -503,27 +640,14 @@ def add_webvtt_timestamp_map(content: str, origin_pts: float | None) -> str:
 # ===========================================================================
 
 
-class _SubtitleInfo(TypedDict):
-    index: int
-    lang: str
-    name: str
-
-
-class _SubtitleTrack(TypedDict):
-    url: str
-    lang: str
-    label: str
-    default: bool
-
-
 @dataclass(kw_only=True, slots=True)
 class _SessionSnapshot:
     """Immutable snapshot of session state for lock-free access."""
 
     output_dir: str
-    process: Any
+    process: ManagedProcess | None
     seek_offset: float
-    subtitles: list[_SubtitleInfo]
+    subtitles: list[StoredSubtitle | int]
     duration: float
     audio_passthrough: bool = False
 
@@ -553,7 +677,7 @@ async def start_transcode(
     fast_start: bool = False,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
     audio_passthrough: bool = False,
-) -> dict[str, Any]:
+) -> TranscodeResponse:
     """Start or reuse a transcode session.
 
     Args:
@@ -603,11 +727,11 @@ async def start_transcode(
 # ===========================================================================
 
 
-def get_session(session_id: str) -> dict[str, Any] | None:
-    """Get a copy of session dict (safe to use outside lock)."""
+def get_session(session_id: str) -> TranscodeSession | None:
+    """Get a shallow copy of the session state (safe to read outside the lock)."""
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
-        return dict(session) if session else None
+        return None if session is None else session.copy()
 
 
 def touch_session(session_id: str) -> bool:
@@ -621,13 +745,13 @@ def touch_session(session_id: str) -> bool:
     """
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
-        if session:
+        if session is not None:
             session["last_access"] = time.time()
             return True
         return False
 
 
-def get_session_progress(session_id: str) -> dict[str, Any] | None:
+def get_session_progress(session_id: str) -> SessionProgress | None:
     """Get transcode progress for a session, recording a heartbeat.
 
     Args:
@@ -639,9 +763,9 @@ def get_session_progress(session_id: str) -> dict[str, Any] | None:
     touch_session(session_id)
 
     session = get_session(session_id)
-    if not session:
+    if session is None:
         return None
-    name = "low.m3u8" if session.get("fast_start") else "stream.m3u8"
+    name = "low.m3u8" if session.get("fast_start", False) else "stream.m3u8"
     playlist_path = pathlib.Path(session["dir"]) / name
     if not playlist_path.exists():
         return {"segment_count": 0, "duration": 0.0}
@@ -669,8 +793,8 @@ class _SeekSessionInfo:
 
     url: str
     output_dir: str
-    process: Any
-    subtitles: list[_SubtitleInfo]
+    process: ManagedProcess | None
+    subtitles: list[StoredSubtitle | int]
     series_id: int | None
     episode_id: int | None
     audio_passthrough: bool = False
@@ -682,7 +806,7 @@ async def seek_transcode(
     *,
     min_segment_size_bytes: int = 1_000,
     playlist_wait_timeout_sec: float = 30.0,
-) -> dict[str, Any]:
+) -> SeekResponse:
     """Seek to a specific time in a VOD session.
 
     Args:
@@ -695,7 +819,7 @@ async def seek_transcode(
         response: Cached playlist location or new seek position.
     """
     info = _get_seek_session_info(session_id)
-    if not info:
+    if info is None:
         raise fastapi.HTTPException(404, "Session not found or not VOD")
     if _is_archive_url(info.url):
         raise fastapi.HTTPException(400, "Seek an archive by opening it at the desired start time")
@@ -719,7 +843,7 @@ async def seek_transcode(
         )
         with _transcode_lock:
             session = _transcode_sessions.get(session_id)
-            if session:
+            if session is not None:
                 session["seek_offset"] = seek_time
         _regenerate_playlist(output_path, segment_num)
         return {"session_id": session_id, "playlist": f"/transcode/{session_id}/stream.m3u8"}
@@ -744,8 +868,10 @@ async def seek_transcode(
     url = await asyncio.to_thread(resolve_hls_master_playlist, info.url)
 
     # Use probe_series if series_id, else probe_movies.
-    probe_setting = "probe_series" if info.series_id else "probe_movies"
-    do_probe = settings.get(probe_setting, False)
+    if info.series_id is not None and info.series_id != 0:
+        do_probe = settings.get("probe_series", False)
+    else:
+        do_probe = settings.get("probe_movies", False)
     if do_probe:
         media_info = (
             await asyncio.to_thread(
@@ -760,7 +886,7 @@ async def seek_transcode(
 
     subtitles: list[SubtitleStream] = []
     for s in info.subtitles:
-        if isinstance(s, dict) and "index" in s:
+        if not isinstance(s, int):
             subtitles.append(
                 SubtitleStream(
                     index=s["index"],
@@ -814,7 +940,9 @@ async def seek_transcode(
     session_json = output_path / "session.json"
     if session_json.exists():
         try:
-            data = json.loads(session_json.read_text())
+            # A plain tree, not _SessionInfo, so keys this version does not declare survive.
+            data = json_loads(session_json.read_text())
+            assert isinstance(data, dict)
             data["seek_offset"] = seek_time
             session_json.write_text(json.dumps(data))
         except Exception as e:
@@ -845,7 +973,7 @@ def report_playback_health(
     session_id: str,
     username: str,
     health: PlaybackHealth,
-) -> dict[str, Any]:
+) -> HealthResponse:
     """Evaluate playback pressure for the current live stream.
 
     Args:
@@ -858,16 +986,20 @@ def report_playback_health(
     """
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
-        if not session or session.get("username") != username:
+        if session is None or session.get("username") != username:
             raise fastapi.HTTPException(404, "Session not found")
-        if session.get("is_vod"):
+        if session.get("is_vod", False):
             raise fastapi.HTTPException(400, "Playback feedback is only supported for live streams")
         session["last_access"] = time.time()
         now = time.monotonic()
-        policy = session["playback_policy"]
+        # Every live producer sets a policy; only recovered VOD sessions lack one.
+        policy = session.get("playback_policy")
+        if policy is None:
+            raise KeyError("playback_policy")
+        bandwidth_saver = session.get("bandwidth_saver", False)
         # Remember actual full-quality requirements, since the configured
         # bitrate may only be an estimate.
-        if not policy.bandwidth_saver and not session.get("bandwidth_saver"):
+        if not policy.bandwidth_saver and not bandwidth_saver:
             session["recovery_bitrate"] = max(
                 session.get("recovery_bitrate", 0),
                 health.required_bitrate,
@@ -875,24 +1007,20 @@ def report_playback_health(
         fast_start = session.get("fast_start", False)
         # A full-quality encoder's output measures what recovery must sustain;
         # a saver session's 720p output would understate it.
-        if (
-            fast_start
-            and not session.get("bandwidth_saver")
-            and _is_process_alive(session.get("process"))
-        ):
+        if fast_start and not bandwidth_saver and _is_process_alive(session.get("process")):
             session["recovery_bitrate"] = max(
                 session.get("recovery_bitrate", 0),
                 ready_bitrate(session["dir"], "low.m3u8"),
             )
         # The single encoder has no second rendition to wait for.
         saver = policy.observe(health, now, session.get("recovery_bitrate", 0))
-        result: dict[str, Any] = {"bandwidth_saver": saver}
+        result: HealthResponse = {"bandwidth_saver": saver}
         # A saver change needs a differently configured encoder. Without a
         # playlist, clients retune to a new session instead of staying here.
-        if fast_start and saver == session.get("bandwidth_saver", False):
-            generation = int(session.get("playlist_generation", 0))
+        if fast_start and saver == bandwidth_saver:
+            generation = session.get("playlist_generation", 0)
             result["playlist"] = _fast_playlist_url(session_id, "low.m3u8", generation)
-            if session.get("closed_captions"):
+            if session.get("closed_captions", False):
                 result["caption_playlist"] = _fast_playlist_url(
                     session_id,
                     "low-captions.m3u8",
@@ -976,7 +1104,7 @@ async def _start_fast_live(
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
     audio_passthrough: bool = False,
     watchdog_stale_floor_sec: float = 45.0,
-) -> dict[str, Any]:
+) -> TranscodeResponse:
     """One upstream reader, one local encoder, one session/stream slot."""
     settings = get_settings()
     resolution = "720p" if bandwidth_saver else settings.get("max_resolution", "1080p")
@@ -997,41 +1125,42 @@ async def _start_fast_live(
     try:
         user_agent = get_user_agent()
         ingest = await startup.launch(ingest_command(url, directory, user_agent), "ingest")
+        session: FastLiveSession = {
+            "dir": directory,
+            "process": ingest,
+            "ingest_process": ingest,
+            "extra_processes": [],
+            "started": time.time(),
+            "last_access": time.time(),
+            "url": url,
+            "is_vod": False,
+            "username": username,
+            "source_id": source_id,
+            "bandwidth_saver": bandwidth_saver,
+            "playback_policy": PlaybackPolicy(bandwidth_saver=bandwidth_saver),
+            "live_recovery": LiveRecoveryPolicy(),
+            # Full-quality requirement a saver session must sustain to recover.
+            "recovery_bitrate": live_video_bitrates(settings.get("max_resolution", "1080p"))[1]
+            * 1.1,
+            "fast_start": True,
+            "playlist_generation": 0,
+            "playback_buffer_seconds": 12.0,
+            "closed_captions": False,
+            "ingest_restart_command": ingest_command(
+                url,
+                directory,
+                user_agent,
+                restarting=True,
+            ),
+            # Conservative until the audio probe settles it, so AAC-only
+            # clients never reuse a session that may start copying Dolby.
+            "audio_passthrough": audio_passthrough,
+            "subtitles": [],
+            "duration": 0,
+            "seek_offset": 0,
+        }
         with _transcode_lock:
-            _transcode_sessions[session_id] = {
-                "dir": directory,
-                "process": ingest,
-                "ingest_process": ingest,
-                "extra_processes": [],
-                "started": time.time(),
-                "last_access": time.time(),
-                "url": url,
-                "is_vod": False,
-                "username": username,
-                "source_id": source_id,
-                "bandwidth_saver": bandwidth_saver,
-                "playback_policy": PlaybackPolicy(bandwidth_saver=bandwidth_saver),
-                "live_recovery": LiveRecoveryPolicy(),
-                # Full-quality requirement a saver session must sustain to recover.
-                "recovery_bitrate": live_video_bitrates(settings.get("max_resolution", "1080p"))[1]
-                * 1.1,
-                "fast_start": True,
-                "playlist_generation": 0,
-                "playback_buffer_seconds": 12.0,
-                "closed_captions": False,
-                "ingest_restart_command": ingest_command(
-                    url,
-                    directory,
-                    user_agent,
-                    restarting=True,
-                ),
-                # Conservative until the audio probe settles it, so AAC-only
-                # clients never reuse a session that may start copying Dolby.
-                "audio_passthrough": audio_passthrough,
-                "subtitles": [],
-                "duration": 0,
-                "seek_offset": 0,
-            }
+            _transcode_sessions[session_id] = session
             _url_to_session[url] = session_id
         # Warm the encoder on the first complete source segment, not a full
         # playback reserve. It still has its own buffer gate.
@@ -1051,13 +1180,12 @@ async def _start_fast_live(
         )
         use_audio_passthrough = uses_audio_passthrough(audio, audio_passthrough)
         with _transcode_lock:
-            _transcode_sessions[session_id].update(
-                origin_pts=origin_pts,
-                origin_time=time.time(),
-                audio_info=audio,
-                audio_passthrough=use_audio_passthrough,
-                closed_captions=closed_captions,
-            )
+            _require_current(session_id, session)
+            session["origin_pts"] = origin_pts
+            session["origin_time"] = time.time()
+            session["audio_info"] = audio
+            session["audio_passthrough"] = use_audio_passthrough
+            session["closed_captions"] = closed_captions
         if closed_captions:
             log.info("Fast-start session %s detected embedded captions", session_id)
         hw = settings.get("transcode_hw", "software")
@@ -1076,20 +1204,19 @@ async def _start_fast_live(
         low_restart_command = encoder(restarting=True)
         low = await startup.launch(encoder(), "encoder")
         with _transcode_lock:
-            _transcode_sessions[session_id].update(
-                process=low,
-                extra_processes=[ingest],
-                low_restart_command=low_restart_command,
-                master_resolution=resolution,
-                master_audio_bitrate=surround_audio_bitrate(audio, audio_passthrough),
-            )
+            _require_current(session_id, session)
+            session["process"] = low
+            session["extra_processes"] = [ingest]
+            session["low_restart_command"] = low_restart_command
+            session["master_resolution"] = resolution
+            session["master_audio_bitrate"] = surround_audio_bitrate(audio, audio_passthrough)
         # A remuxed source is released in source-keyframe-sized bursts. A couple
         # of tiny output segments cannot bridge the next upstream delivery gap.
         input_text = (pathlib.Path(directory) / "input.m3u8").read_text()
         input_durations = [float(value) for value in re.findall(r"#EXTINF:([\d.]+)", input_text)]
         startup_buffer, playback_buffer = live_buffer_durations(input_durations)
         with _transcode_lock:
-            session = _transcode_sessions[session_id]
+            _require_current(session_id, session)
             session["watchdog_stale_after"] = max(
                 watchdog_stale_floor_sec,
                 startup_buffer + 2,
@@ -1110,7 +1237,7 @@ async def _start_fast_live(
         with _transcode_lock:
             if _transcode_sessions.get(session_id) is session:
                 session["watchdog_task"] = watchdog_task
-            elif watchdog_task is not None:
+            else:
                 watchdog_task.cancel()
         return _adaptive_session_response(session_id)
     except BaseException:
@@ -1122,6 +1249,16 @@ async def _start_fast_live(
 
 def _first_input_segment(directory: str) -> pathlib.Path:
     return min(pathlib.Path(directory).glob("input_*.ts"))
+
+
+def _require_current(session_id: str, session: TranscodeSession) -> None:
+    """Abort a startup step once its session was stopped or replaced."""
+    if _transcode_sessions.get(session_id) is not session:
+        raise KeyError(session_id)
+
+
+def _is_fast_live(session: TranscodeSession) -> TypeGuard[FastLiveSession]:
+    return "live_recovery" in session
 
 
 def _is_archive_url(url: str) -> bool:
@@ -1139,9 +1276,12 @@ class _DeadProcess:
     def kill(self) -> None:
         pass
 
+    async def wait(self) -> int:
+        return self.returncode
 
-def _is_process_alive(proc: Any) -> bool:
-    """Check if process is still running."""
+
+def _is_process_alive(proc: object) -> bool:
+    """Check if process is still running; anything without a return code is not."""
     return getattr(proc, "returncode", 0) is None
 
 
@@ -1163,13 +1303,13 @@ async def _launch_ffmpeg(cmd: list[str]) -> asyncio.subprocess.Process:
         raise
 
 
-async def _terminate_processes(processes: Sequence[Any]) -> None:
+async def _terminate_processes(processes: Sequence[ManagedProcess]) -> None:
     await asyncio.gather(*(_terminate_process(process) for process in processes))
 
 
-async def _terminate_process(process: Any) -> None:
+async def _terminate_process(process: ManagedProcess | None) -> None:
     """Stop a process with SIGTERM so ffmpeg can flush, then SIGKILL after 5 s."""
-    if not _is_process_alive(process):
+    if process is None or not _is_process_alive(process):
         return
     try:
         process.terminate()
@@ -1232,7 +1372,7 @@ async def _monitor_resume_ffmpeg(
                 _url_to_session.pop(url, None)
                 session = _transcode_sessions.pop(session_id, None)
             # Clean up output directory.
-            if session:
+            if session is not None:
                 shutil.rmtree(session["dir"], ignore_errors=True)
 
 
@@ -1250,7 +1390,7 @@ async def _monitor_seek_ffmpeg(
         )
 
 
-def _spawn_background_task(coro: Any) -> asyncio.Task[None]:
+def _spawn_background_task(coro: Coroutine[object, object, None]) -> asyncio.Task[None]:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -1259,7 +1399,7 @@ def _spawn_background_task(coro: Any) -> asyncio.Task[None]:
 
 async def _wait_for_playlist(
     playlist_path: pathlib.Path,
-    process: asyncio.subprocess.Process,
+    process: ManagedProcess,
     min_segments: int = 1,
     timeout_sec: float = 30.0,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
@@ -1282,9 +1422,8 @@ async def _wait_for_playlist(
                 seg_files = list(output_dir.glob(f"{SEG_PREFIX}*.ts"))
                 if len(seg_files) >= min_segments:
                     first_seg = min(seg_files, key=lambda f: f.name)
-                    if (
-                        first_seg.stat().st_size > min_segment_size_bytes
-                        and process.returncode is None
+                    if first_seg.stat().st_size > min_segment_size_bytes and _is_process_alive(
+                        process,
                     ):
                         return True
         await asyncio.sleep(poll_interval_sec)
@@ -1302,17 +1441,20 @@ def _calc_hls_duration(playlist_path: pathlib.Path, segment_count: int) -> float
 
 def _build_subtitle_tracks(
     session_id: str,
-    sub_info: Sequence[_SubtitleInfo | int] | None,
-) -> list[_SubtitleTrack]:
-    tracks: list[_SubtitleTrack] = []
-    for index, subtitle in enumerate(sub_info or ()):
+    sub_info: Sequence[StoredSubtitle | int] | None,
+) -> list[SubtitleTrack]:
+    tracks: list[SubtitleTrack] = []
+    for index, subtitle in enumerate(() if sub_info is None else sub_info):
         if isinstance(subtitle, int):
             return []
+        lang = subtitle.get("lang")
+        name = subtitle.get("name")
+        assert isinstance(lang, str) and isinstance(name, str)
         tracks.append(
             {
                 "url": f"/subs/{session_id}/sub{index}.vtt",
-                "lang": subtitle["lang"],
-                "label": subtitle["name"],
+                "lang": lang,
+                "label": name,
                 "default": index == 0,
             },
         )
@@ -1320,7 +1462,7 @@ def _build_subtitle_tracks(
 
 
 def _caption_master_playlist(
-    sub_info: Sequence[_SubtitleInfo],
+    sub_info: Sequence[SubtitleInfo],
     max_resolution: str,
 ) -> str:
     _, maximum_bitrate = live_video_bitrates(max_resolution)
@@ -1352,7 +1494,7 @@ def _caption_attribute(value: str, fallback: str) -> str:
 
 def _write_caption_master(
     output_dir: str,
-    sub_info: Sequence[_SubtitleInfo],
+    sub_info: Sequence[SubtitleInfo],
     max_resolution: str,
 ) -> pathlib.Path | None:
     if not sub_info:
@@ -1383,7 +1525,7 @@ def _write_empty_caption_playlists(output_dir: str, count: int) -> None:
 def _caption_playlist_url(
     session_id: str,
     output_dir: str,
-    sub_info: Sequence[_SubtitleInfo],
+    sub_info: Sequence[StoredSubtitle | int],
 ) -> str | None:
     if sub_info and (pathlib.Path(output_dir) / "captions.m3u8").exists():
         return f"/transcode/{session_id}/captions.m3u8"
@@ -1459,14 +1601,14 @@ def _get_session_snapshot(session_id: str) -> _SessionSnapshot | None:
     """Get atomic snapshot of session state under lock."""
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
-        if not session:
+        if session is None:
             return None
         session["last_access"] = time.time()
         return _SessionSnapshot(
             output_dir=session["dir"],
             process=session["process"],
             seek_offset=session.get("seek_offset", 0),
-            subtitles=session.get("subtitles") or [],
+            subtitles=session.get("subtitles", []),
             duration=session.get("duration", 0),
             audio_passthrough=session.get("audio_passthrough", False),
         )
@@ -1474,7 +1616,7 @@ def _get_session_snapshot(session_id: str) -> _SessionSnapshot | None:
 
 def _update_session_process(
     session_id: str,
-    process: Any,
+    process: ManagedProcess,
     *,
     seek_time: float | None = None,
     url: str = "",
@@ -1482,7 +1624,7 @@ def _update_session_process(
     """Atomically update session process. Returns False if session gone."""
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
-        if not session:
+        if session is None:
             return False
         session["process"] = process
         if seek_time is not None:
@@ -1497,10 +1639,10 @@ def _build_session_response(
     session_id: str,
     snap: _SessionSnapshot,
     playlist_path: pathlib.Path,
-) -> dict[str, Any]:
+) -> TranscodeResponse:
     """Build response dict for existing session, recalculating duration."""
     segments = list(playlist_path.parent.glob(f"{SEG_PREFIX}*.ts"))
-    response = {
+    response: TranscodeResponse = {
         "session_id": session_id,
         "playlist": f"/transcode/{session_id}/stream.m3u8",
         "subtitles": _build_subtitle_tracks(session_id, snap.subtitles),
@@ -1509,7 +1651,7 @@ def _build_session_response(
         "transcoded_duration": _calc_hls_duration(playlist_path, len(segments)),
     }
     caption_playlist = _caption_playlist_url(session_id, snap.output_dir, snap.subtitles)
-    if caption_playlist:
+    if caption_playlist is not None:
         response["caption_playlist"] = caption_playlist
     return response
 
@@ -1523,17 +1665,21 @@ def _adaptive_session_response(
     session_id: str,
     *,
     default_playback_buffer_seconds: float = 12.0,
-) -> dict[str, Any]:
+) -> TranscodeResponse:
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
-        generation = int(session.get("playlist_generation", 0)) if session else 0
-        closed_captions = bool(session and session.get("closed_captions"))
-        playback_buffer_seconds = float(
-            session.get("playback_buffer_seconds", default_playback_buffer_seconds)
-            if session
-            else default_playback_buffer_seconds,
-        )
-    response = {
+        if session is None:
+            generation = 0
+            closed_captions = False
+            playback_buffer_seconds = default_playback_buffer_seconds
+        else:
+            generation = session.get("playlist_generation", 0)
+            closed_captions = session.get("closed_captions", False)
+            playback_buffer_seconds = session.get(
+                "playback_buffer_seconds",
+                default_playback_buffer_seconds,
+            )
+    response: TranscodeResponse = {
         "session_id": session_id,
         "playlist": _fast_playlist_url(session_id, "low.m3u8", generation),
         "master_playlist": f"/transcode/{session_id}/master.m3u8",
@@ -1555,10 +1701,10 @@ def _get_existing_session(url: str) -> tuple[str | None, bool, float]:
     """Get existing session info atomically. Returns (session_id, is_valid, seek_offset)."""
     with _transcode_lock:
         existing_id = _url_to_session.get(url)
-        if not existing_id:
+        if existing_id is None:
             return None, False, 0.0
         session = _transcode_sessions.get(existing_id)
-        if not session:
+        if session is None:
             return None, False, 0.0
         return (
             existing_id,
@@ -1580,17 +1726,17 @@ async def _handle_existing_vod_session(
     resume_wait_timeout_sec: float = 10.0,
     resume_segment_wait_timeout_sec: float = 5.0,
     poll_interval_sec: float = 0.2,
-) -> dict[str, Any] | None:
+) -> TranscodeResponse | None:
     """Handle existing VOD session: reuse active, return cached, or append."""
     snap = _get_session_snapshot(existing_id)
-    if not snap:
+    if snap is None:
         return None
 
     playlist_path = pathlib.Path(snap.output_dir) / "stream.m3u8"
     segments = sorted(pathlib.Path(snap.output_dir).glob(f"{SEG_PREFIX}*.ts"))
 
     # Case 1: Active session - reuse it.
-    if snap.process.returncode is None:
+    if snap.process is not None and snap.process.returncode is None:
         log.info("Reusing active session %s", existing_id)
         await _wait_for_playlist(
             playlist_path,
@@ -1682,25 +1828,27 @@ async def _try_reuse_session(
     url: str,
     is_vod: bool,
     content_type: str,
-) -> dict[str, Any] | None:
+) -> TranscodeResponse | None:
     """Try to reuse an existing valid session. Returns response or None if can't reuse."""
     if is_vod:
         settings = get_settings()
+        probe_flags = {
+            "movie": settings.get("probe_movies", False),
+            "series": settings.get("probe_series", False),
+        }
+        do_probe = probe_flags.get(content_type, False)
         return await _handle_existing_vod_session(
             existing_id,
             url,
             settings.get("transcode_hw", "software"),
-            settings.get(
-                {"movie": "probe_movies", "series": "probe_series"}.get(content_type, ""),
-                False,
-            ),
+            do_probe,
             settings.get("max_resolution", "1080p"),
             settings.get("quality", "high"),
         )
 
     # Live: return existing session if snapshot available.
     snap = _get_session_snapshot(existing_id)
-    if not snap:
+    if snap is None:
         return None
     playlist_path = pathlib.Path(snap.output_dir) / "stream.m3u8"
     return _build_session_response(existing_id, snap, playlist_path)
@@ -1731,12 +1879,15 @@ async def _do_start_transcode(
     *,
     playlist_wait_timeout_sec: float = 30.0,
     seek_wait_timeout_sec: float = 40.0,
-) -> dict[str, Any]:
+) -> TranscodeResponse:
     """Core transcode logic. Raises fastapi.HTTPException on failure."""
     is_archive = _is_archive_url(url)
     request_url = url
     # Resolve HLS master playlist to highest bandwidth variant.
-    url = resolved_url or await asyncio.to_thread(resolve_hls_master_playlist, url)
+    if resolved_url is None:
+        url = await asyncio.to_thread(resolve_hls_master_playlist, url)
+    else:
+        url = resolved_url
 
     settings = get_settings()
     hw = settings.get("transcode_hw", "software")
@@ -1746,8 +1897,12 @@ async def _do_start_transcode(
         max_resolution = "480p" if max_resolution == "480p" else "720p"
         quality = "low"
     is_vod = content_type in ("movie", "series")
-    probe_key = {"movie": "probe_movies", "series": "probe_series", "live": "probe_live"}
-    do_probe = settings.get(probe_key.get(content_type, ""), False)
+    probe_flags = {
+        "movie": settings.get("probe_movies", False),
+        "series": settings.get("probe_series", False),
+        "live": settings.get("probe_live", False),
+    }
+    do_probe = probe_flags.get(content_type, False)
 
     media_info: MediaInfo | None = None
     subtitles: list[SubtitleStream] = []
@@ -1759,10 +1914,9 @@ async def _do_start_transcode(
             episode_id,
             series_name,
         )
-        if media_info:
-            subs_str = (
-                ",".join(media_info.subtitle_codecs) if media_info.subtitle_codecs else "none"
-            )
+        if media_info is not None:
+            codecs = media_info.subtitle_codecs
+            subs_str = ",".join(codecs) if codecs is not None and codecs else "none"
             if subtitles:
                 subs_str += f" [extract:{','.join(s.lang for s in subtitles)}]"
             bitrate_str = (
@@ -1814,11 +1968,15 @@ async def _do_start_transcode(
         cmd.insert(i_idx, "-ss")
         log.info("Applying seek_offset=%.1f from previous session", old_seek_offset)
 
-    sub_info: list[_SubtitleInfo] = [
+    sub_info: list[SubtitleInfo] = [
         {"index": subtitle.index, "lang": subtitle.lang, "name": subtitle.name}
         for subtitle in subtitles
     ]
-    total_duration = media_info.duration if media_info else 0.0
+    stored_subtitles: list[StoredSubtitle | int] = [
+        {"index": subtitle.index, "lang": subtitle.lang, "name": subtitle.name}
+        for subtitle in subtitles
+    ]
+    total_duration = 0.0 if media_info is None else media_info.duration
     try:
         caption_master = _write_caption_master(output_dir, sub_info, max_resolution)
     except OSError as error:
@@ -1847,7 +2005,7 @@ async def _do_start_transcode(
             "is_vod": is_vod,
             "is_archive": is_archive,
             "last_access": time.time(),
-            "subtitles": sub_info,
+            "subtitles": stored_subtitles,
             "duration": total_duration,
             "seek_offset": old_seek_offset,
             "series_id": series_id,
@@ -1863,12 +2021,12 @@ async def _do_start_transcode(
         _url_to_session[url] = session_id
 
     if is_vod and not is_archive:
-        session_info: dict[str, Any] = {
+        session_info: _SessionInfo = {
             "session_id": session_id,
             "url": url,
             "is_vod": True,
             "started": time.time(),
-            "subtitles": sub_info,
+            "subtitles": stored_subtitles,
             "duration": total_duration,
             "seek_offset": old_seek_offset,
             "series_id": series_id,
@@ -1877,7 +2035,7 @@ async def _do_start_transcode(
             "source_id": source_id,
             "audio_passthrough": passthrough_used,
         }
-        if media_info:
+        if media_info is not None:
             session_info["probe"] = {
                 "video_codec": media_info.video_codec,
                 "audio_codec": media_info.audio_codec,
@@ -1914,7 +2072,7 @@ async def _do_start_transcode(
         log.error(
             "ffmpeg:%s failed (exit %d): %s",
             session_id,
-            process.returncode or -1,
+            -1 if process.returncode in (None, 0) else process.returncode,
             error_msg,
         )
         await stop_session(session_id, force=True)
@@ -1923,14 +2081,14 @@ async def _do_start_transcode(
     if sub_info:
         get_caption_timestamp_origin(session_id)
 
-    response = {
+    response: TranscodeResponse = {
         "session_id": session_id,
         "playlist": f"/transcode/{session_id}/stream.m3u8",
-        "subtitles": _build_subtitle_tracks(session_id, sub_info),
+        "subtitles": _build_subtitle_tracks(session_id, stored_subtitles),
         "duration": total_duration,
         "seek_offset": old_seek_offset,
     }
-    if caption_master:
+    if caption_master is not None:
         response["caption_playlist"] = f"/transcode/{session_id}/captions.m3u8"
     return response
 
@@ -1939,13 +2097,13 @@ def _get_seek_session_info(session_id: str) -> _SeekSessionInfo | None:
     """Get session info for seek atomically. Returns None if not VOD."""
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
-        if not session or not session.get("is_vod"):
+        if session is None or not session.get("is_vod", False):
             return None
         return _SeekSessionInfo(
             url=session["url"],
             output_dir=session["dir"],
             process=session["process"],
-            subtitles=session.get("subtitles") or [],
+            subtitles=session.get("subtitles", []),
             series_id=session.get("series_id"),
             episode_id=session.get("episode_id"),
             audio_passthrough=session.get("audio_passthrough", False),
@@ -1984,7 +2142,7 @@ def _prepare_encoder_restart(command: list[str], previous_segments: set[str]) ->
 async def _wait_for_fresh_fast_playlist(
     directory: str,
     name: str,
-    process: Any,
+    process: ManagedProcess,
     previous_marker: tuple[int, int, int] | None,
     *,
     previous_segments: set[str] | None = None,
@@ -2032,9 +2190,8 @@ async def _monitor_fast_process(
     await process.wait()
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
-        current = bool(
-            session
-            and (process is session.get("process") or process is session.get("ingest_process")),
+        current = session is not None and (
+            process is session.get("process") or process is session.get("ingest_process")
         )
     if current:
         log.warning(
@@ -2046,14 +2203,16 @@ async def _monitor_fast_process(
         )
 
 
-def _publish_fast_master(session: dict[str, Any]) -> None:
+def _publish_fast_master(session: FastLiveSession) -> None:
     directory = pathlib.Path(session["dir"])
-    resolution = session["master_resolution"]
-    audio_bitrate = session["master_audio_bitrate"]
+    # Startup publishes only after the encoder launch recorded both values.
+    resolution = session.get("master_resolution")
+    audio_bitrate = session.get("master_audio_bitrate")
+    assert isinstance(resolution, str) and isinstance(audio_bitrate, int)
     temporary = directory / ".master.m3u8.tmp"
     temporary.write_text(master_playlist(resolution, audio_bitrate=audio_bitrate))
     temporary.replace(directory / "master.m3u8")
-    if session.get("closed_captions"):
+    if session.get("closed_captions", False):
         caption_temporary = directory / ".low-captions.m3u8.tmp"
         caption_temporary.write_text(
             closed_caption_master_playlist(resolution, audio_bitrate=audio_bitrate),
@@ -2063,10 +2222,10 @@ def _publish_fast_master(session: dict[str, Any]) -> None:
 
 async def _restart_fast_pipeline(
     session_id: str,
-    session: dict[str, Any],
+    session: FastLiveSession,
     stalled_stage: str,
 ) -> None:
-    recovery: LiveRecoveryPolicy = session["live_recovery"]
+    recovery = session["live_recovery"]
     replacements: list[asyncio.subprocess.Process] = []
     success = False
     try:
@@ -2079,7 +2238,10 @@ async def _restart_fast_pipeline(
             session["extra_processes"] = []
             session["watchdog_recovering"] = stalled_stage
             ingest_command_line = list(session["ingest_restart_command"])
-            low_command_line = list(session["low_restart_command"])
+            # The watchdog starts only after startup recorded the encoder command.
+            low_restart_command = session.get("low_restart_command")
+            assert isinstance(low_restart_command, list)
+            low_command_line = list(low_restart_command)
         await _terminate_processes(old_processes)
 
         directory = session["dir"]
@@ -2130,13 +2292,13 @@ async def _restart_fast_pipeline(
         with _transcode_lock:
             if _transcode_sessions.get(session_id) is not session:
                 raise asyncio.CancelledError
-            session["playlist_generation"] = int(session.get("playlist_generation", 0)) + 1
+            session["playlist_generation"] = session.get("playlist_generation", 0) + 1
         recovery.reset_pipeline()
         success = True
         log.warning(
             "Live watchdog %s recovered pipeline generation %d after %s stalled",
             session_id,
-            session["playlist_generation"],
+            session.get("playlist_generation", 0),
             stalled_stage,
         )
     except asyncio.CancelledError:
@@ -2173,7 +2335,7 @@ async def _restart_fast_pipeline(
 # already listed keep the dates the old origin gave them.
 async def _restart_session_clock(
     session_id: str,
-    session: dict[str, Any],
+    session: TranscodeSession,
     low_playlist: pathlib.Path,
 ) -> None:
     """Date the old encoder's segments, then move the clock to the new ingest."""
@@ -2188,22 +2350,23 @@ async def _restart_session_clock(
 
 def _log_watchdog_delay(
     session_id: str,
-    session: dict[str, Any],
-    action: str,
+    session: TranscodeSession,
+    action: Literal["pipeline"],
     now: float,
 ) -> None:
-    key = f"{action}_restart_log_at"
-    if now - session.get(key, float("-inf")) >= 30:
+    if now - session.get("pipeline_restart_log_at", float("-inf")) >= 30:
         log.warning(
             "Live watchdog %s is delaying %s recovery because its restart budget is cooling down",
             session_id,
             action,
         )
-        session[key] = now
+        session["pipeline_restart_log_at"] = now
 
 
-async def _check_fast_live_session(session_id: str, session: dict[str, Any]) -> None:
-    recovery: LiveRecoveryPolicy = session["live_recovery"]
+async def _check_fast_live_session(session_id: str, session: TranscodeSession) -> None:
+    if not _is_fast_live(session):
+        raise KeyError("live_recovery")
+    recovery = session["live_recovery"]
     directory = session["dir"]
     now = time.monotonic()
 
@@ -2266,7 +2429,7 @@ async def _watch_fast_live(
             log.exception("Live watchdog %s failed while checking pipeline health", session_id)
 
 
-def _retire_session(session: dict[str, Any]) -> list[Any]:
+def _retire_session(session: TranscodeSession) -> list[ManagedProcess]:
     """Cancel the session's watchdog and list the processes to terminate."""
     task = session.get("watchdog_task")
     # The watchdog stops a session it cannot restart; it must finish that stop.
@@ -2275,8 +2438,8 @@ def _retire_session(session: dict[str, Any]) -> list[Any]:
     return _session_processes(session)
 
 
-def _session_processes(session: dict[str, Any]) -> list[Any]:
-    processes: list[Any] = []
+def _session_processes(session: TranscodeSession) -> list[ManagedProcess]:
+    processes: list[ManagedProcess] = []
     for process in (
         session.get("process"),
         session.get("ingest_process"),
@@ -2302,24 +2465,24 @@ async def _start_or_reuse(
     fast_start: bool,
     is_disconnected: Callable[[], Awaitable[bool]] | None,
     audio_passthrough: bool,
-) -> dict[str, Any]:
+) -> TranscodeResponse:
     """Reuse the URL's session or start one; callers hold the URL's startup guard."""
     # A quality change replaces the current stream; release its slot first.
     existing_id, is_valid, old_seek_offset = _get_existing_session(url)
     if _is_archive_url(url):
         old_seek_offset = 0.0
-        existing = get_session(existing_id) if existing_id else None
-        if existing and existing.get("username") != username:
+        existing = get_session(existing_id) if existing_id is not None else None
+        if existing is not None and existing.get("username") != username:
             raise fastapi.HTTPException(409, "This archive is playing on another device.")
-    if bandwidth_saver and existing_id:
+    if bandwidth_saver and existing_id is not None:
         session = get_session(existing_id)
         if session and session.get("username") != username:
             raise fastapi.HTTPException(404, "Session not found")
         await stop_session(existing_id, force=True)
         existing_id, is_valid, old_seek_offset = None, False, 0.0
-    if existing_id and not audio_passthrough:
+    if existing_id is not None and not audio_passthrough:
         session = get_session(existing_id)
-        if session and session.get("audio_passthrough"):
+        if session is not None and session.get("audio_passthrough", False):
             # This client cannot decode the session's Dolby audio.
             if session.get("username") != username:
                 raise fastapi.HTTPException(409, "This stream is playing on another device.")
@@ -2329,9 +2492,9 @@ async def _start_or_reuse(
     is_vod = content_type in ("movie", "series")
 
     # Try to reuse existing valid session.
-    if existing_id and is_valid:
+    if existing_id is not None and is_valid:
         existing = get_session(existing_id)
-        if existing and existing.get("fast_start"):
+        if existing is not None and existing.get("fast_start", False):
             if existing.get("username") != username:
                 raise fastapi.HTTPException(404, "Session not found")
             touch_session(existing_id)
@@ -2342,7 +2505,7 @@ async def _start_or_reuse(
             return result
 
     # Clean up any existing invalid session.
-    if existing_id:
+    if existing_id is not None:
         log.info("Cleaning up invalid session %s", existing_id)
         await _cleanup_invalid_session(url, existing_id)
 
@@ -2355,7 +2518,7 @@ async def _start_or_reuse(
             user_max_streams,
             source_max_streams,
         )
-        if error:
+        if error is not None:
             raise fastapi.HTTPException(status_code=429, detail=error)
 
     resolved: str | None = None
@@ -2454,3 +2617,22 @@ async def _url_startup(url: str) -> AsyncGenerator[None]:
         guard.users -= 1
         if not guard.users:
             del _startup_guards[url]
+
+
+class _SessionInfo(TypedDict, total=False):
+    """The session.json a VOD session persists for recovery after restart."""
+
+    session_id: Required[str]
+    url: str
+    is_vod: bool
+    started: float
+    subtitles: list[StoredSubtitle | int]
+    subtitle_indices: list[int]
+    duration: float
+    seek_offset: float
+    series_id: int | None
+    episode_id: int | None
+    username: str
+    source_id: str
+    audio_passthrough: bool
+    probe: _SessionProbe

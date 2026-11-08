@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
+import json
+
 import pytest
+
+from xtream import ProviderRecord
 
 import playlists
 
 
 @pytest.fixture(autouse=True)
-def cache_dir(tmp_path: Path):
+def cache_dir(tmp_path: Path) -> Iterator[Path]:
     with patch("cache.CACHE_DIR", tmp_path):
         yield tmp_path
 
 
-STREAMS = [
+STREAMS: list[ProviderRecord] = [
     {
         "stream_id": 1,
         "name": "US| ESPN HD",
@@ -73,7 +78,7 @@ def test_crud_and_order():
     )
     assert updated is not None
     assert updated["name"] == "YTTV"
-    assert [c["stream_id"] for c in updated["channels"]] == ["1"]
+    assert [c.get("stream_id") for c in updated.get("channels", [])] == ["1"]
 
     playlists.reorder([second["id"], first["id"]])
     assert [p["id"] for p in playlists.load()] == [second["id"], first["id"]]
@@ -89,7 +94,9 @@ def test_create_requires_name():
 
 
 def test_resolve_survives_stream_id_changes():
-    playlist = {
+    playlist: playlists.Playlist = {
+        "id": "p",
+        "name": "P",
         "channels": [
             {"stream_id": "999", "name": "US| ESPN HD", "source_id": "a", "epg_channel_id": ""},
             {"stream_id": "3", "name": "US| ABC 7 SAN FRANCISCO CA (KGO)", "source_id": "a"},
@@ -103,7 +110,11 @@ def test_resolve_survives_stream_id_changes():
 
 
 def test_resolve_prefers_name_when_stream_id_was_reused():
-    playlist = {"channels": [{"stream_id": "2", "name": "US| ESPN HD", "source_id": "a"}]}
+    playlist: playlists.Playlist = {
+        "id": "p",
+        "name": "P",
+        "channels": [{"stream_id": "2", "name": "US| ESPN HD", "source_id": "a"}],
+    }
     assert [s["stream_id"] for s in playlists.resolve(playlist, STREAMS)] == [1]
 
 
@@ -132,11 +143,13 @@ def test_search_skips_separators_and_filters():
 
 
 def test_resolve_keeps_sources_apart():
-    streams = [
+    streams: list[ProviderRecord] = [
         {"stream_id": 7, "name": "CNN", "source_id": "a"},
         {"stream_id": 7, "name": "BBC", "source_id": "b"},
     ]
-    playlist = {
+    playlist: playlists.Playlist = {
+        "id": "p",
+        "name": "P",
         "channels": [
             {"stream_id": "7", "name": "BBC", "source_id": "b"},
             {"stream_id": "7", "name": "CNN", "source_id": "a"},
@@ -146,11 +159,13 @@ def test_resolve_keeps_sources_apart():
 
 
 def test_resolve_entry_epg_overrides_stream():
-    streams = [
+    streams: list[ProviderRecord] = [
         {"stream_id": 1, "name": "Alpha", "source_id": "a", "epg_channel_id": ""},
         {"stream_id": 2, "name": "Beta", "source_id": "a", "epg_channel_id": "beta.guide"},
     ]
-    playlist = {
+    playlist: playlists.Playlist = {
+        "id": "p",
+        "name": "P",
         "channels": [
             {"stream_id": "1", "name": "Alpha", "source_id": "a", "epg_channel_id": "alpha.guide"},
             {"stream_id": "2", "name": "Beta", "source_id": "a", "epg_channel_id": "old.beta"},
@@ -162,11 +177,16 @@ def test_resolve_entry_epg_overrides_stream():
 
 
 def test_resolve_prefers_epg_over_reused_id():
-    streams = [
+    streams: list[ProviderRecord] = [
         {"stream_id": 1, "name": "Other", "source_id": "a", "epg_channel_id": ""},
         {"stream_id": 2, "name": "ESPN East", "source_id": "a", "epg_channel_id": "espn.us"},
     ]
-    entry = {"stream_id": "1", "name": "ESPN", "source_id": "a", "epg_channel_id": "espn.us"}
+    entry: playlists.PlaylistChannel = {
+        "stream_id": "1",
+        "name": "ESPN",
+        "source_id": "a",
+        "epg_channel_id": "espn.us",
+    }
     stream = playlists.resolve_channel(entry, streams)
     assert stream is not None and stream["stream_id"] == 2
 
@@ -179,7 +199,7 @@ def test_non_string_ids_and_names_are_accepted():
 
 
 def test_index_rebuilds_for_new_stream_list():
-    entry = {"stream_id": "1", "name": "A", "source_id": "s"}
+    entry: playlists.PlaylistChannel = {"stream_id": "1", "name": "A", "source_id": "s"}
     for name in ("A", "B"):
         stream = playlists.resolve_channel(
             entry,
@@ -188,20 +208,52 @@ def test_index_rebuilds_for_new_stream_list():
         assert stream is not None and stream["name"] == name
 
 
-def test_load_tolerates_corrupt_or_foreign_files(cache_dir):
+def test_load_tolerates_corrupt_or_foreign_files(cache_dir: Path):
     path = cache_dir / "playlists.json"
     path.write_text("{not json")
     assert playlists.load() == []
     path.write_text("[1, 2]")
     assert playlists.load() == []
-    path.write_text('{"playlists": [{"id": "x", "name": "X"}, {"name": "no id"}, 3]}')
+    path.write_text('{"playlists": {"id": "x"}}')
+    assert playlists.load() == []
+    path.write_text(
+        '{"playlists": [{"id": "x", "name": "X"}, {"name": "no id"}, {"id": "", "name": "E"}, 3]}',
+    )
     assert playlists.load() == [{"id": "x", "name": "X"}]
+
+
+def test_save_keeps_unknown_playlist_fields_and_drops_deleted(cache_dir: Path):
+    path = cache_dir / "playlists.json"
+    path.write_text(
+        json.dumps(
+            {
+                "playlists": [
+                    {"id": "a", "name": "A", "channels": [], "color": "red"},
+                    {"id": "b", "name": "B", "channels": [], "color": "blue"},
+                ],
+            },
+        ),
+    )
+    assert playlists.delete("a")
+    playlists.update("b", name="Renamed")
+    assert json.loads(path.read_text())["playlists"] == [
+        {"id": "b", "name": "Renamed", "channels": [], "color": "blue"},
+    ]
+
+
+def test_save_keeps_unknown_top_level_keys(cache_dir: Path):
+    path = cache_dir / "playlists.json"
+    path.write_text('{"playlists": [], "version": 2}')
+    playlists.create("News")
+    saved = json.loads(path.read_text())
+    assert saved["version"] == 2
+    assert [p["name"] for p in saved["playlists"]] == ["News"]
 
 
 def test_get_by_id():
     created = playlists.create("News", channels=[{"stream_id": 1, "name": "CNN"}])
     assert playlists.get(created["id"]) == created
-    assert created["channels"] == [
+    assert created.get("channels") == [
         {"stream_id": "1", "name": "CNN", "source_id": "", "epg_channel_id": ""},
     ]
     assert playlists.get("missing") is None
@@ -237,7 +289,7 @@ def test_search_respects_limit_and_category_prefix():
 
 
 def test_match_names_dedupes_names_and_caps_candidates():
-    streams = [
+    streams: list[ProviderRecord] = [
         {"stream_id": 1, "name": "ESPN", "source_id": "a"},
         {"stream_id": 2, "name": "ESPN", "source_id": "b"},
         {"stream_id": 3, "name": "ESPN NEWS", "source_id": "a"},

@@ -40,6 +40,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
+from cache import ServerSettings
 from gateway_catalog import CatalogSnapshot, GatewayCatalog, GatewayStream
 from gateway_epg import EpgUnavailableError, build_filtered_xmltv
 from m3u import get_xtream_client_by_source
@@ -76,27 +77,28 @@ def _available_upscale_models(model_name: str = "2x-nomosuni-compact") -> list[s
     return [model_name] if next(engine_dir.glob(pattern), None) else []
 
 
-def _upscale_settings(model_name: str = "2x-nomosuni-compact") -> dict[str, Any]:
+def _upscale_settings(model_name: str = "2x-nomosuni-compact") -> ServerSettings:
     settings = cache.load_server_settings()
     available_models = _available_upscale_models(model_name)
-    configured_model = model_name if str(settings.get("sr_model") or "").strip() else ""
+    configured_model = model_name if settings.get("sr_model", "").strip() else ""
     if configured_model and configured_model not in available_models:
         raise RuntimeError(
             f"Configured AI Upscale model {configured_model!r} is not installed; "
             f"available models: {', '.join(available_models) or 'none'}",
         )
-    upscale_settings = {
+    max_resolution = settings.get("max_resolution", "") or "1080p"
+    quality = settings.get("quality", "") or "high"
+    if max_resolution not in ("4k", "1080p", "720p", "480p"):
+        raise RuntimeError("Configured max_resolution must be one of: 4k, 1080p, 720p, 480p")
+    if quality not in ("high", "medium", "low"):
+        raise RuntimeError("Configured quality must be one of: high, medium, low")
+    return {
         **settings,
-        "transcode_hw": str(settings.get("transcode_hw") or "nvenc+software"),
-        "max_resolution": str(settings.get("max_resolution") or "1080p"),
-        "quality": str(settings.get("quality") or "high"),
+        "transcode_hw": settings.get("transcode_hw", "nvenc+software"),
+        "max_resolution": max_resolution,
+        "quality": quality,
         "sr_model": configured_model,
     }
-    if upscale_settings["max_resolution"] not in ("4k", "1080p", "720p", "480p"):
-        raise RuntimeError("Configured max_resolution must be one of: 4k, 1080p, 720p, 480p")
-    if upscale_settings["quality"] not in ("high", "medium", "low"):
-        raise RuntimeError("Configured quality must be one of: high, medium, low")
-    return upscale_settings
 
 
 async def _cleanup_upscale_sessions() -> None:
@@ -115,12 +117,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     ffmpeg_session.cleanup_and_recover_sessions()
     settings = _upscale_settings()
-    if settings["sr_model"]:
+    if settings.get("sr_model", ""):
         log.info(
             "Native upscaling enabled: model=%s target=%s hw=%s",
-            settings["sr_model"],
-            settings["max_resolution"],
-            settings["transcode_hw"],
+            settings.get("sr_model", ""),
+            settings.get("max_resolution", ""),
+            settings.get("transcode_hw", ""),
         )
     else:
         log.info("Native upscaling disabled; gateway will use passthrough")
@@ -240,13 +242,14 @@ async def healthcheck() -> dict[str, str]:
 @app.get("/capabilities")
 async def capabilities() -> dict[str, Any]:
     settings = _upscale_settings()
-    upscale = bool(settings["sr_model"])
+    selected_model = settings.get("sr_model", "")
+    upscale = bool(selected_model)
     return {
         "upscale": upscale,
         "models": _available_upscale_models(),
-        "selected_model": settings["sr_model"],
-        "max_resolution": settings["max_resolution"],
-        "quality": settings["quality"],
+        "selected_model": selected_model,
+        "max_resolution": settings.get("max_resolution", ""),
+        "quality": settings.get("quality", ""),
         "output_format": "hls" if upscale else "mpegts",
     }
 
@@ -298,7 +301,8 @@ async def player_api(
             raise HTTPException(404, "Stream not found")
         client = get_xtream_client_by_source(stream.source_id)
         if client is None:
-            return {"epg_listings": []}
+            no_listings: dict[str, list[object]] = {"epg_listings": []}
+            return no_listings
         try:
             return await asyncio.to_thread(
                 client.get_short_epg,
@@ -309,7 +313,8 @@ async def player_api(
             log.warning("Gateway EPG lookup failed (%s)", type(exc).__name__)
             raise HTTPException(502, "Unable to load upstream EPG data") from exc
     if action in ("get_vod_categories", "get_vod_streams", "get_series_categories", "get_series"):
-        return []
+        no_items: list[object] = []
+        return no_items
     raise HTTPException(400, f"Unsupported action: {action}")
 
 
@@ -388,17 +393,19 @@ async def live_stream(request: Request, stream_path: str) -> Response:
                 for source in settings.get("sources", [])
                 if source.get("id") == stream.source_id
             ),
-            {},
+            None,
         )
         user_limits = auth.get_user_limits(username)
         result = await ffmpeg_session.start_transcode(
             _resolve_upstream(stream, "ts"),
             content_type="live",
-            deinterlace_fallback=bool(source.get("deinterlace_fallback", True)),
+            deinterlace_fallback=True
+            if source is None
+            else source.get("deinterlace_fallback", True),
             username=username,
             source_id=stream.source_id,
-            user_max_streams=user_limits.get("max_streams_per_source", {}).get(stream.source_id, 0),
-            source_max_streams=int(source.get("max_streams", 0) or 0),
+            user_max_streams=user_limits["max_streams_per_source"].get(stream.source_id, 0),
+            source_max_streams=0 if source is None else source.get("max_streams", 0),
         )
         return RedirectResponse(
             f"/upscale/{result['session_id']}/stream.m3u8",
@@ -415,7 +422,7 @@ async def upscale_file(session_id: str, filename: str) -> Response:
     if not ffmpeg_session.touch_session(session_id):
         raise HTTPException(404, "Upscale session not found")
     session = ffmpeg_session.get_session(session_id)
-    if not session:
+    if session is None:
         raise HTTPException(404, "Upscale session not found")
     file_path = Path(session["dir"]) / safe_filename
     if not file_path.exists():
@@ -520,7 +527,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _upscale_enabled() -> bool:
-    return bool(_upscale_settings()["sr_model"])
+    return bool(_upscale_settings().get("sr_model", ""))
 
 
 def _public_base_url(request: Request) -> str:
@@ -655,7 +662,15 @@ def _resolve_upstream(stream: GatewayStream, extension: str) -> str:
     return client.build_stream_url("live", int(stream.upstream_id), extension)
 
 
-def _iter_upstream(upstream: Any) -> Iterator[bytes]:
+class _ByteStream(Protocol):
+    """Readable, closable upstream HTTP body."""
+
+    def read(self, amt: int, /) -> bytes: ...
+
+    def close(self) -> None: ...
+
+
+def _iter_upstream(upstream: _ByteStream) -> Iterator[bytes]:
     with contextlib.closing(upstream):
         while chunk := upstream.read(64 * 1024):
             yield chunk
@@ -675,10 +690,10 @@ async def _proxy_url(url: str) -> StreamingResponse:
     content_type = upstream.headers.get("Content-Type") or "video/mp2t"
     headers = {"Cache-Control": "no-store"}
     content_length = upstream.headers.get("Content-Length")
-    if content_length:
+    if content_length is not None and content_length:
         headers["Content-Length"] = content_length
     content_encoding = upstream.headers.get("Content-Encoding")
-    if content_encoding:
+    if content_encoding is not None and content_encoding:
         headers["Content-Encoding"] = content_encoding
     return StreamingResponse(_iter_upstream(upstream), media_type=content_type, headers=headers)
 

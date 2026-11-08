@@ -118,12 +118,12 @@ def test_expand_abbrevs_and_helpers() -> None:
 
 
 def test_equivalent() -> None:
-    a = {"name_tokens": ["SYFY", "EAST"], "id_tokens": []}
-    b = {"name_tokens": [], "id_tokens": ["SYFY", "WEST"]}
+    a: remap_epg.ChannelTokens = {"name_tokens": ["SYFY", "EAST"], "id_tokens": []}
+    b: remap_epg.ChannelTokens = {"name_tokens": [], "id_tokens": ["SYFY", "WEST"]}
     assert remap_epg._equivalent(a, b, [])
-    c = {"name_tokens": ["FOX"], "id_tokens": []}
-    d2 = {"name_tokens": ["FOX", "SPORTS"], "id_tokens": []}
-    variants = [{"tokens": ["FOX"]}, {"tokens": ["FOX", "SPORTS"]}]
+    c: remap_epg.ChannelTokens = {"name_tokens": ["FOX"], "id_tokens": []}
+    d2: remap_epg.ChannelTokens = {"name_tokens": ["FOX", "SPORTS"], "id_tokens": []}
+    variants: list[remap_epg.QueryTokens] = [{"tokens": ["FOX"]}, {"tokens": ["FOX", "SPORTS"]}]
     assert remap_epg._equivalent(c, d2, variants)
     assert not remap_epg._equivalent(c, {"name_tokens": ["NBC"], "id_tokens": []}, variants)
 
@@ -147,23 +147,21 @@ def test_query_variants_expansions() -> None:
     ]
 
 
-def _cand(cid: str, name: str, **kw: object) -> dict[str, object]:
+def _cand(cid: str, name: str) -> remap_epg.Candidate:
     nc, nt, local = remap_epg.parse_name(name)
     ic, it, _ = remap_epg.parse_id(cid)
-    c: dict[str, object] = {
-        "id": cid,
-        "name": name,
-        "upcoming": 5,
-        "name_country": nc,
-        "src_country": "",
-        "name_tokens": remap_epg._expand_abbrevs(nt),
-        "id_country": ic,
-        "id_tokens": remap_epg._expand_abbrevs(it),
-        "timeshift": remap_epg._is_timeshift(nt) or remap_epg._is_timeshift(it),
-        "local": local,
-    }
-    c.update(kw)
-    return c
+    return remap_epg.Candidate(
+        id=cid,
+        name=name,
+        upcoming=5,
+        name_country=nc,
+        src_country="",
+        name_tokens=remap_epg._expand_abbrevs(nt),
+        id_country=ic,
+        id_tokens=remap_epg._expand_abbrevs(it),
+        timeshift=remap_epg._is_timeshift(nt) or remap_epg._is_timeshift(it),
+        local=local,
+    )
 
 
 def test_candidate_scores_and_pick_match() -> None:
@@ -241,7 +239,7 @@ def test_main_missing_files(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPa
         _run_main(monkeypatch, "--cache-dir", str(tmp_path))
 
 
-def _setup_cache(data_dir: pathlib.Path) -> dict:
+def _setup_cache(data_dir: pathlib.Path) -> dict[str, object]:
     future = time.time() + 3600
     _make_db(
         data_dir / "epg.db",
@@ -252,7 +250,7 @@ def _setup_cache(data_dir: pathlib.Path) -> dict:
             ("Fox2.us", "FOX TWO", None, future),
         ],
     )
-    data = {
+    data: dict[str, object] = {
         "extra": "kept",
         "playlists": [
             {

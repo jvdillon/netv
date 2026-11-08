@@ -208,11 +208,12 @@ def test_script_entrypoint_runs_main(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     (tmp_path / "xtream.json").write_text(json.dumps(CONFIG))
-    monkeypatch.setattr(
-        request,
-        "urlopen",
-        lambda url, timeout: FakeResponse(fake_api(url).encode()),
-    )
+
+    def urlopen(url: str, timeout: int) -> FakeResponse:
+        del timeout
+        return FakeResponse(fake_api(url).encode())
+
+    monkeypatch.setattr(request, "urlopen", urlopen)
     monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--dir", str(tmp_path)])
     with pytest.raises(SystemExit) as exc:
         runpy.run_path(str(SCRIPT), run_name="__main__")

@@ -9,7 +9,9 @@ import pytest
 import testing
 
 
-def test_run_tests_invokes_pytest_and_exits_with_its_code(monkeypatch: pytest.MonkeyPatch):
+def test_run_tests_invokes_pytest_and_exits_with_its_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[list[str]] = []
 
     def _main(args: list[str]) -> int:

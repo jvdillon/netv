@@ -24,13 +24,13 @@ classifiers = [
     "Topic :: Multimedia :: Video :: Display",
 ]
 dependencies = [
-    "PyChromecast>=13.1,<15",
-    "codedoctor>=0.1.3",
+    "PyChromecast>=13.1",
     "cryptography>=43.0",
     "defusedxml>=0.7",
     "fastapi>=0.115",
     "jinja2>=3.1",
     "python-multipart>=0.0.9",
+    "treekle>=0.4.4",
     "uvicorn[standard]>=0.32",
     "wrapt>=2.5.2",
 ]
@@ -70,12 +70,22 @@ pre-commit = [
     {include-group = "lint"},
     {include-group = "test"},
     {include-group = "typecheck"},
+    "basedpyright>=1.40.2",
     "codedoctor[coverage,mutation,notebook]>=0.1.3",
+    "codespell>=2.4.3",
     "onnx>=1.23.2",
     "onnxconverter-common>=1.16.0",
     "pre-commit>=4.7.0",
+    "pyrefly>=1.4.1",
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
+    "pytest-testmon>=2.3.0",
+    "pytest-timeout>=2.4.0",
+    "pytest-xdist>=3.8.0",
     "rekursiv-ai-typings>=0.1.16",
+    "ruff>=0.17.4",
     "treekle>=0.4.4",
+    "ty>=0.0.99",
     "wrapt>=2.5.2",
 ]
 
@@ -102,16 +112,23 @@ package = true
 
 [tool.uv.dependency-groups.pre-commit]
 requires-python = ">=3.12"
+
+[tool.uv.sources]
+codedoctor = { path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-policy-v5/codedoctor-0.1.3-py3-none-any.whl" }
 [tool.ruff]
 fix = true
 show-fixes = true
 line-length = 100
 output-format = "concise"
 target-version = "py310"
+exclude = [".venv/", "*.egg-info/", ".pytest_cache/", "build/", "dist/", "**/third_party/"]
+extend-include = ["*.ipynb"]
+force-exclude = true
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["E501", "SIM108"]
+extend-safe-fixes = ["C4", "D301", "E711", "E712", "E731", "F401", "F601", "F841", "ISC004", "PT006", "PT007", "PT018", "PYI034", "RET504", "RUF007", "RUF022", "SIM102", "SIM105", "TC", "UP"]
 
 [tool.ruff.lint.isort]
 case-sensitive = false
@@ -137,24 +154,90 @@ section-order = [
     "first-party",
     "local-folder",
 ]
+extra-standard-library = ["typing", "typing_extensions", "ty_extensions"]
 
+[tool.ruff.lint.flake8-tidy-imports.banned-api."math.pow"]
+msg = "Operators over functions: write `x**y` (STYLE.md Code Style)."
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api."math.sqrt"]
+msg = "Operators over functions: write `x**0.5` (STYLE.md Code Style)."
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api."os.environ.setdefault"]
+msg = "Assign, never setdefault: a deferred default writes a different tree per caller (AGENTS.md Provisioned Paths)."
+
+[tool.ruff.lint.flake8-type-checking]
+exempt-modules = ["typing", "typing_extensions", "dataclasses"]
+runtime-evaluated-base-classes = ["pydantic.BaseModel", "trackinizer.wire.bodies.ActorMixin", "configgle.Fig", "configgle.Makes", "configgle.Maker"]
+runtime-evaluated-decorators = ["dataclasses.dataclass", "mcp.server.MCPServer.tool", "fastapi.APIRouter.get", "fastapi.APIRouter.post", "fastapi.APIRouter.put", "fastapi.APIRouter.patch", "fastapi.APIRouter.delete"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/typings/**" = ["ANN", "PYI015", "PYI018", "UP046", "UP047", "A003", "A004", "E743", "F403", "F405", "F722", "F811", "F821", "F822", "N801", "N802", "N803", "N807", "N811", "N812", "N814", "N815", "N816", "N817", "N818", "PLC0105", "PLE0604", "PLE0605", "PLW0211", "PYI001", "PYI002", "PYI024", "PYI035", "PYI042", "PYI048", "PYI063", "SLF001", "TID252", "D102", "D103", "D205", "D401", "PYI046", "PYI047", "PYI049", "TID251"]
+"*.ipynb" = ["ARG001", "BLE001", "E402", "F811", "F821", "INP001", "PLC0415", "RUF100", "S102", "S301", "T201"]
+"__init__.py" = ["F401"]
+"{**/docs/**,**/scripts/**}" = ["INP001", "T201"]
+"{*_test.py,**/tests/test*.py}" = ["ANN201", "ANN202", "D100", "D101", "D102", "D103", "D205", "INP001", "PLR2004", "S101", "S301", "SLF001"]
 [tool.basedpyright]
 typeCheckingMode = "standard"
 pythonVersion = "3.12"
 exclude = ["tools/", ".venv/"]  # Optional scripts + virtual env
+extraPaths = ["typings", ".venv/share/rekursiv-ai-typings"]
+failOnWarnings = true
+ignore = ["**/.venv/", "**/.venv-ci312/", "**/node_modules/", "*.egg-info/", "**/*.ipynb", ".pytest_cache/", "build/", "dist/", "**/third_party/", "**/typings/"]
+pythonPlatform = "All"
+reportCallInDefaultInitializer = false
+reportImplicitStringConcatenation = false
+reportInvalidCast = false
+reportMissingSuperCall = false
+reportPrivateUsage = false
+reportUnannotatedClassAttribute = false
+reportUnsafeMultipleInheritance = false
+reportUnusedCallResult = false
+useLibraryCodeForTypes = false
 
 [tool.pyrefly]
 search-path = ["."]
+infer-with-first-use = true
+min-severity = "warn"
+output-format = "min-text"
+preset = "strict"
+project-excludes = ["**/.venv/", "**/.venv-ci312/", "**/node_modules/", "*.egg-info/", "**/*.ipynb", ".pytest_cache/", "build/", "dist/", "**/third_party/", "typings/", "**/.export/typings/"]
+project-includes = ["**/*.py", "**/*.pyi"]
+python-version = "3.12.0"
 
+[tool.pyrefly.errors]
+missing-super-call = "ignore"
+no-access = "ignore"
+unused-call-result = "ignore"
 [tool.ty.environment]
 extra-paths = ["."]
+python-version = "3.12"
 
+[[tool.ty.overrides]]
+include = ["*_test.py"]
+
+[tool.ty.overrides.rules]
+invalid-key = "ignore"
+
+[tool.ty.rules]
+all = "warn"
+invalid-attribute-override = "ignore"
+
+[tool.ty.src]
+exclude = [".venv/", ".venv-ci312/", "*.egg-info/", ".pytest_cache/", "build/", "dist/", "**/third_party/", "**/typings/"]
+
+[tool.ty.terminal]
+error-on-warning = true
+output-format = "concise"
 [tool.pytest.ini_options]
 testpaths = ["."]
 python_files = ["*_test.py"]
 pythonpath = ["."]
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = ["ignore::pytest.PytestUnraisableExceptionWarning:coroutine.*was never awaited"]
+addopts = "-m 'not ci_smoke and not cuda and not integration and not performance and not cluster and not slow' --durations=0 --durations-min=0.100 --dist=worksteal -p no:py_pglite"
+markers = ["ci_smoke: slower package/CLI smoke tests run explicitly in CI", "cluster: requires live cluster access; deselected by default (run explicitly with -m cluster)", "cuda: tests that require a real CUDA device (skipped in hosted CI)", "integration: tests that require networking or external deps (deselected by default)", "performance: timing-sensitive tests (deselected by default)", "slow: expensive local correctness test (JIT, training, full fixtures, git, bash, or a fresh interpreter); excluded from the fast unit tier and run by the pre-push slow gate", "bench_compile_time: asserts a compile-time budget or comparison", "bench_memory: asserts a memory-use budget or comparison", "bench_statistical: asserts a statistical performance contract", "bench_throughput: asserts throughput or parallel scaling", "bench_wallclock: asserts wall-clock duration", "browser_chrome: drives a local Chrome/Chromium browser", "browser_zendriver: drives the zendriver browser backend", "cli_bash: shells out to bash", "cli_real_llm: spawns a live LLM CLI (claude, codex); skipped unless RUN_REAL_LLM=1", "cli_docker: shells out to Docker", "cli_git: shells out to git or requires a real git repository", "cli_node: shells out to node/npm tooling", "cli_precommit: shells out to pre-commit", "cli_python_subprocess: spawns a Python child process", "cli_rsync: shells out to rsync", "cli_ssh: shells out to ssh/scp", "cli_uv: shells out to uv", "compute_distributed: starts local distributed/multirank workers", "compute_jax_jit: runs JAX JIT/compiled compute", "compute_large_fixture: materializes a large but local fixture", "compute_torch_compile: runs torch.compile or compiler-heavy torch code", "compute_training: runs a training loop or optimizer trajectory", "db_pglite: starts or depends on PGlite", "db_pgvector: requires the pgvector extension", "db_postgres: starts or depends on a PostgreSQL server", "gpu_cuda_runtime: requires a CUDA runtime", "gpu_flash_attention: requires FlashAttention kernels", "gpu_jax_cuda: requires JAX CUDA execution", "gpu_nvidia: requires NVIDIA GPU hardware", "gpu_torch_cuda: requires torch CUDA execution", "gpu_torch_mps: requires torch MPS execution", "gpu_triton: requires Triton kernels", "network_anthropic: reaches Anthropic over the network", "network_duckduckgo: reaches DuckDuckGo over the network", "network_e2b: reaches E2B over the network", "network_gemini: reaches Gemini over the network", "network_google_search: reaches Google Search over the network", "network_github: reaches GitHub over the network", "network_huggingface: reaches Hugging Face over the network", "network_kaggle: reaches Kaggle over the network", "network_localhost: opens a loopback network socket", "network_openai: reaches OpenAI over the network", "network_openml: reaches OpenML over the network", "network_openreview: reaches OpenReview over the network", "network_pypi: reaches PyPI over the network", "network_searxng: reaches a SearXNG service over the network", "network_gpu_cloud: reaches a GPU cloud provider over the network", "network_slack: reaches Slack over the network", "network_wandb: reaches Weights & Biases over the network"]
+norecursedirs = ["*.egg-info", ".agents", ".claude", ".git", ".hypothesis", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__", "third_party", "typings", "mutants"]
+timeout = 60
 
 [tool.coverage-floor]
 floor = ["=100"]
@@ -162,6 +245,160 @@ floor = ["=100"]
 [tool.houselint]
 select = "ALL"
 fix = "ALL"
-# neTV's per-user namespace is "netv"; it is not a rekursiv-ai tool.
-set = ["userdirs-namespace.vendor-namespaces=netv"]
+set = ["userdirs-namespace.namespace=netv"]
 exclude = ["*_test.py test_*.py **/tests/test*.py =\n    args-section assert cache-kwarg def-order final-inline globals\n    lazy-import-cost mkdir-mode module-side-effects nested-def returns-named\n    returns-section single-use-helper tempfile-prefix tensor-value-guard\n    tmp-literal xdg-literal", "conftest.py =\n    args-section def-order lazy-import-cost module-side-effects returns-section"]
+
+[tool.codedoctor.managed.pytest.ini_options]
+python_files = ["*_test.py", "test_*.py"]
+markers = ["ci_smoke: slower package/CLI smoke tests run explicitly in CI", "cluster: requires live cluster access; deselected by default (run explicitly with -m cluster)", "cuda: tests that require a real CUDA device (skipped in hosted CI)", "integration: tests that require networking or external deps (deselected by default)", "performance: timing-sensitive tests (deselected by default)", "slow: expensive local correctness test (JIT, training, full fixtures, git, bash, or a fresh interpreter); excluded from the fast unit tier and run by the pre-push slow gate", "bench_compile_time: asserts a compile-time budget or comparison", "bench_memory: asserts a memory-use budget or comparison", "bench_statistical: asserts a statistical performance contract", "bench_throughput: asserts throughput or parallel scaling", "bench_wallclock: asserts wall-clock duration", "browser_chrome: drives a local Chrome/Chromium browser", "browser_zendriver: drives the zendriver browser backend", "cli_bash: shells out to bash", "cli_real_llm: spawns a live LLM CLI (claude, codex); skipped unless RUN_REAL_LLM=1", "cli_docker: shells out to Docker", "cli_git: shells out to git or requires a real git repository", "cli_node: shells out to node/npm tooling", "cli_precommit: shells out to pre-commit", "cli_python_subprocess: spawns a Python child process", "cli_rsync: shells out to rsync", "cli_ssh: shells out to ssh/scp", "cli_uv: shells out to uv", "compute_distributed: starts local distributed/multirank workers", "compute_jax_jit: runs JAX JIT/compiled compute", "compute_large_fixture: materializes a large but local fixture", "compute_torch_compile: runs torch.compile or compiler-heavy torch code", "compute_training: runs a training loop or optimizer trajectory", "db_pglite: starts or depends on PGlite", "db_pgvector: requires the pgvector extension", "db_postgres: starts or depends on a PostgreSQL server", "gpu_cuda_runtime: requires a CUDA runtime", "gpu_flash_attention: requires FlashAttention kernels", "gpu_jax_cuda: requires JAX CUDA execution", "gpu_nvidia: requires NVIDIA GPU hardware", "gpu_torch_cuda: requires torch CUDA execution", "gpu_torch_mps: requires torch MPS execution", "gpu_triton: requires Triton kernels", "network_anthropic: reaches Anthropic over the network", "network_duckduckgo: reaches DuckDuckGo over the network", "network_e2b: reaches E2B over the network", "network_gemini: reaches Gemini over the network", "network_google_search: reaches Google Search over the network", "network_github: reaches GitHub over the network", "network_huggingface: reaches Hugging Face over the network", "network_kaggle: reaches Kaggle over the network", "network_localhost: opens a loopback network socket", "network_openai: reaches OpenAI over the network", "network_openml: reaches OpenML over the network", "network_openreview: reaches OpenReview over the network", "network_pypi: reaches PyPI over the network", "network_searxng: reaches a SearXNG service over the network", "network_gpu_cloud: reaches a GPU cloud provider over the network", "network_slack: reaches Slack over the network", "network_wandb: reaches Weights & Biases over the network"]
+addopts = "-m 'not ci_smoke and not cuda and not integration and not performance and not cluster and not slow' --durations=0 --durations-min=0.100 --dist=worksteal -p no:py_pglite"
+timeout = 60
+filterwarnings = ["error", "ignore::pytest.PytestUnraisableExceptionWarning"]
+norecursedirs = ["*.egg-info", ".agents", ".claude", ".git", ".hypothesis", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__", "third_party", "typings", "mutants"]
+
+[tool.codedoctor.managed.mutmut]
+mutate_only_covered_lines = true
+source_paths = ["."]
+pytest_add_cli_args = ["-p", "no:jaxtyping"]
+do_not_mutate_patterns = ["^\\s*help=(\"[^\"]*\"\\s*)+,?\\s*$", "^\\s*(description|formatter_class)=[\\w.]+,?\\s*$"]
+
+[tool.codedoctor.managed.coverage-floor]
+floor = ["=100"]
+
+[tool.codedoctor.managed.coverage.run]
+core = "sysmon"
+omit = ["*_test.py", "test_*.py", "*/tests/*", "*/.venv/*", "*/typings/*", "*/testdata/*", "*/__main__.py"]
+
+[tool.codedoctor.managed.coverage.report]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "if __name__ == .__main__.:", "raise NotImplementedError", "^\\s*\\.\\.\\.$", "^def \\w+_triton\\(", "^def \\w+_numba\\("]
+show_missing = true
+skip_covered = true
+
+[tool.codedoctor.managed.ruff]
+show-fixes = true
+line-length = 88
+output-format = "concise"
+target-version = "py312"
+force-exclude = true
+exclude = [".venv/", "*.egg-info/", ".pytest_cache/", "build/", "dist/", "**/third_party/"]
+extend-include = ["*.ipynb"]
+
+[tool.codedoctor.managed.ruff.lint]
+select = ["ALL"]
+ignore = ["COM812", "E501", "TC006", "CPY001", "D105", "D106", "D107", "D203", "D213", "RUF001", "RUF002", "RUF003", "ERA001", "FIX001", "FIX002", "PLR2044", "TD001", "TD002", "TD003", "TD004", "TD005", "C90", "FLY002", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR1704", "PLR2004", "SIM108", "A001", "A002", "ANN204", "EM101", "EM102", "EXE001", "FBT001", "FBT002", "FBT003", "N806", "PLW0642", "S101", "TRY003", "TRY300"]
+extend-safe-fixes = ["C4", "D301", "E711", "E712", "E731", "F401", "F601", "F841", "ISC004", "PT006", "PT007", "PT018", "PYI034", "RET504", "RUF007", "RUF022", "SIM102", "SIM105", "TC", "UP"]
+
+[tool.codedoctor.managed.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"{*_test.py,**/tests/test*.py}" = ["ANN201", "ANN202", "D100", "D101", "D102", "D103", "D205", "INP001", "PLR2004", "S101", "S301", "SLF001"]
+"*.ipynb" = ["ARG001", "BLE001", "E402", "F811", "F821", "INP001", "PLC0415", "RUF100", "S102", "S301", "T201"]
+"**/typings/**" = ["ANN", "PYI015", "PYI018", "UP046", "UP047", "A003", "A004", "E743", "F403", "F405", "F722", "F811", "F821", "F822", "N801", "N802", "N803", "N807", "N811", "N812", "N814", "N815", "N816", "N817", "N818", "PLC0105", "PLE0604", "PLE0605", "PLW0211", "PYI001", "PYI002", "PYI024", "PYI035", "PYI042", "PYI048", "PYI063", "SLF001", "TID252", "D102", "D103", "D205", "D401", "PYI046", "PYI047", "PYI049", "TID251"]
+"{**/docs/**,**/scripts/**}" = ["INP001", "T201"]
+
+[tool.codedoctor.managed.ruff.lint.flake8-type-checking]
+exempt-modules = ["typing", "typing_extensions", "dataclasses"]
+runtime-evaluated-base-classes = ["pydantic.BaseModel", "trackinizer.wire.bodies.ActorMixin", "configgle.Fig", "configgle.Makes", "configgle.Maker"]
+runtime-evaluated-decorators = ["dataclasses.dataclass", "mcp.server.MCPServer.tool", "fastapi.APIRouter.get", "fastapi.APIRouter.post", "fastapi.APIRouter.put", "fastapi.APIRouter.patch", "fastapi.APIRouter.delete"]
+
+[tool.codedoctor.managed.ruff.lint.flake8-tidy-imports.banned-api."math.sqrt"]
+msg = "Operators over functions: write `x**0.5` (STYLE.md Code Style)."
+
+[tool.codedoctor.managed.ruff.lint.flake8-tidy-imports.banned-api."math.pow"]
+msg = "Operators over functions: write `x**y` (STYLE.md Code Style)."
+
+[tool.codedoctor.managed.ruff.lint.flake8-tidy-imports.banned-api."os.environ.setdefault"]
+msg = "Assign, never setdefault: a deferred default writes a different tree per caller (AGENTS.md Provisioned Paths)."
+
+[tool.codedoctor.managed.ruff.lint.isort]
+case-sensitive = false
+combine-as-imports = true
+force-wrap-aliases = true
+split-on-trailing-comma = true
+default-section = "third-party"
+detect-same-package = true
+force-single-line = false
+force-sort-within-sections = false
+from-first = true
+lines-between-types = 1
+lines-after-imports = 2
+extra-standard-library = ["typing", "typing_extensions", "ty_extensions"]
+known-first-party = ["netv"]
+no-lines-before = ["future"]
+order-by-type = true
+relative-imports-order = "closest-to-furthest"
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+
+[tool.codedoctor.managed.basedpyright]
+typeCheckingMode = "recommended"
+failOnWarnings = true
+useLibraryCodeForTypes = false
+extraPaths = ["typings", ".venv/share/rekursiv-ai-typings"]
+exclude = ["**/.venv/", "**/.venv-ci312/", "**/node_modules/", "*.egg-info/", "**/*.ipynb", ".pytest_cache/", "build/", "dist/", "**/third_party/", "**/typings/"]
+ignore = ["**/.venv/", "**/.venv-ci312/", "**/node_modules/", "*.egg-info/", "**/*.ipynb", ".pytest_cache/", "build/", "dist/", "**/third_party/", "**/typings/"]
+pythonPlatform = "All"
+pythonVersion = "3.12"
+reportCallInDefaultInitializer = false
+reportImplicitStringConcatenation = false
+reportMissingSuperCall = false
+reportPrivateUsage = false
+reportUnannotatedClassAttribute = false
+reportUnsafeMultipleInheritance = false
+reportUnusedCallResult = false
+reportInvalidCast = false
+
+[tool.codedoctor.managed.ty.environment]
+python-version = "3.12"
+extra-paths = ["typings", ".venv/share/rekursiv-ai-typings"]
+
+[tool.codedoctor.managed.ty.src]
+exclude = [".venv/", ".venv-ci312/", "*.egg-info/", ".pytest_cache/", "build/", "dist/", "**/third_party/", "**/typings/"]
+
+[tool.codedoctor.managed.ty.rules]
+all = "warn"
+invalid-attribute-override = "ignore"
+
+[[tool.codedoctor.managed.ty.overrides]]
+include = ["*_test.py"]
+
+[tool.codedoctor.managed.ty.overrides.rules]
+invalid-key = "ignore"
+
+[tool.codedoctor.managed.ty.terminal]
+error-on-warning = true
+output-format = "concise"
+
+[tool.codedoctor.managed.pyrefly]
+project-includes = ["**/*.py", "**/*.pyi"]
+project-excludes = ["**/.venv/", "**/.venv-ci312/", "**/node_modules/", "*.egg-info/", "**/*.ipynb", ".pytest_cache/", "build/", "dist/", "**/third_party/", "typings/", "**/.export/typings/"]
+search-path = ["typings", ".venv/share/rekursiv-ai-typings"]
+python-version = "3.12.0"
+preset = "strict"
+infer-with-first-use = true
+output-format = "min-text"
+min-severity = "warn"
+
+[tool.codedoctor.managed.pyrefly.errors]
+no-access = "ignore"
+missing-super-call = "ignore"
+unused-call-result = "ignore"
+
+[tool.codedoctor.managed.houselint]
+select = "ALL"
+fix = "ALL"
+exclude = ["*_test.py test_*.py **/tests/test*.py =\n    args-section assert cache-kwarg def-order final-inline globals\n    lazy-import-cost mkdir-mode module-side-effects nested-def returns-named\n    returns-section single-use-helper tempfile-prefix tensor-value-guard\n    tmp-literal xdg-literal", "conftest.py =\n    args-section def-order lazy-import-cost module-side-effects returns-section"]
+set = ["import-alias.first-party=netv", "test-footer.runner=codedoctor.lib.testing.runner", "userdirs-namespace.namespace=netv"]
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "if __name__ == .__main__.:", "raise NotImplementedError", "^\\s*\\.\\.\\.$", "^def \\w+_triton\\(", "^def \\w+_numba\\("]
+show_missing = true
+skip_covered = true
+
+[tool.coverage.run]
+core = "sysmon"
+omit = ["*_test.py", "test_*.py", "*/tests/*", "*/.venv/*", "*/typings/*", "*/testdata/*", "*/__main__.py"]
+
+[tool.mutmut]
+do_not_mutate_patterns = ["^\\s*help=(\"[^\"]*\"\\s*)+,?\\s*$", "^\\s*(description|formatter_class)=[\\w.]+,?\\s*$"]
+mutate_only_covered_lines = true
+pytest_add_cli_args = ["-p", "no:jaxtyping"]
+source_paths = ["."]

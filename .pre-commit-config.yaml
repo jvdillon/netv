@@ -392,3 +392,30 @@ repos:
     args:
     - --plugin
     - codedoctor.testing.listing
+- hooks:
+  - args:
+    - --drop-empty-cells
+    - --extra-keys
+    - cell.metadata.heading_collapsed metadata.accelerator metadata.colab metadata.interpreter
+      metadata.kernelspec metadata.language_info.version metadata.name metadata.nbconvert_exporter
+      metadata.version
+    entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.nbstripout
+    exclude: "(?x)^(\n  typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n\
+      \  |(.*/)?third_party/\n)\n"
+    id: nbstripout
+    language: system
+    name: nbstripout
+    stages:
+    - pre-commit
+    types:
+    - jupyter
+  - entry: uv --quiet run --frozen --group pre-commit jupytext --sync --pre-commit-mode
+    exclude: "(?x)^(\n  typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n\
+      \  |(.*/)?third_party/\n)\n"
+    files: \.ipynb$
+    id: jupytext-sync
+    language: system
+    name: jupytext-sync
+    stages:
+    - pre-commit
+  repo: local

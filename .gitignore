@@ -33,3 +33,7 @@ tools/.zap2xml/
 .testmondata
 .codegraph
 .coverage
+.testmondata*
+.codegraph/
+.coverage.*
+.coverage-*

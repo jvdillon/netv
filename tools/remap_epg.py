@@ -26,6 +26,7 @@ Usage:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol, TypedDict, cast
 
 import argparse
@@ -110,7 +111,10 @@ def parse_id(epg_id: object) -> tuple[str, list[str], bool]:
     return country, toks, local
 
 
-def load_candidates(db_path: pathlib.Path, cache_dir: pathlib.Path | None = None) -> list[dict]:
+def load_candidates(
+    db_path: pathlib.Path,
+    cache_dir: pathlib.Path | None = None,
+) -> list[Candidate]:
     """Load EPG channels with upcoming listings.
 
     Args:
@@ -134,24 +138,26 @@ def load_candidates(db_path: pathlib.Path, cache_dir: pathlib.Path | None = None
         (now,),
     ).fetchall()
     conn.close()
-    candidates = []
+    candidates: list[Candidate] = []
     for r in rows:
-        name_country, name_tokens, local = parse_name(r["name"])
-        id_country, id_tokens, _ = parse_id(r["id"])
-        source_country = countries.get(r["source_id"] or "", "")
+        name = cast(str | None, r["name"])
+        channel_id = cast(str, r["id"])
+        name_country, name_tokens, local = parse_name(name)
+        id_country, id_tokens, _ = parse_id(channel_id)
+        source_country = countries.get(cast(str | None, r["source_id"]) or "", "")
         candidates.append(
-            {
-                "id": r["id"],
-                "name": r["name"],
-                "upcoming": r["upcoming"],
-                "name_country": name_country,
-                "src_country": source_country,
-                "name_tokens": _expand_abbrevs(name_tokens),
-                "id_country": id_country,
-                "id_tokens": _expand_abbrevs(id_tokens),
-                "timeshift": _is_timeshift(name_tokens) or _is_timeshift(id_tokens),
-                "local": local,
-            },
+            Candidate(
+                id=channel_id,
+                name=name,
+                upcoming=cast(int, r["upcoming"]),
+                name_country=name_country,
+                src_country=source_country,
+                name_tokens=_expand_abbrevs(name_tokens),
+                id_country=id_country,
+                id_tokens=_expand_abbrevs(id_tokens),
+                timeshift=_is_timeshift(name_tokens) or _is_timeshift(id_tokens),
+                local=local,
+            ),
         )
     return candidates
 
@@ -172,7 +178,7 @@ def channels_with_upcoming(db_path: pathlib.Path) -> set[str]:
         (now,),
     ).fetchall()
     conn.close()
-    return {r[0] for r in rows}
+    return {cast(str, r[0]) for r in rows}
 
 
 # epg.pw channel names carry no country tag, so the feed a channel came from is the best
@@ -201,7 +207,7 @@ def source_countries(cache_dir: pathlib.Path) -> dict[str, str]:
     return result
 
 
-def query_variants(name: object, current_id: str) -> list[dict]:
+def query_variants(name: object, current_id: str) -> list[Variant]:
     """Build query variants from the channel name and current guide ID.
 
     Args:
@@ -212,18 +218,18 @@ def query_variants(name: object, current_id: str) -> list[dict]:
         variants: Country tags, matching tokens, and their name/ID provenance.
     """
     country, tokens, _ = parse_name(name)
-    variants = [{"country": country, "tokens": tokens, "from_name": True}]
+    variants = [Variant(country=country, tokens=tokens, from_name=True)]
     if current_id:
         c2, t2, _ = parse_id(current_id)
         if t2:
-            variants.append({"country": c2, "tokens": t2, "from_name": False})
+            variants.append(Variant(country=c2, tokens=t2, from_name=False))
     # A callsign in parentheses ("PBS (KQED) San Francisco") is its own
     # variant so it can match callsign-only EPG names like "KQED-DT".
     m = re.search(r"\(([A-Z]{2,6}(?:-DT\d?)?)\)", str(name or "").upper())
     if m:
         toks = _tokenize(m.group(1))
         if toks:
-            variants.append({"country": country, "tokens": toks, "from_name": True})
+            variants.append(Variant(country=country, tokens=toks, from_name=True))
     # Abbreviation and phrase aliases expand the name variant.
     aliases = {
         "ID": ["INVESTIGATION", "DISCOVERY"],
@@ -242,23 +248,23 @@ def query_variants(name: object, current_id: str) -> list[dict]:
     for i, t in enumerate(base["tokens"]):
         if t in aliases:
             expanded = base["tokens"][:i] + aliases[t] + base["tokens"][i + 1 :]
-            variants.append({**base, "tokens": expanded, "from_name": True})
+            variants.append(Variant(country=base["country"], tokens=expanded, from_name=True))
     for i in range(len(base["tokens"]) - 1):
-        pair = tuple(base["tokens"][i : i + 2])
+        pair = (base["tokens"][i], base["tokens"][i + 1])
         if pair in phrase_aliases:
             sub = list(phrase_aliases[pair])
             expanded = base["tokens"][:i] + sub + base["tokens"][i + 2 :]
-            variants.append({**base, "tokens": expanded, "from_name": True})
+            variants.append(Variant(country=base["country"], tokens=expanded, from_name=True))
     return variants
 
 
 def pick_match(
-    variants: list[dict],
-    candidates: list[dict],
+    variants: Sequence[Variant],
+    candidates: Sequence[Candidate],
     min_score: float,
     margin: float,
     available: frozenset[str] = frozenset(),
-) -> tuple[dict | None, list[tuple[float, dict]]]:
+) -> tuple[Candidate | None, list[tuple[float, Candidate]]]:
     """Pick a confident guide match and retain the leading suggestions.
 
     Args:
@@ -286,10 +292,10 @@ def pick_match(
 
 
 def candidate_scores(
-    variants: list[dict],
-    candidates: list[dict],
+    variants: Sequence[Variant],
+    candidates: Sequence[Candidate],
     available: frozenset[str] = frozenset(),
-) -> list[tuple[float, dict, bool, int]]:
+) -> list[tuple[float, Candidate, bool, int]]:
     """Score and rank every candidate against the query variants.
 
     Corroborations count how many query-variant/source pairs independently
@@ -305,7 +311,7 @@ def candidate_scores(
             produced the score, and corroboration count.
     """
     query_shift = any(_is_timeshift(v["tokens"]) for v in variants if v["from_name"])
-    scored = []
+    scored: list[tuple[float, Candidate, bool, int]] = []
     for c in candidates:
         if query_shift != c["timeshift"]:
             continue
@@ -373,7 +379,7 @@ def main() -> int:
     remapped = 0
     unmatched = 0
     already_ok = 0
-    changed_playlists: list[dict] = []
+    changed_playlists = 0
 
     for playlist in all_playlists:
         channels = playlist.get("channels", [])
@@ -390,7 +396,7 @@ def main() -> int:
 
             variants = query_variants(name, current)
             best, top = pick_match(variants, candidates, flags.min_score, flags.margin, available)
-            if best:
+            if best is not None:
                 old = current or "(none)"
                 print(
                     f"  REMAP {name}: {old} -> {best['name']} [{best['id']}] "
@@ -407,7 +413,7 @@ def main() -> int:
                 else:
                     print(f"  MISS  {name}: {current or '(none)'} -- no candidate")
         if changed:
-            changed_playlists.append(playlist)
+            changed_playlists += 1
 
     print(f"\nSummary: {remapped} remapped, {unmatched} unmatched, {already_ok} already OK")
 
@@ -426,7 +432,7 @@ def main() -> int:
     tmp = playlists_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2))
     os.replace(tmp, playlists_path)
-    print(f"Updated {len(changed_playlists)} playlist(s) in {playlists_path}")
+    print(f"Updated {changed_playlists} playlist(s) in {playlists_path}")
     return 0
 
 
@@ -438,6 +444,39 @@ class Flags(Protocol):
     min_score: float
     margin: float
     skip_unmapped: bool
+
+
+class QueryTokens(TypedDict):
+    """The tokens one query variant matches with."""
+
+    tokens: list[str]
+
+
+class Variant(QueryTokens):
+    """One query spelling of a playlist channel."""
+
+    country: str
+    from_name: bool
+
+
+class ChannelTokens(TypedDict):
+    """The tokens a guide channel is matched by."""
+
+    name_tokens: list[str]
+    id_tokens: list[str]
+
+
+class Candidate(ChannelTokens):
+    """A guide channel with upcoming listings, normalized for matching."""
+
+    id: str
+    name: str | None
+    upcoming: int
+    name_country: str
+    src_country: str
+    id_country: str
+    timeshift: bool
+    local: bool
 
 
 class _Source(TypedDict, total=False):
@@ -850,11 +889,15 @@ def _expand_abbrevs(tokens: list[str]) -> list[str]:
     return [p for t in tokens for p in abbreviations.get(t, [t])]
 
 
-def _is_west(c: dict) -> bool:
+def _is_west(c: ChannelTokens) -> bool:
     return bool({"WEST", "WESTERN"} & (set(c["name_tokens"]) | set(c["id_tokens"])))
 
 
-def _equivalent(best: dict, second: dict, variants: list[dict]) -> bool:
+def _equivalent(
+    best: ChannelTokens,
+    second: ChannelTokens,
+    variants: Sequence[QueryTokens],
+) -> bool:
     """Whether two candidates differ only by feed tag or each match a query variant."""
     soft = _soft_tags()
     best_tokens = frozenset(t for t in (best["name_tokens"] or best["id_tokens"]) if t not in soft)

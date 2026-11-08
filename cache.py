@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from concurrent import futures
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Literal, NotRequired, TypeAlias, TypedDict
 from urllib import parse
 
 import hashlib
@@ -17,10 +17,107 @@ import subprocess
 import threading
 import time
 
-from util import atomic_write_json, data_dir
+from treekle import MutablePlainTree, ReadError, from_plain, json_loads
+
+from util import atomic_write_json, data_dir, read_json_object, write_json_object
+from xtream import ProviderRecord
 
 
 log = logging.getLogger(__name__)
+
+HwAccel: TypeAlias = Literal[
+    "nvenc+vaapi",
+    "nvenc+software",
+    "amf+vaapi",
+    "amf+software",
+    "qsv",
+    "vaapi",
+    "software",
+]
+
+
+class SourceConfig(TypedDict):
+    """A configured provider as stored in the server settings file."""
+
+    id: str
+    name: str
+    type: str
+    url: str
+    username: NotRequired[str]
+    password: NotRequired[str]
+    epg_timeout: NotRequired[int]
+    epg_schedule: NotRequired[list[str]]
+    epg_enabled: NotRequired[bool]
+    epg_url: NotRequired[str]
+    deinterlace_fallback: NotRequired[bool]
+    max_streams: NotRequired[int]
+    users: NotRequired[list[str] | None]
+
+
+class ServerSettings(TypedDict):
+    """Server-wide settings; keys ``load_server_settings`` defaults are required."""
+
+    transcode_mode: str
+    transcode_hw: HwAccel
+    vod_transcode_cache_mins: int
+    live_transcode_cache_secs: int
+    live_dvr_mins: int
+    transcode_dir: str
+    probe_live: bool
+    probe_movies: bool
+    probe_series: bool
+    sources: list[SourceConfig]
+    user_agent_preset: str
+    user_agent_custom: str
+    max_resolution: NotRequired[str]
+    quality: NotRequired[str]
+    sr_model: NotRequired[str]
+    vod_order: NotRequired[list[str]]
+    series_order: NotRequired[list[str]]
+    # ``users`` and ``secret_key`` live in this file too; auth owns and writes them.
+
+
+class WatchEntry(TypedDict):
+    """Saved playback position of one stream."""
+
+    position: float
+    duration: float
+    updated: float
+
+
+class UserSettings(TypedDict):
+    """Per-user settings; keys ``load_user_settings`` defaults are required."""
+
+    guide_filter: list[str]
+    captions_enabled: bool
+    sort_live_by_views: bool
+    watch_history: dict[str, WatchEntry]
+    # The browser defines favorite entries; the server stores them verbatim.
+    favorites: dict[str, dict[str, MutablePlainTree]]
+    cc_lang: str
+    cc_style: dict[str, MutablePlainTree]
+    cast_host: str
+    vod_filter: NotRequired[list[str]]
+    series_filter: NotRequired[list[str]]
+    guide_selected_cats: NotRequired[list[str] | None]  # None selects all channels.
+    virtual_scroll: NotRequired[bool]
+
+
+class MemoryCache(TypedDict, total=False):
+    """Provider catalogs held in memory between file-cache refreshes.
+
+    Clear it with ``clear_all_caches``: a TypedDict has no portable ``clear()``.
+    """
+
+    live_categories: list[ProviderRecord]
+    live_streams: list[ProviderRecord]
+    vod_categories: list[ProviderRecord]
+    vod_streams: list[ProviderRecord]
+    series_categories: list[ProviderRecord]
+    series: list[ProviderRecord]
+    epg_urls: list[tuple[str, int, str]]
+    epg_error: str
+    epg: MutablePlainTree
 
 
 def clamp_live_dvr_mins(value: int) -> int:
@@ -43,13 +140,14 @@ SERVER_SETTINGS_FILE = CACHE_DIR / "server_settings.json"
 USERS_DIR = CACHE_DIR / "users"
 LOGOS_DIR = CACHE_DIR / "logos"
 
-# In-memory cache.
-_cache: dict[str, Any] = {}
+# In-memory caches.
+_cache: MemoryCache = {}
+_info_cache: dict[str, ProviderRecord] = {}
 _cache_lock = threading.Lock()
 _live_view_lock = threading.Lock()
 
 
-def load_file_cache(name: str, use_process: bool = False) -> tuple[Any, float] | None:
+def load_file_cache(name: str, use_process: bool = False) -> tuple[MutablePlainTree, float] | None:
     """Load cached data from file. Returns (data, timestamp) or None.
 
     Args:
@@ -67,14 +165,10 @@ def load_file_cache(name: str, use_process: bool = False) -> tuple[Any, float] |
         with futures.ProcessPoolExecutor(max_workers=1) as executor:
             future = executor.submit(_parse_json_file, str(path))
             return future.result(timeout=60)
-    try:
-        data = json.loads(path.read_text())
-        return data.get("data"), data.get("timestamp", 0)
-    except Exception:
-        return None
+    return _parse_json_file(str(path))
 
 
-def save_file_cache(name: str, data: Any) -> None:
+def save_file_cache(name: str, data: object) -> None:
     """Save data to cache file with current timestamp."""
     initialize_paths()
     path = CACHE_DIR / f"{name}.json"
@@ -83,12 +177,18 @@ def save_file_cache(name: str, data: Any) -> None:
 
 
 def clear_all_caches() -> None:
-    """Clear memory cache except EPG (file cache preserved for restart)."""
+    """Clear memory caches except EPG (file cache preserved for restart)."""
+    # Pops keep the dict callers hold; cache_test checks they cover every key.
     with _cache_lock:
-        epg = _cache.get("epg")
-        _cache.clear()
-        if epg:
-            _cache["epg"] = epg
+        _cache.pop("live_categories", None)
+        _cache.pop("live_streams", None)
+        _cache.pop("vod_categories", None)
+        _cache.pop("vod_streams", None)
+        _cache.pop("series_categories", None)
+        _cache.pop("series", None)
+        _cache.pop("epg_urls", None)
+        _cache.pop("epg_error", None)
+        _info_cache.clear()
 
 
 def clear_all_file_caches() -> int:
@@ -110,7 +210,7 @@ def clear_all_file_caches() -> int:
     return deleted
 
 
-def get_cache() -> dict[str, Any]:
+def get_cache() -> MemoryCache:
     """Get reference to memory cache."""
     return _cache
 
@@ -190,12 +290,12 @@ def save_logo(source_name: str, url: str, data: bytes, content_type: str) -> pat
 
 def get_cached_info(
     cache_key: str,
-    fetch_fn: Callable[[], Any],
+    fetch_fn: Callable[[], ProviderRecord],
     force: bool = False,
     *,
     ttl_seconds: float = 7 * 24 * 3600,
     stale_seconds: float = 24 * 3600,
-) -> Any:
+) -> ProviderRecord:
     """Get information using stale-while-revalidate caching.
 
     Args:
@@ -209,24 +309,29 @@ def get_cached_info(
         data: Cached or freshly fetched information.
     """
     cached = load_file_cache(cache_key)
-    cached_data, cached_ts = cached if cached else (None, 0)
+    cached_data: ProviderRecord = {}
+    cached_ts = 0.0
+    if cached is not None:
+        tree, cached_ts = cached
+        if isinstance(tree, dict):
+            cached_data = tree
     age = time.time() - cached_ts
 
     if force and cached_data:
-        _cache.pop(cache_key, None)
-        cached_data = None
+        _info_cache.pop(cache_key, None)
+        cached_data = {}
 
-    if cache_key in _cache and not force:
+    if cache_key in _info_cache and not force:
         if cached_ts and age > stale_seconds:
             threading.Thread(
                 target=_refresh_cached_info,
                 args=(cache_key, fetch_fn),
                 daemon=True,
             ).start()
-        return _cache[cache_key]
+        return _info_cache[cache_key]
 
     if cached_data and age < ttl_seconds:
-        _cache[cache_key] = cached_data
+        _info_cache[cache_key] = cached_data
         if age > stale_seconds:
             threading.Thread(
                 target=_refresh_cached_info,
@@ -236,7 +341,7 @@ def get_cached_info(
         return cached_data
 
     data = fetch_fn()
-    _cache[cache_key] = data
+    _info_cache[cache_key] = data
     save_file_cache(cache_key, data)
     return data
 
@@ -292,7 +397,7 @@ def detect_encoders() -> dict[str, bool]:
 
     # VA-API: needs device, hwupload, and driver env vars for hybrid GPU systems.
     vaapi_baseline_only = False
-    if VAAPI_DEVICE and LIBVA_DRIVER and DRI_PATH:
+    if VAAPI_DEVICE is not None and LIBVA_DRIVER is not None and DRI_PATH is not None:
         vaapi_env = {
             "LIBVA_DRIVER_NAME": LIBVA_DRIVER,
             "LIBVA_DRIVERS_PATH": DRI_PATH,
@@ -385,6 +490,34 @@ def refresh_encoders() -> dict[str, bool]:
     return AVAILABLE_ENCODERS
 
 
+def hw_accel(value: str) -> HwAccel:
+    """Map a stored or submitted ``transcode_hw`` value to a supported option.
+
+    Args:
+        value: A current option, a legacy one (``nvidia``, ``intel``), or anything else.
+
+    Returns:
+        hw: The option itself; the migrated one for a legacy value; else the default.
+    """
+    match value:
+        case "nvidia":
+            return "nvenc+vaapi" if AVAILABLE_ENCODERS.get("vaapi", False) else "nvenc+software"
+        case "intel":
+            return "qsv"
+        case (
+            "nvenc+vaapi"
+            | "nvenc+software"
+            | "amf+vaapi"
+            | "amf+software"
+            | "qsv"
+            | "vaapi"
+            | "software"
+        ) as hw:
+            return hw
+        case _:
+            return _default_encoder()
+
+
 @dataclass(kw_only=True, slots=True)
 class Source:
     id: str
@@ -402,52 +535,49 @@ class Source:
     users: list[str] | None = None  # Non-admin users with access (None = everyone)
 
 
-def load_server_settings() -> dict[str, Any]:
+def load_server_settings() -> ServerSettings:
     """Load server-wide settings with defaults and legacy migrations.
 
     Returns:
         settings: Persisted settings supplemented by current defaults.
     """
     initialize()
-    if SERVER_SETTINGS_FILE.exists():
-        data: dict[str, Any] = json.loads(SERVER_SETTINGS_FILE.read_text())
-    else:
-        data = {}
-    data.setdefault("transcode_mode", "auto")
-
-    # Migrate old transcode_hw values to new format.
-    old_hw = data.get("transcode_hw", "")
-    if old_hw == "nvidia":
-        data["transcode_hw"] = (
-            "nvenc+vaapi" if AVAILABLE_ENCODERS.get("vaapi") else "nvenc+software"
-        )
-    elif old_hw == "intel":
-        data["transcode_hw"] = "qsv"
-    # "vaapi" and "software" remain unchanged.
-
-    data.setdefault("transcode_hw", _default_encoder())
-    data.setdefault("vod_transcode_cache_mins", 60)
-    # 0 = no caching (dead sessions cleaned immediately)
-    data.setdefault("live_transcode_cache_secs", 0)
-    live_dvr_mins = data.setdefault("live_dvr_mins", 120)
+    raw = read_json_object(SERVER_SETTINGS_FILE)
+    live_dvr_mins = raw.get("live_dvr_mins", 120)
     if not isinstance(live_dvr_mins, int):
         raise TypeError("live_dvr_mins must be an integer")
-    data["live_dvr_mins"] = clamp_live_dvr_mins(live_dvr_mins)
-    data.setdefault("transcode_dir", "")  # Empty = system temp dir.
-    data.setdefault("probe_live", True)
-    data.setdefault("probe_movies", True)
-    data.setdefault("probe_series", False)
-    data.setdefault("sources", [])
-    data.setdefault("users", {})
-    data.setdefault("user_agent_preset", "tivimate")
-    data.setdefault("user_agent_custom", "")
-    return data
+    stored_hw = raw.get("transcode_hw")
+    return from_plain(
+        {
+            "transcode_mode": "auto",
+            "vod_transcode_cache_mins": 60,
+            # 0 = no caching (dead sessions cleaned immediately)
+            "live_transcode_cache_secs": 0,
+            "transcode_dir": "",  # Empty = system temp dir.
+            "probe_live": True,
+            "probe_movies": True,
+            "probe_series": False,
+            "sources": [],
+            "user_agent_preset": "tivimate",
+            "user_agent_custom": "",
+            **raw,
+            "transcode_hw": hw_accel(stored_hw)
+            if isinstance(stored_hw, str)
+            else _default_encoder(),
+            "live_dvr_mins": clamp_live_dvr_mins(live_dvr_mins),
+        },
+        ServerSettings,
+    )
 
 
-def save_server_settings(settings: dict[str, Any]) -> None:
-    """Save server-wide settings."""
+def save_server_settings(settings: ServerSettings) -> None:
+    """Save server-wide settings, keeping keys this release does not know.
+
+    Args:
+        settings: Settings as ``load_server_settings`` returned them, edited.
+    """
     initialize_paths()
-    atomic_write_json(SERVER_SETTINGS_FILE, settings)
+    write_json_object(SERVER_SETTINGS_FILE, settings, ServerSettings)
 
 
 def get_user_agent() -> str | None:
@@ -457,11 +587,12 @@ def get_user_agent() -> str | None:
         user_agent: Configured header, or None for the caller's default.
     """
     settings = load_server_settings()
-    preset = settings.get("user_agent_preset", "default")
+    preset = settings["user_agent_preset"]
     if preset == "default":
         return None
     if preset == "custom":
-        return settings.get("user_agent_custom") or None
+        custom = settings["user_agent_custom"]
+        return custom if custom else None
     return {
         "vlc": "VLC/3.0.20 LibVLC/3.0.20",
         "chrome": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -469,7 +600,7 @@ def get_user_agent() -> str | None:
     }.get(preset)
 
 
-def load_user_settings(username: str) -> dict[str, Any]:
+def load_user_settings(username: str) -> UserSettings:
     """Load per-user settings with defaults.
 
     Args:
@@ -480,29 +611,32 @@ def load_user_settings(username: str) -> dict[str, Any]:
     """
     initialize_paths()
     _validate_username(username)
-    user_file = USERS_DIR / username / "settings.json"
-    if user_file.exists():
-        data = json.loads(user_file.read_text())
-    else:
-        data = {}
-    data.setdefault("guide_filter", [])
-    data.setdefault("captions_enabled", True)
-    data.setdefault("watch_history", {})
-    data.setdefault("favorites", {"series": {}, "movies": {}})
-    data.setdefault("cc_lang", "")
-    data.setdefault("cc_style", {})
-    data.setdefault("cast_host", "")
-    data.setdefault("sort_live_by_views", True)
-    return data
+    return from_plain(
+        {
+            "guide_filter": [],
+            "captions_enabled": True,
+            "watch_history": {},
+            "favorites": {"series": {}, "movies": {}},
+            "cc_lang": "",
+            "cc_style": {},
+            "cast_host": "",
+            "sort_live_by_views": True,
+            **read_json_object(USERS_DIR / username / "settings.json"),
+        },
+        UserSettings,
+    )
 
 
-def save_user_settings(username: str, settings: dict[str, Any]) -> None:
-    """Save per-user settings."""
+def save_user_settings(username: str, settings: UserSettings) -> None:
+    """Save per-user settings, keeping keys this release does not know.
+
+    Args:
+        username: Account whose settings to write.
+        settings: Settings as ``load_user_settings`` returned them, edited.
+    """
     initialize_paths()
     _validate_username(username)
-    user_dir = USERS_DIR / username
-    user_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(user_dir / "settings.json", settings)
+    write_json_object(USERS_DIR / username / "settings.json", settings, UserSettings)
 
 
 def live_stream_key(source_id: str, stream_id: str | int) -> str:
@@ -542,7 +676,7 @@ def record_live_view(username: str, source_id: str, stream_id: str | int) -> int
         return counts[key]
 
 
-def get_watch_position(username: str, stream_url: str) -> dict[str, Any] | None:
+def get_watch_position(username: str, stream_url: str) -> WatchEntry | None:
     """Get a saved watch position for an unfinished stream.
 
     Args:
@@ -553,15 +687,12 @@ def get_watch_position(username: str, stream_url: str) -> dict[str, Any] | None:
         position: Saved position metadata, or None if missing or at least 95% watched.
     """
     settings = load_user_settings(username)
-    history = settings.get("watch_history", {})
-    entry = history.get(stream_url)
-    if not entry:
+    entry = settings["watch_history"].get(stream_url)
+    if entry is None:
         return None
     # Reset if >=95% watched.
-    if entry.get("duration", 0) > 0:
-        pct = entry.get("position", 0) / entry["duration"]
-        if pct >= 0.95:
-            return None
+    if entry["duration"] > 0 and entry["position"] / entry["duration"] >= 0.95:
+        return None
     return entry
 
 
@@ -575,7 +706,7 @@ def save_watch_position(username: str, stream_url: str, position: float, duratio
         duration: Stream duration in seconds.
     """
     settings = load_user_settings(username)
-    history = settings.setdefault("watch_history", {})
+    history = settings["watch_history"]
     history[stream_url] = {
         "position": position,
         "duration": duration,
@@ -583,7 +714,7 @@ def save_watch_position(username: str, stream_url: str, position: float, duratio
     }
     # Keep only last 200 entries.
     if len(history) > 200:
-        sorted_entries = sorted(history.items(), key=lambda x: x[1].get("updated", 0), reverse=True)
+        sorted_entries = sorted(history.items(), key=_watch_updated, reverse=True)
         settings["watch_history"] = dict(sorted_entries[:200])
     save_user_settings(username, settings)
 
@@ -591,7 +722,7 @@ def save_watch_position(username: str, stream_url: str, position: float, duratio
 def get_sources() -> list[Source]:
     """Get list of configured sources."""
     settings = load_server_settings()
-    return [Source(**s) for s in settings.get("sources", [])]
+    return [_source(s) for s in settings["sources"]]
 
 
 def hidden_source_ids(username: str, admin: bool) -> set[str]:
@@ -611,8 +742,8 @@ def update_source_epg_url(source_id: str, epg_url: str) -> None:
     if not epg_url:
         return
     settings = load_server_settings()
-    for s in settings.get("sources", []):
-        if s["id"] == source_id and not s.get("epg_url"):
+    for s in settings["sources"]:
+        if s["id"] == source_id and not s.get("epg_url", ""):
             s["epg_url"] = epg_url
             save_server_settings(settings)
             host = parse.urlparse(epg_url).hostname or "unknown host"
@@ -620,24 +751,55 @@ def update_source_epg_url(source_id: str, epg_url: str) -> None:
             break
 
 
-def _refresh_cached_info(cache_key: str, fetch_fn: Callable[[], object]) -> None:
+class _CacheFile(TypedDict):
+    data: MutablePlainTree
+    timestamp: NotRequired[float]
+
+
+class _LiveViews(TypedDict):
+    counts: dict[str, int]
+
+
+def _source(config: SourceConfig) -> Source:
+    """Build a ``Source``; a TypedDict may carry extra keys, so it is not splatted."""
+    return Source(
+        id=config["id"],
+        name=config["name"],
+        type=config["type"],
+        url=config["url"],
+        username=config.get("username", ""),
+        password=config.get("password", ""),
+        epg_timeout=config.get("epg_timeout", 120),
+        epg_schedule=config.get("epg_schedule", []),
+        epg_enabled=config.get("epg_enabled", True),
+        epg_url=config.get("epg_url", ""),
+        deinterlace_fallback=config.get("deinterlace_fallback", True),
+        max_streams=config.get("max_streams", 0),
+        users=config.get("users"),
+    )
+
+
+def _refresh_cached_info(cache_key: str, fetch_fn: Callable[[], ProviderRecord]) -> None:
     try:
         data = fetch_fn()
-        _cache[cache_key] = data
+        _info_cache[cache_key] = data
         save_file_cache(cache_key, data)
         log.info("Background refreshed %s", cache_key)
     except Exception as error:
         log.warning("Background refresh failed for %s: %s", cache_key, error)
 
 
-def _parse_json_file(path: str) -> tuple[Any, float] | None:
-    """Parse JSON file - runs in separate process to avoid GIL blocking."""
+def _parse_json_file(path: str) -> tuple[MutablePlainTree, float] | None:
+    """Parse a cache file; runs in a separate process when asked, to avoid the GIL."""
     try:
-        with open(path) as f:
-            data = json.load(f)
-        return data.get("data"), data.get("timestamp", 0)
-    except Exception:
+        cached = json_loads(pathlib.Path(path).read_text(), _CacheFile)
+    except (OSError, ValueError):
         return None
+    return cached["data"], cached.get("timestamp", 0)
+
+
+def _watch_updated(item: tuple[str, WatchEntry]) -> float:
+    return item[1]["updated"]
 
 
 def _sanitize_name(name: str) -> str:
@@ -668,15 +830,16 @@ def _url_to_filename(url: str) -> str:
 
 # Preference order: nvenc > amf > qsv > vaapi > software For nvenc/amf, prefer +vaapi
 # fallback if VAAPI is available.
-def _default_encoder() -> str:
+def _default_encoder() -> HwAccel:
     """Return first available encoder option."""
-    if AVAILABLE_ENCODERS.get("nvenc"):
-        return "nvenc+vaapi" if AVAILABLE_ENCODERS.get("vaapi") else "nvenc+software"
-    if AVAILABLE_ENCODERS.get("amf"):
-        return "amf+vaapi" if AVAILABLE_ENCODERS.get("vaapi") else "amf+software"
-    if AVAILABLE_ENCODERS.get("qsv"):
+    vaapi = AVAILABLE_ENCODERS.get("vaapi", False)
+    if AVAILABLE_ENCODERS.get("nvenc", False):
+        return "nvenc+vaapi" if vaapi else "nvenc+software"
+    if AVAILABLE_ENCODERS.get("amf", False):
+        return "amf+vaapi" if vaapi else "amf+software"
+    if AVAILABLE_ENCODERS.get("qsv", False):
         return "qsv"
-    if AVAILABLE_ENCODERS.get("vaapi"):
+    if vaapi:
         return "vaapi"
     return "software"
 
@@ -697,15 +860,11 @@ def _load_live_view_counts(username: str) -> dict[str, int]:
     path = USERS_DIR / username / "live_views.json"
     if not path.exists():
         return {}
-    data = json.loads(path.read_text())
-    counts = data.get("counts") if isinstance(data, dict) else None
-    if not isinstance(counts, dict) or any(
-        not isinstance(key, str)
-        or isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < 0
-        for key, value in counts.items()
-    ):
+    try:
+        counts = json_loads(path.read_text(), _LiveViews)["counts"]
+    except ReadError as error:
+        raise ValueError("Invalid live view counts") from error
+    if any(isinstance(value, bool) or value < 0 for value in counts.values()):
         raise ValueError("Invalid live view counts")
     return counts
 
@@ -753,7 +912,7 @@ def _detect_libva_driver() -> str | None:
         # iHD for Intel Gen8+ (Broadwell 2014+), supports Xe driver
         # Fall back to i965 for older Intel GPUs.
         dri_path = _detect_dri_path()
-        if dri_path and pathlib.Path(f"{dri_path}/iHD_drv_video.so").exists():
+        if dri_path is not None and pathlib.Path(f"{dri_path}/iHD_drv_video.so").exists():
             return "iHD"
         return "i965"
     if vendor == "1002":
@@ -776,11 +935,15 @@ def _detect_dri_path() -> str | None:
     return None
 
 
-def _test_encoder(cmd: list[str], timeout: int = 5, env: dict | None = None) -> tuple[bool, str]:
+def _test_encoder(
+    cmd: list[str],
+    timeout: int = 5,
+    env: dict[str, str] | None = None,
+) -> tuple[bool, str]:
     """Test if an encoder works. Returns (success, error_message)."""
     try:
         run_env = None
-        if env:
+        if env is not None:
             run_env = os.environ.copy()
             run_env.update(env)
         result = subprocess.run(cmd, capture_output=True, timeout=timeout, env=run_env)

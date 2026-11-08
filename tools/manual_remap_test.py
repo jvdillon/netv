@@ -32,7 +32,7 @@ def _setup(data_dir: pathlib.Path) -> pathlib.Path:
     conn.execute("INSERT INTO programs VALUES ('464798', 1.0)")
     conn.commit()
     conn.close()
-    data = {
+    data: dict[str, object] = {
         "playlists": [
             {
                 "channels": [

@@ -25,7 +25,7 @@ Cron example:
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, TypedDict, cast
 from urllib import error, parse, request
 
 import argparse
@@ -190,7 +190,8 @@ def get_cached(
     )
     try:
         response = request.urlopen(req)
-        result = response.read()
+        # Typeshed types urlopen's return as Any.
+        result = cast(bytes, response.read())
     except error.HTTPError as e:
         if e.code != 400:
             e.add_note(f'Url is "{url}".')
@@ -464,7 +465,7 @@ def add_programme_tvimate(
     else:
         season_episode = None
 
-    short = " ".join([a_ for a_ in [season_episode, subtitle] if a_])
+    short = " ".join([a_ for a_ in [season_episode, subtitle] if a_ is not None and a_])
     description = "\n".join([a_ for a_ in [short, description] if a_])
     if description:
         _ = add_xml_child(
@@ -505,7 +506,7 @@ def add_programme_tvimate(
         )
 
 
-def get_channel_key(c: Mapping[str, Any]) -> str:
+def get_channel_key(c: CallSigned) -> str:
     # Old way:
     # return f"I{c['channelNo']}.{c['channelId']}.zap2it.com"
     return c["callSign"]
@@ -552,13 +553,13 @@ def add_xml_child(
     attrib: Mapping[str, str] | None = None,
     **extra: Any,
 ) -> xml.Element:
-    attrib = {} if attrib is None else dict(attrib)
+    attributes: dict[str, str] = {} if attrib is None else dict(attrib)
     if parent is None:
         # https://docs.python.org/3/library/xml.etree.elementtree.html#xml.etree.ElementTree.Element
-        el = xml.Element(tag, attrib, **extra)
+        el = xml.Element(tag, attributes, **extra)
     else:
         # https://docs.python.org/3/library/xml.etree.elementtree.html#xml.etree.ElementTree.SubElement
-        el = xml.SubElement(parent, tag, attrib, **extra)
+        el = xml.SubElement(parent, tag, attributes, **extra)
     if text is not None:
         el.text = text
     return el
@@ -568,6 +569,12 @@ def toint(x: str | None, fail: int = 0) -> int:
     if x is None:
         return fail
     return int(x)
+
+
+class CallSigned(TypedDict):
+    """The one field of a grid channel that keys it."""
+
+    callSign: str
 
 
 class Flags(Protocol):

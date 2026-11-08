@@ -8,9 +8,9 @@ import pathlib
 import re
 import time
 
+from cache import HwAccel
 from ffmpeg_command import (
     PASSTHROUGH_AUDIO_CODECS,
-    HwAccel,
     MediaInfo,
     build_hls_ffmpeg_cmd,
     get_live_hls_list_size,
@@ -86,7 +86,7 @@ def ingest_command(
     # Remux only. No probe subprocess and no encoder may open the upstream URL.
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
     cmd += http_reconnect_args(url, max_delay=5)
-    if user_agent:
+    if user_agent is not None:
         cmd += ["-user_agent", user_agent]
     if is_hls_url(url):
         # Providers often serve segments without media extensions. The option

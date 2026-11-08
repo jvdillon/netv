@@ -32,7 +32,7 @@ def find_binary(name: str) -> Path:
     if bundled.is_file():
         return bundled
     resolved = shutil.which(name)
-    if resolved:
+    if resolved is not None:
         return Path(resolved)
     raise FileNotFoundError(f"Unable to find {name}; add it to PATH or place it in {ROOT / 'bin'}")
 

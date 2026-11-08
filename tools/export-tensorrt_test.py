@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterator
 from importlib import util
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any, Final
+from typing import Any, Final, cast, override
 from urllib import request
 
 import runpy
@@ -68,6 +68,7 @@ class _ModuleList(_Module):
     def __getitem__(self, index: Any) -> Any:
         return self.items[index]
 
+    @override
     def children(self) -> Iterator[_Module]:
         yield from self.items
 
@@ -79,6 +80,7 @@ class _Conv2d(_Module):
         self.name = f"conv{cin}->{cout}"
         self.params = [_Param(cout * cin * k * k), _Param(cout)]
 
+    @override
     def forward(self, x: list[Any]) -> list[Any]:
         return [*x, self.name]
 
@@ -88,6 +90,7 @@ class _PReLU(_Module):
         super().__init__()
         self.params = [_Param(num_parameters)]
 
+    @override
     def forward(self, x: list[Any]) -> list[Any]:
         return [*x, "prelu"]
 
@@ -97,12 +100,39 @@ class _PixelShuffle(_Module):
         super().__init__()
         self.scale = scale
 
+    @override
     def forward(self, x: list[Any]) -> list[Any]:
         return [*x, f"shuffle{self.scale}"]
 
 
 def _interpolate(x: list[Any], scale_factor: int, mode: str) -> list[Any]:
     return [("interp", tuple(x), scale_factor, mode)]
+
+
+def _randn(*shape: int, device: str) -> tuple[str, tuple[int, ...], str]:
+    return ("randn", shape, device)
+
+
+def _convert_float_to_float16(model: object, keep_io_types: bool) -> tuple[str, object, bool]:
+    return ("fp16", model, keep_io_types)
+
+
+def _load_nothing(path: object, device: str) -> dict[str, object]:
+    del path, device
+    return {}
+
+
+def _onnx_load(path: object) -> tuple[str, str]:
+    return ("onnx", str(path))
+
+
+def _cached_checkpoint(directory: Path) -> Path:
+    return directory / CHECKPOINT
+
+
+def _load_state(path: object, device: str) -> dict[str, SimpleNamespace]:
+    del path, device
+    return _state_dict()
 
 
 class Recorder:
@@ -141,18 +171,16 @@ def _fake_modules(rec: Recorder) -> dict[str, ModuleType]:
         nn=nn,
         onnx=onnx_export,
         Tensor=object,
-        randn=lambda *shape, device: ("randn", shape, device),
+        randn=_randn,
     )
-    float16 = SimpleNamespace(
-        convert_float_to_float16=lambda model, keep_io_types: ("fp16", model, keep_io_types),
-    )
-    safetensors_torch = _module("safetensors.torch", load_file=lambda path, device: {})
+    float16 = SimpleNamespace(convert_float_to_float16=_convert_float_to_float16)
+    safetensors_torch = _module("safetensors.torch", load_file=_load_nothing)
     return {
         "torch": torch,
         "torch.nn": nn,
         "torch.nn.functional": functional,
         "torch.onnx": onnx_export,
-        "onnx": _module("onnx", load=lambda path: ("onnx", str(path)), save=rec.save),
+        "onnx": _module("onnx", load=_onnx_load, save=rec.save),
         "onnxconverter_common": _module("onnxconverter_common", float16=float16),
         "safetensors": _module("safetensors", torch=safetensors_torch),
         "safetensors.torch": safetensors_torch,
@@ -177,6 +205,20 @@ class _Tensor:
         self._dtype = value
 
 
+class _Network:
+    def __init__(self, *, settable: bool) -> None:
+        self.inputs = [_Tensor("input", settable=settable)]
+        self.outputs = [_Tensor("output", settable=settable)]
+        self.num_inputs = 1
+        self.num_outputs = 1
+
+    def get_input(self, i: int) -> _Tensor:
+        return self.inputs[i]
+
+    def get_output(self, i: int) -> _Tensor:
+        return self.outputs[i]
+
+
 def make_trt(
     *,
     explicit_batch: int | None = 0,
@@ -191,14 +233,7 @@ def make_trt(
     engine_dtypes: tuple[str, str] | None = None,
 ) -> ModuleType:
     rec: dict[str, Any] = {"flags": [], "profiles": []}
-    network = SimpleNamespace(
-        inputs=[_Tensor("input", settable=io_settable)],
-        outputs=[_Tensor("output", settable=io_settable)],
-    )
-    network.num_inputs = 1
-    network.num_outputs = 1
-    network.get_input = lambda i: network.inputs[i]
-    network.get_output = lambda i: network.outputs[i]
+    network = _Network(settable=io_settable)
 
     class Profile:
         def set_shape(self, name: str, **shapes: tuple[int, ...]) -> None:
@@ -222,7 +257,7 @@ def make_trt(
             if fast_fp16 is not None:
                 self.platform_has_fast_fp16 = fast_fp16
 
-        def create_network(self, flags: int) -> SimpleNamespace:
+        def create_network(self, flags: int) -> _Network:
             rec["network_flags"] = flags
             return network
 
@@ -313,7 +348,8 @@ def fakes(monkeypatch: pytest.MonkeyPatch, rec: Recorder) -> dict[str, ModuleTyp
 @pytest.fixture
 def exp(fakes: dict[str, ModuleType], monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     del fakes
-    spec = util.spec_from_file_location("export_tensorrt", SCRIPT)
+    # Name it by its path, as mutation testing keys each function by module path.
+    spec = util.spec_from_file_location("tools.export-tensorrt", SCRIPT)
     assert spec is not None
     assert spec.loader is not None
     module = util.module_from_spec(spec)
@@ -365,7 +401,11 @@ def test_download_model_empty_cleans_up(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(request, "urlopen", lambda url, timeout: FakeResponse(b""))
+    def urlopen(url: str, timeout: int) -> FakeResponse:
+        del url, timeout
+        return FakeResponse(b"")
+
+    monkeypatch.setattr(request, "urlopen", urlopen)
     with pytest.raises(RuntimeError, match="Failed to download model .*Downloaded file is empty"):
         exp.download_model(tmp_path)
     assert list(tmp_path.iterdir()) == []
@@ -431,7 +471,7 @@ def test_load_model(
         return state
 
     monkeypatch.setattr(exp, "load_file", load_file)
-    monkeypatch.setattr(exp, "download_model", lambda d: d / CHECKPOINT)
+    monkeypatch.setattr(exp, "download_model", _cached_checkpoint)
     model = exp.load_model(cache)
     assert cache.is_dir()
     assert loads == [(cache / CHECKPOINT, "cpu")]
@@ -443,9 +483,14 @@ def test_load_model(
 
 def test_load_model_default_cache(exp: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
     made: list[Path] = []
-    monkeypatch.setattr(Path, "mkdir", lambda self, parents, exist_ok: made.append(self))
-    monkeypatch.setattr(exp, "download_model", lambda d: d / CHECKPOINT)
-    monkeypatch.setattr(exp, "load_file", lambda path, device: _state_dict())
+
+    def mkdir(self: Path, parents: bool, exist_ok: bool) -> None:
+        del parents, exist_ok
+        made.append(self)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+    monkeypatch.setattr(exp, "download_model", _cached_checkpoint)
+    monkeypatch.setattr(exp, "load_file", _load_state)
     exp.load_model()
     assert made == [Path("/opt/scratch/caches/netv/ai_upscale")]
 
@@ -622,7 +667,8 @@ def test_height_to_shape_and_dtype_names(exp: ModuleType) -> None:
 
 def _main(exp: ModuleType, monkeypatch: pytest.MonkeyPatch, *args: str) -> int:
     monkeypatch.setattr(sys, "argv", ["export-tensorrt.py", *args])
-    return exp.main()
+    # A module loaded from a file path exposes its attributes as Any.
+    return cast(int, exp.main())
 
 
 def test_main_list(

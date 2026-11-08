@@ -53,13 +53,14 @@ def parse_callsign(coded_callsign: str) -> tuple[str, str, int]:
     result = _CALLSIGN_REGEX.search(coded_callsign.upper())
     if not result:
         return coded_callsign, "", 1
-    call, suffix, num = result.groups()
+    # Every group participates in a match, so none is None.
+    call, suffix, num = cast(tuple[str, str, str], result.groups())
     if call == "KQS" and suffix == "LD":
         call, suffix = "KQSL", "LD"  # Known bug in some data.
     return call, suffix, int(num) if num else 1
 
 
-def parse_m3u(path: pathlib.Path) -> list[list]:
+def parse_m3u(path: pathlib.Path) -> list[list[str | dict[str, str]]]:
     """Parse M3U entries without discarding incomplete records.
 
     Args:
@@ -72,7 +73,7 @@ def parse_m3u(path: pathlib.Path) -> list[list]:
         first_line = f.readline().strip()
         if not first_line.startswith("#EXTM3U"):
             raise ValueError(f"Invalid M3U file: {path}")
-        entries = []
+        entries: list[list[str | dict[str, str]]] = []
         for line in f:
             line = line.strip()
             if not line:
@@ -85,7 +86,11 @@ def parse_m3u(path: pathlib.Path) -> list[list]:
             attrs_str, title = line.split("#EXTINF:")[1].split(",", 1)
             attrs_str = attrs_str.split("-1 ", 1)[1] if "-1 " in attrs_str else attrs_str
             attrs_list = re.findall(r'(?:[^\s,"]|"(?:\\.|[^"])*")+', attrs_str)
-            attrs = dict(s.replace('"', "").split("=", 1) for s in attrs_list if "=" in s)
+            attrs: dict[str, str] = {}
+            for pair in attrs_list:
+                if "=" in pair:
+                    key, value = pair.replace('"', "").split("=", 1)
+                    attrs[key] = value
             entries.append([title.strip(), attrs])
     return entries
 
@@ -99,12 +104,16 @@ def parse_xmltv_channels(path: pathlib.Path) -> dict[str, tuple[str, ...]]:
     Returns:
         channels: Channel IDs mapped to their display names.
     """
-    channels = {}
+    channels: dict[str, tuple[str, ...]] = {}
     for elem in ET.parse(path).getroot():
         if elem.tag == "channel":
             channel_id = elem.get("id")
-            names = tuple(v.text for v in elem if v.tag == "display-name" and v.text)
-            if channel_id:
+            names = tuple(
+                text
+                for v in elem
+                if v.tag == "display-name" and (text := v.text) is not None and text
+            )
+            if channel_id is not None and channel_id:
                 channels[channel_id] = names
     return channels
 
@@ -119,9 +128,9 @@ def build_lookup(xmltv_channels: dict[str, tuple[str, ...]]) -> dict[str, set[st
 
 
 def align_channels(
-    m3u: list[list],
+    m3u: list[list[str | dict[str, str]]],
     lookup: dict[str, set[str]],
-) -> tuple[list[list], list[list]]:
+) -> tuple[list[list[str | dict[str, str]]], list[list[str | dict[str, str]]]]:
     """Align M3U entries with XMLTV channel IDs in place.
 
     Args:
@@ -132,11 +141,11 @@ def align_channels(
         aligned: Original playlist with matched guide IDs added.
         missing: Complete entries with no matching guide ID.
     """
-    missing = []
+    missing: list[list[str | dict[str, str]]] = []
     for entry in m3u:
         if len(entry) < 3:
             continue
-        title, attrs, _ = entry
+        title, attrs = entry_fields(entry)
         chan_num = attrs.get("channel-number", "")
         chan_name = attrs.get("tvg-name", title)
 
@@ -162,8 +171,15 @@ def align_channels(
     return m3u, missing
 
 
+def entry_fields(entry: list[str | dict[str, str]]) -> tuple[str, dict[str, str]]:
+    """Return a parsed entry's title and attributes, its first two fields."""
+    title, attrs = entry[0], entry[1]
+    assert isinstance(title, str) and isinstance(attrs, dict)
+    return title, attrs
+
+
 def write_m3u(
-    m3u: list[list],
+    m3u: list[list[str | dict[str, str]]],
     output: pathlib.Path,
     xmltv_url: str,
     group_prefix: str = "OTA",
@@ -184,7 +200,8 @@ def write_m3u(
         for entry in m3u:
             if len(entry) < 3:
                 continue
-            title, attrs, url = entry
+            title, attrs = entry_fields(entry)
+            url = entry[2]
             # Use tvg-name as title if available.
             title = attrs.get("tvg-name", title)
             # Build group-title.
@@ -230,7 +247,7 @@ def main() -> int:
     if missing:
         print(f"\nUnable to align {len(missing)} channels:")
         for entry in missing:
-            title, attrs = entry[0], entry[1]
+            title, attrs = entry_fields(entry)
             num = attrs.get("channel-number", "?")
             print(f"  {num}: {title}")
 

@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
+from treekle import MutablePlainTree
+
 import pytest
+
+from xtream import ProviderRecord
 
 import catchup
 
@@ -25,9 +30,11 @@ class TestArchiveDays:
             {"tv_archive_duration": "bad"},
             {"tv_archive_duration": None},
             {"tv_archive_duration": -2},
+            {"tv_archive_duration": ""},
+            {"tv_archive_duration": [3]},
         ],
     )
-    def test_no_archive(self, overrides):
+    def test_no_archive(self, overrides: ProviderRecord):
         assert catchup.archive_days(_stream(**overrides)) == 0
 
     def test_clamps_long_archives(self):
@@ -49,6 +56,11 @@ class TestCanPlay:
 
     def test_without_archive(self):
         assert not catchup.can_play(_stream(tv_archive=0), self.now - timedelta(hours=1), self.now)
+
+    def test_defaults_to_current_time(self):
+        recent = datetime.now(timezone.utc) - timedelta(hours=1)
+        assert catchup.can_play(_stream(), recent)
+        assert not catchup.can_play(_stream(), recent + timedelta(hours=2))
 
 
 def test_history_covers_longest_archive():
@@ -96,7 +108,7 @@ class TestServerTimezone:
         fetch.assert_called_once()
 
     def test_missing_zone_is_utc(self):
-        assert catchup.server_timezone("src1", lambda: {}) == timezone.utc
+        assert catchup.server_timezone("src1", MagicMock(return_value={})) == timezone.utc
 
     def test_transient_failure_is_retried(self):
         fetch = MagicMock(side_effect=[OSError("down"), {"server_info": {"timezone": "UTC"}}])
@@ -105,8 +117,8 @@ class TestServerTimezone:
         assert fetch.call_count == 2
 
 
-def _stream(**overrides):
-    stream = {
+def _stream(**overrides: MutablePlainTree) -> ProviderRecord:
+    stream: ProviderRecord = {
         "stream_id": "src1_42",
         "source_type": "xtream",
         "source_url": "http://upstream.test:8080/",
@@ -120,7 +132,7 @@ def _stream(**overrides):
 
 
 @pytest.fixture(autouse=True)
-def _clear_tz_cache():
+def _clear_tz_cache() -> Iterator[None]:
     catchup._tz_cache.clear()
     yield
     catchup._tz_cache.clear()

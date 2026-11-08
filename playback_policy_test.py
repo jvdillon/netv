@@ -7,7 +7,13 @@ import pytest
 from playback_policy import LiveRecoveryPolicy, PlaybackHealth, PlaybackPolicy
 
 
-def health(*, buffer=0, waiting=True, observed=0, required=0):
+def health(
+    *,
+    buffer: float = 0,
+    waiting: bool = True,
+    observed: float = 0,
+    required: float = 0,
+) -> PlaybackHealth:
     return PlaybackHealth(
         buffer_seconds=buffer,
         waiting=waiting,
@@ -40,7 +46,7 @@ def test_low_throughput_with_dwindling_buffer_triggers_fallback():
         health(waiting=False, observed=10_000_000, required=4_000_000),
     ],
 )
-def test_healthy_or_unknown_samples_do_not_trigger(sample):
+def test_healthy_or_unknown_samples_do_not_trigger(sample: PlaybackHealth):
     policy = PlaybackPolicy()
     assert not any(policy.observe(sample, now) for now in range(0, 60, 2))
 
@@ -66,7 +72,7 @@ def test_background_gap_resets_evidence():
 
 
 @pytest.mark.parametrize("value", [-1, float("nan"), float("inf")])
-def test_invalid_metrics_rejected(value):
+def test_invalid_metrics_rejected(value: float):
     with pytest.raises(ValidationError):
         health(buffer=value)
     with pytest.raises(ValidationError):
@@ -94,7 +100,7 @@ def test_recovery_requires_cooldown_and_sustained_headroom():
         health(buffer=10, waiting=False),
     ],
 )
-def test_recovery_rejects_insufficient_or_unknown_capacity(bad):
+def test_recovery_rejects_insufficient_or_unknown_capacity(bad: PlaybackHealth):
     policy = PlaybackPolicy(bandwidth_saver=True)
     for now in range(0, 180, 2):
         assert policy.observe(bad, now, 20_000_000)

@@ -66,13 +66,13 @@ def test_main_survives_vlc_options(
 
 def test_align_atsc3_keeps_two_digit_subchannel() -> None:
     lookup = {"2.1": {"wrong"}, "2.10": {"right"}, "15": {"whole"}}
-    entries: list[list] = [
+    entries: list[list[str | dict[str, str]]] = [
         ["A", {"channel-number": "102.10"}, "u"],
         ["B", {"channel-number": "115"}, "u"],
     ]
     alignm3u.align_channels(entries, lookup)
-    assert entries[0][1]["tvg-id"] == "right"
-    assert entries[1][1]["tvg-id"] == "whole"
+    assert alignm3u.entry_fields(entries[0])[1]["tvg-id"] == "right"
+    assert alignm3u.entry_fields(entries[1])[1]["tvg-id"] == "whole"
 
 
 def test_parse_m3u_rejects_missing_header(tmp_path: pathlib.Path) -> None:
@@ -100,7 +100,7 @@ def test_parse_xmltv_channels_and_lookup(tmp_path: pathlib.Path) -> None:
 
 def test_align_channels_priority() -> None:
     lookup = {"2.1": {"num"}, "N": {"name"}, "5.1": {"x", "y"}, "M": {"m1", "m2"}}
-    entries: list[list] = [
+    entries: list[list[str | dict[str, str]]] = [
         ["short", {}],
         ["A", {"channel-number": "2.1", "tvg-name": "N"}, "u"],
         ["B", {"channel-number": "9.9", "tvg-name": "N"}, "u"],
@@ -112,17 +112,18 @@ def test_align_channels_priority() -> None:
     aligned, missing = alignm3u.align_channels(entries, lookup)
     assert aligned is entries
     assert entries[0] == ["short", {}]
-    assert entries[1][1]["tvg-id"] == "num"
-    assert entries[2][1]["tvg-id"] == "name"
-    assert entries[3][1]["tvg-id"] in {"x", "y"}
-    assert entries[4][1]["tvg-id"] in {"m1", "m2"}
-    assert entries[5][1]["tvg-id"] == "num"  # ATSC3 102.1 -> 2.1.
+    ids = [alignm3u.entry_fields(entry)[1].get("tvg-id") for entry in entries]
+    assert ids[1] == "num"
+    assert ids[2] == "name"
+    assert ids[3] in {"x", "y"}
+    assert ids[4] in {"m1", "m2"}
+    assert ids[5] == "num"  # ATSC3 102.1 -> 2.1.
     assert missing == [entries[6]]
 
 
 def test_write_m3u(tmp_path: pathlib.Path) -> None:
     out = tmp_path / "o.m3u"
-    entries = [
+    entries: list[list[str | dict[str, str]]] = [
         ["short", {}],
         ["T", {"tvg-name": "Named", "group-title": "News", "channel-id": "105"}, "u1"],
         ["Plain", {"channel-id": "5"}, "u2"],

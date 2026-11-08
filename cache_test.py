@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from concurrent import futures
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import functools
 import json
 import os
 import subprocess
@@ -18,13 +20,11 @@ import cache
 
 
 @pytest.fixture
-def cache_module(tmp_path: Path, monkeypatch):
-    """Import cache module with temp directories."""
-
+def cache_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Point cache at temp directories."""
     # Skip real ffmpeg hardware probing on first settings load.
     monkeypatch.setattr(cache, "AVAILABLE_ENCODERS", {"nvenc": False})
     monkeypatch.setattr(cache, "LOGOS_DIR", tmp_path / "logos")
-    # Patch paths to temp locations.
     original_server_settings = cache.SERVER_SETTINGS_FILE
     original_users_dir = cache.USERS_DIR
     original_cache_dir = cache.CACHE_DIR
@@ -33,75 +33,134 @@ def cache_module(tmp_path: Path, monkeypatch):
     cache.USERS_DIR.mkdir(exist_ok=True)
     cache.CACHE_DIR = tmp_path / "cache"
     cache.CACHE_DIR.mkdir(exist_ok=True)
+    _reset_memory()
 
-    # Clear memory cache.
-    cache._cache.clear()
-
-    yield cache
+    yield
 
     cache.SERVER_SETTINGS_FILE = original_server_settings
     cache.USERS_DIR = original_users_dir
     cache.CACHE_DIR = original_cache_dir
-    cache._cache.clear()
+    _reset_memory()
 
 
+def _reset_memory() -> None:
+    cache.clear_all_caches()
+    cache.get_cache().pop("epg", None)
+
+
+def _write_settings(raw: dict[str, object]) -> None:
+    """Store a settings file as an older or hand-edited release would."""
+    cache.SERVER_SETTINGS_FILE.write_text(json.dumps(raw))
+
+
+def _source(
+    source_id: str,
+    *,
+    users: list[str] | None = None,
+    epg_url: str = "",
+) -> cache.SourceConfig:
+    source: cache.SourceConfig = {
+        "id": source_id,
+        "name": source_id,
+        "type": "m3u",
+        "url": "http://x",
+    }
+    if users is not None:
+        source["users"] = users
+    if epg_url:
+        source["epg_url"] = epg_url
+    return source
+
+
+@pytest.mark.usefixtures("cache_module")
 class TestFileCache:
-    def test_save_and_load_file_cache(self, cache_module):
-        cache_module.save_file_cache("test", {"key": "value"})
-        result = cache_module.load_file_cache("test")
+    def test_save_and_load_file_cache(self):
+        cache.save_file_cache("test", {"key": "value"})
+        result = cache.load_file_cache("test")
         assert result is not None
         data, ts = result
         assert data == {"key": "value"}
         assert ts > 0
 
-    def test_load_nonexistent_cache(self, cache_module):
-        assert cache_module.load_file_cache("nonexistent") is None
+    def test_load_nonexistent_cache(self):
+        assert cache.load_file_cache("nonexistent") is None
 
-    def test_load_corrupted_cache(self, cache_module):
-        path = cache_module.CACHE_DIR / "corrupted.json"
+    def test_load_corrupted_cache(self):
+        path = cache.CACHE_DIR / "corrupted.json"
         path.write_text("not valid json")
-        assert cache_module.load_file_cache("corrupted") is None
+        assert cache.load_file_cache("corrupted") is None
 
 
+@pytest.mark.usefixtures("cache_module")
 class TestMemoryCache:
-    def test_get_cache_returns_reference(self, cache_module):
-        cache = cache_module.get_cache()
-        cache["test"] = 123
-        assert cache_module.get_cache()["test"] == 123
+    def test_get_cache_returns_reference(self):
+        cache.get_cache()["epg_error"] = "down"
+        memory = cache.get_cache()
+        assert "epg_error" in memory
+        assert memory["epg_error"] == "down"
 
-    def test_clear_all_caches_preserves_epg(self, cache_module):
-        cache = cache_module.get_cache()
-        cache["epg"] = {"data": "epg"}
-        cache["live"] = {"data": "live"}
-        cache_module.clear_all_caches()
-        assert "epg" in cache
-        assert "live" not in cache
+    def test_clear_all_caches_covers_every_key_but_epg(self):
+        memory = cache.get_cache()
+        memory.update(
+            {
+                "live_categories": [],
+                "live_streams": [],
+                "vod_categories": [],
+                "vod_streams": [],
+                "series_categories": [],
+                "series": [],
+                "epg_urls": [],
+                "epg_error": "x",
+                "epg": None,
+            },
+        )
+        # A key added to MemoryCache must also be popped by clear_all_caches.
+        assert set(memory) == cache.MemoryCache.__optional_keys__
+        cache.clear_all_caches()
+        assert cache.get_cache() is memory
+        assert set(memory) == {"epg"}
+
+    def test_clear_all_caches_preserves_epg(self):
+        memory = cache.get_cache()
+        memory["epg"] = {"data": "epg"}
+        memory["live_streams"] = [{"data": "live"}]
+        cache._info_cache["info"] = {"v": 1}
+        cache.clear_all_caches()
+        assert "epg" in memory
+        assert "live_streams" not in memory
+        assert cache._info_cache == {}
 
 
+@pytest.mark.usefixtures("cache_module")
 class TestCachedInfo:
-    def test_get_cached_info_calls_fetch(self, cache_module):
+    def test_get_cached_info_calls_fetch(self):
         fetch_fn = mock.Mock(return_value={"result": 42})
-        result = cache_module.get_cached_info("test_key", fetch_fn)
+        result = cache.get_cached_info("test_key", fetch_fn)
         assert result == {"result": 42}
         fetch_fn.assert_called_once()
 
-    def test_get_cached_info_uses_memory_cache(self, cache_module):
+    def test_get_cached_info_uses_memory_cache(self):
         fetch_fn = mock.Mock(return_value={"result": 1})
-        cache_module.get_cached_info("key1", fetch_fn)
-        cache_module.get_cached_info("key1", fetch_fn)
+        cache.get_cached_info("key1", fetch_fn)
+        cache.get_cached_info("key1", fetch_fn)
         # Only called once - second call uses memory cache.
         fetch_fn.assert_called_once()
 
-    def test_get_cached_info_force_bypasses_memory(self, cache_module):
+    def test_get_cached_info_force_bypasses_memory(self):
         fetch_fn = mock.Mock(return_value={"result": 1})
-        cache_module.get_cached_info("key2", fetch_fn)
-        cache_module.get_cached_info("key2", fetch_fn, force=True)
+        cache.get_cached_info("key2", fetch_fn)
+        cache.get_cached_info("key2", fetch_fn, force=True)
         assert fetch_fn.call_count == 2
 
+    def test_non_object_file_cache_is_refetched(self):
+        cache.save_file_cache("key3", [1, 2])
+        assert cache.get_cached_info("key3", lambda: {"fresh": True}) == {"fresh": True}
 
+
+@pytest.mark.usefixtures("cache_module")
 class TestSettings:
-    def test_load_settings_defaults(self, cache_module):
-        settings = cache_module.load_server_settings()
+    def test_load_settings_defaults(self):
+        settings = cache.load_server_settings()
         assert settings["sources"] == []
         assert settings["transcode_mode"] == "auto"
         assert settings["transcode_hw"] in (
@@ -116,68 +175,136 @@ class TestSettings:
         assert settings["probe_movies"] is True
         assert settings["live_dvr_mins"] == 120
 
-    def test_save_and_load_settings(self, cache_module):
-        settings = {"sources": [{"id": "s1", "name": "Test"}], "custom": True}
-        cache_module.save_server_settings(settings)
-        loaded = cache_module.load_server_settings()
-        assert loaded["sources"] == [{"id": "s1", "name": "Test"}]
-        assert loaded["custom"] is True
+    def test_save_and_load_settings(self):
+        settings = cache.load_server_settings()
+        settings["sources"] = [_source("s1")]
+        settings["probe_live"] = False
+        cache.save_server_settings(settings)
+        loaded = cache.load_server_settings()
+        assert loaded["sources"] == [_source("s1")]
+        assert loaded["probe_live"] is False
 
-    def test_live_dvr_window_is_user_set(self, cache_module):
-        cache_module.save_server_settings({"live_dvr_mins": 999})
-        assert cache_module.load_server_settings()["live_dvr_mins"] == 999
-        cache_module.save_server_settings({"live_dvr_mins": -5})
-        assert cache_module.load_server_settings()["live_dvr_mins"] == 0
+    def test_save_keeps_unknown_keys_and_removes_dropped_owned_ones(self):
+        _write_settings({"future": {"nested": [1]}, "sr_model": "old"})
+        settings = cache.load_server_settings()
+        assert "sr_model" in settings
+        assert settings["sr_model"] == "old"
+        del settings["sr_model"]
+        settings["probe_live"] = False
+        cache.save_server_settings(settings)
+        saved = json.loads(cache.SERVER_SETTINGS_FILE.read_text())
+        assert saved["future"] == {"nested": [1]}
+        assert "sr_model" not in saved
+        assert saved["probe_live"] is False
+
+    def test_save_keeps_unknown_source_fields_across_reorder_and_deletion(self):
+        _write_settings(
+            {
+                "sources": [
+                    {**_source("a"), "vendor": "kept-a"},
+                    {**_source("b"), "vendor": "dropped-b"},
+                    {**_source("c"), "vendor": "kept-c"},
+                ],
+            },
+        )
+        settings = cache.load_server_settings()
+        sources = settings["sources"]
+        settings["sources"] = [sources[2], sources[0]]
+        settings["sources"][0]["name"] = "renamed"
+        cache.save_server_settings(settings)
+        saved = json.loads(cache.SERVER_SETTINGS_FILE.read_text())["sources"]
+        assert [(s["id"], s["name"], s["vendor"]) for s in saved] == [
+            ("c", "renamed", "kept-c"),
+            ("a", "a", "kept-a"),
+        ]
+
+    def test_live_dvr_window_is_user_set(self):
+        _write_settings({"live_dvr_mins": 999})
+        assert cache.load_server_settings()["live_dvr_mins"] == 999
+        _write_settings({"live_dvr_mins": -5})
+        assert cache.load_server_settings()["live_dvr_mins"] == 0
 
     @pytest.mark.parametrize("value", ["120", [], {}])
-    def test_live_dvr_window_rejects_non_integer_settings(self, cache_module, value):
-        cache_module.save_server_settings({"live_dvr_mins": value})
+    def test_live_dvr_window_rejects_non_integer_settings(self, value: object):
+        _write_settings({"live_dvr_mins": value})
         with pytest.raises(TypeError, match="live_dvr_mins must be an integer"):
-            cache_module.load_server_settings()
+            cache.load_server_settings()
 
 
+@pytest.mark.usefixtures("cache_module")
 class TestUserSettings:
-    def test_load_user_settings_defaults(self, cache_module):
-        settings = cache_module.load_user_settings("testuser")
+    def test_load_user_settings_defaults(self):
+        settings = cache.load_user_settings("testuser")
         assert settings["guide_filter"] == []
         assert settings["captions_enabled"] is True
         assert settings["watch_history"] == {}
         assert settings["sort_live_by_views"] is True
 
-    def test_save_and_load_user_settings(self, cache_module):
-        settings = {"guide_filter": ["cat1", "cat2"], "captions_enabled": False}
-        cache_module.save_user_settings("testuser", settings)
-        loaded = cache_module.load_user_settings("testuser")
+    def test_save_and_load_user_settings(self):
+        settings = cache.load_user_settings("testuser")
+        settings["guide_filter"] = ["cat1", "cat2"]
+        settings["captions_enabled"] = False
+        settings["vod_filter"] = ["films"]
+        cache.save_user_settings("testuser", settings)
+        loaded = cache.load_user_settings("testuser")
         assert loaded["guide_filter"] == ["cat1", "cat2"]
         assert loaded["captions_enabled"] is False
+        assert "vod_filter" in loaded
+        assert loaded["vod_filter"] == ["films"]
 
-    def test_watch_position_save_and_get(self, cache_module):
-        cache_module.save_watch_position("user1", "http://video.url", 120.5, 3600.0)
-        entry = cache_module.get_watch_position("user1", "http://video.url")
+    def test_save_keeps_unknown_user_keys(self):
+        path = cache.USERS_DIR / "testuser" / "settings.json"
+        path.parent.mkdir()
+        path.write_text(json.dumps({"theme": "dark", "cc_lang": "en"}))
+        settings = cache.load_user_settings("testuser")
+        settings["cc_lang"] = "fr"
+        cache.save_user_settings("testuser", settings)
+        saved = json.loads(path.read_text())
+        assert saved["theme"] == "dark"
+        assert saved["cc_lang"] == "fr"
+
+    def test_watch_history_eviction_drops_entries_and_keeps_unknown_fields(self):
+        path = cache.USERS_DIR / "testuser" / "settings.json"
+        path.parent.mkdir()
+        history = {
+            f"u{i}": {"position": 1, "duration": 10, "updated": i, "device": f"d{i}"}
+            for i in range(200)
+        }
+        path.write_text(json.dumps({"watch_history": history}))
+        cache.save_watch_position("testuser", "new", 1.0, 10.0)
+        saved = json.loads(path.read_text())["watch_history"]
+        assert "u0" not in saved
+        assert saved["u1"]["device"] == "d1"
+        assert "device" not in saved["new"]
+
+    def test_watch_position_save_and_get(self):
+        cache.save_watch_position("user1", "http://video.url", 120.5, 3600.0)
+        entry = cache.get_watch_position("user1", "http://video.url")
         assert entry is not None
         assert entry["position"] == 120.5
         assert entry["duration"] == 3600.0
 
-    def test_watch_position_resets_at_95_percent(self, cache_module):
+    def test_watch_position_resets_at_95_percent(self):
         # Save at 96% watched.
-        cache_module.save_watch_position("user1", "http://video.url", 960.0, 1000.0)
-        entry = cache_module.get_watch_position("user1", "http://video.url")
+        cache.save_watch_position("user1", "http://video.url", 960.0, 1000.0)
+        entry = cache.get_watch_position("user1", "http://video.url")
         assert entry is None  # Should be reset.
 
-    def test_live_views_are_counted_by_source_and_stream(self, cache_module):
-        assert cache_module.record_live_view("user1", "source-a", 7) == 1
-        assert cache_module.record_live_view("user1", "source-a", 7) == 2
-        assert cache_module.record_live_view("user1", "source-b", 7) == 1
+    def test_live_views_are_counted_by_source_and_stream(self):
+        assert cache.record_live_view("user1", "source-a", 7) == 1
+        assert cache.record_live_view("user1", "source-a", 7) == 2
+        assert cache.record_live_view("user1", "source-b", 7) == 1
 
-        assert cache_module.load_live_view_counts("user1") == {
+        assert cache.load_live_view_counts("user1") == {
             "source-a:7": 2,
             "source-b:7": 1,
         }
 
 
+@pytest.mark.usefixtures("cache_module")
 class TestSource:
-    def test_source_dataclass(self, cache_module):
-        source = cache_module.Source(
+    def test_source_dataclass(self):
+        source = cache.Source(
             id="test",
             name="Test Source",
             type="xtream",
@@ -188,66 +315,59 @@ class TestSource:
         assert source.epg_timeout == 120
         assert source.epg_enabled is True
 
-    def test_get_sources_empty(self, cache_module):
-        sources = cache_module.get_sources()
+    def test_get_sources_empty(self):
+        sources = cache.get_sources()
         assert sources == []
 
-    def test_get_sources_from_settings(self, cache_module):
-        settings = {
-            "sources": [
-                {
-                    "id": "s1",
-                    "name": "Source 1",
-                    "type": "m3u",
-                    "url": "http://example.com/playlist.m3u",
-                },
-            ],
-        }
-        cache_module.save_server_settings(settings)
-        sources = cache_module.get_sources()
+    def test_get_sources_from_settings(self):
+        _write_settings(
+            {
+                "sources": [
+                    {
+                        "id": "s1",
+                        "name": "Source 1",
+                        "type": "m3u",
+                        "url": "http://example.com/playlist.m3u",
+                    },
+                ],
+            },
+        )
+        sources = cache.get_sources()
         assert len(sources) == 1
         assert sources[0].id == "s1"
         assert sources[0].type == "m3u"
 
 
+@pytest.mark.usefixtures("cache_module")
 class TestUpdateSourceEpgUrl:
-    def test_update_source_epg_url(self, cache_module):
-        settings = {"sources": [{"id": "s1", "name": "S1", "type": "m3u", "url": "http://x"}]}
-        cache_module.save_server_settings(settings)
-        cache_module.update_source_epg_url("s1", "http://epg.example.com")
-        loaded = cache_module.load_server_settings()
-        assert loaded["sources"][0]["epg_url"] == "http://epg.example.com"
+    def test_update_source_epg_url(self):
+        _write_settings({"sources": [_source("s1")]})
+        cache.update_source_epg_url("s1", "http://epg.example.com")
+        source = cache.load_server_settings()["sources"][0]
+        assert "epg_url" in source
+        assert source["epg_url"] == "http://epg.example.com"
 
-    def test_update_source_epg_url_not_overwrite(self, cache_module):
-        settings = {
-            "sources": [
-                {
-                    "id": "s1",
-                    "name": "S1",
-                    "type": "m3u",
-                    "url": "http://x",
-                    "epg_url": "http://existing",
-                },
-            ],
-        }
-        cache_module.save_server_settings(settings)
-        cache_module.update_source_epg_url("s1", "http://new")
-        loaded = cache_module.load_server_settings()
-        assert loaded["sources"][0]["epg_url"] == "http://existing"
+    def test_update_source_epg_url_not_overwrite(self):
+        _write_settings({"sources": [_source("s1", epg_url="http://existing")]})
+        cache.update_source_epg_url("s1", "http://new")
+        source = cache.load_server_settings()["sources"][0]
+        assert "epg_url" in source
+        assert source["epg_url"] == "http://existing"
 
-    def test_update_source_epg_url_empty_noop(self, cache_module):
-        settings = {"sources": [{"id": "s1", "name": "S1", "type": "m3u", "url": "http://x"}]}
-        cache_module.save_server_settings(settings)
-        cache_module.update_source_epg_url("s1", "")
-        loaded = cache_module.load_server_settings()
+    def test_update_source_epg_url_empty_noop(self):
+        _write_settings({"sources": [_source("s1")]})
+        cache.update_source_epg_url("s1", "")
+        loaded = cache.load_server_settings()
         assert "epg_url" not in loaded["sources"][0]
 
-    def test_update_source_epg_url_does_not_log_credentials(self, cache_module, caplog):
-        caplog.set_level("INFO", logger=cache_module.log.name)
-        settings = {"sources": [{"id": "s1", "name": "S1", "type": "xtream", "url": "http://x"}]}
-        cache_module.save_server_settings(settings)
+    def test_update_source_epg_url_does_not_log_credentials(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        caplog.set_level("INFO", logger=cache.log.name)
+        _write_settings({"sources": [_source("s1")]})
 
-        cache_module.update_source_epg_url(
+        cache.update_source_epg_url(
             "s1",
             "https://provider.example/xmltv.php?username=private-user&password=private-secret",
         )
@@ -255,6 +375,25 @@ class TestUpdateSourceEpgUrl:
         assert "private-user" not in caplog.text
         assert "private-secret" not in caplog.text
         assert "provider.example" in caplog.text
+
+
+def _encoder_result(
+    accept: str,
+    captured: list[list[str]] | None = None,
+) -> mock.Mock:
+    """Fake ``_test_encoder`` accepting commands that mention ``accept``."""
+
+    def run(
+        cmd: list[str],
+        timeout: int = 5,
+        env: dict[str, str] | None = None,
+    ) -> tuple[bool, str]:
+        del timeout, env
+        if captured is not None:
+            captured.append(cmd)
+        return (accept in cmd, "" if accept in cmd else "not available")
+
+    return mock.Mock(side_effect=run)
 
 
 class TestEncoderDetection:
@@ -326,15 +465,8 @@ class TestEncoderDetection:
 
     def test_detect_encoders_partial(self):
         """Test detect_encoders with mixed hardware availability."""
-
-        def mock_test(cmd, timeout=5, env=None):
-            # Return True only for VAAPI.
-            if "h264_vaapi" in cmd:
-                return True, ""
-            return False, "not available"
-
         with (
-            mock.patch.object(cache, "_test_encoder", side_effect=mock_test),
+            mock.patch.object(cache, "_test_encoder", _encoder_result("h264_vaapi")),
             mock.patch.object(cache, "VAAPI_DEVICE", "/dev/dri/renderD128"),
             mock.patch.object(cache, "LIBVA_DRIVER", "i965"),
             mock.patch.object(cache, "DRI_PATH", "/usr/lib/x86_64-linux-gnu/dri"),
@@ -347,13 +479,7 @@ class TestEncoderDetection:
 
     def test_detect_encoders_nvenc_only(self):
         """Test detect_encoders when only NVENC is available."""
-
-        def mock_test(cmd, timeout=5, env=None):
-            if "h264_nvenc" in cmd:
-                return True, ""
-            return False, "not available"
-
-        with mock.patch.object(cache, "_test_encoder", side_effect=mock_test):
+        with mock.patch.object(cache, "_test_encoder", _encoder_result("h264_nvenc")):
             result = cache.detect_encoders()
             assert result["nvenc"] is True
             assert result["amf"] is False
@@ -362,17 +488,9 @@ class TestEncoderDetection:
 
     def test_detect_encoders_vaapi_command_structure(self):
         """Test detect_encoders passes correct VAAPI command structure when GPU detected."""
-        captured_cmds = []
-        captured_envs = []
-
-        def capture_cmd(cmd, timeout=5, env=None):
-            captured_cmds.append(cmd)
-            captured_envs.append(env)
-            return False, "test"
-
-        # Mock auto-detected VAAPI device.
+        captured_cmds: list[list[str]] = []
         with (
-            mock.patch.object(cache, "_test_encoder", side_effect=capture_cmd),
+            mock.patch.object(cache, "_test_encoder", _encoder_result("never", captured_cmds)),
             mock.patch.object(cache, "VAAPI_DEVICE", "/dev/dri/renderD128"),
             mock.patch.object(cache, "LIBVA_DRIVER", "i965"),
             mock.patch.object(cache, "DRI_PATH", "/usr/lib/x86_64-linux-gnu/dri"),
@@ -391,149 +509,78 @@ class TestEncoderDetection:
 
     def test_detect_encoders_qsv_command_structure(self):
         """Test detect_encoders passes correct QSV command structure."""
-        captured_cmds = []
-
-        def capture_cmd(cmd, timeout=5, env=None):
-            captured_cmds.append(cmd)
-            return False, "test"
-
-        with mock.patch.object(cache, "_test_encoder", side_effect=capture_cmd):
+        captured_cmds: list[list[str]] = []
+        with mock.patch.object(cache, "_test_encoder", _encoder_result("never", captured_cmds)):
             cache.detect_encoders()
 
         # Find QSV command.
-        qsv_cmd = [c for c in captured_cmds if "h264_qsv" in c][0]
+        qsv_cmd = next(c for c in captured_cmds if "h264_qsv" in c)
         assert "-hwaccel" in qsv_cmd
         assert "qsv" in qsv_cmd
         assert "-hwaccel_output_format" in qsv_cmd
 
-    def test_refresh_encoders_updates_global(self):
+    def test_refresh_encoders_updates_global(self, monkeypatch: pytest.MonkeyPatch):
         """Test refresh_encoders updates AVAILABLE_ENCODERS."""
-        original = cache.AVAILABLE_ENCODERS.copy()
-
-        with mock.patch.object(
-            cache,
-            "detect_encoders",
-            return_value={"nvenc": True, "amf": True, "qsv": True, "vaapi": True},
-        ):
+        monkeypatch.setattr(cache, "AVAILABLE_ENCODERS", {})
+        detected = {"nvenc": True, "amf": True, "qsv": True, "vaapi": True}
+        with mock.patch.object(cache, "detect_encoders", return_value=detected):
             result = cache.refresh_encoders()
-            assert cache.AVAILABLE_ENCODERS == {
-                "nvenc": True,
-                "amf": True,
-                "qsv": True,
-                "vaapi": True,
-            }
-            assert result == cache.AVAILABLE_ENCODERS
+        assert detected == cache.AVAILABLE_ENCODERS
+        assert result == cache.AVAILABLE_ENCODERS
 
-        # Restore original.
-        cache.AVAILABLE_ENCODERS = original
+    @pytest.mark.parametrize(
+        ("available", "expected"),
+        [
+            ({"nvenc": True, "amf": True, "qsv": True, "vaapi": True}, "nvenc+vaapi"),
+            ({"nvenc": True, "amf": False, "qsv": False, "vaapi": False}, "nvenc+software"),
+            ({"nvenc": False, "amf": True, "qsv": True, "vaapi": True}, "amf+vaapi"),
+            ({"nvenc": False, "amf": True, "qsv": False, "vaapi": False}, "amf+software"),
+            ({"nvenc": False, "amf": False, "qsv": True, "vaapi": True}, "qsv"),
+            ({"nvenc": False, "amf": False, "qsv": False, "vaapi": True}, "vaapi"),
+            ({"nvenc": False, "amf": False, "qsv": False, "vaapi": False}, "software"),
+        ],
+    )
+    def test_default_encoder_preference(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        available: dict[str, bool],
+        expected: str,
+    ):
+        """Test _default_encoder picks nvenc > amf > qsv > vaapi > software."""
+        monkeypatch.setattr(cache, "AVAILABLE_ENCODERS", available)
+        assert cache._default_encoder() == expected
 
-    def test_default_encoder_prefers_nvenc_with_vaapi(self):
-        """Test _default_encoder prefers NVENC+VAAPI when both available."""
-        original = cache.AVAILABLE_ENCODERS.copy()
-        cache.AVAILABLE_ENCODERS = {
-            "nvenc": True,
-            "amf": True,
-            "qsv": True,
-            "vaapi": True,
-        }
-        try:
-            assert cache._default_encoder() == "nvenc+vaapi"
-        finally:
-            cache.AVAILABLE_ENCODERS = original
 
-    def test_default_encoder_nvenc_without_vaapi(self):
-        """Test _default_encoder uses NVENC+software when VAAPI unavailable."""
-        original = cache.AVAILABLE_ENCODERS.copy()
-        cache.AVAILABLE_ENCODERS = {
-            "nvenc": True,
-            "amf": False,
-            "qsv": False,
-            "vaapi": False,
-        }
-        try:
-            assert cache._default_encoder() == "nvenc+software"
-        finally:
-            cache.AVAILABLE_ENCODERS = original
-
-    def test_default_encoder_falls_back_to_amf(self):
-        """Test _default_encoder falls back to AMF when NVENC unavailable."""
-        original = cache.AVAILABLE_ENCODERS.copy()
-        cache.AVAILABLE_ENCODERS = {
-            "nvenc": False,
-            "amf": True,
-            "qsv": True,
-            "vaapi": True,
-        }
-        try:
-            assert cache._default_encoder() == "amf+vaapi"
-        finally:
-            cache.AVAILABLE_ENCODERS = original
-
-    def test_default_encoder_falls_back_to_qsv(self):
-        """Test _default_encoder falls back to QSV when NVENC/AMF unavailable."""
-        original = cache.AVAILABLE_ENCODERS.copy()
-        cache.AVAILABLE_ENCODERS = {
-            "nvenc": False,
-            "amf": False,
-            "qsv": True,
-            "vaapi": True,
-        }
-        try:
-            assert cache._default_encoder() == "qsv"
-        finally:
-            cache.AVAILABLE_ENCODERS = original
-
-    def test_default_encoder_falls_back_to_vaapi(self):
-        """Test _default_encoder falls back to VAAPI when NVENC/AMF/QSV unavailable."""
-        original = cache.AVAILABLE_ENCODERS.copy()
-        cache.AVAILABLE_ENCODERS = {
-            "nvenc": False,
-            "amf": False,
-            "qsv": False,
-            "vaapi": True,
-        }
-        try:
-            assert cache._default_encoder() == "vaapi"
-        finally:
-            cache.AVAILABLE_ENCODERS = original
-
-    def test_default_encoder_falls_back_to_software(self):
-        """Test _default_encoder falls back to software as last resort."""
-        original = cache.AVAILABLE_ENCODERS.copy()
-        cache.AVAILABLE_ENCODERS = {
-            "nvenc": False,
-            "amf": False,
-            "qsv": False,
-            "vaapi": False,
-        }
-        try:
-            assert cache._default_encoder() == "software"
-        finally:
-            cache.AVAILABLE_ENCODERS = original
+def _point_paths_at(monkeypatch: pytest.MonkeyPatch, app_dir: Path, cache_dir: Path) -> None:
+    monkeypatch.setattr(cache, "APP_DIR", app_dir)
+    monkeypatch.setattr(cache, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(cache, "SERVER_SETTINGS_FILE", cache_dir / "server_settings.json")
+    monkeypatch.setattr(cache, "USERS_DIR", cache_dir / "users")
+    monkeypatch.setattr(cache, "LOGOS_DIR", cache_dir / "logos")
 
 
 class TestInitialize:
-    def test_initialize_paths_prefers_legacy_cache_dir(self, monkeypatch, tmp_path):
+    def test_initialize_paths_prefers_legacy_cache_dir(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
         (tmp_path / "cache").mkdir()
-        monkeypatch.setattr(cache, "APP_DIR", tmp_path)
-        monkeypatch.setattr(cache, "CACHE_DIR", tmp_path / ".cache")
-        monkeypatch.setattr(cache, "SERVER_SETTINGS_FILE", tmp_path / ".cache/server_settings.json")
-        monkeypatch.setattr(cache, "USERS_DIR", tmp_path / ".cache/users")
-        monkeypatch.setattr(cache, "LOGOS_DIR", tmp_path / ".cache/logos")
+        _point_paths_at(monkeypatch, tmp_path, tmp_path / ".cache")
         cache.initialize_paths()
         assert tmp_path / "cache" == cache.CACHE_DIR
         assert tmp_path / "cache/server_settings.json" == cache.SERVER_SETTINGS_FILE
         assert tmp_path / "cache/users" == cache.USERS_DIR
         assert tmp_path / "cache/logos" == cache.LOGOS_DIR
 
-    def test_initialize_paths_puts_installed_state_in_user_data_dir(self, monkeypatch, tmp_path):
+    def test_initialize_paths_puts_installed_state_in_user_data_dir(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
         monkeypatch.delenv("NETV_DATA_DIR", raising=False)
         monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-        monkeypatch.setattr(cache, "APP_DIR", tmp_path)
-        monkeypatch.setattr(cache, "CACHE_DIR", tmp_path / ".cache")
-        monkeypatch.setattr(cache, "SERVER_SETTINGS_FILE", tmp_path / ".cache/server_settings.json")
-        monkeypatch.setattr(cache, "USERS_DIR", tmp_path / ".cache/users")
-        monkeypatch.setattr(cache, "LOGOS_DIR", tmp_path / ".cache/logos")
+        _point_paths_at(monkeypatch, tmp_path, tmp_path / ".cache")
         cache.initialize_paths()
         state = tmp_path / "xdg" / "netv"
         assert state == cache.CACHE_DIR
@@ -541,7 +588,11 @@ class TestInitialize:
         assert state / "users" == cache.USERS_DIR
         assert state / "logos" == cache.LOGOS_DIR
 
-    def test_initialize_paths_keeps_caller_overrides(self, monkeypatch, tmp_path):
+    def test_initialize_paths_keeps_caller_overrides(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
         (tmp_path / "cache").mkdir()
         custom = tmp_path / "custom"
         monkeypatch.setattr(cache, "APP_DIR", tmp_path)
@@ -556,15 +607,19 @@ class TestInitialize:
         assert custom / "icons" == cache.LOGOS_DIR
         assert not custom.exists()
 
-    def test_initialize_detects_once_into_shared_table(self, monkeypatch):
+    def test_initialize_detects_once_into_shared_table(self, monkeypatch: pytest.MonkeyPatch):
         table: dict[str, bool] = {}
         monkeypatch.setattr(cache, "AVAILABLE_ENCODERS", table)
         monkeypatch.setattr(cache, "VAAPI_DEVICE", None)
         monkeypatch.setattr(cache, "LIBVA_DRIVER", None)
         monkeypatch.setattr(cache, "DRI_PATH", None)
-        monkeypatch.setattr(cache, "_detect_vaapi_device", lambda: "/dev/dri/renderD128")
-        monkeypatch.setattr(cache, "_detect_libva_driver", lambda: "iHD")
-        monkeypatch.setattr(cache, "_detect_dri_path", lambda: "/usr/lib/dri")
+        monkeypatch.setattr(
+            cache,
+            "_detect_vaapi_device",
+            mock.Mock(return_value="/dev/dri/renderD128"),
+        )
+        monkeypatch.setattr(cache, "_detect_libva_driver", mock.Mock(return_value="iHD"))
+        monkeypatch.setattr(cache, "_detect_dri_path", mock.Mock(return_value="/usr/lib/dri"))
         detect = mock.Mock(return_value={"nvenc": True})
         monkeypatch.setattr(cache, "detect_encoders", detect)
         cache.initialize()
@@ -575,12 +630,12 @@ class TestInitialize:
         assert cache.LIBVA_DRIVER == "iHD"
         assert cache.DRI_PATH == "/usr/lib/dri"
 
-    def test_initialize_keeps_supplied_hardware(self, monkeypatch):
+    def test_initialize_keeps_supplied_hardware(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(cache, "AVAILABLE_ENCODERS", {})
         monkeypatch.setattr(cache, "VAAPI_DEVICE", "/dev/custom")
         monkeypatch.setattr(cache, "LIBVA_DRIVER", "radeonsi")
         monkeypatch.setattr(cache, "DRI_PATH", "/opt/dri")
-        monkeypatch.setattr(cache, "detect_encoders", lambda: {"vaapi": True})
+        monkeypatch.setattr(cache, "detect_encoders", mock.Mock(return_value={"vaapi": True}))
         cache.initialize()
         assert (cache.VAAPI_DEVICE, cache.LIBVA_DRIVER, cache.DRI_PATH) == (
             "/dev/custom",
@@ -588,10 +643,13 @@ class TestInitialize:
             "/opt/dri",
         )
 
-    def test_refresh_encoders_updates_shared_table_in_place(self, monkeypatch):
+    def test_refresh_encoders_updates_shared_table_in_place(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
         table = {"nvenc": True}
         monkeypatch.setattr(cache, "AVAILABLE_ENCODERS", table)
-        monkeypatch.setattr(cache, "detect_encoders", lambda: {"qsv": True})
+        monkeypatch.setattr(cache, "detect_encoders", mock.Mock(return_value={"qsv": True}))
         assert cache.refresh_encoders() is table
         assert table == {"qsv": True}
 
@@ -639,13 +697,14 @@ class TestLogoCache:
         result = cache._url_to_filename("http://example.com/")
         assert len(result) == 8  # Just the hash.
 
-    def test_save_and_get_cached_logo(self, cache_module, tmp_path):
-        cache_module.LOGOS_DIR = tmp_path / "logos"
-        cache_module.LOGOS_DIR.mkdir()
+    @pytest.mark.usefixtures("cache_module")
+    def test_save_and_get_cached_logo(self, tmp_path: Path):
+        cache.LOGOS_DIR = tmp_path / "logos"
+        cache.LOGOS_DIR.mkdir()
 
         # Save a logo.
         data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100  # Fake PNG.
-        path = cache_module.save_logo(
+        path = cache.save_logo(
             "TestSource",
             "http://example.com/logo.png",
             data,
@@ -656,24 +715,25 @@ class TestLogoCache:
         assert path.read_bytes() == data
 
         # Get cached logo.
-        cached = cache_module.get_cached_logo("TestSource", "http://example.com/logo.png")
+        cached = cache.get_cached_logo("TestSource", "http://example.com/logo.png")
         assert cached == path
 
-    def test_get_cached_logo_returns_none_when_missing(self, cache_module, tmp_path):
-        cache_module.LOGOS_DIR = tmp_path / "logos"
-        cache_module.LOGOS_DIR.mkdir()
+    @pytest.mark.usefixtures("cache_module")
+    def test_get_cached_logo_returns_none_when_missing(self, tmp_path: Path):
+        cache.LOGOS_DIR = tmp_path / "logos"
+        cache.LOGOS_DIR.mkdir()
 
-        cached = cache_module.get_cached_logo("NoSource", "http://missing.com/logo.png")
+        cached = cache.get_cached_logo("NoSource", "http://missing.com/logo.png")
         assert cached is None
 
-    def test_get_cached_logo_expires(self, cache_module, tmp_path):
-
-        cache_module.LOGOS_DIR = tmp_path / "logos"
-        cache_module.LOGOS_DIR.mkdir()
+    @pytest.mark.usefixtures("cache_module")
+    def test_get_cached_logo_expires(self, tmp_path: Path):
+        cache.LOGOS_DIR = tmp_path / "logos"
+        cache.LOGOS_DIR.mkdir()
 
         # Save a logo.
         data = b"\x89PNG" + b"\x00" * 100
-        path = cache_module.save_logo("TestSource", "http://example.com/old.png", data, "image/png")
+        path = cache.save_logo("TestSource", "http://example.com/old.png", data, "image/png")
 
         # Backdate the file.
         old_time = time.time() - 7 * 24 * 3600 - 100
@@ -681,31 +741,35 @@ class TestLogoCache:
         os.utime(path, (old_time, old_time))
 
         # Should be expired.
-        cached = cache_module.get_cached_logo("TestSource", "http://example.com/old.png")
+        cached = cache.get_cached_logo("TestSource", "http://example.com/old.png")
         assert cached is None
         assert not path.exists()  # Should be deleted.
 
-    def test_save_logo_content_type_mapping(self, cache_module, tmp_path):
-        cache_module.LOGOS_DIR = tmp_path / "logos"
-        cache_module.LOGOS_DIR.mkdir()
+    @pytest.mark.usefixtures("cache_module")
+    def test_save_logo_content_type_mapping(self, tmp_path: Path):
+        cache.LOGOS_DIR = tmp_path / "logos"
+        cache.LOGOS_DIR.mkdir()
 
         data = b"test"
-        assert cache_module.save_logo("s", "http://a.com/1", data, "image/jpeg").suffix == ".jpg"
-        assert cache_module.save_logo("s", "http://a.com/2", data, "image/gif").suffix == ".gif"
-        assert cache_module.save_logo("s", "http://a.com/3", data, "image/webp").suffix == ".webp"
-        assert cache_module.save_logo("s", "http://a.com/4", data, "image/svg+xml").suffix == ".svg"
-        assert cache_module.save_logo("s", "http://a.com/5", data, "unknown/type").suffix == ".png"
+        assert cache.save_logo("s", "http://a.com/1", data, "image/jpeg").suffix == ".jpg"
+        assert cache.save_logo("s", "http://a.com/2", data, "image/gif").suffix == ".gif"
+        assert cache.save_logo("s", "http://a.com/3", data, "image/webp").suffix == ".webp"
+        assert cache.save_logo("s", "http://a.com/4", data, "image/svg+xml").suffix == ".svg"
+        assert cache.save_logo("s", "http://a.com/5", data, "unknown/type").suffix == ".png"
 
 
 class TestFileCacheExtras:
-    def test_load_in_subprocess(self, cache_module, monkeypatch):
+    @pytest.mark.usefixtures("cache_module")
+    def test_load_in_subprocess(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(cache.futures, "ProcessPoolExecutor", futures.ThreadPoolExecutor)
-        cache_module.save_file_cache("proc", [1, 2])
-        data, ts = cache_module.load_file_cache("proc", use_process=True)
+        cache.save_file_cache("proc", [1, 2])
+        loaded = cache.load_file_cache("proc", use_process=True)
+        assert loaded is not None
+        data, ts = loaded
         assert data == [1, 2]
         assert ts > 0
 
-    def test_parse_json_file(self, tmp_path):
+    def test_parse_json_file(self, tmp_path: Path):
         good = tmp_path / "good.json"
         good.write_text(json.dumps({"data": {"a": 1}}))
         assert cache._parse_json_file(str(good)) == ({"a": 1}, 0)
@@ -714,65 +778,75 @@ class TestFileCacheExtras:
         assert cache._parse_json_file(str(bad)) is None
         assert cache._parse_json_file(str(tmp_path / "missing.json")) is None
 
-    def test_clear_all_file_caches(self, cache_module):
-        cache_module.save_file_cache("live_data", [1])
-        cache_module.save_file_cache("vod_data", [2])
-        cache_module.save_file_cache("other", [3])
-        cache_module.get_cache()["live"] = 1
-        assert cache_module.clear_all_file_caches() == 2
-        assert cache_module.load_file_cache("live_data") is None
-        assert cache_module.load_file_cache("other") is not None
-        assert cache_module.get_cache() == {}
+    @pytest.mark.usefixtures("cache_module")
+    def test_clear_all_file_caches(self):
+        cache.save_file_cache("live_data", [1])
+        cache.save_file_cache("vod_data", [2])
+        cache.save_file_cache("other", [3])
+        cache.get_cache()["live_streams"] = []
+        assert cache.clear_all_file_caches() == 2
+        assert cache.load_file_cache("live_data") is None
+        assert cache.load_file_cache("other") is not None
+        assert cache.get_cache() == {}
 
     def test_get_cache_lock(self):
         assert cache.get_cache_lock() is cache._cache_lock
 
 
-class TestStaleWhileRevalidate:
-    def _backdate(self, cache_module, key, data, age):
-        path = cache_module.CACHE_DIR / f"{key}.json"
-        path.write_text(json.dumps({"data": data, "timestamp": time.time() - age}))
+def _backdate(key: str, data: object, age: float) -> None:
+    path = cache.CACHE_DIR / f"{key}.json"
+    path.write_text(json.dumps({"data": data, "timestamp": time.time() - age}))
 
-    def test_memory_hit_with_stale_file_refreshes_in_background(self, cache_module):
-        self._backdate(cache_module, "k", {"v": "file"}, 2 * 24 * 3600)
-        cache_module.get_cache()["k"] = {"v": "mem"}
+
+@pytest.mark.usefixtures("cache_module")
+class TestStaleWhileRevalidate:
+    def test_memory_hit_with_stale_file_refreshes_in_background(self):
+        _backdate("k", {"v": "file"}, 2 * 24 * 3600)
+        cache._info_cache["k"] = {"v": "mem"}
         fetch = mock.Mock()
         with mock.patch.object(cache.threading, "Thread") as thread:
-            assert cache_module.get_cached_info("k", fetch) == {"v": "mem"}
+            assert cache.get_cached_info("k", fetch) == {"v": "mem"}
         assert thread.call_args.kwargs["args"] == ("k", fetch)
         thread.return_value.start.assert_called_once()
         fetch.assert_not_called()
 
-    def test_stale_file_served_and_refreshed(self, cache_module):
-        self._backdate(cache_module, "k", {"v": "file"}, 2 * 24 * 3600)
+    def test_stale_file_served_and_refreshed(self):
+        _backdate("k", {"v": "file"}, 2 * 24 * 3600)
         fetch = mock.Mock()
         with mock.patch.object(cache.threading, "Thread") as thread:
-            assert cache_module.get_cached_info("k", fetch) == {"v": "file"}
-        assert cache_module.get_cache()["k"] == {"v": "file"}
+            assert cache.get_cached_info("k", fetch) == {"v": "file"}
+        assert cache._info_cache["k"] == {"v": "file"}
         thread.return_value.start.assert_called_once()
 
-    def test_fresh_file_served_without_refresh(self, cache_module):
-        self._backdate(cache_module, "k", {"v": "file"}, 60)
+    def test_fresh_file_served_without_refresh(self):
+        _backdate("k", {"v": "file"}, 60)
         with mock.patch.object(cache.threading, "Thread") as thread:
-            assert cache_module.get_cached_info("k", mock.Mock()) == {"v": "file"}
+            assert cache.get_cached_info("k", mock.Mock()) == {"v": "file"}
         thread.assert_not_called()
 
-    def test_force_refetches_despite_file(self, cache_module):
-        self._backdate(cache_module, "k", {"v": "file"}, 60)
-        cache_module.get_cache()["k"] = {"v": "mem"}
-        assert cache_module.get_cached_info("k", lambda: {"v": "new"}, force=True) == {"v": "new"}
-        assert cache_module.load_file_cache("k")[0] == {"v": "new"}
+    def test_force_refetches_despite_file(self):
+        _backdate("k", {"v": "file"}, 60)
+        cache._info_cache["k"] = {"v": "mem"}
+        assert cache.get_cached_info("k", mock.Mock(return_value={"v": "new"}), force=True) == {
+            "v": "new",
+        }
+        loaded = cache.load_file_cache("k")
+        assert loaded is not None
+        assert loaded[0] == {"v": "new"}
 
-    def test_refresh_success_and_failure(self, cache_module, caplog):
+    def test_refresh_success_and_failure(self, caplog: pytest.LogCaptureFixture):
         caplog.set_level("INFO", logger=cache.log.name)
-        cache._refresh_cached_info("k", lambda: [9])
-        assert cache_module.get_cache()["k"] == [9]
-        assert cache_module.load_file_cache("k")[0] == [9]
+        cache._refresh_cached_info("k", mock.Mock(return_value={"v": 9}))
+        assert cache._info_cache["k"] == {"v": 9}
+        loaded = cache.load_file_cache("k")
+        assert loaded is not None
+        assert loaded[0] == {"v": 9}
         cache._refresh_cached_info("k", mock.Mock(side_effect=RuntimeError("boom")))
-        assert cache_module.get_cache()["k"] == [9]
+        assert cache._info_cache["k"] == {"v": 9}
         assert "Background refresh failed for k: boom" in caplog.text
 
 
+@pytest.mark.usefixtures("cache_module")
 class TestServerSettingsExtras:
     @pytest.mark.parametrize(
         ("old", "encoders", "new"),
@@ -781,12 +855,19 @@ class TestServerSettingsExtras:
             ("nvidia", {"vaapi": False}, "nvenc+software"),
             ("intel", {"vaapi": False}, "qsv"),
             ("vaapi", {"vaapi": False}, "vaapi"),
+            ("bogus", {"vaapi": False}, "software"),
         ],
     )
-    def test_legacy_transcode_hw_migrated(self, cache_module, monkeypatch, old, encoders, new):
+    def test_legacy_transcode_hw_migrated(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        old: str,
+        encoders: dict[str, bool],
+        new: str,
+    ):
         monkeypatch.setattr(cache, "AVAILABLE_ENCODERS", encoders)
-        cache_module.save_server_settings({"transcode_hw": old})
-        assert cache_module.load_server_settings()["transcode_hw"] == new
+        _write_settings({"transcode_hw": old})
+        assert cache.load_server_settings()["transcode_hw"] == new
 
     @pytest.mark.parametrize(
         ("settings", "expected"),
@@ -799,52 +880,58 @@ class TestServerSettingsExtras:
             ({"user_agent_preset": "bogus"}, None),
         ],
     )
-    def test_user_agent(self, cache_module, settings, expected):
-        cache_module.save_server_settings(settings)
-        assert cache_module.get_user_agent() == expected
+    def test_user_agent(self, settings: dict[str, object], expected: str | None):
+        _write_settings(settings)
+        assert cache.get_user_agent() == expected
 
-    def test_hidden_source_ids(self, cache_module):
-        base = {"type": "m3u", "url": "http://x"}
-        cache_module.save_server_settings(
+    def test_hidden_source_ids(self):
+        _write_settings(
             {
                 "sources": [
-                    {"id": "all", "name": "A", **base},
-                    {"id": "mine", "name": "B", "users": ["alice"], **base},
-                    {"id": "theirs", "name": "C", "users": ["bob"], **base},
+                    _source("all"),
+                    _source("mine", users=["alice"]),
+                    _source("theirs", users=["bob"]),
                 ],
             },
         )
-        assert cache_module.hidden_source_ids("alice", admin=True) == set()
-        assert cache_module.hidden_source_ids("alice", admin=False) == {"theirs"}
+        assert cache.hidden_source_ids("alice", admin=True) == set()
+        assert cache.hidden_source_ids("alice", admin=False) == {"theirs"}
 
-    def test_update_source_epg_url_unknown_source(self, cache_module):
-        cache_module.save_server_settings({"sources": [{"id": "s1", "name": "S1"}]})
-        cache_module.update_source_epg_url("s2", "http://epg")
-        assert "epg_url" not in cache_module.load_server_settings()["sources"][0]
+    def test_update_source_epg_url_unknown_source(self):
+        _write_settings({"sources": [_source("s1")]})
+        cache.update_source_epg_url("s2", "http://epg")
+        assert "epg_url" not in cache.load_server_settings()["sources"][0]
 
 
+@pytest.mark.usefixtures("cache_module")
 class TestUserSettingsExtras:
-    def test_missing_watch_position(self, cache_module):
-        assert cache_module.get_watch_position("user1", "http://none") is None
+    def test_missing_watch_position(self):
+        assert cache.get_watch_position("user1", "http://none") is None
 
-    def test_watch_position_without_duration_is_kept(self, cache_module):
-        cache_module.save_watch_position("user1", "http://live", 50.0, 0)
-        assert cache_module.get_watch_position("user1", "http://live")["position"] == 50.0
+    def test_watch_position_without_duration_is_kept(self):
+        cache.save_watch_position("user1", "http://live", 50.0, 0)
+        entry = cache.get_watch_position("user1", "http://live")
+        assert entry is not None
+        assert entry["position"] == 50.0
 
-    def test_watch_history_keeps_200_most_recent(self, cache_module):
-        history = {f"u{i}": {"position": 1, "duration": 10, "updated": i} for i in range(200)}
-        cache_module.save_user_settings("user1", {"watch_history": history})
-        cache_module.save_watch_position("user1", "new", 1.0, 10.0)
-        saved = cache_module.load_user_settings("user1")["watch_history"]
+    def test_watch_history_keeps_200_most_recent(self):
+        history: dict[str, cache.WatchEntry] = {
+            f"u{i}": {"position": 1, "duration": 10, "updated": i} for i in range(200)
+        }
+        settings = cache.load_user_settings("user1")
+        settings["watch_history"] = history
+        cache.save_user_settings("user1", settings)
+        cache.save_watch_position("user1", "new", 1.0, 10.0)
+        saved = cache.load_user_settings("user1")["watch_history"]
         assert len(saved) == 200
         assert "new" in saved
         assert "u0" not in saved
         assert "u1" in saved
 
     @pytest.mark.parametrize("username", ["", "a" * 65, "a..b", "a/b", "a\\b"])
-    def test_invalid_usernames_rejected(self, cache_module, username):
+    def test_invalid_usernames_rejected(self, username: str):
         with pytest.raises(ValueError, match="Invalid username"):
-            cache_module.load_user_settings(username)
+            cache.load_user_settings(username)
 
     @pytest.mark.parametrize(
         "payload",
@@ -856,21 +943,25 @@ class TestUserSettingsExtras:
             {"counts": {"a:1": -1}},
         ],
     )
-    def test_invalid_live_view_counts_rejected(self, cache_module, payload):
-        path = cache_module.USERS_DIR / "user1" / "live_views.json"
+    def test_invalid_live_view_counts_rejected(self, payload: object):
+        path = cache.USERS_DIR / "user1" / "live_views.json"
         path.parent.mkdir()
         path.write_text(json.dumps(payload))
         with pytest.raises(ValueError, match="Invalid live view counts"):
-            cache_module.load_live_view_counts("user1")
+            cache.load_live_view_counts("user1")
+
+
+def _rooted(root: Path, path: str | Path) -> Path:
+    return root / str(path).lstrip("/")
 
 
 @pytest.fixture
-def fake_root(tmp_path, monkeypatch):
+def fake_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect cache's absolute system paths under tmp_path."""
     monkeypatch.setattr(
         cache,
         "pathlib",
-        SimpleNamespace(Path=lambda p: tmp_path / str(p).lstrip("/")),
+        SimpleNamespace(Path=functools.partial(_rooted, tmp_path)),
     )
     return tmp_path
 
@@ -883,7 +974,8 @@ class TestGpuDetection:
             ("03:00.0 Display controller [0380]: AMD [1002:73ff]\n", "1002"),
         ],
     )
-    def test_lspci_vendor(self, fake_root, stdout, vendor):
+    @pytest.mark.usefixtures("fake_root")
+    def test_lspci_vendor(self, stdout: str, vendor: str):
         with mock.patch.object(
             cache.subprocess,
             "run",
@@ -891,7 +983,7 @@ class TestGpuDetection:
         ):
             assert cache._get_gpu_vendor() == vendor
 
-    def test_sysfs_fallback(self, fake_root):
+    def test_sysfs_fallback(self, fake_root: Path):
         drm = fake_root / "sys/class/drm"
         for name, vendor in [("card0", "0x10de"), ("card1", "0x1002")]:
             (drm / name / "device").mkdir(parents=True)
@@ -903,7 +995,7 @@ class TestGpuDetection:
         with mock.patch.object(cache.subprocess, "run", side_effect=FileNotFoundError):
             assert cache._get_gpu_vendor() == "1002"
 
-    def test_unknown_gpu(self, fake_root):
+    def test_unknown_gpu(self, fake_root: Path):
         (fake_root / "sys/class/drm/card0/device").mkdir(parents=True)
         (fake_root / "sys/class/drm/card0/device/vendor").write_text("0x10de\n")
         with mock.patch.object(
@@ -913,23 +1005,24 @@ class TestGpuDetection:
         ):
             assert cache._get_gpu_vendor() is None
 
-    def test_no_sysfs(self, fake_root):
+    @pytest.mark.usefixtures("fake_root")
+    def test_no_sysfs(self):
         with mock.patch.object(cache.subprocess, "run", return_value=mock.Mock(stdout="")):
             assert cache._get_gpu_vendor() is None
 
-    def test_unreadable_sysfs(self, fake_root):
+    def test_unreadable_sysfs(self, fake_root: Path):
         (fake_root / "sys/class").mkdir(parents=True)
         (fake_root / "sys/class/drm").write_text("")  # iterdir() raises NotADirectoryError.
         with mock.patch.object(cache.subprocess, "run", return_value=mock.Mock(stdout="")):
             assert cache._get_gpu_vendor() is None
 
-    def test_vaapi_device(self, fake_root):
+    def test_vaapi_device(self, fake_root: Path):
         assert cache._detect_vaapi_device() is None
         (fake_root / "dev/dri").mkdir(parents=True)
         (fake_root / "dev/dri/renderD128").touch()
         assert cache._detect_vaapi_device() == str(fake_root / "dev/dri/renderD128")
 
-    def test_dri_path(self, fake_root):
+    def test_dri_path(self, fake_root: Path):
         assert cache._detect_dri_path() is None
         (fake_root / "usr/lib/dri").mkdir(parents=True)
         assert cache._detect_dri_path() == "/usr/lib/dri"
@@ -945,8 +1038,15 @@ class TestGpuDetection:
             (None, False, None),
         ],
     )
-    def test_libva_driver(self, fake_root, monkeypatch, vendor, ihd, driver):
-        monkeypatch.setattr(cache, "_get_gpu_vendor", lambda: vendor)
+    def test_libva_driver(
+        self,
+        fake_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        vendor: str | None,
+        ihd: bool,
+        driver: str | None,
+    ):
+        monkeypatch.setattr(cache, "_get_gpu_vendor", mock.Mock(return_value=vendor))
         dri = fake_root / "usr/lib/dri"
         dri.mkdir(parents=True)
         if ihd:
@@ -955,11 +1055,8 @@ class TestGpuDetection:
 
 
 class TestEncoderExtras:
-    def test_vaapi_baseline_fallback(self, monkeypatch):
-        def fake(cmd, timeout=5, env=None):
-            return ("constrained_baseline" in cmd, "no high profile")
-
-        monkeypatch.setattr(cache, "_test_encoder", fake)
+    def test_vaapi_baseline_fallback(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(cache, "_test_encoder", _encoder_result("constrained_baseline"))
         monkeypatch.setattr(cache, "VAAPI_DEVICE", "/dev/dri/renderD128")
         monkeypatch.setattr(cache, "LIBVA_DRIVER", "radeonsi")
         monkeypatch.setattr(cache, "DRI_PATH", "/usr/lib/dri")

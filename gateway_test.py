@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol, TypedDict, TypeVar
 from unittest.mock import AsyncMock, MagicMock
 from urllib import parse
 
@@ -13,6 +15,7 @@ import sys
 
 from fastapi import Request
 from fastapi.testclient import TestClient
+from treekle import MutablePlainTree, json_loads
 
 import pytest
 import uvicorn
@@ -24,8 +27,12 @@ import cache
 import gateway
 
 
+GatewayClient = tuple[TestClient, CatalogSnapshot]
+T = TypeVar("T")
+
+
 @pytest.fixture
-def gateway_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def gateway_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> GatewayClient:
     settings_file = tmp_path / "server_settings.json"
     users_dir = tmp_path / "users"
     users_dir.mkdir()
@@ -79,29 +86,29 @@ def gateway_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return TestClient(gateway.app), snapshot
 
 
-def test_healthcheck_does_not_require_auth(gateway_client):
+def test_healthcheck_does_not_require_auth(gateway_client: GatewayClient):
     client, _ = gateway_client
     assert client.get("/healthz").json() == {"status": "ok"}
 
 
-def test_player_api_rejects_invalid_credentials(gateway_client):
+def test_player_api_rejects_invalid_credentials(gateway_client: GatewayClient):
     client, _ = gateway_client
     response = client.get(
         "/player_api.php",
         params={"username": "player", "password": "wrong"},
     )
     assert response.status_code == 200
-    assert response.json()["user_info"]["auth"] == 0
+    assert _body(response, _UserInfo)["user_info"]["auth"] == 0
 
 
-def test_player_api_exposes_active_server_profile(gateway_client):
+def test_player_api_exposes_active_server_profile(gateway_client: GatewayClient):
     client, _ = gateway_client
     response = client.get(
         "/player_api.php",
         params={"username": "player", "password": "local-pass"},
     )
     assert response.status_code == 200
-    assert response.json()["user_info"] == {
+    assert _body(response, _UserInfo)["user_info"] == {
         "username": "player",
         "password": "local-pass",
         "message": "neTV native-player gateway",
@@ -117,7 +124,7 @@ def test_player_api_exposes_active_server_profile(gateway_client):
 
 
 def test_server_profile_uses_configured_public_url(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
     client, _ = gateway_client
@@ -128,20 +135,21 @@ def test_server_profile_uses_configured_public_url(
         params={"username": "player", "password": "local-pass"},
     )
 
-    assert response.json()["server_info"] == {
+    server_info = _body(response, _Profile)["server_info"]
+    assert server_info == {
         "url": "tv.example",
         "port": "8443",
         "https_port": "8443",
         "server_protocol": "https",
         "rtmp_port": "0",
         "timezone": "UTC",
-        "timestamp_now": response.json()["server_info"]["timestamp_now"],
-        "time_now": response.json()["server_info"]["time_now"],
+        "timestamp_now": server_info["timestamp_now"],
+        "time_now": server_info["time_now"],
     }
 
 
 def test_successful_authentication_is_cached(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
     client, _ = gateway_client
@@ -158,7 +166,7 @@ def test_successful_authentication_is_cached(
     verify_password.assert_called_once_with("player", "local-pass")
 
 
-def test_failed_authentication_is_rate_limited(gateway_client):
+def test_failed_authentication_is_rate_limited(gateway_client: GatewayClient):
     client, _ = gateway_client
     params = {"username": "player", "password": "wrong"}
 
@@ -169,7 +177,7 @@ def test_failed_authentication_is_rate_limited(gateway_client):
 
 
 def test_success_cache_is_checked_before_client_rate_limit(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
     client, _ = gateway_client
@@ -187,7 +195,7 @@ def test_success_cache_is_checked_before_client_rate_limit(
     assert client.get("/player_api.php", params=valid).status_code == 200
 
 
-def test_player_api_exposes_local_live_catalog(gateway_client):
+def test_player_api_exposes_local_live_catalog(gateway_client: GatewayClient):
     client, _ = gateway_client
     response = client.get(
         "/player_api.php",
@@ -216,7 +224,7 @@ def test_player_api_exposes_local_live_catalog(gateway_client):
     ]
 
 
-def test_player_api_orders_most_viewed_streams_within_category(gateway_client):
+def test_player_api_orders_most_viewed_streams_within_category(gateway_client: GatewayClient):
     client, snapshot = gateway_client
     second = GatewayStream(
         local_id=42,
@@ -246,7 +254,7 @@ def test_player_api_orders_most_viewed_streams_within_category(gateway_client):
         },
     )
 
-    assert [stream["stream_id"] for stream in response.json()] == [42, 41]
+    assert [stream["stream_id"] for stream in _records(response)] == [42, 41]
 
     settings = cache.load_user_settings("player")
     settings["sort_live_by_views"] = False
@@ -260,10 +268,10 @@ def test_player_api_orders_most_viewed_streams_within_category(gateway_client):
             "category_id": "src_1_news",
         },
     )
-    assert [stream["stream_id"] for stream in response.json()] == [41, 42]
+    assert [stream["stream_id"] for stream in _records(response)] == [41, 42]
 
 
-def test_playlist_contains_only_local_playback_urls(gateway_client):
+def test_playlist_contains_only_local_playback_urls(gateway_client: GatewayClient):
     client, _ = gateway_client
     response = client.get(
         "/get.php",
@@ -297,8 +305,8 @@ def test_upscale_setting_controls_gateway_mode(
     settings["sr_model"] = "retired-model"
 
     assert gateway._upscale_enabled() is True
-    assert gateway._upscale_settings()["sr_model"] == "2x-nomosuni-compact"
-    assert gateway._upscale_settings()["max_resolution"] == "4k"
+    assert gateway._upscale_settings().get("sr_model") == "2x-nomosuni-compact"
+    assert gateway._upscale_settings().get("max_resolution") == "4k"
 
 
 def test_disabled_upscale_accepts_480p_max_resolution(
@@ -318,11 +326,11 @@ def test_disabled_upscale_accepts_480p_max_resolution(
     )
 
     assert gateway._upscale_enabled() is False
-    assert gateway._upscale_settings()["max_resolution"] == "480p"
+    assert gateway._upscale_settings().get("max_resolution") == "480p"
 
 
 def test_upscale_playlist_uses_hls_urls(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
     client, _ = gateway_client
@@ -338,7 +346,7 @@ def test_upscale_playlist_uses_hls_urls(
 
 
 def test_upscale_live_stream_starts_session(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
     client, _ = gateway_client
@@ -346,7 +354,7 @@ def test_upscale_live_stream_starts_session(
     monkeypatch.setattr(
         gateway,
         "_resolve_upstream",
-        lambda _stream, _extension: "https://provider.example/live/987.ts",
+        _returning("https://provider.example/live/987.ts"),
     )
     start = AsyncMock(return_value={"session_id": "upscale-session"})
     monkeypatch.setattr(gateway.ffmpeg_session, "start_transcode", start)
@@ -367,7 +375,7 @@ def test_upscale_live_stream_starts_session(
 
 
 def test_upscale_files_are_served_from_session(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
@@ -377,7 +385,7 @@ def test_upscale_files_are_served_from_session(
     monkeypatch.setattr(
         gateway.ffmpeg_session,
         "get_session",
-        lambda _session_id: {"dir": str(tmp_path)},
+        _returning({"dir": str(tmp_path)}),
     )
     touch = MagicMock(return_value=True)
     monkeypatch.setattr(gateway.ffmpeg_session, "touch_session", touch)
@@ -393,7 +401,7 @@ def test_upscale_files_are_served_from_session(
     assert touch.call_count == 2
 
 
-def test_user_category_restrictions_apply_to_gateway(gateway_client):
+def test_user_category_restrictions_apply_to_gateway(gateway_client: GatewayClient):
     client, _ = gateway_client
     assert auth.set_user_limits("player", unavailable_groups=["cat:src_1_news"])
     response = client.get(
@@ -407,7 +415,7 @@ def test_user_category_restrictions_apply_to_gateway(gateway_client):
     assert response.json() == []
 
 
-def test_source_assignment_applies_to_gateway(gateway_client):
+def test_source_assignment_applies_to_gateway(gateway_client: GatewayClient):
     client, _ = gateway_client
     auth.create_user("guest", "guest-pass")
     settings = cache.load_server_settings()
@@ -416,9 +424,9 @@ def test_source_assignment_applies_to_gateway(gateway_client):
     ]
     cache.save_server_settings(settings)
 
-    def api(username: str, password: str, action: str):
+    def api(username: str, password: str, action: str) -> list[dict[str, MutablePlainTree]]:
         params = {"username": username, "password": password, "action": action}
-        return client.get("/player_api.php", params=params).json()
+        return _records(client.get("/player_api.php", params=params))
 
     assert api("guest", "guest-pass", "get_live_streams") == []
     assert api("guest", "guest-pass", "get_live_categories") == []
@@ -426,7 +434,7 @@ def test_source_assignment_applies_to_gateway(gateway_client):
 
 
 def test_uncategorized_streams_hidden_for_restricted_user(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
     _, snapshot = gateway_client
@@ -449,14 +457,17 @@ def test_uncategorized_streams_hidden_for_restricted_user(
     monkeypatch.setattr(
         auth,
         "get_user_limits",
-        lambda _username: {"unavailable_groups": ["cat:some-other-category"]},
+        _returning({"unavailable_groups": ["cat:some-other-category"]}),
     )
 
     assert gateway._allowed_category_ids("player", restricted_snapshot) == set()
     assert gateway._visible_streams("player", restricted_snapshot) == []
 
 
-def test_live_stream_proxies_resolved_upstream(gateway_client, monkeypatch: pytest.MonkeyPatch):
+def test_live_stream_proxies_resolved_upstream(
+    gateway_client: GatewayClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
     client, _ = gateway_client
     upstream = MagicMock()
     upstream.headers = {"Content-Type": "video/mp2t"}
@@ -465,7 +476,7 @@ def test_live_stream_proxies_resolved_upstream(gateway_client, monkeypatch: pyte
     fake_xtream.build_stream_url.return_value = (
         "https://provider.example/live/remote-user/remote-pass/987.ts"
     )
-    monkeypatch.setattr(gateway, "get_xtream_client_by_source", lambda _source_id: fake_xtream)
+    monkeypatch.setattr(gateway, "get_xtream_client_by_source", _returning(fake_xtream))
     open_mock = MagicMock(return_value=upstream)
     monkeypatch.setattr(gateway, "safe_urlopen", open_mock)
 
@@ -480,7 +491,7 @@ def test_live_stream_proxies_resolved_upstream(gateway_client, monkeypatch: pyte
 
 
 def test_live_stream_enforces_category_restrictions(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
     client, _ = gateway_client
@@ -495,7 +506,7 @@ def test_live_stream_enforces_category_restrictions(
 
 
 def test_xmltv_builds_feed_for_visible_streams(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
     client, snapshot = gateway_client
@@ -513,7 +524,7 @@ def test_xmltv_builds_feed_for_visible_streams(
 
 
 def test_xmltv_enforces_category_restrictions(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
     client, _ = gateway_client
@@ -530,7 +541,7 @@ def test_xmltv_enforces_category_restrictions(
     assert build_mock.call_args.args[1] == []
 
 
-def test_playlist_accepts_mpegts_output(gateway_client):
+def test_playlist_accepts_mpegts_output(gateway_client: GatewayClient):
     client, _ = gateway_client
     response = client.get(
         "/get.php",
@@ -544,7 +555,7 @@ def test_playlist_accepts_mpegts_output(gateway_client):
 
 
 def test_live_stream_password_may_contain_slash(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
     client, _ = gateway_client
@@ -556,7 +567,7 @@ def test_live_stream_password_may_contain_slash(
         "verify",
         AsyncMock(return_value=True),
     )
-    monkeypatch.setattr(gateway, "_resolve_upstream", lambda _stream, _extension: "http://upstream")
+    monkeypatch.setattr(gateway, "_resolve_upstream", _returning("http://upstream"))
     monkeypatch.setattr(gateway, "safe_urlopen", MagicMock(return_value=upstream))
 
     response = client.get("/live/player/local%2Fpass/41.ts")
@@ -565,7 +576,7 @@ def test_live_stream_password_may_contain_slash(
     assert response.content == b"video-data"
 
 
-def _settings(**overrides):
+def _settings(**overrides: str) -> dict[str, str]:
     return {
         "sr_model": "",
         "transcode_hw": "nvenc+software",
@@ -587,12 +598,12 @@ def _request(host: str | None, base_url: str = "http://host/") -> Request:
             "path": "/",
             "query_string": b"",
             "headers": [(b"host", url.netloc.encode())],
-            "client": (host, 0) if host else None,
+            "client": None if host is None or host == "" else (host, 0),
         },
     )
 
 
-def _params(**extra):
+def _params(**extra: str | int) -> dict[str, str | int]:
     return {"username": "player", "password": "local-pass", **extra}
 
 
@@ -614,8 +625,8 @@ def test_upscale_settings_rejects_missing_model(tmp_path: Path, monkeypatch: pyt
 def test_upscale_settings_rejects_invalid_values(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    override,
-    message,
+    override: dict[str, str],
+    message: str,
 ):
     monkeypatch.setenv("SR_ENGINE_DIR", str(tmp_path))
     monkeypatch.setattr(gateway.cache, "load_server_settings", lambda: _settings(**override))
@@ -662,8 +673,8 @@ def test_lifespan_initializes_and_shuts_down(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    sr_model,
-    message,
+    sr_model: str,
+    message: str,
 ):
     calls: list[str] = []
     monkeypatch.setenv("SR_ENGINE_DIR", str(tmp_path))
@@ -693,9 +704,10 @@ def test_lifespan_initializes_and_shuts_down(
 
 
 def test_authenticator_evicts_expired_success_entries(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(auth, "verify_password", lambda _u, _p: True)
+    monkeypatch.setattr(auth, "verify_password", _returning(True))
+    monkeypatch.setattr(gateway.time, "monotonic", lambda: 1000.0)
     authenticator = gateway.GatewayAuthenticator(max_auth_cache_entries=2)
-    authenticator._success_cache = {"expired": 0.0, "live": 1e12}
+    authenticator._success_cache = {"expired": 1000.0, "live": 1001.0}
 
     assert asyncio.run(authenticator.verify(_request("1.1.1.1"), "u", "p"))
 
@@ -704,9 +716,10 @@ def test_authenticator_evicts_expired_success_entries(monkeypatch: pytest.Monkey
 
 
 def test_authenticator_evicts_oldest_success_entry_when_full(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(auth, "verify_password", lambda _u, _p: True)
+    monkeypatch.setattr(auth, "verify_password", _returning(True))
+    monkeypatch.setattr(gateway.time, "monotonic", lambda: 1000.0)
     authenticator = gateway.GatewayAuthenticator(max_auth_cache_entries=2)
-    authenticator._success_cache = {"expired": 0.0, "old": 1e12, "new": 2e12}
+    authenticator._success_cache = {"expired": 1000.0, "old": 1001.0, "new": 1002.0}
 
     assert asyncio.run(authenticator.verify(_request(None), "u", "p"))
 
@@ -715,7 +728,7 @@ def test_authenticator_evicts_oldest_success_entry_when_full(monkeypatch: pytest
 
 
 def test_authenticator_bounds_failure_clients(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(auth, "verify_password", lambda _u, _p: False)
+    monkeypatch.setattr(auth, "verify_password", _returning(False))
     authenticator = gateway.GatewayAuthenticator(max_failure_clients=1)
 
     assert not asyncio.run(authenticator.verify(_request("1.1.1.1"), "u", "bad"))
@@ -728,7 +741,7 @@ def test_authenticator_bounds_failure_clients(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_authenticator_global_rate_limit(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(auth, "verify_password", lambda _u, _p: False)
+    monkeypatch.setattr(auth, "verify_password", _returning(False))
     authenticator = gateway.GatewayAuthenticator(max_global_login_failures=1)
     asyncio.run(authenticator.verify(_request("1.1.1.1"), "u", "bad"))
 
@@ -737,19 +750,31 @@ def test_authenticator_global_rate_limit(monkeypatch: pytest.MonkeyPatch):
     assert exc_info.value.status_code == 429
 
 
-def test_authenticator_forgets_failures_outside_window(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(auth, "verify_password", lambda _u, _p: True)
+@pytest.mark.parametrize("now", [0.0, 1000.0])
+def test_authenticator_forgets_failures_outside_window(
+    monkeypatch: pytest.MonkeyPatch,
+    now: float,
+):
+    monkeypatch.setattr(auth, "verify_password", _returning(True))
+    monkeypatch.setattr(gateway.time, "monotonic", lambda: now)
     authenticator = gateway.GatewayAuthenticator(max_login_failures=1)
-    authenticator._failures = {"1.1.1.1": [0.0], "2.2.2.2": [0.0, 1e12]}
-    authenticator._global_failures = [0.0]
+    cutoff = now - authenticator.login_window_seconds
+    authenticator._failures = {
+        "1.1.1.1": [cutoff - 1, cutoff],
+        "2.2.2.2": [cutoff - 1, cutoff, cutoff + 1],
+    }
+    authenticator._global_failures = [cutoff - 1, cutoff]
 
     assert asyncio.run(authenticator.verify(_request("3.3.3.3"), "u", "p"))
 
-    assert authenticator._failures == {"2.2.2.2": [1e12]}
+    assert authenticator._failures == {"2.2.2.2": [cutoff + 1]}
     assert authenticator._global_failures == []
 
 
-def test_healthcheck_reports_upscale_mode(gateway_client, monkeypatch: pytest.MonkeyPatch):
+def test_healthcheck_reports_upscale_mode(
+    gateway_client: GatewayClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
     client, _ = gateway_client
     monkeypatch.setattr(gateway, "_upscale_enabled", lambda: True)
 
@@ -784,11 +809,11 @@ def test_healthcheck_reports_upscale_mode(gateway_client, monkeypatch: pytest.Mo
     ],
 )
 def test_capabilities(
-    gateway_client,
+    gateway_client: GatewayClient,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    sr_model,
-    expected,
+    sr_model: str,
+    expected: dict[str, object],
 ):
     client, _ = gateway_client
     engines = tmp_path / "engines"
@@ -813,36 +838,36 @@ def test_available_upscale_models_requires_matching_engine(
     assert gateway._available_upscale_models() == []
 
 
-def test_player_api_live_categories_include_unmapped_category(gateway_client):
+def test_player_api_live_categories_include_unmapped_category(gateway_client: GatewayClient):
     client, snapshot = gateway_client
     snapshot.categories.append({"category_id": "77", "category_name": "Misc", "parent_id": 0})
 
     response = client.get("/player_api.php", params=_params(action="get_live_categories"))
 
-    assert [category["category_id"] for category in response.json()] == ["src_1_news", "77"]
+    assert [category["category_id"] for category in _records(response)] == ["src_1_news", "77"]
 
 
-def test_player_api_hides_unmapped_category_for_restricted_user(gateway_client):
+def test_player_api_hides_unmapped_category_for_restricted_user(gateway_client: GatewayClient):
     client, snapshot = gateway_client
     snapshot.categories.append({"category_id": "77", "category_name": "Misc", "parent_id": 0})
     assert auth.set_user_limits("player", unavailable_groups=["cat:other"])
 
     response = client.get("/player_api.php", params=_params(action="get_live_categories"))
 
-    assert [category["category_id"] for category in response.json()] == ["src_1_news"]
+    assert [category["category_id"] for category in _records(response)] == ["src_1_news"]
 
 
 @pytest.mark.parametrize(
     "action",
     ["get_vod_categories", "get_vod_streams", "get_series_categories", "get_series"],
 )
-def test_player_api_returns_empty_vod_and_series(gateway_client, action):
+def test_player_api_returns_empty_vod_and_series(gateway_client: GatewayClient, action: str):
     client, _ = gateway_client
 
     assert client.get("/player_api.php", params=_params(action=action)).json() == []
 
 
-def test_player_api_rejects_unsupported_action(gateway_client):
+def test_player_api_rejects_unsupported_action(gateway_client: GatewayClient):
     client, _ = gateway_client
 
     response = client.get("/player_api.php", params=_params(action="bogus"))
@@ -851,7 +876,7 @@ def test_player_api_rejects_unsupported_action(gateway_client):
     assert response.json() == {"detail": "Unsupported action: bogus"}
 
 
-def test_short_epg_requires_stream_id(gateway_client):
+def test_short_epg_requires_stream_id(gateway_client: GatewayClient):
     client, _ = gateway_client
 
     response = client.get("/player_api.php", params=_params(action="get_short_epg"))
@@ -860,7 +885,7 @@ def test_short_epg_requires_stream_id(gateway_client):
     assert response.json() == {"detail": "stream_id is required"}
 
 
-def test_short_epg_rejects_unknown_stream(gateway_client):
+def test_short_epg_rejects_unknown_stream(gateway_client: GatewayClient):
     client, _ = gateway_client
 
     response = client.get(
@@ -871,7 +896,7 @@ def test_short_epg_rejects_unknown_stream(gateway_client):
     assert response.status_code == 404
 
 
-def test_short_epg_rejects_hidden_stream(gateway_client):
+def test_short_epg_rejects_hidden_stream(gateway_client: GatewayClient):
     client, _ = gateway_client
     assert auth.set_user_limits("player", unavailable_groups=["cat:src_1_news"])
 
@@ -884,11 +909,11 @@ def test_short_epg_rejects_hidden_stream(gateway_client):
 
 
 def test_short_epg_without_source_client_is_empty(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
     client, _ = gateway_client
-    monkeypatch.setattr(gateway, "get_xtream_client_by_source", lambda _source_id: None)
+    monkeypatch.setattr(gateway, "get_xtream_client_by_source", _returning(None))
 
     response = client.get(
         "/player_api.php",
@@ -900,15 +925,15 @@ def test_short_epg_without_source_client_is_empty(
 
 @pytest.mark.parametrize(("limit", "expected_limit"), [(500, 100), (0, 1), (5, 5)])
 def test_short_epg_proxies_upstream_with_clamped_limit(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
-    limit,
-    expected_limit,
+    limit: int,
+    expected_limit: int,
 ):
     client, _ = gateway_client
     xtream = MagicMock()
     xtream.get_short_epg.return_value = {"epg_listings": [{"title": "News"}]}
-    monkeypatch.setattr(gateway, "get_xtream_client_by_source", lambda _source_id: xtream)
+    monkeypatch.setattr(gateway, "get_xtream_client_by_source", _returning(xtream))
 
     response = client.get(
         "/player_api.php",
@@ -920,14 +945,14 @@ def test_short_epg_proxies_upstream_with_clamped_limit(
 
 
 def test_short_epg_upstream_failure_is_bad_gateway(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ):
     client, _ = gateway_client
     xtream = MagicMock()
     xtream.get_short_epg.side_effect = OSError("boom")
-    monkeypatch.setattr(gateway, "get_xtream_client_by_source", lambda _source_id: xtream)
+    monkeypatch.setattr(gateway, "get_xtream_client_by_source", _returning(xtream))
 
     response = client.get(
         "/player_api.php",
@@ -939,7 +964,7 @@ def test_short_epg_upstream_failure_is_bad_gateway(
     assert "Gateway EPG lookup failed (OSError)" in caplog.text
 
 
-def test_player_api_orders_by_views_preserving_category_order(gateway_client):
+def test_player_api_orders_by_views_preserving_category_order(gateway_client: GatewayClient):
     client, snapshot = gateway_client
 
     def add(local_id: int, upstream_id: str, category: str) -> None:
@@ -968,10 +993,10 @@ def test_player_api_orders_by_views_preserving_category_order(gateway_client):
 
     response = client.get("/player_api.php", params=_params(action="get_live_streams"))
 
-    assert [stream["stream_id"] for stream in response.json()] == [43, 41, 42]
+    assert [stream["stream_id"] for stream in _records(response)] == [43, 41, 42]
 
 
-def test_playlist_rejects_invalid_credentials(gateway_client):
+def test_playlist_rejects_invalid_credentials(gateway_client: GatewayClient):
     client, _ = gateway_client
 
     response = client.get("/get.php", params={"username": "player", "password": "wrong"})
@@ -987,7 +1012,11 @@ def test_playlist_rejects_invalid_credentials(gateway_client):
         ({"output": "mkv"}, "Unsupported playlist output"),
     ],
 )
-def test_playlist_rejects_unsupported_options(gateway_client, params, detail):
+def test_playlist_rejects_unsupported_options(
+    gateway_client: GatewayClient,
+    params: dict[str, str],
+    detail: str,
+):
     client, _ = gateway_client
 
     response = client.get("/get.php", params=_params(**params))
@@ -996,7 +1025,7 @@ def test_playlist_rejects_unsupported_options(gateway_client, params, detail):
     assert response.json() == {"detail": detail}
 
 
-def test_playlist_sanitizes_values_and_defaults_group(gateway_client):
+def test_playlist_sanitizes_values_and_defaults_group(gateway_client: GatewayClient):
     client, snapshot = gateway_client
     stream = snapshot.streams[0]
     snapshot.streams[0] = GatewayStream(
@@ -1017,7 +1046,7 @@ def test_playlist_sanitizes_values_and_defaults_group(gateway_client):
     ) in response.text
 
 
-def test_live_stream_rejects_malformed_path(gateway_client):
+def test_live_stream_rejects_malformed_path(gateway_client: GatewayClient):
     client, _ = gateway_client
 
     for path in ("/live/player", "/live/player/pass", "/live/player/pass/41", "/live/u/p/x.ts"):
@@ -1026,13 +1055,13 @@ def test_live_stream_rejects_malformed_path(gateway_client):
         assert response.json() == {"detail": "Invalid live stream path"}
 
 
-def test_live_stream_rejects_invalid_credentials(gateway_client):
+def test_live_stream_rejects_invalid_credentials(gateway_client: GatewayClient):
     client, _ = gateway_client
 
     assert client.get("/live/player/wrong/41.ts").status_code == 401
 
 
-def test_live_stream_rejects_unsupported_format(gateway_client):
+def test_live_stream_rejects_unsupported_format(gateway_client: GatewayClient):
     client, _ = gateway_client
 
     response = client.get("/live/player/local-pass/41.mp4")
@@ -1041,14 +1070,14 @@ def test_live_stream_rejects_unsupported_format(gateway_client):
     assert response.json() == {"detail": "Unsupported stream format"}
 
 
-def test_live_stream_rejects_unknown_stream(gateway_client):
+def test_live_stream_rejects_unknown_stream(gateway_client: GatewayClient):
     client, _ = gateway_client
 
     assert client.get("/live/player/local-pass/999.ts").status_code == 404
 
 
 def test_upscale_live_stream_applies_source_limits(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
     client, _ = gateway_client
@@ -1066,7 +1095,7 @@ def test_upscale_live_stream_applies_source_limits(
     cache.save_server_settings(settings)
     assert auth.set_user_limits("player", max_streams_per_source={"src_1": 2})
     monkeypatch.setattr(gateway, "_upscale_enabled", lambda: True)
-    monkeypatch.setattr(gateway, "_resolve_upstream", lambda _stream, _extension: "http://up")
+    monkeypatch.setattr(gateway, "_resolve_upstream", _returning("http://up"))
     start = AsyncMock(return_value={"session_id": "s1"})
     monkeypatch.setattr(gateway.ffmpeg_session, "start_transcode", start)
 
@@ -1085,11 +1114,11 @@ def test_upscale_live_stream_applies_source_limits(
 
 
 def test_live_stream_upstream_failure_is_bad_gateway(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
     client, _ = gateway_client
-    monkeypatch.setattr(gateway, "_resolve_upstream", lambda _stream, _extension: "http://up")
+    monkeypatch.setattr(gateway, "_resolve_upstream", _returning("http://up"))
     monkeypatch.setattr(gateway, "safe_urlopen", MagicMock(side_effect=OSError("refused")))
 
     response = client.get("/live/player/local-pass/41.ts")
@@ -1141,14 +1170,14 @@ def test_resolve_upstream_rejects_m3u_without_url():
 
 
 def test_resolve_upstream_rejects_removed_xtream_source(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(gateway, "get_xtream_client_by_source", lambda _source_id: None)
+    monkeypatch.setattr(gateway, "get_xtream_client_by_source", _returning(None))
 
     with pytest.raises(gateway.HTTPException) as exc_info:
         gateway._resolve_upstream(_bare_stream("xtream", ""), "ts")
     assert exc_info.value.status_code == 404
 
 
-def test_upscale_file_rejects_dotted_filename(gateway_client):
+def test_upscale_file_rejects_dotted_filename(gateway_client: GatewayClient):
     client, _ = gateway_client
 
     response = client.get("/upscale/session/..stream.m3u8")
@@ -1157,17 +1186,23 @@ def test_upscale_file_rejects_dotted_filename(gateway_client):
     assert response.json() == {"detail": "Invalid filename"}
 
 
-def test_upscale_file_rejects_unknown_session(gateway_client, monkeypatch: pytest.MonkeyPatch):
+def test_upscale_file_rejects_unknown_session(
+    gateway_client: GatewayClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
     client, _ = gateway_client
-    monkeypatch.setattr(gateway.ffmpeg_session, "touch_session", lambda _sid: False)
+    monkeypatch.setattr(gateway.ffmpeg_session, "touch_session", _returning(False))
 
     assert client.get("/upscale/session/stream.m3u8").status_code == 404
 
 
-def test_upscale_file_rejects_vanished_session(gateway_client, monkeypatch: pytest.MonkeyPatch):
+def test_upscale_file_rejects_vanished_session(
+    gateway_client: GatewayClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
     client, _ = gateway_client
-    monkeypatch.setattr(gateway.ffmpeg_session, "touch_session", lambda _sid: True)
-    monkeypatch.setattr(gateway.ffmpeg_session, "get_session", lambda _sid: None)
+    monkeypatch.setattr(gateway.ffmpeg_session, "touch_session", _returning(True))
+    monkeypatch.setattr(gateway.ffmpeg_session, "get_session", _returning(None))
 
     response = client.get("/upscale/session/stream.m3u8")
 
@@ -1176,14 +1211,14 @@ def test_upscale_file_rejects_vanished_session(gateway_client, monkeypatch: pyte
 
 
 def test_upscale_file_rejects_missing_and_unsupported_files(
-    gateway_client,
+    gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
     client, _ = gateway_client
     (tmp_path / "notes.txt").write_text("x")
-    monkeypatch.setattr(gateway.ffmpeg_session, "touch_session", lambda _sid: True)
-    monkeypatch.setattr(gateway.ffmpeg_session, "get_session", lambda _sid: {"dir": str(tmp_path)})
+    monkeypatch.setattr(gateway.ffmpeg_session, "touch_session", _returning(True))
+    monkeypatch.setattr(gateway.ffmpeg_session, "get_session", _returning({"dir": str(tmp_path)}))
 
     missing = client.get("/upscale/session/segment999.ts")
     unsupported = client.get("/upscale/session/notes.txt")
@@ -1194,7 +1229,7 @@ def test_upscale_file_rejects_missing_and_unsupported_files(
     assert unsupported.json() == {"detail": "Unsupported upscale file"}
 
 
-def test_xmltv_rejects_invalid_credentials(gateway_client):
+def test_xmltv_rejects_invalid_credentials(gateway_client: GatewayClient):
     client, _ = gateway_client
 
     response = client.get("/xmltv.php", params={"username": "player", "password": "wrong"})
@@ -1202,7 +1237,10 @@ def test_xmltv_rejects_invalid_credentials(gateway_client):
     assert response.status_code == 401
 
 
-def test_xmltv_reports_unavailable_epg(gateway_client, monkeypatch: pytest.MonkeyPatch):
+def test_xmltv_reports_unavailable_epg(
+    gateway_client: GatewayClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
     client, _ = gateway_client
     monkeypatch.setattr(
         gateway,
@@ -1248,10 +1286,10 @@ def test_server_info_https_without_port(monkeypatch: pytest.MonkeyPatch):
 )
 def test_main_runs_uvicorn(
     monkeypatch: pytest.MonkeyPatch,
-    argv,
-    env,
-    expected_level,
-    uvicorn_level,
+    argv: list[str],
+    env: dict[str, str],
+    expected_level: int,
+    uvicorn_level: str,
 ):
 
     run = MagicMock()
@@ -1283,6 +1321,37 @@ class _FakeCatalog:
 
     def get(self) -> CatalogSnapshot:
         return self.snapshot
+
+
+def _returning(value: T) -> Callable[..., T]:
+    """Build a stand-in callable that ignores its arguments and returns ``value``."""
+
+    def respond(*args: object, **kwargs: object) -> T:
+        del args, kwargs
+        return value
+
+    return respond
+
+
+class _JsonResponse(Protocol):
+    @property
+    def content(self) -> bytes: ...
+
+
+def _body(response: _JsonResponse, target: type[T]) -> T:
+    return json_loads(response.content, target)
+
+
+def _records(response: _JsonResponse) -> list[dict[str, MutablePlainTree]]:
+    return _body(response, list[dict[str, MutablePlainTree]])
+
+
+class _UserInfo(TypedDict):
+    user_info: dict[str, MutablePlainTree]
+
+
+class _Profile(_UserInfo):
+    server_info: dict[str, MutablePlainTree]
 
 
 if __name__ == "__main__":

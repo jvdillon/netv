@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import NotRequired, TypedDict
 
 import hashlib
 import hmac
@@ -11,7 +11,39 @@ import pathlib
 import secrets
 import time
 
-from util import atomic_write_json, data_dir
+from treekle import MutablePlainTree, from_plain, json_loads, mutable, to_plain
+
+from util import atomic_write_json, data_dir, merge_unknown, read_json_object
+
+
+class UserRecord(TypedDict):
+    """A stored account; ``password`` is a salted PBKDF2 hash."""
+
+    password: str
+    admin: bool
+    max_streams_per_source: NotRequired[dict[str, int]]
+    unavailable_groups: NotRequired[list[str]]
+
+
+class UserLimits(TypedDict):
+    """A user's per-source stream limits and blocked groups."""
+
+    max_streams_per_source: dict[str, int]
+    unavailable_groups: list[str]
+
+
+class UserSummary(UserLimits):
+    """Public account metadata, without the password hash."""
+
+    username: str
+    admin: bool
+
+
+class TokenClaims(TypedDict):
+    """Claims signed into a session token."""
+
+    sub: str
+    exp: NotRequired[int]
 
 
 APP_DIR = pathlib.Path(__file__).parent
@@ -21,13 +53,34 @@ USERS_DIR = CACHE_DIR / "users"
 
 
 def get_all_usernames() -> list[str]:
-    """Get list of all usernames."""
-    return list(_get_users().keys())
+    """Get list of all usernames.
+
+    Returns:
+        usernames: Account names in stored order.
+    """
+    return list(
+        from_plain(
+            read_json_object(_get_settings_file()).get("users", {}),
+            dict[str, UserRecord],
+        ).keys(),
+    )
 
 
 def is_setup_required() -> bool:
-    """Check if initial setup is required (no users configured)."""
-    return len(_get_users()) == 0
+    """Check if initial setup is required (no users configured).
+
+    Returns:
+        required: Whether no account exists yet.
+    """
+    return (
+        len(
+            from_plain(
+                read_json_object(_get_settings_file()).get("users", {}),
+                dict[str, UserRecord],
+            ),
+        )
+        == 0
+    )
 
 
 def create_user(username: str, password: str, admin: bool = False) -> None:
@@ -38,17 +91,13 @@ def create_user(username: str, password: str, admin: bool = False) -> None:
         password: Plaintext password to hash.
         admin: Grant administrator access; the first account is always admin.
     """
-    settings_file = _get_settings_file()
-    settings = {}
-    if settings_file.exists():
-        settings = json.loads(settings_file.read_text())
-    users = settings.get("users", {})
+    settings = read_json_object(_get_settings_file())
+    users = from_plain(settings.get("users", {}), dict[str, UserRecord])
     # First user is always admin.
     if len(users) == 0:
         admin = True
     users[username] = {"password": _hash_password(password), "admin": admin}
-    settings["users"] = users
-    atomic_write_json(settings_file, settings)
+    _save_users(settings, users)
     # Create user directory for per-user settings.
     user_dir = USERS_DIR / username
     user_dir.mkdir(parents=True, exist_ok=True)
@@ -66,27 +115,40 @@ def delete_user(username: str) -> bool:
     settings_file = _get_settings_file()
     if not settings_file.exists():
         return False
-    settings = json.loads(settings_file.read_text())
-    users = settings.get("users", {})
+    settings = read_json_object(settings_file)
+    users = from_plain(settings.get("users", {}), dict[str, UserRecord])
     if username not in users:
         return False
     del users[username]
     _ensure_one_admin(users)
-    settings["users"] = users
     # Drop the user from source assignments so a future account with the same
     # name does not inherit access.
-    for source in settings.get("sources", []):
-        if isinstance(source.get("users"), list) and username in source["users"]:
-            source["users"] = [u for u in source["users"] if u != username]
-    atomic_write_json(settings_file, settings)
+    sources = settings.get("sources", [])
+    if isinstance(sources, list):
+        for source in sources:
+            if isinstance(source, dict):
+                assigned = source.get("users")
+                if isinstance(assigned, list) and username in assigned:
+                    source["users"] = [u for u in assigned if u != username]
+    _save_users(settings, users)
     return True
 
 
 def verify_password(username: str, password: str) -> bool:
-    """Verify username and password."""
-    users = _get_users()
-    user_data = users.get(username, {"password": _hash_password("dummy")})
-    stored = user_data["password"]
+    """Verify username and password.
+
+    Args:
+        username: Account to check.
+        password: Plaintext password to verify.
+
+    Returns:
+        valid: Whether the account exists and the password matches.
+    """
+    users = from_plain(
+        read_json_object(_get_settings_file()).get("users", {}),
+        dict[str, UserRecord],
+    )
+    stored = users[username]["password"] if username in users else _hash_password("dummy")
     valid = _verify_hashed_password(password, stored)
     return valid and username in users
 
@@ -104,21 +166,22 @@ def change_password(username: str, new_password: str) -> bool:
     settings_file = _get_settings_file()
     if not settings_file.exists():
         return False
-    settings = json.loads(settings_file.read_text())
-    users = settings.get("users", {})
+    settings = read_json_object(settings_file)
+    users = from_plain(settings.get("users", {}), dict[str, UserRecord])
     if username not in users:
         return False
     users[username]["password"] = _hash_password(new_password)
-    settings["users"] = users
-    atomic_write_json(settings_file, settings)
+    _save_users(settings, users)
     return True
 
 
 def is_admin(username: str) -> bool:
     """Check if user is an admin."""
-    users = _get_users()
-    user_data = users.get(username, {})
-    return user_data.get("admin", False)
+    users = from_plain(
+        read_json_object(_get_settings_file()).get("users", {}),
+        dict[str, UserRecord],
+    )
+    return username in users and users[username]["admin"]
 
 
 def set_admin(username: str, admin: bool) -> bool:
@@ -134,36 +197,37 @@ def set_admin(username: str, admin: bool) -> bool:
     settings_file = _get_settings_file()
     if not settings_file.exists():
         return False
-    settings = json.loads(settings_file.read_text())
-    users = settings.get("users", {})
+    settings = read_json_object(settings_file)
+    users = from_plain(settings.get("users", {}), dict[str, UserRecord])
     if username not in users:
         return False
     users[username]["admin"] = admin
     _ensure_one_admin(users)
-    settings["users"] = users
-    atomic_write_json(settings_file, settings)
+    _save_users(settings, users)
     return True
 
 
-def get_users_with_admin() -> list[dict[str, Any]]:
+def get_users_with_admin() -> list[UserSummary]:
     """Get users with their administrator status and limits.
 
     Returns:
         users: Public account metadata without password hashes.
     """
-    users = _get_users()
     return [
         {
             "username": u,
-            "admin": d.get("admin", False),
+            "admin": d["admin"],
             "max_streams_per_source": d.get("max_streams_per_source", {}),
             "unavailable_groups": d.get("unavailable_groups", []),
         }
-        for u, d in users.items()
+        for u, d in from_plain(
+            read_json_object(_get_settings_file()).get("users", {}),
+            dict[str, UserRecord],
+        ).items()
     ]
 
 
-def get_user_limits(username: str) -> dict[str, Any]:
+def get_user_limits(username: str) -> UserLimits:
     """Get a user's stream limits and group restrictions.
 
     Args:
@@ -172,8 +236,12 @@ def get_user_limits(username: str) -> dict[str, Any]:
     Returns:
         limits: Per-source stream limits and unavailable groups.
     """
-    users = _get_users()
-    user_data = users.get(username, {})
+    user_data = from_plain(
+        read_json_object(_get_settings_file()).get("users", {}),
+        dict[str, UserRecord],
+    ).get(username)
+    if user_data is None:
+        return {"max_streams_per_source": {}, "unavailable_groups": []}
     return {
         "max_streams_per_source": user_data.get("max_streams_per_source", {}),
         "unavailable_groups": user_data.get("unavailable_groups", []),
@@ -198,28 +266,27 @@ def set_user_limits(
     settings_file = _get_settings_file()
     if not settings_file.exists():
         return False
-    settings = json.loads(settings_file.read_text())
-    users = settings.get("users", {})
+    settings = read_json_object(settings_file)
+    users = from_plain(settings.get("users", {}), dict[str, UserRecord])
     if username not in users:
         return False
     if max_streams_per_source is not None:
         users[username]["max_streams_per_source"] = max_streams_per_source
     if unavailable_groups is not None:
         users[username]["unavailable_groups"] = unavailable_groups
-    settings["users"] = users
-    atomic_write_json(settings_file, settings)
+    _save_users(settings, users)
     return True
 
 
-def create_token(payload: dict[str, Any], *, expiry_seconds: int = 86_400 * 7) -> str:
+def create_token(payload: TokenClaims, *, expiry_seconds: int = 86_400 * 7) -> str:
     """Create a signed JWT-like token."""
-    payload = {**payload, "exp": int(time.time()) + expiry_seconds}
-    data = json.dumps(payload, separators=(",", ":")).encode()
+    claims: TokenClaims = {**payload, "exp": int(time.time()) + expiry_seconds}
+    data = json.dumps(claims, separators=(",", ":")).encode()
     sig = hmac.new(_get_secret_key().encode(), data, hashlib.sha256).hexdigest()
     return f"{data.hex()}.{sig}"
 
 
-def verify_token(token: str) -> dict[str, Any] | None:
+def verify_token(token: str) -> TokenClaims | None:
     """Verify a token's signature and expiry.
 
     Args:
@@ -234,12 +301,12 @@ def verify_token(token: str) -> dict[str, Any] | None:
         expected = hmac.new(_get_secret_key().encode(), data, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected):
             return None
-        payload = json.loads(data)
-        if payload.get("exp", 0) < time.time():
-            return None
-        return payload
-    except Exception:
+        payload = json_loads(data.decode(), TokenClaims)
+    except (OSError, ValueError):
         return None
+    if payload.get("exp", 0) < time.time():
+        return None
+    return payload
 
 
 def _get_settings_file() -> pathlib.Path:
@@ -258,13 +325,14 @@ def _get_settings_file() -> pathlib.Path:
 def _get_secret_key() -> str:
     """Get or generate secret key (persisted in settings)."""
     settings_file = _get_settings_file()
-    settings = {}
-    if settings_file.exists():
-        settings = json.loads(settings_file.read_text())
-    if "secret_key" not in settings:
-        settings["secret_key"] = secrets.token_hex(32)
-        atomic_write_json(settings_file, settings)
-    return settings["secret_key"]
+    settings = read_json_object(settings_file)
+    key = settings.get("secret_key")
+    if isinstance(key, str):
+        return key
+    key = secrets.token_hex(32)
+    settings["secret_key"] = key
+    atomic_write_json(settings_file, settings)
+    return key
 
 
 def _hash_password(password: str, salt: str | None = None) -> str:
@@ -283,18 +351,20 @@ def _verify_hashed_password(password: str, hashed: str) -> bool:
     return hmac.compare_digest(_hash_password(password, salt), hashed)
 
 
-# User format: {username: {password: str, admin: bool}}.
-def _get_users() -> dict[str, dict[str, Any]]:
-    """Get users from settings. Returns empty dict if no users configured."""
-    settings_file = _get_settings_file()
-    if settings_file.exists():
-        settings = json.loads(settings_file.read_text())
-        return settings.get("users", {})
-    return {}
+# Unknown keys survive both beside ``users`` and inside each user's record; a deleted
+# user, or an owned key the record no longer has, is removed.
+def _save_users(settings: dict[str, MutablePlainTree], users: dict[str, UserRecord]) -> None:
+    """Write ``users`` into the raw settings tree, keeping keys this release does not know."""
+    settings["users"] = merge_unknown(
+        settings.get("users"),
+        mutable(to_plain(users)),
+        dict[str, UserRecord],
+    )
+    atomic_write_json(_get_settings_file(), settings)
 
 
-def _ensure_one_admin(users: dict[str, dict[str, Any]]) -> None:
+def _ensure_one_admin(users: dict[str, UserRecord]) -> None:
     """Ensure at least one user is admin. Promotes first user if needed."""
-    if not users or any(u.get("admin") for u in users.values()):
+    if not users or any(u["admin"] for u in users.values()):
         return
     next(iter(users.values()))["admin"] = True

@@ -326,7 +326,7 @@ wheels = [
 [[package]]
 name = "codedoctor"
 version = "0.1.3"
-source = { registry = "https://pypi.org/simple" }
+source = { path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-policy-v5/codedoctor-0.1.3-py3-none-any.whl" }
 dependencies = [
     { name = "pyyaml" },
     { name = "rignore" },
@@ -335,9 +335,8 @@ dependencies = [
     { name = "treekle" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/32/48/d01247b0020ca1a133d47b65e6be353d536c29c94cbe4e61d34969400c72/codedoctor-0.1.3.tar.gz", hash = "sha256:ab5986d23a291b4a7a66479ae4d5a635ee0e94e6f5b9510e59ce49d366076f18", size = 691163, upload-time = "2026-11-07T23:50:27.728Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0b/65/8710f6e64b42804d21ac2213d96c44c5b30d8d1d83869bb0a00d3f72ece5/codedoctor-0.1.3-py3-none-any.whl", hash = "sha256:ab3e855a73a30c1c54ca220b1a85250afec9690d6b49e970a54ef472498e9315", size = 296588, upload-time = "2026-11-07T23:50:25.97Z" },
+    { filename = "codedoctor-0.1.3-py3-none-any.whl", hash = "sha256:7e92605342a9280189b5700719209a571a52ed92b3e1e13449e55718b6bea92b" },
 ]
 
 [package.optional-dependencies]
@@ -356,6 +355,44 @@ notebook = [
     { name = "nbstripout", marker = "sys_platform != 'linux'" },
     { name = "nbstripout-fast", marker = "sys_platform == 'linux'" },
 ]
+
+[package.metadata]
+requires-dist = [
+    { name = "coverage", marker = "extra == 'coverage'", specifier = ">=7.17.0" },
+    { name = "jupytext", marker = "extra == 'notebook'", specifier = ">=1.19.6" },
+    { name = "libcst", marker = "extra == 'mutation'", specifier = ">=1.9.0" },
+    { name = "mutmut", marker = "extra == 'mutation'", specifier = ">=3.8.1" },
+    { name = "nbstripout", marker = "sys_platform != 'linux' and extra == 'notebook'", specifier = ">=0.9.1" },
+    { name = "nbstripout-fast", marker = "sys_platform == 'linux' and extra == 'notebook'", specifier = ">=1.1.2" },
+    { name = "pytest", marker = "extra == 'mutation'", specifier = ">=9.2.0" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
+    { name = "rignore", specifier = ">=0.8.1" },
+    { name = "ruamel-yaml", specifier = ">=0.18.6" },
+    { name = "tomlkit", specifier = ">=0.15.2" },
+    { name = "tomlkit", marker = "extra == 'mutation'", specifier = ">=0.15.2" },
+    { name = "torch", marker = "extra == 'cpu'" },
+    { name = "torch", marker = "extra == 'cu126'" },
+    { name = "torch", marker = "extra == 'cu128'" },
+    { name = "torch", marker = "extra == 'cu130'" },
+    { name = "torch", marker = "extra == 'cu132'" },
+    { name = "torch", marker = "extra == 'cu134'" },
+    { name = "torchao", marker = "extra == 'cpu'" },
+    { name = "torchao", marker = "extra == 'cu126'" },
+    { name = "torchao", marker = "extra == 'cu128'" },
+    { name = "torchao", marker = "extra == 'cu130'" },
+    { name = "torchao", marker = "extra == 'cu132'" },
+    { name = "torchao", marker = "extra == 'cu134'" },
+    { name = "torchvision", marker = "extra == 'cpu'" },
+    { name = "torchvision", marker = "extra == 'cu126'" },
+    { name = "torchvision", marker = "extra == 'cu128'" },
+    { name = "torchvision", marker = "extra == 'cu130'" },
+    { name = "torchvision", marker = "extra == 'cu132'" },
+    { name = "torchvision", marker = "extra == 'cu134'" },
+    { name = "treekle", specifier = ">=0.4.1" },
+    { name = "typing-extensions", specifier = ">=4.16.0" },
+    { name = "wrapt", marker = "extra == 'mutation'", specifier = ">=2.5.2" },
+]
+provides-extras = ["coverage", "cpu", "cu126", "cu128", "cu130", "cu132", "cu134", "mutation", "notebook"]
 
 [[package]]
 name = "codespell"
@@ -1369,13 +1406,13 @@ name = "netv"
 version = "0.4.1"
 source = { editable = "." }
 dependencies = [
-    { name = "codedoctor" },
     { name = "cryptography" },
     { name = "defusedxml" },
     { name = "fastapi" },
     { name = "jinja2" },
     { name = "pychromecast" },
     { name = "python-multipart" },
+    { name = "treekle" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "wrapt" },
 ]
@@ -1439,13 +1476,13 @@ pre-commit = ">=3.12"
 
 [package.metadata]
 requires-dist = [
-    { name = "codedoctor", specifier = ">=0.1.3" },
     { name = "cryptography", specifier = ">=43.0" },
     { name = "defusedxml", specifier = ">=0.7" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "jinja2", specifier = ">=3.1" },
-    { name = "pychromecast", specifier = ">=13.1,<15" },
+    { name = "pychromecast", specifier = ">=13.1" },
     { name = "python-multipart", specifier = ">=0.0.9" },
+    { name = "treekle", specifier = ">=0.4.4" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
     { name = "wrapt", specifier = ">=2.5.2" },
 ]
@@ -1468,7 +1505,7 @@ lint = [
 ]
 pre-commit = [
     { name = "basedpyright", marker = "python_full_version >= '3.12'", specifier = ">=1.40.2" },
-    { name = "codedoctor", extras = ["coverage", "mutation", "notebook"], marker = "python_full_version >= '3.12'", specifier = ">=0.1.3" },
+    { name = "codedoctor", extras = ["coverage", "mutation", "notebook"], marker = "python_full_version >= '3.12'", path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-policy-v5/codedoctor-0.1.3-py3-none-any.whl" },
     { name = "codespell", marker = "python_full_version >= '3.12'", specifier = ">=2.4.3" },
     { name = "hatchling", marker = "python_full_version >= '3.12'", specifier = ">=1.33.0" },
     { name = "httpx2", marker = "python_full_version >= '3.12'", specifier = ">=2.16.0" },
@@ -1476,7 +1513,9 @@ pre-commit = [
     { name = "onnxconverter-common", marker = "python_full_version >= '3.12'", specifier = ">=1.16.0" },
     { name = "pre-commit", marker = "python_full_version >= '3.12'", specifier = ">=4.7.0" },
     { name = "pyrefly", marker = "python_full_version >= '3.12'", specifier = ">=1.4.0" },
+    { name = "pyrefly", marker = "python_full_version >= '3.12'", specifier = ">=1.4.1" },
     { name = "pytest", marker = "python_full_version >= '3.12'", specifier = ">=9.1.1" },
+    { name = "pytest", marker = "python_full_version >= '3.12'", specifier = ">=9.2.0" },
     { name = "pytest-asyncio", marker = "python_full_version >= '3.12'", specifier = ">=1.4.1" },
     { name = "pytest-cov", marker = "python_full_version >= '3.12'", specifier = ">=7.1.0" },
     { name = "pytest-testmon", marker = "python_full_version >= '3.12'", specifier = ">=2.3.0" },
@@ -1484,8 +1523,10 @@ pre-commit = [
     { name = "pytest-xdist", marker = "python_full_version >= '3.12'", specifier = ">=3.8.0" },
     { name = "rekursiv-ai-typings", marker = "python_full_version >= '3.12'", specifier = ">=0.1.16" },
     { name = "ruff", marker = "python_full_version >= '3.12'", specifier = ">=0.17.3" },
+    { name = "ruff", marker = "python_full_version >= '3.12'", specifier = ">=0.17.4" },
     { name = "treekle", marker = "python_full_version >= '3.12'", specifier = ">=0.4.4" },
     { name = "ty", marker = "python_full_version >= '3.12'", specifier = ">=0.0.95" },
+    { name = "ty", marker = "python_full_version >= '3.12'", specifier = ">=0.0.99" },
     { name = "wrapt", marker = "python_full_version >= '3.12'", specifier = ">=2.5.2" },
 ]
 test = [

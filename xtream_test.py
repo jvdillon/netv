@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
 import json
 
+from treekle import ReadError
+
 import pytest
 
-from xtream import XtreamClient
+from xtream import (
+    ProviderRecord,
+    XtreamClient,
+    category_ids,
+    list_field,
+    record_field,
+    text_field,
+)
 
 
 class TestXtreamClient:
@@ -80,15 +90,16 @@ class TestXtreamClientApi:
     """Tests for XtreamClient API methods with mocked network."""
 
     @pytest.fixture
-    def client(self):
+    def client(self) -> XtreamClient:
         return XtreamClient(base_url="http://example.com", username="user", password="pass")
 
     @pytest.fixture
-    def mock_urlopen(self):
-        with patch("xtream.safe_urlopen") as mock:
+    def mock_urlopen(self) -> Iterator[MagicMock]:
+        mock = MagicMock()
+        with patch("xtream.safe_urlopen", mock):
             yield mock
 
-    def _setup_response(self, mock_urlopen, data):
+    def _setup_response(self, mock_urlopen: MagicMock, data: object) -> None:
         """Helper to setup mock response."""
         mock_resp = MagicMock()
         mock_resp.read.return_value = json.dumps(data).encode("utf-8")
@@ -96,7 +107,7 @@ class TestXtreamClientApi:
         mock_resp.__exit__ = MagicMock(return_value=False)
         mock_urlopen.return_value = mock_resp
 
-    def test_get_live_categories(self, client, mock_urlopen):
+    def test_get_live_categories(self, client: XtreamClient, mock_urlopen: MagicMock):
         categories = [{"category_id": "1", "category_name": "News"}]
         self._setup_response(mock_urlopen, categories)
 
@@ -107,7 +118,7 @@ class TestXtreamClientApi:
         url = mock_urlopen.call_args[0][0]
         assert "action=get_live_categories" in url
 
-    def test_get_live_streams(self, client, mock_urlopen):
+    def test_get_live_streams(self, client: XtreamClient, mock_urlopen: MagicMock):
         streams = [{"stream_id": 1, "name": "CNN"}]
         self._setup_response(mock_urlopen, streams)
 
@@ -117,7 +128,7 @@ class TestXtreamClientApi:
         url = mock_urlopen.call_args[0][0]
         assert "action=get_live_streams" in url
 
-    def test_get_live_streams_with_category(self, client, mock_urlopen):
+    def test_get_live_streams_with_category(self, client: XtreamClient, mock_urlopen: MagicMock):
         streams = [{"stream_id": 1, "name": "CNN"}]
         self._setup_response(mock_urlopen, streams)
 
@@ -128,7 +139,7 @@ class TestXtreamClientApi:
         assert "action=get_live_streams" in url
         assert "category_id=5" in url
 
-    def test_get_vod_categories(self, client, mock_urlopen):
+    def test_get_vod_categories(self, client: XtreamClient, mock_urlopen: MagicMock):
         categories = [{"category_id": "10", "category_name": "Movies"}]
         self._setup_response(mock_urlopen, categories)
 
@@ -138,7 +149,7 @@ class TestXtreamClientApi:
         url = mock_urlopen.call_args[0][0]
         assert "action=get_vod_categories" in url
 
-    def test_get_vod_streams(self, client, mock_urlopen):
+    def test_get_vod_streams(self, client: XtreamClient, mock_urlopen: MagicMock):
         streams = [{"stream_id": 100, "name": "Movie 1"}]
         self._setup_response(mock_urlopen, streams)
 
@@ -148,7 +159,7 @@ class TestXtreamClientApi:
         url = mock_urlopen.call_args[0][0]
         assert "action=get_vod_streams" in url
 
-    def test_get_vod_streams_with_category(self, client, mock_urlopen):
+    def test_get_vod_streams_with_category(self, client: XtreamClient, mock_urlopen: MagicMock):
         streams = [{"stream_id": 100, "name": "Movie 1"}]
         self._setup_response(mock_urlopen, streams)
 
@@ -158,7 +169,7 @@ class TestXtreamClientApi:
         url = mock_urlopen.call_args[0][0]
         assert "category_id=10" in url
 
-    def test_get_series_categories(self, client, mock_urlopen):
+    def test_get_series_categories(self, client: XtreamClient, mock_urlopen: MagicMock):
         categories = [{"category_id": "20", "category_name": "Drama"}]
         self._setup_response(mock_urlopen, categories)
 
@@ -168,7 +179,7 @@ class TestXtreamClientApi:
         url = mock_urlopen.call_args[0][0]
         assert "action=get_series_categories" in url
 
-    def test_get_series(self, client, mock_urlopen):
+    def test_get_series(self, client: XtreamClient, mock_urlopen: MagicMock):
         series = [{"series_id": 200, "name": "Show 1"}]
         self._setup_response(mock_urlopen, series)
 
@@ -178,7 +189,7 @@ class TestXtreamClientApi:
         url = mock_urlopen.call_args[0][0]
         assert "action=get_series" in url
 
-    def test_get_series_with_category(self, client, mock_urlopen):
+    def test_get_series_with_category(self, client: XtreamClient, mock_urlopen: MagicMock):
         series = [{"series_id": 200, "name": "Show 1"}]
         self._setup_response(mock_urlopen, series)
 
@@ -188,8 +199,8 @@ class TestXtreamClientApi:
         url = mock_urlopen.call_args[0][0]
         assert "category_id=20" in url
 
-    def test_get_series_info(self, client, mock_urlopen):
-        info = {"info": {"name": "Show 1"}, "episodes": {"1": []}}
+    def test_get_series_info(self, client: XtreamClient, mock_urlopen: MagicMock):
+        info: ProviderRecord = {"info": {"name": "Show 1"}, "episodes": {"1": []}}
         self._setup_response(mock_urlopen, info)
 
         result = client.get_series_info(series_id=200)
@@ -199,8 +210,8 @@ class TestXtreamClientApi:
         assert "action=get_series_info" in url
         assert "series_id=200" in url
 
-    def test_get_vod_info(self, client, mock_urlopen):
-        info = {"info": {"name": "Movie 1", "plot": "A story"}}
+    def test_get_vod_info(self, client: XtreamClient, mock_urlopen: MagicMock):
+        info: ProviderRecord = {"info": {"name": "Movie 1", "plot": "A story"}}
         self._setup_response(mock_urlopen, info)
 
         result = client.get_vod_info(vod_id=100)
@@ -210,7 +221,7 @@ class TestXtreamClientApi:
         assert "action=get_vod_info" in url
         assert "vod_id=100" in url
 
-    def test_get_server_info(self, client, mock_urlopen):
+    def test_get_server_info(self, client: XtreamClient, mock_urlopen: MagicMock):
         server_info = {
             "user_info": {
                 "auth": 1,
@@ -231,20 +242,24 @@ class TestXtreamClientApi:
         result = client.get_server_info()
 
         assert result == server_info
-        assert result["user_info"]["auth"] == 1
+        assert record_field(result, "user_info")["auth"] == 1
         url = mock_urlopen.call_args[0][0]
         # get_server_info calls API with no action.
         assert "action" not in url
 
-    def test_get_server_info_auth_failed(self, client, mock_urlopen):
+    def test_get_server_info_auth_failed(self, client: XtreamClient, mock_urlopen: MagicMock):
         server_info = {"user_info": {"auth": 0}}
         self._setup_response(mock_urlopen, server_info)
 
         result = client.get_server_info()
 
-        assert result["user_info"]["auth"] == 0
+        assert record_field(result, "user_info")["auth"] == 0
 
-    def test_get_server_info_uses_shorter_timeout(self, client, mock_urlopen):
+    def test_get_server_info_uses_shorter_timeout(
+        self,
+        client: XtreamClient,
+        mock_urlopen: MagicMock,
+    ):
         self._setup_response(mock_urlopen, {"user_info": {"auth": 1}})
 
         client.get_server_info()
@@ -253,7 +268,7 @@ class TestXtreamClientApi:
         _, kwargs = mock_urlopen.call_args
         assert kwargs["timeout"] == 15
 
-    def test_custom_timeout_passed_through(self, client, mock_urlopen):
+    def test_custom_timeout_passed_through(self, client: XtreamClient, mock_urlopen: MagicMock):
         self._setup_response(mock_urlopen, [])
 
         client.get_live_categories()
@@ -262,7 +277,11 @@ class TestXtreamClientApi:
         _, kwargs = mock_urlopen.call_args
         assert kwargs["timeout"] == 30
 
-    def test_api_encodes_special_chars_in_params(self, client, mock_urlopen):
+    def test_api_encodes_special_chars_in_params(
+        self,
+        client: XtreamClient,
+        mock_urlopen: MagicMock,
+    ):
         self._setup_response(mock_urlopen, {})
 
         client._api("test_action", foo="bar&baz", key="left=right")
@@ -271,7 +290,7 @@ class TestXtreamClientApi:
         assert "foo=bar%26baz" in url
         assert "key=left%3Dright" in url
 
-    def test_get_short_epg(self, client, mock_urlopen):
+    def test_get_short_epg(self, client: XtreamClient, mock_urlopen: MagicMock):
         epg_data = {
             "epg_listings": [
                 {"title": "Show 1", "start": "2024-01-15 14:00:00"},
@@ -288,7 +307,7 @@ class TestXtreamClientApi:
         assert "stream_id=123" in url
         assert "limit=10" in url  # Default limit.
 
-    def test_get_short_epg_custom_limit(self, client, mock_urlopen):
+    def test_get_short_epg_custom_limit(self, client: XtreamClient, mock_urlopen: MagicMock):
         self._setup_response(mock_urlopen, {"epg_listings": []})
 
         client.get_short_epg(stream_id=456, limit=5)
@@ -296,6 +315,51 @@ class TestXtreamClientApi:
         url = mock_urlopen.call_args[0][0]
         assert "stream_id=456" in url
         assert "limit=5" in url
+
+    def test_zero_category_means_all(self, client: XtreamClient, mock_urlopen: MagicMock):
+        self._setup_response(mock_urlopen, [])
+
+        client.get_vod_streams(category_id=0)
+
+        assert "category_id" not in mock_urlopen.call_args[0][0]
+
+    def test_provider_extensions_are_kept(self, client: XtreamClient, mock_urlopen: MagicMock):
+        streams = [{"stream_id": 1, "vendor": {"extra": [True, None, 1.5]}}]
+        self._setup_response(mock_urlopen, streams)
+
+        assert client.get_live_streams() == streams
+
+    def test_wrong_shape_raises(self, client: XtreamClient, mock_urlopen: MagicMock):
+        self._setup_response(mock_urlopen, {"user_info": {"auth": 0}})
+
+        with pytest.raises(ReadError):
+            client.get_live_streams()
+
+
+class TestFieldReaders:
+    RECORD: ProviderRecord = {
+        "name": "CNN",
+        "num": 7,
+        "missing": None,
+        "category_ids": [1, "2"],
+        "info": {"plot": "p"},
+    }
+
+    def test_text_field(self):
+        assert text_field(self.RECORD, "name") == "CNN"
+        assert text_field(self.RECORD, "num") == "7"
+        assert text_field(self.RECORD, "missing") == ""
+        assert text_field(self.RECORD, "absent") == ""
+
+    def test_list_and_record_fields(self):
+        assert list_field(self.RECORD, "category_ids") == [1, "2"]
+        assert list_field(self.RECORD, "name") == []
+        assert record_field(self.RECORD, "info") == {"plot": "p"}
+        assert record_field(self.RECORD, "name") == {}
+
+    def test_category_ids(self):
+        assert category_ids(self.RECORD) == ["1", "2"]
+        assert category_ids({}) == []
 
 
 class TestXtreamClientUserAgent:
@@ -306,13 +370,13 @@ class TestXtreamClientUserAgent:
     """
 
     @pytest.fixture
-    def mock_urlopen(self):
-        with patch("xtream.safe_urlopen") as mock:
-            resp = MagicMock()
-            resp.read.return_value = b"[]"
-            resp.__enter__ = MagicMock(return_value=resp)
-            resp.__exit__ = MagicMock(return_value=False)
-            mock.return_value = resp
+    def mock_urlopen(self) -> Iterator[MagicMock]:
+        resp = MagicMock()
+        resp.read.return_value = b"[]"
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        mock = MagicMock(return_value=resp)
+        with patch("xtream.safe_urlopen", mock):
             yield mock
 
     def test_defaults_to_none(self):
@@ -321,7 +385,7 @@ class TestXtreamClientUserAgent:
             is None
         )
 
-    def test_user_agent_forwarded_to_urlopen(self, mock_urlopen):
+    def test_user_agent_forwarded_to_urlopen(self, mock_urlopen: MagicMock):
         client = XtreamClient(
             base_url="http://example.com",
             username="user",
@@ -331,7 +395,7 @@ class TestXtreamClientUserAgent:
         client.get_live_streams()
         assert mock_urlopen.call_args.kwargs["user_agent"] == "TiviMate/4.7.0"
 
-    def test_none_user_agent_forwarded_so_default_applies(self, mock_urlopen):
+    def test_none_user_agent_forwarded_so_default_applies(self, mock_urlopen: MagicMock):
         XtreamClient(
             base_url="http://example.com",
             username="user",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import io
 import pathlib
 import sqlite3
 import xml.etree.ElementTree as ET
@@ -54,7 +55,7 @@ def build_filtered_xmltv(
 
     root = ET.Element("tv", {"generator-info-name": "neTV"})
     if not stream_channels:
-        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        return _xml_bytes(root)
     if not database_path.exists():
         raise EpgUnavailableError("EPG database is not ready")
 
@@ -164,7 +165,15 @@ def build_filtered_xmltv(
             if row["desc"]:
                 ET.SubElement(programme, "desc").text = _xml_text(row["desc"])
 
-    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    return _xml_bytes(root)
+
+
+def _xml_bytes(root: ET.Element) -> bytes:
+    """Serialize ``root`` as UTF-8 XML with a declaration."""
+    # ``ET.tostring`` with an explicit encoding is typed Any; this is what it does.
+    buffer = io.BytesIO()
+    ET.ElementTree(root).write(buffer, encoding="utf-8", xml_declaration=True)
+    return buffer.getvalue()
 
 
 def _xml_text(value: object) -> str:

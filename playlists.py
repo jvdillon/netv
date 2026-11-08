@@ -7,17 +7,65 @@ Apple apps, can show them without editing support.
 
 from __future__ import annotations
 
-from typing import Any, Final
+from collections.abc import Iterator, Mapping
+from typing import Final, NotRequired, TypedDict
 
-import json
+import pathlib
 import re
 import threading
 import unicodedata
 import uuid
 
-from util import atomic_write_json
+from treekle import MutablePlainTree, ReadError, from_plain
+
+from util import read_json_object, write_json_object
+from xtream import ProviderRecord, category_ids, text_field
 
 import cache
+
+
+class PlaylistChannel(TypedDict, total=False):
+    """A saved playlist entry, identifying a stream as it was when added.
+
+    Entries saved by older releases may lack fields; a missing one reads as empty.
+    """
+
+    stream_id: str
+    name: str
+    source_id: str
+    epg_channel_id: str
+
+
+class Playlist(TypedDict):
+    """A named, ordered channel list."""
+
+    id: str
+    name: str
+    channels: NotRequired[list[PlaylistChannel]]
+
+
+class StreamSummary(TypedDict):
+    """The stream fields the playlist editor shows."""
+
+    stream_id: str
+    name: str
+    source_id: str
+    epg_channel_id: str
+    icon: str
+    category: str
+
+
+class ScoredSummary(StreamSummary):
+    """A stream summary ranked against a pasted channel name."""
+
+    score: float
+
+
+class NameMatch(TypedDict):
+    """The candidate streams for one pasted channel name."""
+
+    query: str
+    candidates: list[ScoredSummary]
 
 
 PREFIX: Final = "pl:"
@@ -29,36 +77,47 @@ def is_playlist_id(category_id: object) -> bool:
     return str(category_id).startswith(PREFIX)
 
 
-def stream_key(stream: dict) -> str:
+def stream_key(stream: Mapping[str, MutablePlainTree]) -> str:
     """Stream ids are only unique within a source, so qualify them."""
-    return f"{stream.get('source_id') or ''}:{stream.get('stream_id', '')}"
+    return f"{text_field(stream, 'source_id')}:{text_field(stream, 'stream_id')}"
 
 
-def load() -> list[dict[str, Any]]:
-    path = _path()
-    if not path.exists():
-        return []
+def load() -> list[Playlist]:
     try:
-        data = json.loads(path.read_text())
+        raw = read_json_object(_path()).get("playlists", [])
     except (OSError, ValueError):
         return []
-    playlists = data.get("playlists", []) if isinstance(data, dict) else []
-    return [p for p in playlists if isinstance(p, dict) and p.get("id")]
+    if not isinstance(raw, list):
+        return []
+    playlists: list[Playlist] = []
+    for entry in raw:
+        try:
+            playlist = from_plain(entry, Playlist)
+        except ReadError:
+            continue
+        if playlist["id"]:
+            playlists.append(playlist)
+    return playlists
 
 
-def save(playlists: list[dict[str, Any]]) -> None:
-    atomic_write_json(_path(), {"playlists": playlists})
+def save(playlists: list[Playlist]) -> None:
+    write_json_object(_path(), {"playlists": playlists}, _PlaylistFile)
 
 
-def get(playlist_id: str) -> dict[str, Any] | None:
+def get(playlist_id: str) -> Playlist | None:
     return next((p for p in load() if p["id"] == playlist_id), None)
 
 
-def create(name: str, channels: Any = None, *, max_playlists: int = 100) -> dict[str, Any]:
-    playlist = {
+def create(
+    name: MutablePlainTree,
+    channels: MutablePlainTree = None,
+    *,
+    max_playlists: int = 100,
+) -> Playlist:
+    playlist: Playlist = {
         "id": uuid.uuid4().hex[:12],
         "name": _clean_name(name),
-        "channels": _clean_channels(channels) if channels is not None else [],
+        "channels": [] if channels is None else _clean_channels(channels),
     }
     with _lock:
         playlists = load()
@@ -69,7 +128,11 @@ def create(name: str, channels: Any = None, *, max_playlists: int = 100) -> dict
         return playlist
 
 
-def update(playlist_id: str, name: Any = None, channels: Any = None) -> dict[str, Any] | None:
+def update(
+    playlist_id: str,
+    name: MutablePlainTree = None,
+    channels: MutablePlainTree = None,
+) -> Playlist | None:
     with _lock:
         playlists = load()
         playlist = next((p for p in playlists if p["id"] == playlist_id), None)
@@ -93,7 +156,7 @@ def delete(playlist_id: str) -> bool:
         return True
 
 
-def reorder(ids: list[str]) -> list[dict[str, Any]]:
+def reorder(ids: list[str]) -> list[Playlist]:
     with _lock:
         playlists = load()
         position = {pid: i for i, pid in enumerate(ids)}
@@ -109,17 +172,20 @@ def reorder(ids: list[str]) -> list[dict[str, Any]]:
 _index_lock = threading.Lock()
 _index: (
     tuple[
-        list[dict],
-        dict[tuple[str, str], dict],
-        dict[str, dict],
-        dict[tuple[str, str], dict],
-        dict[tuple[str, str], dict],
+        list[ProviderRecord],
+        dict[tuple[str, str], ProviderRecord],
+        dict[str, ProviderRecord],
+        dict[tuple[str, str], ProviderRecord],
+        dict[tuple[str, str], ProviderRecord],
     ]
     | None
 ) = None
 
 
-def resolve_channel(entry: dict, streams: list[dict]) -> dict | None:
+def resolve_channel(
+    entry: PlaylistChannel,
+    streams: list[ProviderRecord],
+) -> ProviderRecord | None:
     """Find the current stream for a saved entry.
 
     Stream IDs can change (or be reused) when a provider refreshes, so an id
@@ -148,7 +214,7 @@ def resolve_channel(entry: dict, streams: list[dict]) -> dict | None:
     return stream
 
 
-def with_entry_epg(entry: dict, stream: dict) -> dict:
+def with_entry_epg(entry: PlaylistChannel, stream: ProviderRecord) -> ProviderRecord:
     """Apply a curated guide identity without mutating the provider stream.
 
     Args:
@@ -158,13 +224,13 @@ def with_entry_epg(entry: dict, stream: dict) -> dict:
     Returns:
         stream: Stream metadata with any curated guide identity applied.
     """
-    epg_id = entry.get("epg_channel_id") or ""
+    epg_id = entry.get("epg_channel_id", "")
     if epg_id:
         return {**stream, "epg_channel_id": epg_id}
     return stream
 
 
-def resolve(playlist: dict, streams: list[dict]) -> list[dict]:
+def resolve(playlist: Playlist, streams: list[ProviderRecord]) -> list[ProviderRecord]:
     """Resolve available streams in playlist order without duplicates.
 
     Args:
@@ -174,7 +240,7 @@ def resolve(playlist: dict, streams: list[dict]) -> list[dict]:
     Returns:
         resolved: Available streams with curated guide identities.
     """
-    resolved: list[dict] = []
+    resolved: list[ProviderRecord] = []
     seen: set[str] = set()
     for entry in playlist.get("channels", []):
         stream = resolve_channel(entry, streams)
@@ -222,38 +288,40 @@ def normalize(name: object) -> list[str]:
     return [t for t in tokens if t not in noise]
 
 
-def summarize(stream: dict, category_names: dict[str, str]) -> dict[str, Any]:
-    category_ids = [str(c) for c in (stream.get("category_ids") or [])]
-    category = next((category_names[c] for c in category_ids if c in category_names), "")
+def summarize(stream: ProviderRecord, category_names: Mapping[str, str]) -> StreamSummary:
+    category = next(
+        (category_names[c] for c in category_ids(stream) if c in category_names),
+        "",
+    )
     return {
-        "stream_id": str(stream.get("stream_id", "")),
-        "name": stream.get("name", ""),
-        "source_id": str(stream.get("source_id") or ""),
-        "epg_channel_id": stream.get("epg_channel_id") or "",
-        "icon": stream.get("stream_icon") or "",
+        "stream_id": text_field(stream, "stream_id"),
+        "name": text_field(stream, "name"),
+        "source_id": text_field(stream, "source_id"),
+        "epg_channel_id": text_field(stream, "epg_channel_id"),
+        "icon": text_field(stream, "stream_icon"),
         "category": category,
     }
 
 
 def search(
-    streams: list[dict],
-    category_names: dict[str, str],
+    streams: list[ProviderRecord],
+    category_names: Mapping[str, str],
     query: str = "",
     category_id: str = "",
     category_prefix: str = "",
     limit: int = 200,
-) -> list[dict]:
+) -> list[StreamSummary]:
     query_tokens = normalize(query) if query else []
     raw = query.strip().upper()
-    results = []
+    results: list[StreamSummary] = []
     for s in _category_filter(streams, category_names, category_prefix):
-        if category_id and category_id not in {str(c) for c in (s.get("category_ids") or [])}:
+        if category_id and category_id not in category_ids(s):
             continue
         if query_tokens:
             tokens = set(normalize(s.get("name", "")))
             if (
                 not all(t in tokens for t in query_tokens)
-                and raw not in str(s.get("name", "")).upper()
+                and raw not in text_field(s, "name").upper()
             ):
                 continue
         results.append(summarize(s, category_names))
@@ -264,11 +332,11 @@ def search(
 
 def match_names(
     lines: list[str],
-    streams: list[dict],
-    category_names: dict[str, str],
+    streams: list[ProviderRecord],
+    category_names: Mapping[str, str],
     category_prefix: str = "",
     candidates_per_line: int = 5,
-) -> list[dict[str, Any]]:
+) -> list[NameMatch]:
     """Fuzzy-match pasted channel names to streams.
 
     Args:
@@ -297,77 +365,98 @@ def match_names(
         (s, normalize(s.get("name", "")))
         for s in _category_filter(streams, category_names, category_prefix)
     ]
-    results = []
+    results: list[NameMatch] = []
     for line in lines:
         query = line.strip()
         if not query:
             continue
         variants = [normalize(query)]
         alias = aliases.get(" ".join(variants[0]))
-        if alias:
+        if alias is not None:
             variants.append(normalize(alias))
-        scored = []
+        scored: list[tuple[float, ProviderRecord]] = []
         for s, tokens in pool:
             score = max(_score(v, tokens) for v in variants)
             if score >= 50:
                 scored.append((score, s))
         scored.sort(key=lambda item: -item[0])
         seen_names: set[str] = set()
-        candidates = []
+        candidates: list[ScoredSummary] = []
         for score, s in scored:
-            name = str(s.get("name", ""))
+            name = text_field(s, "name")
             if name in seen_names:
                 continue
             seen_names.add(name)
-            candidates.append({**summarize(s, category_names), "score": round(score, 1)})
+            summary = summarize(s, category_names)
+            candidates.append(
+                {
+                    "stream_id": summary["stream_id"],
+                    "name": summary["name"],
+                    "source_id": summary["source_id"],
+                    "epg_channel_id": summary["epg_channel_id"],
+                    "icon": summary["icon"],
+                    "category": summary["category"],
+                    "score": round(score, 1),
+                },
+            )
             if len(candidates) >= candidates_per_line:
                 break
         results.append({"query": query, "candidates": candidates})
     return results
 
 
-def _path():
+class _PlaylistFile(TypedDict):
+    playlists: list[Playlist]
+
+
+def _path() -> pathlib.Path:
     cache.initialize_paths()
     return cache.CACHE_DIR / "playlists.json"
 
 
-def _clean_name(name: Any, *, max_length: int = 80) -> str:
-    name = str(name or "").strip()[:max_length]
-    if not name:
+def _clean_name(name: MutablePlainTree, *, max_length: int = 80) -> str:
+    cleaned = ("" if name is None else str(name)).strip()[:max_length]
+    if not cleaned:
         raise ValueError("Playlist name is required")
-    return name
+    return cleaned
 
 
-def _clean_channel(entry: Any) -> dict[str, str] | None:
+def _clean_channel(entry: MutablePlainTree) -> PlaylistChannel | None:
     if not isinstance(entry, dict):
         return None
-    stream_id = str(entry.get("stream_id", "")).strip()
-    name = str(entry.get("name", "")).strip()
+    stream_id = text_field(entry, "stream_id").strip()
+    name = text_field(entry, "name").strip()
     if not stream_id and not name:
         return None
     return {
         "stream_id": stream_id,
         "name": name,
-        "source_id": str(entry.get("source_id") or "").strip(),
-        "epg_channel_id": str(entry.get("epg_channel_id") or "").strip(),
+        "source_id": text_field(entry, "source_id").strip(),
+        "epg_channel_id": text_field(entry, "epg_channel_id").strip(),
     }
 
 
-def _clean_channels(channels: Any, *, max_channels: int = 2000) -> list[dict[str, str]]:
+def _clean_channels(
+    channels: MutablePlainTree,
+    *,
+    max_channels: int = 2000,
+) -> list[PlaylistChannel]:
     if not isinstance(channels, list):
         raise ValueError("channels must be a list")
     if len(channels) > max_channels:
         raise ValueError(f"A playlist can hold at most {max_channels} channels")
-    cleaned: list[dict[str, str]] = []
+    cleaned: list[PlaylistChannel] = []
     seen: set[str] = set()
     for entry in channels:
         channel = _clean_channel(entry)
-        if not channel:
+        if channel is None:
             continue
+        source_id = channel.get("source_id", "")
+        stream_id = channel.get("stream_id", "")
         key = (
-            f"{channel['source_id']}:{channel['stream_id']}"
-            if channel["stream_id"]
-            else f"name:{channel['source_id']}:{channel['name']}"
+            f"{source_id}:{stream_id}"
+            if stream_id
+            else f"name:{source_id}:{channel.get('name', '')}"
         )
         if key in seen:
             continue
@@ -377,41 +466,51 @@ def _clean_channels(channels: Any, *, max_channels: int = 2000) -> list[dict[str
 
 
 # Cached per stream list; the list itself is kept so its identity can't be reused.
-def _stream_index(streams: list[dict]):
+def _stream_index(
+    streams: list[ProviderRecord],
+) -> tuple[
+    dict[tuple[str, str], ProviderRecord],
+    dict[str, ProviderRecord],
+    dict[tuple[str, str], ProviderRecord],
+    dict[tuple[str, str], ProviderRecord],
+]:
     """Index streams by (source, id), bare id, (source, name) and (source, epg id)."""
     global _index
     with _index_lock:
         if _index is not None and _index[0] is streams:
-            return _index[1:]
-        by_id: dict[tuple[str, str], dict] = {}
-        by_bare_id: dict[str, dict] = {}
-        by_name: dict[tuple[str, str], dict] = {}
-        by_epg: dict[tuple[str, str], dict] = {}
+            return _index[1], _index[2], _index[3], _index[4]
+        by_id: dict[tuple[str, str], ProviderRecord] = {}
+        by_bare_id: dict[str, ProviderRecord] = {}
+        by_name: dict[tuple[str, str], ProviderRecord] = {}
+        by_epg: dict[tuple[str, str], ProviderRecord] = {}
         for s in streams:
-            source = str(s.get("source_id") or "")
-            stream_id = str(s.get("stream_id", ""))
+            source = text_field(s, "source_id")
+            stream_id = text_field(s, "stream_id")
             by_id.setdefault((source, stream_id), s)
             by_bare_id.setdefault(stream_id, s)
-            by_name.setdefault((source, str(s.get("name", ""))), s)
-            epg_id = s.get("epg_channel_id") or ""
+            by_name.setdefault((source, text_field(s, "name")), s)
+            epg_id = text_field(s, "epg_channel_id")
             if epg_id:
                 by_epg.setdefault((source, epg_id), s)
         _index = (streams, by_id, by_bare_id, by_name, by_epg)
-        return _index[1:]
+        return by_id, by_bare_id, by_name, by_epg
 
 
 def _is_separator(name: str) -> bool:
     return "#####" in name or not re.search(r"[A-Za-z0-9]", name)
 
 
-def _category_filter(streams: list[dict], category_names: dict[str, str], category_prefix: str):
+def _category_filter(
+    streams: list[ProviderRecord],
+    category_names: Mapping[str, str],
+    category_prefix: str,
+) -> Iterator[ProviderRecord]:
     prefix = category_prefix.strip().upper()
     for s in streams:
-        name = str(s.get("name", ""))
-        if _is_separator(name):
+        if _is_separator(text_field(s, "name")):
             continue
         if prefix:
-            names = [category_names.get(str(c), "") for c in (s.get("category_ids") or [])]
+            names = [category_names.get(c, "") for c in category_ids(s)]
             if not any(n.upper().startswith(prefix) for n in names):
                 continue
         yield s

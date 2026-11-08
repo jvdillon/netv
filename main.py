@@ -17,19 +17,19 @@ Examples:
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Callable, Coroutine
+from collections.abc import AsyncGenerator, Callable, Coroutine, Mapping
 from concurrent import futures
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Annotated, Literal, NotRequired, Protocol, TypedDict, cast
 from urllib import error, parse
 from xml.sax.saxutils import escape as xml_escape
 
 import argparse
 import asyncio
 import contextlib
-import json
+import functools
 import logging
 import math
 import os
@@ -46,8 +46,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
+from treekle import MutablePlainTree, ReadError, from_plain, json_loads
 
-from auth import create_token, verify_password, verify_token
+from auth import TokenClaims, create_token, verify_password, verify_token
 from cache import (
     AVAILABLE_ENCODERS,
     Source,
@@ -61,7 +62,6 @@ from cache import (
     get_sources,
     get_watch_position,
     hidden_source_ids,
-    load_file_cache,
     load_live_view_counts,
     load_server_settings,
     load_user_settings,
@@ -77,6 +77,9 @@ from cache import (
 from epg import fetch_epg
 from fast_start import add_live_start_offset
 from m3u import (
+    cached_live_data,
+    cached_series_data,
+    cached_vod_data,
     fetch_m3u,
     fetch_source_live_data,
     fetch_source_vod_data,
@@ -86,16 +89,22 @@ from m3u import (
     load_all_live_data,
     load_series_data,
     load_vod_data,
-    parse_epg_urls,
 )
 from playback_policy import PlaybackHealth
 from util import safe_urlopen
-from xtream import XtreamClient
+from xtream import (
+    ProviderRecord,
+    XtreamClient,
+    category_ids,
+    list_field,
+    record_field,
+    text_field,
+)
 
 import auth
 import cache
-import casting
 import catchup
+import chromecast
 import epg
 import ffmpeg_command
 import ffmpeg_session
@@ -284,7 +293,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                                     _, _, epg_url = fetch_m3u(src.url, src.id)
                                 elif src.type == "epg":
                                     epg_url = src.url
-                                if epg_url:
+                                if epg_url is not None and epg_url:
                                     _fetch_all_epg([(epg_url, src.epg_timeout, src.id)])
                                     log.info("Scheduled EPG refresh complete for %s", src.name)
                             except Exception as e:
@@ -305,12 +314,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _shutdown_event.set()
     cleanup_stop.set()
     scheduler_stop.set()
-    await asyncio.to_thread(casting.manager.close)
+    await asyncio.to_thread(chromecast.manager.close)
     await ffmpeg_session.shutdown()
     handoff.shutdown()
 
 
-def _run_on_loop(loop: asyncio.AbstractEventLoop, coroutine: Coroutine[Any, Any, None]) -> None:
+def _run_on_loop(
+    loop: asyncio.AbstractEventLoop,
+    coroutine: Coroutine[object, object, None],
+) -> None:
     """Run a session coroutine from a worker thread on the loop that owns its processes."""
     asyncio.run_coroutine_threadsafe(coroutine, loop).result()
 
@@ -407,23 +419,23 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
 
 
-def get_current_user(request: Request) -> dict | None:
+def get_current_user(request: Request) -> TokenClaims | None:
     token = request.cookies.get("token")
-    if not token:
+    if token is None or token == "":
         return None
     return verify_token(token)
 
 
-def require_auth(request: Request) -> dict:
+def require_auth(request: Request) -> TokenClaims:
     user = get_current_user(request)
-    if not user:
+    if user is None:
         raise AuthRequired
     return user
 
 
-def require_admin(request: Request) -> dict:
+def require_admin(request: Request) -> TokenClaims:
     user = require_auth(request)
-    username = user.get("sub", "")
+    username = user["sub"]
     if not auth.is_admin(username):
         raise HTTPException(403, "Admin access required")
     return user
@@ -555,7 +567,7 @@ async def favicon():
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request, user: Annotated[dict, Depends(require_auth)]):
+async def index(request: Request, user: Annotated[TokenClaims, Depends(require_auth)]):
     del user
     return RedirectResponse("/guide", status_code=303)
 
@@ -582,7 +594,7 @@ def load_all_epg(epg_urls: list[tuple[str, int, str]]) -> None:
 
 
 @app.get("/events/epg")
-async def epg_events(user: Annotated[dict, Depends(require_auth)]):
+async def epg_events(user: Annotated[TokenClaims, Depends(require_auth)]):
     """Stream a server-sent event when the EPG is ready.
 
     Args:
@@ -600,44 +612,40 @@ async def epg_events(user: Annotated[dict, Depends(require_auth)]):
 @app.get("/guide", response_class=HTMLResponse)
 async def guide_page(
     request: Request,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     offset: int = 0,  # Hours offset from now.
     cats: str = "",  # comma-separated category IDs.
 ):
-    username = user.get("sub", "")
+    username = user["sub"]
     # Check if cats was explicitly in URL (even if empty)
     cats_in_url = "cats" in request.query_params
 
     # If no channel data in memory, try file cache first (async to avoid blocking)
-    if "live_categories" not in get_cache() or "live_streams" not in get_cache():
-        cached = await asyncio.to_thread(load_file_cache, "live_data")
-        if cached:
-            data, _ = cached
-            with get_cache_lock():
-                get_cache()["live_categories"] = data["cats"]
-                get_cache()["live_streams"] = data["streams"]
-                get_cache()["epg_urls"] = parse_epg_urls(data.get("epg_urls", []))
-        else:
-            # No cache at all - start background load and show loading page.
-            _start_guide_background_load()
-            return TEMPLATES.TemplateResponse(
-                request,
-                "guide.html",
-                {
-                    "grid_data": [],
-                    "selected_cats": [],
-                    "cats_param": cats,
-                    "time_markers": [],
-                    "offset": offset,
-                    "window_start": "",
-                    "loading_message": "Loading channel data...",
-                    "channel_count": 0,
-                    "loading": True,
-                },
-            )
+    if (
+        "live_categories" not in get_cache() or "live_streams" not in get_cache()
+    ) and not await asyncio.to_thread(_store_cached_live_data):
+        # No cache at all - start background load and show loading page.
+        _start_guide_background_load()
+        return TEMPLATES.TemplateResponse(
+            request,
+            "guide.html",
+            {
+                "grid_data": [],
+                "selected_cats": [],
+                "cats_param": cats,
+                "time_markers": [],
+                "offset": offset,
+                "window_start": "",
+                "loading_message": "Loading channel data...",
+                "channel_count": 0,
+                "loading": True,
+            },
+        )
 
     unavailable_groups = _unavailable_groups(username)
-    categories = [c for c in get_cache()["live_categories"] if _live_allowed(c, unavailable_groups)]
+    categories = [
+        c for c in get_cache().get("live_categories", []) if _live_allowed(c, unavailable_groups)
+    ]
     # EPG is optional - check sqlite db for data.
     epg_loading = not epg.has_programs()
 
@@ -651,7 +659,7 @@ async def guide_page(
     all_streams, _, _ = _get_guide_streams(",".join(default_cats), username)
     counts: dict[str, int] = {}
     for s in all_streams:
-        for c in {str(c) for c in s.get("category_ids") or []}:
+        for c in {str(c) for c in list_field(s, "category_ids")}:
             counts[c] = counts.get(c, 0) + 1
     sidebar_playlists = [
         {
@@ -666,7 +674,7 @@ async def guide_page(
         for cid in saved_filter_list
         if cid in cat_by_id
     ]
-    names = {cid: c["category_name"] for cid, c in cat_by_id.items()}
+    names: dict[str, MutablePlainTree] = {cid: c["category_name"] for cid, c in cat_by_id.items()}
     names.update({c["category_id"]: c["category_name"] for c in playlist_cats})
 
     # Selection: URL (?cats=<id>, empty = all) > saved selection > all.
@@ -674,19 +682,19 @@ async def guide_page(
     if cats_in_url:
         requested = cats
     else:
-        requested = saved_view[0] if saved_view and len(saved_view) == 1 else ""
-    selected_id = requested if requested in names else None
-    view = [selected_id] if selected_id else None
-    if saved_view != view and (cats_in_url or saved_view):
+        requested = saved_view[0] if saved_view is not None and len(saved_view) == 1 else ""
+    selected_id = requested if requested and requested in names else None
+    view = None if selected_id is None else [selected_id]
+    if saved_view != view and (cats_in_url or (saved_view is not None and len(saved_view) > 0)):
         user_settings["guide_selected_cats"] = view
         save_user_settings(username, user_settings)
-    if selected_id:
+    if selected_id is not None:
         effective_cats = selected_id
         streams, ordered_cats, selected_cats = _get_guide_streams(selected_id, username)
     else:
         effective_cats = ",".join(default_cats)
         streams, ordered_cats, selected_cats = all_streams, default_cats, set(default_cats)
-    selected_name = names[selected_id] if selected_id else "All Channels"
+    selected_name = "All Channels" if selected_id is None else names[selected_id]
     total_count = len(streams)
     guide_sections = _guide_sections(streams, ordered_cats) if selected_id is None else []
 
@@ -702,7 +710,7 @@ async def guide_page(
     grid_data = _build_guide_rows(streams, 0, initial_batch_size, window_start, window_end)
 
     # Time markers (every 30 min) - convert to local time for display.
-    time_markers = []
+    time_markers: list[dict[str, str | float]] = []
     for i in range(7):  # 0, 30, 60, 90, 120, 150, 180 minutes.
         t = window_start + timedelta(minutes=i * 30)
         t_local = t.astimezone()  # Convert to local timezone.
@@ -715,7 +723,7 @@ async def guide_page(
         )
 
     # Mobile time markers (2 hour window instead of 3)
-    time_markers_mobile = []
+    time_markers_mobile: list[dict[str, str | float]] = []
     for i in range(5):  # 0, 30, 60, 90, 120 minutes.
         t = window_start + timedelta(minutes=i * 30)
         t_local = t.astimezone()
@@ -738,7 +746,7 @@ async def guide_page(
             "all_count": len(all_streams),
             "selected_id": selected_id,
             "selected_name": selected_name,
-            "cats_param": selected_id or "",
+            "cats_param": "" if selected_id is None else selected_id,
             "effective_cats": effective_cats,  # What's actually being used.
             "grid_data": grid_data,
             "guide_sections": guide_sections,
@@ -760,7 +768,7 @@ async def guide_page(
 
 @app.get("/api/guide/rows")
 async def guide_rows_api(
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     start: int = Query(default=0, ge=0, description="Starting row index"),
     count: int = Query(default=130, ge=1, le=500, description="Number of rows to fetch"),
     offset: int = Query(default=0, ge=-168, le=168, description="Hours offset from now"),
@@ -796,39 +804,37 @@ async def guide_rows_api(
 
     # Ensure data is loaded.
     if "live_streams" not in get_cache():
-        cached = await asyncio.to_thread(load_file_cache, "live_data")
-        if cached:
-            data, _ = cached
-            with get_cache_lock():
-                get_cache()["live_categories"] = data["cats"]
-                get_cache()["live_streams"] = data["streams"]
-                get_cache()["epg_urls"] = parse_epg_urls(data.get("epg_urls", []))
+        await asyncio.to_thread(_store_cached_live_data)
 
     streams, ordered_cat_ids, _ = _get_guide_streams(cats, username)
     total_count = len(streams)
 
     if total_count == 0:
-        return JSONResponse(
-            {"rows": [], "categories": [], "total": 0, "start": start, "direct_playback": direct},
-            headers={"Cache-Control": "no-store"},
-        )
+        empty: GuideRowsResponse = {
+            "rows": [],
+            "categories": [],
+            "total": 0,
+            "start": start,
+            "direct_playback": direct,
+        }
+        return JSONResponse(empty, headers={"Cache-Control": "no-store"})
 
-    category_by_id = {
-        str(category["category_id"]): category
+    category_names: dict[str, MutablePlainTree] = {
+        str(category["category_id"]): category.get("category_name")
         for category in get_cache().get("live_categories", [])
     }
-    category_by_id.update({c["category_id"]: c for c in _playlist_categories()})
+    category_names.update({c["category_id"]: c["category_name"] for c in _playlist_categories()})
     populated_category_ids = {
-        str(category_id) for stream in streams for category_id in (stream.get("category_ids") or [])
+        str(category_id) for stream in streams for category_id in list_field(stream, "category_ids")
     }
-    guide_categories = [
+    guide_categories: list[dict[str, MutablePlainTree]] = [
         {
             "category_id": category_id,
-            "category_name": category_by_id[category_id]["category_name"],
+            "category_name": category_names[category_id],
             **({"kind": "playlist"} if playlists.is_playlist_id(category_id) else {}),
         }
         for category_id in ordered_cat_ids
-        if category_id in category_by_id and category_id in populated_category_ids
+        if category_id in category_names and category_id in populated_category_ids
     ]
 
     # Time window.
@@ -841,61 +847,55 @@ async def guide_rows_api(
         # Only export URLs from the already permission-filtered guide page.
         # Nothing is proxied or transcoded; the client connects to the provider.
         for row, stream in zip(rows, streams[start : start + count], strict=False):
-            url = stream.get("direct_url", "")
+            url = text_field(stream, "direct_url")
             if not url and stream.get("source_type") == "xtream":
-                base = stream.get("source_url", "").rstrip("/")
-                user_name = parse.quote(stream.get("source_username", ""), safe="")
-                password = parse.quote(stream.get("source_password", ""), safe="")
+                base = text_field(stream, "source_url").rstrip("/")
+                user_name = parse.quote(text_field(stream, "source_username"), safe="")
+                password = parse.quote(text_field(stream, "source_password"), safe="")
                 upstream_id = str(stream["stream_id"]).rsplit("_", 1)[-1]
                 url = f"{base}/live/{user_name}/{password}/{upstream_id}.m3u8"
             row["channel"]["direct_url"] = url
             # This contract exports live URLs only, not archive playback URLs.
             row["channel"]["catchup_days"] = 0
 
-    return JSONResponse(
-        {
-            "rows": rows,
-            "categories": guide_categories,
-            "total": total_count,
-            "start": start,
-            "window_start_timestamp": window_start.timestamp(),
-            "direct_playback": direct,
-        },
-        headers={"Cache-Control": "no-store"},
-    )
+    page: GuideRowsResponse = {
+        "rows": rows,
+        "categories": guide_categories,
+        "total": total_count,
+        "start": start,
+        "window_start_timestamp": window_start.timestamp(),
+        "direct_playback": direct,
+    }
+    return JSONResponse(page, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/vod", response_class=HTMLResponse)
 async def vod_page(
     request: Request,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     category: int | None = None,
     sort: str | None = None,
 ):
     # Load from file cache if not in memory (async to avoid blocking)
-    if "vod_categories" not in get_cache() or "vod_streams" not in get_cache():
-        cached = await asyncio.to_thread(load_file_cache, "vod_data")
-        if cached:
-            data, _ = cached
-            get_cache()["vod_categories"] = data["cats"]
-            get_cache()["vod_streams"] = data["streams"]
-        else:
-            # No cache - start background load and show loading page.
-            _start_vod_background_load()
-            username = user.get("sub", "")
-            user_settings = load_user_settings(username)
-            return TEMPLATES.TemplateResponse(
-                request,
-                "vod.html",
-                {
-                    "categories": [],
-                    "streams": [],
-                    "current_category": category,
-                    "current_sort": sort,
-                    "loading": True,
-                    "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
-                },
-            )
+    if (
+        "vod_categories" not in get_cache() or "vod_streams" not in get_cache()
+    ) and not await asyncio.to_thread(_store_cached_vod_data):
+        # No cache - start background load and show loading page.
+        _start_vod_background_load()
+        username = user["sub"]
+        user_settings = load_user_settings(username)
+        return TEMPLATES.TemplateResponse(
+            request,
+            "vod.html",
+            {
+                "categories": [],
+                "streams": [],
+                "current_category": category,
+                "current_sort": sort,
+                "loading": True,
+                "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
+            },
+        )
 
     username = user.get("sub", "")
     user_settings = load_user_settings(username)
@@ -909,35 +909,35 @@ async def vod_page(
     unavailable_groups = _unavailable_groups(username)
 
     # Filter by group access (movies:{source_id})
-    def movie_allowed(s: dict) -> bool:
-        source_id = s.get("source_id", "")
-        return f"movies:{source_id}" not in unavailable_groups
-
-    streams = [s for s in get_cache()["vod_streams"] if movie_allowed(s)]
+    streams = [
+        s
+        for s in get_cache().get("vod_streams", [])
+        if f"movies:{text_field(s, 'source_id')}" not in unavailable_groups
+    ]
     categories = [
         c
-        for c in get_cache()["vod_categories"]
-        if f"movies:{c.get('source_id', '')}" not in unavailable_groups
+        for c in get_cache().get("vod_categories", [])
+        if f"movies:{text_field(c, 'source_id')}" not in unavailable_groups
     ]
 
     # Apply user's VOD category filter (if set)
     vod_filter = user_settings.get("vod_filter", [])
     if vod_filter:
-        vod_filter_set = set(str(c) for c in vod_filter)
+        vod_filter_set = set(vod_filter)
         categories = [c for c in categories if str(c.get("category_id")) in vod_filter_set]
         streams = [s for s in streams if str(s.get("category_id")) in vod_filter_set]
 
     # Filter by category if specified.
-    if category:
+    if category is not None and category != 0:
         streams = [s for s in streams if str(s.get("category_id")) == str(category)]
 
     # Sort.
     if sort == "alpha":
-        streams.sort(key=lambda s: (s.get("name") or "").lower())
+        streams.sort(key=lambda s: text_field(s, "name").lower())
     elif sort == "rating":
         streams.sort(key=lambda s: _safe_float(s.get("rating")), reverse=True)
     elif sort == "newest":
-        streams.sort(key=lambda s: int(s.get("added") or 0), reverse=True)
+        streams.sort(key=lambda s: _int_value(s.get("added")), reverse=True)
 
     return TEMPLATES.TemplateResponse(
         request,
@@ -956,34 +956,30 @@ async def vod_page(
 @app.get("/series", response_class=HTMLResponse)
 async def series_page(
     request: Request,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     category: int | None = None,
     sort: str | None = None,
 ):
     # Load from file cache if not in memory (async to avoid blocking)
-    if "series_categories" not in get_cache() or "series" not in get_cache():
-        cached = await asyncio.to_thread(load_file_cache, "series_data")
-        if cached:
-            data, _ = cached
-            get_cache()["series_categories"] = data["cats"]
-            get_cache()["series"] = data["series"]
-        else:
-            # No cache - start background load and show loading page.
-            _start_series_background_load()
-            username = user.get("sub", "")
-            user_settings = load_user_settings(username)
-            return TEMPLATES.TemplateResponse(
-                request,
-                "series.html",
-                {
-                    "categories": [],
-                    "series": [],
-                    "current_category": category,
-                    "current_sort": sort,
-                    "loading": True,
-                    "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
-                },
-            )
+    if (
+        "series_categories" not in get_cache() or "series" not in get_cache()
+    ) and not await asyncio.to_thread(_store_cached_series_data):
+        # No cache - start background load and show loading page.
+        _start_series_background_load()
+        username = user["sub"]
+        user_settings = load_user_settings(username)
+        return TEMPLATES.TemplateResponse(
+            request,
+            "series.html",
+            {
+                "categories": [],
+                "series": [],
+                "current_category": category,
+                "current_sort": sort,
+                "loading": True,
+                "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
+            },
+        )
 
     username = user.get("sub", "")
     user_settings = load_user_settings(username)
@@ -997,35 +993,35 @@ async def series_page(
     unavailable_groups = _unavailable_groups(username)
 
     # Filter by group access (series:{source_id})
-    def series_allowed(s: dict) -> bool:
-        source_id = s.get("source_id", "")
-        return f"series:{source_id}" not in unavailable_groups
-
-    series = [s for s in get_cache()["series"] if series_allowed(s)]
+    series = [
+        s
+        for s in get_cache().get("series", [])
+        if f"series:{text_field(s, 'source_id')}" not in unavailable_groups
+    ]
     categories = [
         c
-        for c in get_cache()["series_categories"]
-        if f"series:{c.get('source_id', '')}" not in unavailable_groups
+        for c in get_cache().get("series_categories", [])
+        if f"series:{text_field(c, 'source_id')}" not in unavailable_groups
     ]
 
     # Apply user's series category filter (if set)
     series_filter = user_settings.get("series_filter", [])
     if series_filter:
-        series_filter_set = set(str(c) for c in series_filter)
+        series_filter_set = set(series_filter)
         categories = [c for c in categories if str(c.get("category_id")) in series_filter_set]
         series = [s for s in series if str(s.get("category_id")) in series_filter_set]
 
     # Filter by category if specified.
-    if category:
+    if category is not None and category != 0:
         series = [s for s in series if str(s.get("category_id")) == str(category)]
 
     # Sort.
     if sort == "alpha":
-        series.sort(key=lambda s: (s.get("name") or "").lower())
+        series.sort(key=lambda s: text_field(s, "name").lower())
     elif sort == "rating":
         series.sort(key=lambda s: _safe_float(s.get("rating")), reverse=True)
     elif sort == "newest":
-        series.sort(key=lambda s: int(s.get("last_modified") or 0), reverse=True)
+        series.sort(key=lambda s: _int_value(s.get("last_modified")), reverse=True)
 
     return TEMPLATES.TemplateResponse(
         request,
@@ -1045,23 +1041,22 @@ async def series_page(
 async def series_detail_page(
     request: Request,
     series_id: int,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     refresh: bool = False,
 ):
-    username = user.get("sub", "")
+    username = user["sub"]
 
     # Check access for this specific series and get source_id.
     source_id = ""
-    if "series" in get_cache():
-        cached_series = next(
-            (s for s in get_cache()["series"] if str(s.get("series_id")) == str(series_id)),
-            None,
-        )
-        if cached_series:
-            source_id = cached_series.get("source_id", "")
-            unavailable_groups = _unavailable_groups(username)
-            if f"series:{source_id}" in unavailable_groups:
-                raise HTTPException(403, "Access to this series is restricted")
+    cached_series = next(
+        (s for s in get_cache().get("series", []) if str(s.get("series_id")) == str(series_id)),
+        None,
+    )
+    if cached_series is not None:
+        source_id = text_field(cached_series, "source_id")
+        unavailable_groups = _unavailable_groups(username)
+        if f"series:{source_id}" in unavailable_groups:
+            raise HTTPException(403, "Access to this series is restricted")
 
     # Use the series' source, fall back to first Xtream source.
     xtream = get_xtream_client_by_source(source_id) if source_id else None
@@ -1090,46 +1085,17 @@ async def series_detail_page(
     if refresh:
         log.info("Force refreshed series info %s", series_id)
     # Extract year from releaseDate if not present.
-    if series_data.get("info"):
-        info = series_data["info"]
-        if not info.get("year") and info.get("releaseDate"):
-            info["year"] = info["releaseDate"][:4]
+    info = record_field(series_data, "info")
+    release_date = info.get("releaseDate")
+    if not _present(info.get("year")) and isinstance(release_date, str) and release_date:
+        info["year"] = release_date[:4]
     # Strip redundant series title and episode numbers from episode titles.
-    if series_data.get("episodes"):
-        for season_eps in series_data["episodes"].values():
+    for season_eps in record_field(series_data, "episodes").values():
+        if isinstance(season_eps, list):
             for ep in season_eps:
-                if ep.get("title"):
-                    # Remove patterns like "Series Name - S01E01 - Episode Title"
-                    # Keep only the actual episode title.
-                    title = ep["title"]
-                    # Remove S##E## - pattern.
-                    title = re.sub(r"^S\d+E\d+\s*-\s*", "", title)
-                    # Remove any leading "SeriesName - " pattern.
-                    if " - " in title and len(title.split(" - ")) > 1:
-                        parts = title.split(" - ")
-                        # Take the last part which should be the actual episode title.
-                        title = parts[-1]
-                    ep["title"] = title.strip()
+                if isinstance(ep, dict):
+                    _clean_episode(ep)
 
-                # Parse info field if it's JSON.
-                if ep.get("info"):
-                    if isinstance(ep["info"], str):
-                        try:
-                            info_obj = json.loads(ep["info"])
-                            # Extract plot/description from parsed JSON.
-                            if isinstance(info_obj, dict):
-                                ep["description"] = (
-                                    info_obj.get("plot") or info_obj.get("description") or ""
-                                )
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                    elif isinstance(ep["info"], dict):
-                        # Already a dict.
-                        ep["description"] = (
-                            ep["info"].get("plot") or ep["info"].get("description") or ""
-                        )
-
-    username = user.get("sub", "")
     user_settings = load_user_settings(username)
     return TEMPLATES.TemplateResponse(
         request,
@@ -1146,9 +1112,9 @@ async def series_detail_page(
 async def movie_detail_page(
     request: Request,
     stream_id: int,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
 ):
-    username = user.get("sub", "")
+    username = user["sub"]
 
     # Load from file cache if not in memory.
     if "vod_streams" not in get_cache():
@@ -1158,47 +1124,12 @@ async def movie_detail_page(
 
     vod_streams = get_cache().get("vod_streams", [])
     movie = next((m for m in vod_streams if m.get("stream_id") == stream_id), None)
-
-    # Check access for this specific movie.
-    if movie:
-        source_id = movie.get("source_id", "")
-        unavailable_groups = _unavailable_groups(username)
-        if f"movies:{source_id}" in unavailable_groups:
+    if movie is not None:
+        source_id = text_field(movie, "source_id")
+        if f"movies:{source_id}" in _unavailable_groups(username):
             raise HTTPException(403, "Access to this movie is restricted")
+        movie = await _with_vod_details(movie, source_id, stream_id)
 
-    # Fetch detailed movie info.
-    if movie:
-        source_id = movie.get("source_id", "")
-        xtream = get_xtream_client_by_source(source_id) if source_id else None
-        if not xtream:
-            xtream = get_first_xtream_client()
-        if xtream:
-            cache_key = (
-                f"vod_info_{source_id}_{stream_id}" if source_id else f"vod_info_{stream_id}"
-            )
-            try:
-                vod_info = await asyncio.to_thread(
-                    get_cached_info,
-                    cache_key,
-                    lambda: xtream.get_vod_info(stream_id),
-                )
-            except (error.URLError, TimeoutError):
-                vod_info = {}
-            if vod_info and vod_info.get("info"):
-                info = vod_info["info"]
-                # Merge detailed info into movie object.
-                movie = {**movie}  # Copy.
-                movie["plot"] = info.get("plot") or info.get("description", "")
-                movie["director"] = info.get("director", "")
-                movie["cast"] = info.get("cast") or info.get("actors", "")
-                movie["genre"] = info.get("genre", "")
-                movie["rating"] = info.get("rating", "")
-                movie["year"] = info.get("releasedate", "")[:4] if info.get("releasedate") else ""
-                movie["duration"] = info.get("duration", "")
-                movie["cover_big"] = info.get("cover_big") or info.get("movie_image", "")
-                movie["youtube_trailer"] = info.get("youtube_trailer", "")
-
-    username = user.get("sub", "")
     user_settings = load_user_settings(username)
     return TEMPLATES.TemplateResponse(
         request,
@@ -1208,6 +1139,102 @@ async def movie_detail_page(
             "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
         },
     )
+
+
+class CurrentProgram(TypedDict):
+    """EPG program airing now on a channel."""
+
+    title: str
+    desc: str
+    start: float
+    end: float
+
+
+class GuideProgram(TypedDict):
+    """One program cell in the guide grid or archive list."""
+
+    title: str
+    desc: str
+    start: str
+    end: str
+    start_timestamp: float
+    end_timestamp: float
+    left_pct: float
+    width_pct: float
+    catchup: bool
+    unavailable: NotRequired[bool]
+
+
+class CatchupListing(TypedDict):
+    """Archive length and the archived programs of one channel."""
+
+    days: int
+    programs: list[GuideProgram]
+
+
+class GuideChannel(TypedDict):
+    """Channel header of one guide row."""
+
+    stream_id: MutablePlainTree
+    name: MutablePlainTree
+    icon: MutablePlainTree
+    epg_id: str
+    category_ids: list[str]
+    catchup_days: int
+    direct_url: NotRequired[str]
+
+
+class GuideRow(TypedDict):
+    """One channel and its programs for the desktop and mobile windows."""
+
+    channel: GuideChannel
+    programs: list[GuideProgram]
+    programs_mobile: list[GuideProgram]
+    index: int
+
+
+class GuideRowsResponse(TypedDict):
+    """One page of guide rows for virtual scrolling and native clients."""
+
+    rows: list[GuideRow]
+    categories: list[dict[str, MutablePlainTree]]
+    total: int
+    start: int
+    direct_playback: bool
+    window_start_timestamp: NotRequired[float]
+
+
+class PlaylistChannelView(playlists.PlaylistChannel, total=False):
+    """A playlist entry resolved against current streams."""
+
+    icon: str
+    category: str
+    available: bool
+    guide_assignable: bool
+
+
+class PlaylistPayload(TypedDict):
+    """A shared playlist with its channels resolved against current streams."""
+
+    id: str
+    category_id: str
+    name: str
+    channels: list[PlaylistChannelView]
+
+
+class GuideSection(TypedDict):
+    """Guide row index where a selected category's channels begin."""
+
+    start: int
+    name: str
+
+
+class PlaylistCategory(TypedDict):
+    """Shared playlist presented as a guide category."""
+
+    category_id: str
+    category_name: str
+    kind: str
 
 
 @dataclass(kw_only=True, slots=True)
@@ -1223,7 +1250,7 @@ class PlayerInfo:
     program_end: float = 0.0  # Unix timestamp of current program end (EPG)
     deinterlace_fallback: bool = True  # Used when probe is skipped.
     source_id: str = ""  # Source ID for stream limit tracking.
-    category_ids: list[str] | None = None  # Category IDs for live streams (access check)
+    category_ids: list[MutablePlainTree] | None = None  # Live stream categories (access check)
     catchup_days: int = 0  # Days of upstream archive for live streams (0 = none)
     catchup_start: float = 0.0  # Unix time the archived stream starts at.
     catchup_seek: float = 0.0  # Seconds into the archived stream to start playing.
@@ -1235,7 +1262,7 @@ async def player_page(
     request: Request,
     stream_type: str,
     stream_id: str,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     ext: str = "",
     series_id: int | None = None,
     start: float | None = Query(default=None, description="Catchup: unix start of a past program"),
@@ -1253,7 +1280,7 @@ async def player_page(
         start: Archive broadcast timestamp to resume.
         handoff_id: Handoff identifier to claim.
     """
-    username = user.get("sub", "")
+    username = user["sub"]
     next_episode_url = None
     if stream_type == "live" and handoff_id:
         info = await asyncio.to_thread(
@@ -1298,7 +1325,7 @@ async def player_page(
     if unavailable_groups:
         if stream_type == "live":
             # Live streams: blocked if the source or any category is unavailable.
-            live = {"source_id": info.source_id, "category_ids": info.category_ids}
+            live: ProviderRecord = {"source_id": info.source_id, "category_ids": info.category_ids}
             if not _live_allowed(live, unavailable_groups):
                 raise HTTPException(403, "Access to this channel is restricted")
         elif stream_type == "movie" and info.source_id:
@@ -1341,8 +1368,8 @@ async def player_page(
     resume_position = 0.0
     if stream_type in ("movie", "series"):
         watch_entry = get_watch_position(username, info.url)
-        if watch_entry:
-            resume_position = watch_entry.get("position", 0.0)
+        if watch_entry is not None:
+            resume_position = watch_entry["position"]
 
     # For series, stream_id is episode_id.
     episode_id = int(stream_id) if stream_type == "series" and stream_id.isdigit() else None
@@ -1390,7 +1417,7 @@ async def player_page(
 @app.get("/api/live/program/{stream_id:path}")
 async def live_program_api(
     stream_id: str,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     """Return the current EPG program for a live channel.
 
@@ -1399,19 +1426,17 @@ async def live_program_api(
         user: Authenticated viewer claims used for access checks.
     """
 
-    def lookup() -> dict | None:
+    def lookup() -> CurrentProgram | None:
         _ensure_live_cache()
-        stream = next(
-            (s for s in get_cache()["live_streams"] if str(s.get("stream_id")) == stream_id),
-            None,
-        )
-        if not stream or not _live_stream_filter(user.get("sub", ""))(stream):
+        stream = _find_live_stream(stream_id)
+        if stream is None or not _live_stream_filter(user["sub"])(stream):
             raise HTTPException(404, "Stream not found")
         return _get_current_program(_live_epg_id(stream))
 
     program = await asyncio.to_thread(lookup)
+    no_program: CurrentProgram = {"title": "", "desc": "", "start": 0.0, "end": 0.0}
     return JSONResponse(
-        program or {"title": "", "desc": "", "start": 0.0, "end": 0.0},
+        no_program if program is None else program,
         headers={"Cache-Control": "no-store"},
     )
 
@@ -1419,7 +1444,7 @@ async def live_program_api(
 @app.get("/api/live/catchup/{stream_id:path}")
 async def live_catchup_api(
     stream_id: str,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     """Return archived programs newest first, including the airing program.
 
@@ -1428,10 +1453,10 @@ async def live_catchup_api(
         user: Authenticated viewer claims used for access checks.
     """
 
-    def lookup() -> dict:
+    def lookup() -> CatchupListing:
         _ensure_live_cache()
         stream = _find_live_stream(stream_id)
-        if not stream or not _live_stream_filter(user.get("sub", ""))(stream):
+        if stream is None or not _live_stream_filter(user["sub"])(stream):
             raise HTTPException(404, "Stream not found")
         days = catchup.archive_days(stream)
         epg_id = _live_epg_id(stream)
@@ -1442,7 +1467,7 @@ async def live_catchup_api(
             epg_id,
             now - timedelta(days=days),
             now,
-            stream.get("source_id", ""),
+            text_field(stream, "source_id"),
         )
         return {
             "days": days,
@@ -1469,7 +1494,7 @@ async def live_catchup_api(
 @app.get("/search", response_class=HTMLResponse)
 async def search_page(
     request: Request,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     q: str = "",
     regex: bool = False,
     live: bool = False,
@@ -1477,7 +1502,7 @@ async def search_page(
     series: bool = False,
     limit: int = 100,
 ):
-    results: dict[str, list] = {"live": [], "vod": [], "series": []}
+    results: dict[str, list[ProviderRecord]] = {"live": [], "vod": [], "series": []}
 
     # Default all on if none specified.
     if not live and not vod and not series:
@@ -1497,11 +1522,11 @@ async def search_page(
                     get_cache()["live_categories"] = cats
                     get_cache()["live_streams"] = streams
                     get_cache()["epg_urls"] = epg_urls
-            matched = sorted(
-                [s for s in get_cache()["live_streams"] if match_fn(s.get("name") or "")],
-                key=lambda x: x.get("name", "").lower(),
+            results["live"] = _matching_names(
+                get_cache().get("live_streams", []),
+                match_fn,
+                limit,
             )
-            results["live"] = matched[:limit] if limit else matched
 
         # Load VOD data (run in thread to avoid blocking)
         if vod:
@@ -1510,11 +1535,7 @@ async def search_page(
                 with get_cache_lock():
                     get_cache()["vod_categories"] = vod_cats
                     get_cache()["vod_streams"] = vod_streams
-            matched = sorted(
-                [s for s in get_cache()["vod_streams"] if match_fn(s.get("name") or "")],
-                key=lambda x: x.get("name", "").lower(),
-            )
-            results["vod"] = matched[:limit] if limit else matched
+            results["vod"] = _matching_names(get_cache().get("vod_streams", []), match_fn, limit)
 
         # Load series data (run in thread to avoid blocking)
         if series:
@@ -1523,13 +1544,9 @@ async def search_page(
                 with get_cache_lock():
                     get_cache()["series_categories"] = series_cats
                     get_cache()["series"] = series_list
-            matched = sorted(
-                [s for s in get_cache()["series"] if match_fn(s.get("name") or "")],
-                key=lambda x: x.get("name", "").lower(),
-            )
-            results["series"] = matched[:limit] if limit else matched
+            results["series"] = _matching_names(get_cache().get("series", []), match_fn, limit)
 
-    username = user.get("sub", "")
+    username = user["sub"]
     user_settings = load_user_settings(username)
 
     # Filter results based on user access.
@@ -1549,21 +1566,21 @@ async def search_page(
     # Apply user's category filters from settings.
     guide_filter = user_settings.get("guide_filter", [])
     if guide_filter:
-        guide_filter_set = set(str(c) for c in guide_filter)
+        guide_filter_set = set(guide_filter)
         results["live"] = [
             s
             for s in results["live"]
-            if any(str(cat_id) in guide_filter_set for cat_id in (s.get("category_ids") or []))
+            if any(str(cat_id) in guide_filter_set for cat_id in list_field(s, "category_ids"))
         ]
 
     vod_filter = user_settings.get("vod_filter", [])
     if vod_filter:
-        vod_filter_set = set(str(c) for c in vod_filter)
+        vod_filter_set = set(vod_filter)
         results["vod"] = [s for s in results["vod"] if str(s.get("category_id")) in vod_filter_set]
 
     series_filter = user_settings.get("series_filter", [])
     if series_filter:
-        series_filter_set = set(str(c) for c in series_filter)
+        series_filter_set = set(series_filter)
         results["series"] = [
             s for s in results["series"] if str(s.get("category_id")) in series_filter_set
         ]
@@ -1590,7 +1607,7 @@ async def search_page(
 async def stream_redirect(
     stream_type: str,
     stream_id: int,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     ext: str = "",
 ):
     xtream = get_first_xtream_client()
@@ -1605,7 +1622,7 @@ async def stream_redirect(
 
 @app.get("/playlist.xspf")
 async def playlist_xspf(
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     url: str,
 ):
     del user
@@ -1628,7 +1645,7 @@ async def playlist_xspf(
 @app.get("/transcode/start")
 async def transcode_start(
     request: Request,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     url: str,
     content_type: str = "live",  # "movie", "series", or "live"
     series_id: int | None = None,
@@ -1656,7 +1673,7 @@ async def transcode_start(
         fast_start: Enable adaptive live startup.
         audio_passthrough: Whether the client decodes Dolby audio.
     """
-    if casting.manager.owns_url(url):
+    if chromecast.manager.owns_url(url):
         raise HTTPException(
             409,
             "This stream is playing on a TV. Stop casting before starting it here.",
@@ -1685,7 +1702,7 @@ async def transcode_start(
         settings = load_server_settings()
         sources = settings.get("sources", [])
         source = next((s for s in sources if s.get("id") == source_id), None)
-        if source:
+        if source is not None:
             source_max_streams = source.get("max_streams", 0)
 
     result = await ffmpeg_session.start_transcode(
@@ -1714,7 +1731,7 @@ async def transcode_start(
 async def transcode_health(
     session_id: str,
     health: PlaybackHealth,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     return ffmpeg_session.report_playback_health(session_id, user.get("sub", ""), health)
 
@@ -1723,11 +1740,11 @@ async def transcode_health(
 async def transcode_seek(
     session_id: str,
     time: float,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     """Seek VOD transcode to a new position."""
     del user
-    if casting.manager.owns_session(session_id):
+    if chromecast.manager.owns_session(session_id):
         raise HTTPException(409, "Stop casting before changing the transcode position.")
     return await ffmpeg_session.seek_transcode(session_id, time)
 
@@ -1735,12 +1752,12 @@ async def transcode_seek(
 @app.get("/transcode/progress/{session_id}")
 async def transcode_progress(
     session_id: str,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     """Get transcode progress (segment count, duration)."""
     del user
     progress = ffmpeg_session.get_session_progress(session_id)
-    if not progress:
+    if progress is None:
         raise HTTPException(404, "Session not found")
     return progress
 
@@ -1764,7 +1781,7 @@ async def transcode_file(
         raise HTTPException(400, "Invalid filename")
 
     session = ffmpeg_session.get_session(session_id)
-    if not session:
+    if session is None:
         log.debug("[CAST] 404 session not found: %s", session_id)
         raise HTTPException(404, "Transcode session not found")
 
@@ -1783,7 +1800,7 @@ async def transcode_file(
     cors = {"Access-Control-Allow-Origin": "*"}
     if filename.endswith(".m3u8"):
         content = file_path.read_text()
-        if filename == "low.m3u8" and session.get("fast_start"):
+        if filename == "low.m3u8" and session.get("fast_start", False):
             content = add_live_start_offset(
                 ffmpeg_session.dated_fast_playlist(session_id, content),
                 float(session.get("playback_buffer_seconds", 12.0)),
@@ -1819,7 +1836,7 @@ async def subtitle_file(session_id: str, filename: str):
     if not safe_filename.endswith(".vtt"):
         raise HTTPException(400, "Only VTT files allowed")
     session = ffmpeg_session.get_session(session_id)
-    if not session:
+    if session is None:
         raise HTTPException(404, "Session not found")
     file_path = pathlib.Path(session["dir"]) / safe_filename
     # Wait briefly for file, return empty VTT if not ready (client will poll again)
@@ -1842,7 +1859,7 @@ async def subtitle_file(session_id: str, filename: str):
 @app.delete("/transcode/{session_id}")
 async def transcode_stop(
     session_id: str,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     force: bool = False,
 ):
     """Stop a transcode session while retaining reusable VOD caches.
@@ -1852,11 +1869,11 @@ async def transcode_stop(
         user: Authenticated viewer claims used to verify forced-stop ownership.
         force: Remove the session and its cache immediately.
     """
-    if casting.manager.owns_session(session_id):
+    if chromecast.manager.owns_session(session_id):
         return {"status": "casting"}
     session = ffmpeg_session.get_session(session_id)
-    force = force or bool(session and session.get("is_archive"))
-    if force and session and session.get("username") != user.get("sub", ""):
+    force = force or (session is not None and session.get("is_archive", False))
+    if force and session is not None and session.get("username") != user["sub"]:
         raise HTTPException(404, "Session not found")
     await ffmpeg_session.stop_session(session_id, force=force)
     return {"status": "stopped"}
@@ -1865,7 +1882,7 @@ async def transcode_stop(
 @app.post("/transcode/{session_id}/stop")
 async def transcode_stop_post(
     session_id: str,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     force: bool = False,
 ):
     """Stop a transcode session (POST for sendBeacon, VOD cached)."""
@@ -1875,7 +1892,7 @@ async def transcode_stop_post(
 @app.delete("/transcode-clear")
 async def transcode_clear(
     url: str,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     """Force-delete any cached transcode session for a URL.
 
@@ -1884,56 +1901,40 @@ async def transcode_clear(
         user: Authenticated viewer claims.
     """
     del user
-    if casting.manager.owns_url(url):
+    if chromecast.manager.owns_url(url):
         raise HTTPException(409, "Stop casting before restarting this transcode.")
     session_id = ffmpeg_session.clear_url_session(url)
-    if session_id:
+    if session_id is not None:
         await ffmpeg_session.stop_session(session_id, force=True)
         log.info("Force-cleared transcode session %s for URL", session_id)
     return {"status": "cleared", "session_id": session_id}
 
 
 @app.get("/settings", response_class=HTMLResponse)
-async def settings_page(request: Request, user: Annotated[dict, Depends(require_auth)]):
+async def settings_page(request: Request, user: Annotated[TokenClaims, Depends(require_auth)]):
     username = user.get("sub", "")
     is_admin = auth.is_admin(username)
     server_settings = load_server_settings()
     sr_model_name = "2x-nomosuni-compact"
     sr_models = get_sr_models(sr_model_name)
     sr_model = (
-        sr_model_name if server_settings.get("sr_model") and sr_model_name in sr_models else ""
+        sr_model_name if server_settings.get("sr_model", "") and sr_model_name in sr_models else ""
     )
     user_settings = load_user_settings(username)
     # Load categories (from file cache or trigger background load)
-    if "live_categories" not in get_cache():
-        cached = await asyncio.to_thread(load_file_cache, "live_data")
-        if cached:
-            data, _ = cached
-            with get_cache_lock():
-                get_cache()["live_categories"] = data["cats"]
-                get_cache()["live_streams"] = data["streams"]
-                get_cache()["epg_urls"] = parse_epg_urls(data.get("epg_urls", []))
-        else:
-            # No cache - start background load.
-            _start_guide_background_load()
+    if "live_categories" not in get_cache() and not await asyncio.to_thread(
+        _store_cached_live_data,
+    ):
+        # No cache - start background load.
+        _start_guide_background_load()
 
     # Load VOD categories if not cached.
     if "vod_categories" not in get_cache():
-        cached = await asyncio.to_thread(load_file_cache, "vod_data")
-        if cached:
-            data, _ = cached
-            with get_cache_lock():
-                get_cache()["vod_categories"] = data["cats"]
-                get_cache()["vod_streams"] = data["streams"]
+        await asyncio.to_thread(_store_cached_vod_data)
 
     # Load series categories if not cached.
     if "series_categories" not in get_cache():
-        cached = await asyncio.to_thread(load_file_cache, "series_data")
-        if cached:
-            data, _ = cached
-            with get_cache_lock():
-                get_cache()["series_categories"] = data["cats"]
-                get_cache()["series"] = data["series"]
+        await asyncio.to_thread(_store_cached_series_data)
 
     # Build source_id -> source_name mapping.
     source_names = {s["id"]: s["name"] for s in server_settings.get("sources", [])}
@@ -2003,7 +2004,7 @@ async def settings_page(request: Request, user: Annotated[dict, Depends(require_
 @app.post("/settings/guide-filter")
 async def settings_guide_filter(
     request: Request,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     return await _save_category_filter(request, user, "guide_filter")
 
@@ -2011,7 +2012,7 @@ async def settings_guide_filter(
 @app.post("/settings/vod-filter")
 async def settings_vod_filter(
     request: Request,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     return await _save_category_filter(request, user, "vod_filter")
 
@@ -2019,14 +2020,14 @@ async def settings_vod_filter(
 @app.post("/settings/series-filter")
 async def settings_series_filter(
     request: Request,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     return await _save_category_filter(request, user, "series_filter")
 
 
 @app.post("/settings/add")
 async def settings_add_source(
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
     name: Annotated[str, Form()],
     source_type: Annotated[str, Form()],
     url: Annotated[str, Form()],
@@ -2053,7 +2054,7 @@ async def settings_add_source(
         raise HTTPException(400, "Name too long")
 
     # Parse schedule times.
-    schedule_list = []
+    schedule_list: list[str] = []
     for t in epg_schedule.split(","):
         t = t.strip()
         if t and re.match(r"^\d{1,2}:\d{2}$", t):
@@ -2088,7 +2089,7 @@ async def settings_add_source(
 @app.post("/settings/edit/{source_id}")
 async def settings_edit_source(
     source_id: str,
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
     name: Annotated[str, Form()],
     source_type: Annotated[str, Form()],
     url: Annotated[str, Form()],
@@ -2116,7 +2117,7 @@ async def settings_edit_source(
         raise HTTPException(400, "Name too long")
 
     # Parse schedule times (comma-separated HH:MM)
-    schedule_list = []
+    schedule_list: list[str] = []
     for t in epg_schedule.split(","):
         t = t.strip()
         if t and re.match(r"^\d{1,2}:\d{2}$", t):
@@ -2147,7 +2148,7 @@ async def settings_edit_source(
 @app.post("/settings/delete/{source_id}")
 async def settings_delete_source(
     source_id: str,
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
 ):
     del user
     settings = load_server_settings()
@@ -2160,7 +2161,7 @@ async def settings_delete_source(
 
 
 @app.get("/guide/refresh")
-async def guide_refresh(user: Annotated[dict, Depends(require_auth)]):
+async def guide_refresh(user: Annotated[TokenClaims, Depends(require_auth)]):
     """Refresh guide data in background while serving cached results.
 
     Args:
@@ -2214,7 +2215,7 @@ async def guide_refresh(user: Annotated[dict, Depends(require_auth)]):
 
 
 @app.get("/guide/refresh-status")
-async def guide_refresh_status(user: Annotated[dict, Depends(require_auth)]):
+async def guide_refresh_status(user: Annotated[TokenClaims, Depends(require_auth)]):
     """Return refresh status for polling."""
     del user
     return {
@@ -2227,7 +2228,7 @@ async def guide_refresh_status(user: Annotated[dict, Depends(require_auth)]):
 async def settings_refresh_source(
     source_id: str,
     refresh_type: str,
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
 ):
     """Refresh a specific data type for a single source.
 
@@ -2268,7 +2269,9 @@ async def settings_refresh_source(
                     existing_epg = [e for e in get_cache().get("epg_urls", []) if e[2] != source_id]
                     new_cats = existing_cats + cats
                     new_streams = existing_streams + streams
-                    new_epg = existing_epg + ([(epg_url, timeout, source_id)] if epg_url else [])
+                    new_epg = existing_epg + (
+                        [] if epg_url is None or epg_url == "" else [(epg_url, timeout, source_id)]
+                    )
                     get_cache()["live_categories"] = new_cats
                     get_cache()["live_streams"] = new_streams
                     get_cache()["epg_urls"] = new_epg
@@ -2368,14 +2371,14 @@ async def settings_refresh_source(
 
 
 @app.get("/settings/refresh-status")
-async def settings_refresh_status(user: Annotated[dict, Depends(require_auth)]):
+async def settings_refresh_status(user: Annotated[TokenClaims, Depends(require_auth)]):
     """Return per-source refresh status.
 
     Args:
         user: Authenticated viewer claims.
     """
     del user
-    statuses: dict[str, Any] = {}
+    statuses: dict[str, dict[str, bool]] = {}
     for key in list(get_refresh_in_progress()):
         if "_" in key:
             # Format: source_id_type (e.g., "ota_epg" or "src_123_epg")
@@ -2391,7 +2394,7 @@ async def settings_refresh_status(user: Annotated[dict, Depends(require_auth)]):
 
 @app.post("/settings/captions")
 async def settings_captions(
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     enabled: Annotated[str, Form()] = "",
 ):
     username = user.get("sub", "")
@@ -2414,19 +2417,19 @@ class CastCommand(BaseModel):
     volume: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
 
 
-def require_cast_auth(request: Request) -> dict:
+def require_cast_auth(request: Request) -> TokenClaims:
     user = get_current_user(request)
-    if not user:
+    if user is None:
         raise HTTPException(401, "Sign in to control Chromecast devices.")
     return user
 
 
 @app.get("/api/cast/devices")
-def cast_devices(user: Annotated[dict, Depends(require_cast_auth)]):
+def cast_devices(user: Annotated[TokenClaims, Depends(require_cast_auth)]):
     del user
     try:
-        return {"devices": casting.manager.discover()}
-    except (OSError, casting.PyChromecastError) as exc:
+        return {"devices": chromecast.manager.discover()}
+    except (OSError, chromecast.PyChromecastError) as exc:
         log.warning("Chromecast discovery failed: %s", type(exc).__name__)
         raise HTTPException(
             503,
@@ -2435,23 +2438,23 @@ def cast_devices(user: Annotated[dict, Depends(require_cast_auth)]):
 
 
 @app.get("/api/cast/status")
-def cast_status(user: Annotated[dict, Depends(require_cast_auth)]):
-    return casting.manager.status(user.get("sub", ""))
+def cast_status(user: Annotated[TokenClaims, Depends(require_cast_auth)]):
+    return chromecast.manager.status(user.get("sub", ""))
 
 
 @app.post("/api/cast/start")
 def cast_start(
     data: CastStart,
     request: Request,
-    user: Annotated[dict, Depends(require_cast_auth)],
+    user: Annotated[TokenClaims, Depends(require_cast_auth)],
 ):
     username = user.get("sub", "")
     settings = load_user_settings(username)
     address = data.server_url.strip() or settings.get("cast_host", "") or str(request.base_url)
     if "://" not in address:
         address = f"{request.url.scheme}://{address}"
-    origin = casting.media_origin(address)
-    result = casting.manager.start(
+    origin = chromecast.media_origin(address)
+    result = chromecast.manager.start(
         username,
         data.host,
         data.session_id,
@@ -2467,10 +2470,10 @@ def cast_start(
 
 
 @app.post("/api/cast/control")
-async def cast_control(data: CastCommand, user: Annotated[dict, Depends(require_cast_auth)]):
+async def cast_control(data: CastCommand, user: Annotated[TokenClaims, Depends(require_cast_auth)]):
     loop = asyncio.get_running_loop()
     return await asyncio.to_thread(
-        casting.manager.command,
+        chromecast.manager.command,
         user.get("sub", ""),
         data.action,
         data.volume,
@@ -2482,7 +2485,7 @@ async def cast_control(data: CastCommand, user: Annotated[dict, Depends(require_
 
 
 @app.get("/api/user-prefs")
-async def get_user_prefs(user: Annotated[dict, Depends(require_auth)]):
+async def get_user_prefs(user: Annotated[TokenClaims, Depends(require_auth)]):
     """Get user preferences.
 
     Args:
@@ -2503,7 +2506,7 @@ async def get_user_prefs(user: Annotated[dict, Depends(require_auth)]):
 @app.post("/api/user-prefs")
 async def save_user_prefs(
     request: Request,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     """Save a partial update to user preferences.
 
@@ -2511,25 +2514,33 @@ async def save_user_prefs(
         request: Request carrying the preference update body.
         user: Authenticated viewer claims identifying the settings owner.
     """
-    username = user.get("sub", "")
+    username = user["sub"]
     body = await request.body()
     if len(body) > 64 * 1024:  # 64KB limit.
         raise HTTPException(400, "Request too large")
-    data = json.loads(body)
-    if "sort_live_by_views" in data and not isinstance(data["sort_live_by_views"], bool):
+    data = json_loads(body)
+    updates = data if isinstance(data, dict) else {}
+    if "sort_live_by_views" in updates and not isinstance(updates["sort_live_by_views"], bool):
         raise HTTPException(400, "sort_live_by_views must be a boolean")
+    try:
+        prefs = from_plain(updates, _UserPrefsUpdate)
+    except ReadError as exc:
+        raise HTTPException(400, f"Invalid preferences: {exc}") from exc
     settings = load_user_settings(username)
-    for key in (
-        "favorites",
-        "cc_lang",
-        "cc_style",
-        "cast_host",
-        "virtual_scroll",
-        "sort_live_by_views",
-        "guide_selected_cats",
-    ):
-        if key in data:
-            settings[key] = data[key]
+    if "favorites" in prefs:
+        settings["favorites"] = prefs["favorites"]
+    if "cc_lang" in prefs:
+        settings["cc_lang"] = prefs["cc_lang"]
+    if "cc_style" in prefs:
+        settings["cc_style"] = prefs["cc_style"]
+    if "cast_host" in prefs:
+        settings["cast_host"] = prefs["cast_host"]
+    if "virtual_scroll" in prefs:
+        settings["virtual_scroll"] = prefs["virtual_scroll"]
+    if "sort_live_by_views" in prefs:
+        settings["sort_live_by_views"] = prefs["sort_live_by_views"]
+    if "guide_selected_cats" in prefs:
+        settings["guide_selected_cats"] = prefs["guide_selected_cats"]
     save_user_settings(username, settings)
     return {"ok": True}
 
@@ -2540,16 +2551,16 @@ async def save_user_prefs(
 
 
 @app.get("/playlists", response_class=HTMLResponse)
-async def playlists_page(request: Request, user: Annotated[dict, Depends(require_admin)]):
+async def playlists_page(request: Request, user: Annotated[TokenClaims, Depends(require_admin)]):
     del user
     return TEMPLATES.TemplateResponse(request, "playlists.html", {})
 
 
 @app.get("/api/playlists")
-async def list_playlists(user: Annotated[dict, Depends(require_auth)]):
+async def list_playlists(user: Annotated[TokenClaims, Depends(require_auth)]):
     viewer = _payload_viewer(user)
     streams, names = await _live_streams_and_category_names()
-    result = []
+    result: list[dict[str, str | int]] = []
     for p in playlists.load():
         payload = _playlist_payload(p, streams, names, viewer)
         if viewer is not None and not payload["channels"]:
@@ -2567,7 +2578,7 @@ async def list_playlists(user: Annotated[dict, Depends(require_auth)]):
 
 @app.get("/api/playlists/search")
 async def search_playlist_channels(
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
     q: str = "",
     category_id: str = "",
     category_prefix: str = "",
@@ -2590,7 +2601,7 @@ async def search_playlist_channels(
 
 @app.get("/api/playlists/epg-channels")
 async def search_playlist_epg_channels(
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
     q: str = "",
     limit: int = Query(default=20, ge=1, le=100),
 ):
@@ -2602,10 +2613,13 @@ async def search_playlist_epg_channels(
 
 
 @app.post("/api/playlists/match")
-async def match_playlist_channels(request: Request, user: Annotated[dict, Depends(require_admin)]):
+async def match_playlist_channels(
+    request: Request,
+    user: Annotated[TokenClaims, Depends(require_admin)],
+):
     del user
     data = await _json_body(request)
-    lines = [str(line) for line in data.get("lines", []) if str(line).strip()][:1000]
+    lines = [str(line) for line in list_field(data, "lines") if str(line).strip()][:1000]
     streams, names = await _live_streams_and_category_names()
     matches = await asyncio.to_thread(
         playlists.match_names,
@@ -2618,15 +2632,15 @@ async def match_playlist_channels(request: Request, user: Annotated[dict, Depend
 
 
 @app.post("/api/playlists/order")
-async def reorder_playlists(request: Request, user: Annotated[dict, Depends(require_admin)]):
+async def reorder_playlists(request: Request, user: Annotated[TokenClaims, Depends(require_admin)]):
     del user
     data = await _json_body(request)
-    ids = [str(i) for i in data.get("ids", [])]
+    ids = [str(i) for i in list_field(data, "ids")]
     return {"playlists": [p["id"] for p in playlists.reorder(ids)]}
 
 
 @app.post("/api/playlists")
-async def create_playlist(request: Request, user: Annotated[dict, Depends(require_admin)]):
+async def create_playlist(request: Request, user: Annotated[TokenClaims, Depends(require_admin)]):
     del user
     data = await _json_body(request)
     try:
@@ -2638,7 +2652,7 @@ async def create_playlist(request: Request, user: Annotated[dict, Depends(requir
 
 
 @app.get("/api/playlists/{playlist_id}")
-async def get_playlist(playlist_id: str, user: Annotated[dict, Depends(require_auth)]):
+async def get_playlist(playlist_id: str, user: Annotated[TokenClaims, Depends(require_auth)]):
     playlist = playlists.get(playlist_id)
     if playlist is None:
         raise HTTPException(404, "Playlist not found")
@@ -2650,7 +2664,7 @@ async def get_playlist(playlist_id: str, user: Annotated[dict, Depends(require_a
 async def update_playlist(
     playlist_id: str,
     request: Request,
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
 ):
     del user
     data = await _json_body(request)
@@ -2665,7 +2679,7 @@ async def update_playlist(
 
 
 @app.delete("/api/playlists/{playlist_id}")
-async def delete_playlist(playlist_id: str, user: Annotated[dict, Depends(require_admin)]):
+async def delete_playlist(playlist_id: str, user: Annotated[TokenClaims, Depends(require_admin)]):
     del user
     if not playlists.delete(playlist_id):
         raise HTTPException(404, "Playlist not found")
@@ -2675,7 +2689,7 @@ async def delete_playlist(playlist_id: str, user: Annotated[dict, Depends(requir
 @app.get("/api/logo")
 async def get_logo(
     url: str,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     source: str = "default",
 ):
     """Proxy and cache external logos to avoid mixed-content issues.
@@ -2713,7 +2727,7 @@ async def get_logo(
 
 @app.post("/settings/transcode")
 async def settings_transcode(
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
     transcode_mode: Annotated[str, Form()],
     transcode_hw: Annotated[str, Form()],
     max_resolution: Annotated[str, Form()] = "1080p",
@@ -2733,16 +2747,13 @@ async def settings_transcode(
     # Validate sr_model against available models.
     available_models = get_sr_models()
     settings["sr_model"] = sr_model if sr_model in available_models else ""
-    settings["transcode_hw"] = transcode_hw
+    settings["transcode_hw"] = cache.hw_accel(transcode_hw)
     settings["max_resolution"] = max_resolution
     settings["quality"] = quality if quality in ("high", "medium", "low") else "high"
     settings["vod_transcode_cache_mins"] = max(0, vod_transcode_cache_mins)
     settings["live_transcode_cache_secs"] = max(0, live_transcode_cache_secs)
     settings["live_dvr_mins"] = clamp_live_dvr_mins(live_dvr_mins)
-    if transcode_dir:
-        settings["transcode_dir"] = transcode_dir
-    elif "transcode_dir" in settings:
-        del settings["transcode_dir"]  # Use default.
+    settings["transcode_dir"] = transcode_dir  # Empty uses the system temp dir.
     settings["probe_live"] = probe_live == "on"
     settings["probe_movies"] = probe_movies == "on"
     settings["probe_series"] = probe_series == "on"
@@ -2752,7 +2763,7 @@ async def settings_transcode(
 
 @app.post("/settings/refresh-encoders")
 async def settings_refresh_encoders(
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
 ):
     """Re-detect available hardware encoders."""
     del user
@@ -2762,7 +2773,7 @@ async def settings_refresh_encoders(
 
 @app.post("/settings/user-agent")
 async def settings_user_agent(
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
     preset: Annotated[str, Form()],
     custom: Annotated[str, Form()] = "",
 ):
@@ -2779,7 +2790,7 @@ async def settings_user_agent(
 
 @app.get("/settings/probe-cache")
 async def get_probe_cache(
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     response: Response,
 ):
     """Get probe cache stats for settings UI.
@@ -2799,7 +2810,7 @@ async def get_probe_cache(
 
 
 @app.post("/settings/probe-cache/clear")
-async def clear_probe_cache(user: Annotated[dict, Depends(require_admin)]):
+async def clear_probe_cache(user: Annotated[TokenClaims, Depends(require_admin)]):
     """Clear all probe caches."""
     del user
     count = ffmpeg_command.clear_all_probe_cache()
@@ -2809,7 +2820,7 @@ async def clear_probe_cache(user: Annotated[dict, Depends(require_admin)]):
 @app.post("/settings/probe-cache/clear/{series_id}")
 async def clear_series_probe_cache(
     series_id: int,
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
     episode_id: int | None = None,
 ):
     """Clear probe cache for a specific series or episode."""
@@ -2821,7 +2832,7 @@ async def clear_series_probe_cache(
 @app.post("/settings/probe-cache/clear-mru/{series_id}")
 async def clear_series_mru(
     series_id: int,
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
 ):
     """Clear only the MRU for a series, keeping episode cache intact."""
     del user
@@ -2830,7 +2841,7 @@ async def clear_series_mru(
 
 
 @app.post("/settings/data-cache/clear")
-async def clear_data_cache(user: Annotated[dict, Depends(require_admin)]):
+async def clear_data_cache(user: Annotated[TokenClaims, Depends(require_admin)]):
     """Clear all data file caches (live, VOD, series) and memory cache."""
     del user
     count = clear_all_file_caches()
@@ -2838,7 +2849,7 @@ async def clear_data_cache(user: Annotated[dict, Depends(require_admin)]):
 
 
 @app.get("/api/settings")
-async def get_settings_api(user: Annotated[dict, Depends(require_auth)]):
+async def get_settings_api(user: Annotated[TokenClaims, Depends(require_auth)]):
     del user
     return _api_settings(load_server_settings())
 
@@ -2846,12 +2857,31 @@ async def get_settings_api(user: Annotated[dict, Depends(require_auth)]):
 @app.post("/api/settings")
 async def update_settings_api(
     request: Request,
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
 ):
     del user
-    data = await request.json()
+    data = json_loads(await request.body())
+    try:
+        update = from_plain(data if isinstance(data, dict) else {}, _ApiSettingsUpdate)
+    except ReadError as exc:
+        raise HTTPException(400, f"Invalid settings: {exc}") from exc
     settings = load_server_settings()
-    settings.update(_api_settings(data))
+    if "transcode_mode" in update:
+        settings["transcode_mode"] = update["transcode_mode"]
+    if "transcode_hw" in update:
+        settings["transcode_hw"] = cache.hw_accel(update["transcode_hw"])
+    if "vod_transcode_cache_mins" in update:
+        settings["vod_transcode_cache_mins"] = update["vod_transcode_cache_mins"]
+    if "probe_live" in update:
+        settings["probe_live"] = update["probe_live"]
+    if "probe_movies" in update:
+        settings["probe_movies"] = update["probe_movies"]
+    if "probe_series" in update:
+        settings["probe_series"] = update["probe_series"]
+    if "vod_order" in update:
+        settings["vod_order"] = update["vod_order"]
+    if "series_order" in update:
+        settings["series_order"] = update["series_order"]
     save_server_settings(settings)
     return {"status": "ok"}
 
@@ -2859,7 +2889,7 @@ async def update_settings_api(
 @app.post("/api/watch-position")
 async def save_watch_position_api(
     request: Request,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     """Save a user's watch position for a stream.
 
@@ -2867,11 +2897,12 @@ async def save_watch_position_api(
         request: Request carrying URL, position and duration.
         user: Authenticated viewer claims identifying the watch owner.
     """
-    username = user.get("sub", "")
-    data = await request.json()
-    url = data.get("url", "")
-    position = float(data.get("position", 0))
-    duration = float(data.get("duration", 0))
+    username = user["sub"]
+    data = json_loads(await request.body())
+    fields = data if isinstance(data, dict) else {}
+    url = text_field(fields, "url")
+    position = _float_field(fields, "position")
+    duration = _float_field(fields, "duration")
     if url and position >= 0:
         save_watch_position(username, url, position, duration)
     return {"status": "ok"}
@@ -2879,14 +2910,14 @@ async def save_watch_position_api(
 
 @app.get("/api/watch-position")
 async def get_watch_position_api(
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     url: str,
 ):
     """Get watch position for a stream (per-user)."""
     username = user.get("sub", "")
     entry = get_watch_position(username, url)
-    if entry:
-        return {"position": entry.get("position", 0), "duration": entry.get("duration", 0)}
+    if entry is not None:
+        return {"position": entry["position"], "duration": entry["duration"]}
     return {"position": 0, "duration": 0}
 
 
@@ -2901,7 +2932,7 @@ class HandoffReport(BaseModel):
 @app.post("/api/handoff/watch")
 async def handoff_watch_api(
     report: HandoffReport,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     """Note where a live channel is playing for resuming elsewhere.
 
@@ -2921,7 +2952,7 @@ async def handoff_watch_api(
 @app.post("/api/handoff/stop")
 async def handoff_stop_api(
     report: HandoffReport,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     """Offer stopped playback to the user's other devices.
 
@@ -2946,14 +2977,14 @@ async def handoff_stop_api(
 
 
 @app.get("/api/handoff")
-async def handoff_api(user: Annotated[dict, Depends(require_auth)]):
+async def handoff_api(user: Annotated[TokenClaims, Depends(require_auth)]):
     """Return the channel left playing on another device, if any.
 
     Args:
         user: Authenticated viewer claims identifying the handoff owner.
     """
-    record = handoff.current(user.get("sub", ""))
-    if not record:
+    record = handoff.current(user["sub"])
+    if record is None:
         return JSONResponse({"handoff": None}, headers={"Cache-Control": "no-store"})
     keys = (
         "id",
@@ -2972,7 +3003,7 @@ async def handoff_api(user: Annotated[dict, Depends(require_auth)]):
 
 
 @app.delete("/api/handoff")
-async def handoff_dismiss_api(user: Annotated[dict, Depends(require_auth)]):
+async def handoff_dismiss_api(user: Annotated[TokenClaims, Depends(require_auth)]):
     """Dismiss the handoff, ending its recording."""
     await asyncio.to_thread(handoff.cancel, user.get("sub", ""))
     return {"status": "ok"}
@@ -3004,7 +3035,7 @@ async def handoff_file(recording_id: str, filename: str):
 @app.post("/settings/users/delete/{username}")
 async def settings_delete_user(
     username: str,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     password: Annotated[str, Form()] = "",
 ):
     """Delete an account after checking its owner's or administrator's access.
@@ -3032,7 +3063,7 @@ async def settings_delete_user(
 
 @app.post("/settings/users/add")
 async def settings_add_user(
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
     username: Annotated[str, Form()],
     password: Annotated[str, Form()],
     admin: Annotated[str, Form()] = "",
@@ -3058,23 +3089,25 @@ async def settings_add_user(
     if username in auth.get_all_usernames():
         raise HTTPException(400, "User already exists")
     auth.create_user(username, password, admin=admin == "on")
-    # Apply limits if provided.
-    parsed_max_streams = None
-    if max_streams_per_source:
-        with contextlib.suppress(json.JSONDecodeError):
-            parsed_max_streams = json.loads(max_streams_per_source)
-    parsed_unavailable = None
-    if unavailable_groups:
-        with contextlib.suppress(json.JSONDecodeError):
-            parsed_unavailable = json.loads(unavailable_groups)
-    if parsed_max_streams or parsed_unavailable:
+    # Apply limits if provided; malformed limits are ignored.
+    parsed_max_streams: dict[str, int] | None = None
+    if max_streams_per_source is not None and max_streams_per_source:
+        with contextlib.suppress(ValueError):
+            parsed_max_streams = json_loads(max_streams_per_source, dict[str, int])
+    parsed_unavailable: list[str] | None = None
+    if unavailable_groups is not None and unavailable_groups:
+        with contextlib.suppress(ValueError):
+            parsed_unavailable = json_loads(unavailable_groups, list[str])
+    if (parsed_max_streams is not None and len(parsed_max_streams) > 0) or (
+        parsed_unavailable is not None and len(parsed_unavailable) > 0
+    ):
         auth.set_user_limits(username, parsed_max_streams, parsed_unavailable)
     return {"status": "ok"}
 
 
 @app.post("/settings/users/password")
 async def settings_change_own_password(
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     current_password: Annotated[str, Form()],
     new_password: Annotated[str, Form()],
 ):
@@ -3098,7 +3131,7 @@ async def settings_change_own_password(
 @app.post("/settings/users/password/{target_user}")
 async def settings_change_password(
     target_user: str,
-    user: Annotated[dict, Depends(require_auth)],
+    user: Annotated[TokenClaims, Depends(require_auth)],
     new_password: Annotated[str, Form()],
 ):
     """Change a password for the account owner or an administrator.
@@ -3121,7 +3154,7 @@ async def settings_change_password(
 @app.post("/settings/users/admin/{target_user}")
 async def settings_set_admin(
     target_user: str,
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
     admin: Annotated[str, Form()] = "",
 ):
     """Set admin status for a user."""
@@ -3134,7 +3167,7 @@ async def settings_set_admin(
 @app.post("/settings/users/limits/{target_user}")
 async def settings_set_user_limits(
     target_user: str,
-    user: Annotated[dict, Depends(require_admin)],
+    user: Annotated[TokenClaims, Depends(require_admin)],
     max_streams_per_source: Annotated[str | None, Form()] = None,  # JSON object string.
     unavailable_groups: Annotated[str | None, Form()] = None,  # JSON array string.
 ):
@@ -3147,22 +3180,22 @@ async def settings_set_user_limits(
         unavailable_groups: Optional encoded restricted group identifiers.
     """
     del user
-    parsed_max_streams = None
+    parsed_max_streams: dict[str, int] | None = None
     if max_streams_per_source is not None:
         try:
-            parsed_max_streams = json.loads(max_streams_per_source)
-            if not isinstance(parsed_max_streams, dict):
-                raise HTTPException(400, "max_streams_per_source must be a JSON object")
-        except json.JSONDecodeError as err:
+            parsed_max_streams = json_loads(max_streams_per_source, dict[str, int])
+        except ReadError as err:
+            raise HTTPException(400, "max_streams_per_source must be a JSON object") from err
+        except ValueError as err:
             raise HTTPException(400, "Invalid JSON for max_streams_per_source") from err
 
-    parsed_unavailable = None
+    parsed_unavailable: list[str] | None = None
     if unavailable_groups is not None:
         try:
-            parsed_unavailable = json.loads(unavailable_groups)
-            if not isinstance(parsed_unavailable, list):
-                raise HTTPException(400, "unavailable_groups must be a JSON array")
-        except json.JSONDecodeError as err:
+            parsed_unavailable = json_loads(unavailable_groups, list[str])
+        except ReadError as err:
+            raise HTTPException(400, "unavailable_groups must be a JSON array") from err
+        except ValueError as err:
             raise HTTPException(400, "Invalid JSON for unavailable_groups") from err
 
     if not auth.set_user_limits(target_user, parsed_max_streams, parsed_unavailable):
@@ -3221,12 +3254,12 @@ def _get_content_access(username: str) -> dict[str, bool]:
 def _get_content_access_from_request(request: Request) -> dict[str, bool]:
     """Get content access from request (for use in base template)."""
     token = request.cookies.get("token")
-    if not token:
+    if token is None or token == "":
         return {"movies": True, "series": True}  # Not logged in, show all.
     payload = verify_token(token)
-    if not payload:
+    if payload is None:
         return {"movies": True, "series": True}
-    username = payload.get("sub", "")
+    username = payload["sub"]
     if not username:
         return {"movies": True, "series": True}
     return _get_content_access(username)
@@ -3265,7 +3298,7 @@ def main() -> int:
 
     ssl_certfile = None
     ssl_keyfile = None
-    if flags.cert and flags.key:
+    if flags.cert is not None and flags.key is not None and flags.cert and flags.key:
         ssl_certfile = flags.cert
         ssl_keyfile = flags.key
     elif flags.https is not None:
@@ -3331,7 +3364,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _api_settings(
-    settings: dict[str, Any],
+    settings: Mapping[str, object],
     keys: tuple[str, ...] = (
         "transcode_mode",
         "transcode_hw",
@@ -3342,27 +3375,35 @@ def _api_settings(
         "vod_order",
         "series_order",
     ),
-) -> dict[str, Any]:
-    """Select settings the API may expose or edit."""
+) -> dict[str, object]:
+    """Select settings the API may expose."""
     # Users, secrets and sources must never be exposed or edited through this API.
     return {key: settings[key] for key in keys if key in settings}
 
 
 async def _save_category_filter(
     request: Request,
-    user: dict,
-    setting: str,
+    user: TokenClaims,
+    setting: Literal["guide_filter", "vod_filter", "series_filter"],
     *,
     max_categories: int = 10_000,
 ) -> dict[str, str]:
     """Validate and store a user's category filter list under ``setting``."""
-    username = user.get("sub", "")
-    data = await request.json()
-    cats = data.get("cats", [])
-    if not isinstance(cats, list) or len(cats) > max_categories:
+    username = user["sub"]
+    data = json_loads(await request.body())
+    raw_cats = data.get("cats", []) if isinstance(data, dict) else None
+    if not isinstance(raw_cats, list) or len(raw_cats) > max_categories:
+        raise HTTPException(400, "Invalid filter list")
+    cats = [c for c in raw_cats if isinstance(c, str)]
+    if len(cats) != len(raw_cats):
         raise HTTPException(400, "Invalid filter list")
     user_settings = load_user_settings(username)
-    user_settings[setting] = cats
+    if setting == "guide_filter":
+        user_settings["guide_filter"] = cats
+    elif setting == "vod_filter":
+        user_settings["vod_filter"] = cats
+    else:
+        user_settings["series_filter"] = cats
     save_user_settings(username, user_settings)
     return {"status": "ok"}
 
@@ -3411,14 +3452,150 @@ async def _next_epg_event(queue: asyncio.Queue[str]) -> str | None:
         return None
 
 
-def _safe_float(value: float | str | None, default: float = 0.0) -> float:
+def _safe_float(value: MutablePlainTree, default: float = 0.0) -> float:
     """Safely convert value to float, returning default on failure."""
-    if value is None:
+    if not isinstance(value, (int, float, str)):
         return default
     try:
         return float(value)
-    except (ValueError, TypeError):
+    except ValueError:
         return default
+
+
+def _float_field(record: Mapping[str, MutablePlainTree], key: str) -> float:
+    """Read a numeric request field, defaulting a missing one to zero."""
+    value = record.get(key, 0)
+    if isinstance(value, (int, float, str)):
+        return float(value)
+    raise TypeError(f"{key} must be a number")
+
+
+def _int_value(value: MutablePlainTree) -> int:
+    """Integer form of a provider value; unset or non-scalar values are zero."""
+    return int(value) if isinstance(value, (int, float, str)) and value else 0
+
+
+def _present(value: MutablePlainTree) -> bool:
+    """Whether a provider value is set: neither null nor empty, zero or false."""
+    return value is not None and bool(value)
+
+
+def _first_present(record: Mapping[str, MutablePlainTree], *keys: str) -> MutablePlainTree:
+    """The first set value among ``keys``, else an empty string."""
+    return next((record[key] for key in keys if _present(record.get(key))), "")
+
+
+def _store_cached_live_data() -> bool:
+    """Fill the memory cache from the live file cache; report whether one existed."""
+    cached = cached_live_data()
+    if cached is None:
+        return False
+    data, _ = cached
+    with get_cache_lock():
+        store = get_cache()
+        store["live_categories"] = data["cats"]
+        store["live_streams"] = data["streams"]
+        store["epg_urls"] = data["epg_urls"]
+    return True
+
+
+def _store_cached_vod_data() -> bool:
+    """Fill the memory cache from the VOD file cache; report whether one existed."""
+    cached = cached_vod_data()
+    if cached is None:
+        return False
+    data, _ = cached
+    with get_cache_lock():
+        store = get_cache()
+        store["vod_categories"] = data["cats"]
+        store["vod_streams"] = data["streams"]
+    return True
+
+
+def _store_cached_series_data() -> bool:
+    """Fill the memory cache from the series file cache; report whether one existed."""
+    cached = cached_series_data()
+    if cached is None:
+        return False
+    data, _ = cached
+    with get_cache_lock():
+        store = get_cache()
+        store["series_categories"] = data["cats"]
+        store["series"] = data["series"]
+    return True
+
+
+def _matching_names(
+    records: list[ProviderRecord],
+    match_fn: Callable[[str], bool],
+    limit: int,
+) -> list[ProviderRecord]:
+    """Records whose names match, sorted by name, at most ``limit`` (0 keeps all)."""
+    matched = sorted(
+        (r for r in records if match_fn(text_field(r, "name"))),
+        key=lambda r: text_field(r, "name").lower(),
+    )
+    return matched[:limit] if limit else matched
+
+
+def _clean_episode(ep: ProviderRecord) -> None:
+    """Strip redundant series prefixes from an episode title and expose its plot."""
+    title = ep.get("title")
+    if isinstance(title, str) and title:
+        # Remove patterns like "Series Name - S01E01 - Episode Title"; keep the title.
+        title = re.sub(r"^S\d+E\d+\s*-\s*", "", title)
+        if " - " in title:
+            title = title.split(" - ")[-1]
+        ep["title"] = title.strip()
+    info = ep.get("info")
+    if isinstance(info, str) and info:
+        try:
+            parsed = json_loads(info)
+        except ValueError:
+            return
+        if isinstance(parsed, dict):
+            ep["description"] = _first_present(parsed, "plot", "description")
+    elif isinstance(info, dict) and info:
+        ep["description"] = _first_present(info, "plot", "description")
+
+
+async def _with_vod_details(
+    movie: ProviderRecord,
+    source_id: str,
+    stream_id: int,
+) -> ProviderRecord:
+    """A copy of ``movie`` merged with its provider details, when they load."""
+    xtream = get_xtream_client_by_source(source_id) if source_id else None
+    if xtream is None:
+        xtream = get_first_xtream_client()
+    if xtream is None:
+        return movie
+    client = xtream
+    cache_key = f"vod_info_{source_id}_{stream_id}" if source_id else f"vod_info_{stream_id}"
+    try:
+        vod_info = await asyncio.to_thread(
+            get_cached_info,
+            cache_key,
+            lambda: client.get_vod_info(stream_id),
+        )
+    except (error.URLError, TimeoutError):
+        return movie
+    info = record_field(vod_info, "info")
+    if not info:
+        return movie
+    release = info.get("releasedate")
+    return {
+        **movie,
+        "plot": _first_present(info, "plot", "description"),
+        "director": info.get("director", ""),
+        "cast": _first_present(info, "cast", "actors"),
+        "genre": info.get("genre", ""),
+        "rating": info.get("rating", ""),
+        "year": release[:4] if isinstance(release, str) and release else "",
+        "duration": info.get("duration", ""),
+        "cover_big": _first_present(info, "cover_big", "movie_image"),
+        "youtube_trailer": info.get("youtube_trailer", ""),
+    }
 
 
 def _check_rate_limit(ip: str, *, window_secs: float = 300, max_attempts: int = 10) -> None:
@@ -3442,7 +3619,7 @@ def _check_rate_limit(ip: str, *, window_secs: float = 300, max_attempts: int = 
 
 def _fetch_all_epg(epg_urls: list[tuple[str, int, str]]) -> int:
     """Fetch EPG from all URLs into sqlite (in parallel). Returns total program count."""
-    user_agent = ffmpeg_command.get_user_agent()
+    user_agent = cache.get_user_agent()
 
     def fetch_one(url_timeout_source: tuple[str, int, str]) -> tuple[str, int]:
         url, timeout, source_id = url_timeout_source
@@ -3477,7 +3654,7 @@ def _fetch_all_epg(epg_urls: list[tuple[str, int, str]]) -> int:
 
 def _prune_epg() -> None:
     """Drop listings older than the longest catchup archive (at least 24h)."""
-    cutoff = datetime.now(timezone.utc) - catchup.history(get_cache().get("live_streams") or [])
+    cutoff = datetime.now(timezone.utc) - catchup.history(get_cache().get("live_streams", []))
     pruned = epg.prune_old_programs(cutoff)
     if pruned:
         log.info("Pruned %d expired EPG programs", pruned)
@@ -3514,7 +3691,10 @@ def _start_guide_background_load() -> None:
     threading.Thread(target=load, daemon=True).start()
 
 
-def _get_guide_streams(cats: str, username: str) -> tuple[list[dict], list[str], set[str]]:
+def _get_guide_streams(
+    cats: str,
+    username: str,
+) -> tuple[list[ProviderRecord], list[str], set[str]]:
     """Get filtered and sorted streams for guide."""
     all_streams = get_cache().get("live_streams", [])
 
@@ -3534,10 +3714,10 @@ def _get_guide_streams(cats: str, username: str) -> tuple[list[dict], list[str],
         load_live_view_counts(username) if user_settings.get("sort_live_by_views", True) else {}
     )
 
-    def stream_sort_key(s: dict) -> int:
+    def stream_sort_key(s: ProviderRecord) -> int:
         return _guide_section_rank(s, cat_order, len(ordered_cats))
 
-    def view_count(s: dict) -> int:
+    def view_count(s: ProviderRecord) -> int:
         return view_counts.get(playlists.stream_key(s), 0)
 
     playlist_ids = [c for c in ordered_cats if playlists.is_playlist_id(c)]
@@ -3545,7 +3725,7 @@ def _get_guide_streams(cats: str, username: str) -> tuple[list[dict], list[str],
     streams = [
         s
         for s in all_streams
-        if any(str(c) in category_cats for c in (s.get("category_ids") or [])) and stream_allowed(s)
+        if any(c in category_cats for c in category_ids(s)) and stream_allowed(s)
     ]
     streams.sort(key=lambda s: (stream_sort_key(s), -view_count(s)))
     if not playlist_ids:
@@ -3556,7 +3736,7 @@ def _get_guide_streams(cats: str, username: str) -> tuple[list[dict], list[str],
     playlist_by_id = {f"{playlists.PREFIX}{p['id']}": p for p in playlists.load()}
     placement: dict[str, tuple[int, int]] = {}
     memberships: dict[str, list[str]] = {}
-    stream_by_key: dict[str, dict] = {}
+    stream_by_key: dict[str, ProviderRecord] = {}
     for playlist_id in playlist_ids:
         playlist = playlist_by_id.get(playlist_id)
         if playlist is None:
@@ -3575,7 +3755,7 @@ def _get_guide_streams(cats: str, username: str) -> tuple[list[dict], list[str],
         if key not in placement or rank[0] < placement[key][0]:
             placement[key] = rank
 
-    merged = []
+    merged: list[ProviderRecord] = []
     for key in sorted(
         placement,
         key=lambda key: (
@@ -3586,58 +3766,59 @@ def _get_guide_streams(cats: str, username: str) -> tuple[list[dict], list[str],
     ):
         s = stream_by_key[key]
         if key in memberships:
-            s = {**s, "category_ids": [*(s.get("category_ids") or []), *memberships[key]]}
+            s = {**s, "category_ids": [*list_field(s, "category_ids"), *memberships[key]]}
         merged.append(s)
     return merged, ordered_cats, selected_cats
 
 
-def _guide_section_rank(s: dict, cat_order: dict[str, int], default: int) -> int:
+def _guide_section_rank(s: ProviderRecord, cat_order: dict[str, int], default: int) -> int:
     """Position of the earliest selected category (or playlist) a stream belongs to."""
     return min(
-        (cat_order[str(c)] for c in s.get("category_ids") or [] if str(c) in cat_order),
+        (cat_order[c] for c in category_ids(s) if c in cat_order),
         default=default,
     )
 
 
-def _guide_sections(streams: list[dict], ordered_cats: list[str]) -> list[dict]:
+def _guide_sections(streams: list[ProviderRecord], ordered_cats: list[str]) -> list[GuideSection]:
     """Headings for the web guide: the row index where each selected category starts."""
     cat_order = {c: i for i, c in enumerate(ordered_cats)}
     names = {
-        str(c["category_id"]): c["category_name"] for c in get_cache().get("live_categories", [])
+        str(c["category_id"]): text_field(c, "category_name")
+        for c in get_cache().get("live_categories", [])
     }
     names.update({c["category_id"]: f"★ {c['category_name']}" for c in _playlist_categories()})
-    sections = []
+    sections: list[GuideSection] = []
     current = None
     for index, s in enumerate(streams):
         rank = _guide_section_rank(s, cat_order, -1)
         if rank < 0 or rank == current:
             continue
         current = rank
-        name = names.get(ordered_cats[rank])
+        name = names.get(ordered_cats[rank], "")
         if name:
             sections.append({"start": index, "name": name})
     return sections
 
 
-def _live_allowed(s: dict, unavailable_groups: set[str]) -> bool:
+def _live_allowed(s: ProviderRecord, unavailable_groups: set[str]) -> bool:
     """Whether a live stream or category dict passes the user's restrictions."""
     if f"source:{s.get('source_id', '')}" in unavailable_groups:
         return False
-    cat_ids = s.get("category_ids") or ([s["category_id"]] if "category_id" in s else [])
+    cat_ids = list_field(s, "category_ids") or ([s["category_id"]] if "category_id" in s else [])
     return not any(f"cat:{c}" in unavailable_groups for c in cat_ids)
 
 
-def _live_stream_filter(username: str):
+def _live_stream_filter(username: str) -> Callable[[ProviderRecord], bool]:
     """Predicate for live streams the user may see (source and category restrictions)."""
     unavailable_groups = _unavailable_groups(username)
 
-    def stream_allowed(s: dict) -> bool:
+    def stream_allowed(s: ProviderRecord) -> bool:
         return _live_allowed(s, unavailable_groups)
 
     return stream_allowed
 
 
-def _playlist_categories() -> list[dict[str, str]]:
+def _playlist_categories() -> list[PlaylistCategory]:
     """Non-empty shared playlists as guide categories, in admin-defined order."""
     return [
         {
@@ -3646,13 +3827,13 @@ def _playlist_categories() -> list[dict[str, str]]:
             "kind": "playlist",
         }
         for p in playlists.load()
-        if p.get("channels")
+        if p.get("channels", [])
     ]
 
 
 def _default_guide_cats(
     saved_filter: list[str],
-    playlist_cats: list[dict[str, str]] | None = None,
+    playlist_cats: list[PlaylistCategory] | None = None,
 ) -> list[str]:
     if playlist_cats is None:
         playlist_cats = _playlist_categories()
@@ -3662,12 +3843,12 @@ def _default_guide_cats(
 
 
 def _build_guide_rows(
-    streams: list[dict],
+    streams: list[ProviderRecord],
     start_idx: int,
     count: int,
     window_start: datetime,
     window_end: datetime,
-) -> list[dict]:
+) -> list[GuideRow]:
     """Build guide grid rows for a range of streams."""
     end_idx = min(start_idx + count, len(streams))
     slice_streams = streams[start_idx:end_idx]
@@ -3676,7 +3857,7 @@ def _build_guide_rows(
         return []
 
     # Collect EPG IDs for batch query.
-    epg_ids = [s.get("epg_channel_id") or "" for s in slice_streams]
+    epg_ids = [text_field(s, "epg_channel_id") for s in slice_streams]
     epg_ids_set = [e for e in epg_ids if e]
 
     # Batch fetch icons and programs.
@@ -3684,9 +3865,9 @@ def _build_guide_rows(
 
     # Build preferred_sources for EPG matching.
     preferred_sources = {
-        epg_id: s.get("source_id", "")
+        epg_id: text_field(s, "source_id")
         for s, epg_id in zip(slice_streams, epg_ids, strict=False)
-        if epg_id and s.get("source_id")
+        if epg_id and text_field(s, "source_id")
     }
     programs_map = (
         epg.get_programs_batch(epg_ids_set, window_start, window_end, preferred_sources)
@@ -3697,19 +3878,20 @@ def _build_guide_rows(
     # Build rows.
     window_end_mobile = window_start + timedelta(hours=2)
     now = datetime.now(timezone.utc)
-    grid_data = []
+    grid_data: list[GuideRow] = []
 
     for idx, (s, epg_id) in enumerate(zip(slice_streams, epg_ids, strict=False), start=start_idx):
-        icon = s.get("stream_icon", "") or icons_map.get(epg_id, "")
-        ch = {
+        stream_icon = s.get("stream_icon", "")
+        icon = stream_icon if _present(stream_icon) else icons_map.get(epg_id, "")
+        ch: GuideChannel = {
             "stream_id": s["stream_id"],
             "name": s["name"],
             "icon": icon,
             "epg_id": epg_id,
-            "category_ids": [str(category_id) for category_id in (s.get("category_ids") or [])],
+            "category_ids": category_ids(s),
             "catchup_days": catchup.archive_days(s),
         }
-        row = {"channel": ch, "programs": [], "programs_mobile": [], "index": idx}
+        row: GuideRow = {"channel": ch, "programs": [], "programs_mobile": [], "index": idx}
 
         for p in programs_map.get(epg_id, []):
             # Ended programs still in the archive can be watched from the start.
@@ -3800,20 +3982,20 @@ def _start_series_background_load() -> None:
     threading.Thread(target=load, daemon=True).start()
 
 
-def _get_episode_desc(ep: dict) -> str:
+def _get_episode_desc(ep: ProviderRecord) -> str:
     """Extract description from episode info (handles str or dict)."""
     info = ep.get("info")
     if isinstance(info, str):
         try:
-            info = json.loads(info)
-        except (json.JSONDecodeError, TypeError):
+            info = json_loads(info)
+        except ValueError:
             info = None
     if isinstance(info, dict):
-        return info.get("plot") or info.get("description") or ""
-    return ep.get("description") or ep.get("plot") or ""
+        return str(_first_present(info, "plot", "description"))
+    return str(_first_present(ep, "description", "plot"))
 
 
-def _get_current_program(epg_id: str) -> dict | None:
+def _get_current_program(epg_id: str) -> CurrentProgram | None:
     """Current EPG program for a channel, or None when the guide has no entry."""
     if not epg_id:
         return None
@@ -3830,24 +4012,25 @@ def _get_current_program(epg_id: str) -> dict | None:
     }
 
 
-def _find_live_stream(stream_id: str) -> dict | None:
+def _find_live_stream(stream_id: str) -> ProviderRecord | None:
     return next(
-        (s for s in get_cache()["live_streams"] if str(s.get("stream_id")) == stream_id),
+        (s for s in get_cache().get("live_streams", []) if str(s.get("stream_id")) == stream_id),
         None,
     )
 
 
-def _live_epg_id(stream: dict) -> str:
+def _live_epg_id(stream: ProviderRecord) -> str:
     """A stream's EPG id, falling back to one assigned to it in a shared playlist."""
-    epg_id = stream.get("epg_channel_id") or ""
+    epg_id = text_field(stream, "epg_channel_id")
     if epg_id:
         return epg_id
     key = playlists.stream_key(stream)
-    streams = get_cache().get("live_streams") or []
+    streams = get_cache().get("live_streams", [])
     for playlist in playlists.load():
         for resolved in playlists.resolve(playlist, streams):
-            if playlists.stream_key(resolved) == key and resolved.get("epg_channel_id"):
-                return resolved["epg_channel_id"]
+            resolved_epg_id = text_field(resolved, "epg_channel_id")
+            if playlists.stream_key(resolved) == key and resolved_epg_id:
+                return resolved_epg_id
     return ""
 
 
@@ -3855,38 +4038,40 @@ def _get_live_player_info(stream_id: str) -> PlayerInfo:
     """Get player info for live stream."""
     _ensure_live_cache()
     stream = _find_live_stream(stream_id)
-    if not stream:
+    if stream is None:
         return PlayerInfo()
 
     info = PlayerInfo(
-        channel_name=stream.get("name", ""),
+        channel_name=text_field(stream, "name"),
         catchup_days=catchup.archive_days(stream),
     )
 
-    if stream.get("direct_url"):
-        info.url = stream["direct_url"]
+    direct_url = text_field(stream, "direct_url")
+    if direct_url:
+        info.url = direct_url
         info.is_m3u = True
     elif stream.get("source_type") == "xtream":
-        base, user, pwd = stream["source_url"], stream["source_username"], stream["source_password"]
+        base = text_field(stream, "source_url")
         orig_id = stream_id.split("_")[-1] if "_" in stream_id else stream_id
         # URL-encode username/password to handle special chars like # in passwords.
-        user = parse.quote(user, safe="")
-        pwd = parse.quote(pwd, safe="")
+        user = parse.quote(text_field(stream, "source_username"), safe="")
+        pwd = parse.quote(text_field(stream, "source_password"), safe="")
         info.url = f"{base}/live/{user}/{pwd}/{orig_id}.m3u8"
 
     # Look up source settings.
-    source_id = stream.get("source_id", "")
+    source_id = text_field(stream, "source_id")
     info.source_id = source_id
-    info.category_ids = stream.get("category_ids")
+    stream_category_ids = stream.get("category_ids")
+    info.category_ids = stream_category_ids if isinstance(stream_category_ids, list) else None
     if source_id:
         sources = load_server_settings().get("sources", [])
         source = next((s for s in sources if s.get("id") == source_id), None)
-        if source:
+        if source is not None:
             info.deinterlace_fallback = source.get("deinterlace_fallback", True)
 
     # Look up current program from EPG.
     program = _get_current_program(_live_epg_id(stream))
-    if program:
+    if program is not None:
         info.program_title = program["title"]
         info.program_desc = program["desc"]
         info.program_start = program["start"]
@@ -3894,7 +4079,7 @@ def _get_live_player_info(stream_id: str) -> PlayerInfo:
     return info
 
 
-def _find_archived_program(stream: dict, start: datetime) -> epg.Program | None:
+def _find_archived_program(stream: ProviderRecord, start: datetime) -> epg.Program | None:
     """The EPG program airing at ``start`` on a stream's channel."""
     epg_id = _live_epg_id(stream)
     if not epg_id:
@@ -3903,7 +4088,7 @@ def _find_archived_program(stream: dict, start: datetime) -> epg.Program | None:
         epg_id,
         start,
         start + timedelta(seconds=1),
-        stream.get("source_id", ""),
+        text_field(stream, "source_id"),
     )
     return next((p for p in programs if p.start <= start < p.stop), None)
 
@@ -3912,7 +4097,7 @@ def _get_catchup_player_info(stream_id: str, start_ts: float) -> PlayerInfo:
     """Player info for an archived program, played from its start."""
     info = _get_live_player_info(stream_id)
     stream = _find_live_stream(stream_id) if info.url else None
-    if not stream:
+    if stream is None:
         return PlayerInfo()
     try:
         start = datetime.fromtimestamp(start_ts, timezone.utc)
@@ -3925,7 +4110,7 @@ def _get_catchup_player_info(stream_id: str, start_ts: float) -> PlayerInfo:
     stop = program.stop if program else start + timedelta(hours=1)
     # Archives start on whole minutes; the player skips the remaining seconds.
     begin = start.replace(second=0, microsecond=0)
-    source_id = stream.get("source_id", "")
+    source_id = text_field(stream, "source_id")
     client = get_xtream_client_by_source(source_id)
     tz = catchup.server_timezone(source_id, client.get_server_info) if client else timezone.utc
     info.url = catchup.timeshift_url(stream, begin, catchup.duration_minutes(begin, stop), tz)
@@ -3942,36 +4127,36 @@ def _get_catchup_player_info(stream_id: str, start_ts: float) -> PlayerInfo:
 def _get_movie_player_info(stream_id: str, ext: str) -> PlayerInfo:
     """Get player info for movie."""
     # Find movie in cache to get its source_id.
-    cached_movie = None
-    if "vod_streams" in get_cache():
-        cached_movie = next(
-            (m for m in get_cache()["vod_streams"] if str(m.get("stream_id")) == stream_id),
-            None,
-        )
+    cached_movie = next(
+        (m for m in get_cache().get("vod_streams", []) if str(m.get("stream_id")) == stream_id),
+        None,
+    )
 
     # Get client for the movie's source (fall back to first if not found)
-    source_id = cached_movie.get("source_id", "") if cached_movie else ""
+    source_id = "" if cached_movie is None else text_field(cached_movie, "source_id")
     xtream = get_xtream_client_by_source(source_id) if source_id else None
-    if not xtream:
+    if xtream is None:
         xtream = get_first_xtream_client()
-    if not xtream:
+    if xtream is None:
         return PlayerInfo()
+    client = xtream
 
     ext = ext or "mkv"
-    info = PlayerInfo(url=xtream.build_stream_url("movie", int(stream_id), ext))
+    info = PlayerInfo(url=client.build_stream_url("movie", int(stream_id), ext))
     info.source_id = source_id
 
     cache_key = f"vod_info_{source_id}_{stream_id}"
     try:
-        movie = get_cached_info(cache_key, lambda: xtream.get_vod_info(int(stream_id)))
+        movie = get_cached_info(cache_key, lambda: client.get_vod_info(int(stream_id)))
     except (error.URLError, TimeoutError):
         return info
-    if movie and movie.get("info"):
-        m = movie["info"]
+    m = record_field(movie, "info")
+    if m:
         name = m.get("name", "")
-        year = str(m.get("year") or m.get("releasedate", ""))[:4]
-        info.channel_name = f"{name} ({year})" if year else name
-        info.program_desc = m.get("plot") or m.get("description") or ""
+        year_value = m.get("year")
+        year = str(year_value if _present(year_value) else m.get("releasedate", ""))[:4]
+        info.channel_name = f"{name} ({year})" if year else str(name)
+        info.program_desc = str(_first_present(m, "plot", "description"))
     return info
 
 
@@ -3982,65 +4167,68 @@ def _get_series_player_info(
 ) -> tuple[PlayerInfo, str | None]:
     """Get player info for series episode. Returns (info, next_episode_url)."""
     # Find series in cache to get its source_id.
-    cached_series = None
     source_id = ""
-    if series_id and "series" in get_cache():
+    if series_id is not None and series_id != 0:
         cached_series = next(
-            (s for s in get_cache()["series"] if str(s.get("series_id")) == str(series_id)),
+            (s for s in get_cache().get("series", []) if str(s.get("series_id")) == str(series_id)),
             None,
         )
-        if cached_series:
-            source_id = cached_series.get("source_id", "")
+        if cached_series is not None:
+            source_id = text_field(cached_series, "source_id")
 
     # Get client for the series' source (fall back to first if not found)
     xtream = get_xtream_client_by_source(source_id) if source_id else None
-    if not xtream:
+    if xtream is None:
         xtream = get_first_xtream_client()
-    if not xtream:
+    if xtream is None:
         return PlayerInfo(), None
+    client = xtream
 
     ext = ext or "mkv"
-    info = PlayerInfo(url=xtream.build_stream_url("series", int(stream_id), ext))
+    info = PlayerInfo(url=client.build_stream_url("series", int(stream_id), ext))
     info.source_id = source_id
 
-    if not series_id:
+    if series_id is None or series_id == 0:
         return info, None
+    requested_series = series_id
 
     cache_key = f"series_info_{source_id}_{series_id}"
     try:
-        series = get_cached_info(cache_key, lambda: xtream.get_series_info(series_id))
+        series = get_cached_info(cache_key, lambda: client.get_series_info(requested_series))
     except (error.URLError, TimeoutError) as e:
         log.warning("Failed to fetch series info %s: %s", series_id, e)
         return info, None
     if not series:
         return info, None
 
-    if series.get("info"):
-        name = series["info"].get("name", "")
-        year = series["info"].get("year", "")
-        info.channel_name = f"{name} ({year})" if year else name
+    series_info = record_field(series, "info")
+    if series_info:
+        name = series_info.get("name", "")
+        year = series_info.get("year", "")
+        info.channel_name = f"{name} ({year})" if _present(year) else str(name)
 
     # Build flat list of all episodes in order (season, episode)
-    all_episodes: list[tuple[int, dict]] = []
-    for season_num, eps in sorted((series.get("episodes") or {}).items(), key=lambda x: int(x[0])):
-        for ep in sorted(eps, key=lambda e: int(e.get("episode_num", 0))):
+    all_episodes: list[tuple[int, ProviderRecord]] = []
+    seasons = record_field(series, "episodes")
+    for season_num, eps in sorted(seasons.items(), key=lambda x: int(x[0])):
+        season_eps = [ep for ep in eps if isinstance(ep, dict)] if isinstance(eps, list) else []
+        for ep in sorted(season_eps, key=lambda e: _int_value(e.get("episode_num", 0))):
             all_episodes.append((int(season_num), ep))
 
     # Find current episode and next.
     next_episode_url = None
     for i, (season_num, ep) in enumerate(all_episodes):
         if str(ep.get("id")) == stream_id:
-            title = re.sub(r"^S\d+E\d+\s*-\s*", "", ep.get("title", ""))
+            title = re.sub(r"^S\d+E\d+\s*-\s*", "", text_field(ep, "title"))
             if " - " in title:
                 title = title.split(" - ")[-1]
-            info.program_title = (
-                f"S{season_num:02d}E{int(ep.get('episode_num', 0)):02d} -- {title.strip()}"
-            )
+            episode_num = _int_value(ep.get("episode_num", 0))
+            info.program_title = f"S{season_num:02d}E{episode_num:02d} -- {title.strip()}"
             info.program_desc = _get_episode_desc(ep)
             # Get next episode URL.
             if i + 1 < len(all_episodes):
                 _, next_ep = all_episodes[i + 1]
-                next_ext = next_ep.get("container_extension") or ext
+                next_ext = text_field(next_ep, "container_extension") or ext
                 next_episode_url = (
                     f"/play/series/{next_ep['id']}?series_id={series_id}&ext={next_ext}"
                 )
@@ -4070,7 +4258,7 @@ def _handoff_channel(
     """A live channel and the program airing on it at ``position``."""
     info = _get_live_player_info(stream_id)
     stream = _find_live_stream(stream_id) if info.url else None
-    if not stream:
+    if stream is None:
         return None
     channel = handoff.Channel(
         stream_id=stream_id,
@@ -4106,7 +4294,7 @@ def _get_handoff_player_info(
 ) -> PlayerInfo:
     """Player info resuming a handoff, from where it was left or from ``start``."""
     record = handoff.claim(username, handoff_id)
-    if not record or record["stream_id"] != stream_id:
+    if record is None or record["stream_id"] != stream_id:
         raise HTTPException(404, "This program is no longer available to resume")
     position = record["position"] if start is None else start
     if record["mode"] == "catchup":
@@ -4148,8 +4336,7 @@ def _build_all_groups() -> list[dict[str, str]]:
 
     # Live TV categories.
     for cat in get_cache().get("live_categories", []):
-        source_id = cat.get("source_id", "")
-        source = sources_by_id.get(source_id)
+        source = sources_by_id.get(text_field(cat, "source_id"))
         if source:
             groups.append(
                 {
@@ -4190,18 +4377,12 @@ def _source_users(access: str, users: list[str] | None) -> list[str] | None:
     return sorted({u for u in users or [] if u in known})
 
 
-async def _live_streams_and_category_names() -> tuple[list[dict], dict[str, str]]:
+async def _live_streams_and_category_names() -> tuple[list[ProviderRecord], dict[str, str]]:
     if "live_streams" not in get_cache():
-        cached = await asyncio.to_thread(load_file_cache, "live_data")
-        if cached:
-            data, _ = cached
-            with get_cache_lock():
-                get_cache()["live_categories"] = data["cats"]
-                get_cache()["live_streams"] = data["streams"]
-                get_cache()["epg_urls"] = parse_epg_urls(data.get("epg_urls", []))
+        await asyncio.to_thread(_store_cached_live_data)
     streams = get_cache().get("live_streams", [])
     names = {
-        str(c["category_id"]): c.get("category_name", "")
+        str(c["category_id"]): text_field(c, "category_name")
         for c in get_cache().get("live_categories", [])
     }
     return streams, names
@@ -4210,28 +4391,35 @@ async def _live_streams_and_category_names() -> tuple[list[dict], dict[str, str]
 # Admins (username=None) see every entry, including unavailable ones; other users only
 # see channels they are allowed to watch.
 def _playlist_payload(
-    playlist: dict,
-    streams: list[dict],
+    playlist: playlists.Playlist,
+    streams: list[ProviderRecord],
     category_names: dict[str, str],
     username: str | None = None,
-) -> dict[str, Any]:
+) -> PlaylistPayload:
     """Playlist with resolved channels."""
     stream_allowed = _live_stream_filter(username) if username is not None else None
-    channels = []
+    channels: list[PlaylistChannelView] = []
     for entry in playlist.get("channels", []):
         stream = playlists.resolve_channel(entry, streams)
         if stream_allowed is not None and (stream is None or not stream_allowed(stream)):
             continue
-        channel = (
-            playlists.summarize(playlists.with_entry_epg(entry, stream), category_names)
-            if stream
-            else dict(entry)
+        if stream is None:
+            channels.append(_unavailable_channel(entry))
+            continue
+        summary = playlists.summarize(playlists.with_entry_epg(entry, stream), category_names)
+        channels.append(
+            {
+                "stream_id": summary["stream_id"],
+                "name": summary["name"],
+                "source_id": summary["source_id"],
+                "epg_channel_id": summary["epg_channel_id"],
+                "icon": summary["icon"],
+                "category": summary["category"],
+                "available": True,
+                # Only streams without their own EPG id take the entry's guide channel.
+                "guide_assignable": not _present(stream.get("epg_channel_id")),
+            },
         )
-        channel["available"] = stream is not None
-        # Only streams without their own EPG id take the entry's guide channel.
-        if stream is not None:
-            channel["guide_assignable"] = not stream.get("epg_channel_id")
-        channels.append(channel)
     return {
         "id": playlist["id"],
         "category_id": f"{playlists.PREFIX}{playlist['id']}",
@@ -4240,12 +4428,27 @@ def _playlist_payload(
     }
 
 
-async def _json_body(request: Request, limit: int = 1024 * 1024) -> dict[str, Any]:
+def _unavailable_channel(entry: playlists.PlaylistChannel) -> PlaylistChannelView:
+    """A saved entry whose stream is gone, keeping only the fields it was saved with."""
+    view: PlaylistChannelView = {}
+    if "stream_id" in entry:
+        view["stream_id"] = entry["stream_id"]
+    if "name" in entry:
+        view["name"] = entry["name"]
+    if "source_id" in entry:
+        view["source_id"] = entry["source_id"]
+    if "epg_channel_id" in entry:
+        view["epg_channel_id"] = entry["epg_channel_id"]
+    view["available"] = False
+    return view
+
+
+async def _json_body(request: Request, limit: int = 1024 * 1024) -> ProviderRecord:
     body = await request.body()
     if len(body) > limit:
         raise HTTPException(400, "Request too large")
     try:
-        data = json.loads(body or b"{}")
+        data = json_loads(body or b"{}")
     except ValueError as e:
         raise HTTPException(400, "Invalid JSON") from e
     if not isinstance(data, dict):
@@ -4253,9 +4456,9 @@ async def _json_body(request: Request, limit: int = 1024 * 1024) -> dict[str, An
     return data
 
 
-def _payload_viewer(user: dict) -> str | None:
+def _payload_viewer(user: TokenClaims) -> str | None:
     """None for admins (full view), else the username to apply restrictions for."""
-    username = user.get("sub", "")
+    username = user["sub"]
     return None if auth.is_admin(username) else username
 
 
@@ -4272,44 +4475,82 @@ def _fetch_logo(url: str, timeout: int = 3, *, max_size: int = 1024 * 1024) -> t
     return data, content_type
 
 
-def _enrich_probe_cache_stats(stats: list[dict], xtream: Any) -> list[dict]:
-    """Enrich probe cache stats with series/episode names (blocking)."""
+def _enrich_probe_cache_stats(
+    stats: list[ffmpeg_command.SeriesProbeStats],
+    xtream: XtreamClient,
+) -> list[dict[str, object]]:
+    """Copy probe cache stats, adding series and episode names (blocking)."""
+    enriched: list[dict[str, object]] = []
     for entry in stats:
-        series: dict | None = None
-        if not entry.get("name") or entry.get("episodes"):
+        name = entry["name"]
+        episodes: list[dict[str, object]] = [{**ep} for ep in entry["episodes"]]
+        series: ProviderRecord = {}
+        if not name or episodes:
             cache_key = f"series_info_{entry['series_id']}"
             with contextlib.suppress(Exception):
                 series = get_cached_info(
                     cache_key,
-                    lambda sid=entry["series_id"]: xtream.get_series_info(sid),
+                    functools.partial(xtream.get_series_info, entry["series_id"]),
                 )
         if series:
-            if not entry.get("name") and series.get("info"):
-                entry["name"] = series["info"].get("name", "")
-            ep_map: dict[int, str] = {}
-            for season_num, eps in (series.get("episodes") or {}).items():
-                for ep in eps:
-                    eid = ep.get("id")
-                    if eid:
-                        ep_num = ep.get("episode_num", 0)
-                        title = ep.get("title", "")
-                        title = re.sub(r"^S\d+E\d+\s*-\s*", "", title)
-                        if " - " in title:
-                            title = title.split(" - ")[-1]
-                        ep_map[int(eid)] = (
-                            f"S{int(season_num):02d}E{int(ep_num):02d} {title.strip()}"
-                        )
-            for ep in entry.get("episodes", []):
+            info = record_field(series, "info")
+            if not name and info:
+                name = text_field(info, "name")
+            ep_map = _episode_labels(series)
+            for ep in episodes:
                 ep_id = ep.get("episode_id")
-                if ep_id in ep_map:
+                if isinstance(ep_id, int) and ep_id in ep_map:
                     ep["name"] = ep_map[ep_id]
-    return stats
+        enriched.append({**entry, "name": name, "episodes": episodes})
+    return enriched
+
+
+def _episode_labels(series: ProviderRecord) -> dict[int, str]:
+    """Map each episode id to an ``SxxEyy Title`` label."""
+    labels: dict[int, str] = {}
+    for season_num, eps in record_field(series, "episodes").items():
+        for ep in eps if isinstance(eps, list) else []:
+            if not isinstance(ep, dict) or not _present(ep.get("id")):
+                continue
+            title = re.sub(r"^S\d+E\d+\s*-\s*", "", text_field(ep, "title"))
+            if " - " in title:
+                title = title.split(" - ")[-1]
+            episode_num = _int_value(ep.get("episode_num", 0))
+            labels[_int_value(ep.get("id"))] = (
+                f"S{int(season_num):02d}E{episode_num:02d} {title.strip()}"
+            )
+    return labels
 
 
 def _handoff_stream_allowed(username: str, stream_id: str) -> bool:
     _ensure_live_cache()
     stream = _find_live_stream(stream_id)
-    return bool(stream and _live_stream_filter(username)(stream))
+    return stream is not None and _live_stream_filter(username)(stream)
+
+
+class _ApiSettingsUpdate(TypedDict, total=False):
+    """Server settings an administrator may change through ``/api/settings``."""
+
+    transcode_mode: str
+    transcode_hw: str
+    vod_transcode_cache_mins: int
+    probe_live: bool
+    probe_movies: bool
+    probe_series: bool
+    vod_order: list[str]
+    series_order: list[str]
+
+
+class _UserPrefsUpdate(TypedDict, total=False):
+    """Preferences a client may change through ``/api/user-prefs``."""
+
+    favorites: dict[str, dict[str, MutablePlainTree]]
+    cc_lang: str
+    cc_style: dict[str, MutablePlainTree]
+    cast_host: str
+    virtual_scroll: bool
+    sort_live_by_views: bool
+    guide_selected_cats: list[str] | None
 
 
 if __name__ == "__main__":

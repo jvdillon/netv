@@ -61,7 +61,7 @@ def main() -> int:
         for playlist in data.get("playlists", []):
             for channel in playlist.get("channels", []):
                 target = targets.get(channel.get("name", ""))
-                if not target:
+                if target is None:
                     continue
                 row = conn.execute(
                     "SELECT c.name, COUNT(*) AS up FROM channels c "

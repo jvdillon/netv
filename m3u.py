@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Sequence
+from typing import NotRequired, TypedDict
 
 import logging
 import re
 import threading
 import time
 
+from treekle import MutablePlainTree, ReadError, from_plain
+
 from cache import (
+    Source,
     get_cache,
     get_cache_lock,
     get_sources,
@@ -19,7 +23,29 @@ from cache import (
     update_source_epg_url,
 )
 from util import safe_urlopen
-from xtream import XtreamClient
+from xtream import ProviderRecord, XtreamClient
+
+
+class LiveData(TypedDict):
+    """Live categories, streams, and guide URLs of every source."""
+
+    cats: list[ProviderRecord]
+    streams: list[ProviderRecord]
+    epg_urls: list[tuple[str, int, str]]
+
+
+class VodData(TypedDict):
+    """VOD categories and streams of every Xtream source."""
+
+    cats: list[ProviderRecord]
+    streams: list[ProviderRecord]
+
+
+class SeriesData(TypedDict):
+    """Series categories and listings of every Xtream source."""
+
+    cats: list[ProviderRecord]
+    series: list[ProviderRecord]
 
 
 log = logging.getLogger(__name__)
@@ -32,7 +58,10 @@ _fetch_locks: dict[str, threading.Lock] = {
 }
 
 
-def parse_m3u(content: str, source_id: str) -> tuple[list[dict], list[dict], str]:
+def parse_m3u(
+    content: str,
+    source_id: str,
+) -> tuple[list[ProviderRecord], list[ProviderRecord], str]:
     """Parse a source's M3U playlist.
 
     Args:
@@ -44,9 +73,10 @@ def parse_m3u(content: str, source_id: str) -> tuple[list[dict], list[dict], str
         streams: Stream metadata and direct playback URLs.
         epg_url: Advertised guide URL, or an empty string.
     """
-    categories: dict[str, dict] = {}
-    streams: list[dict] = []
+    categories: dict[str, ProviderRecord] = {}
+    streams: list[ProviderRecord] = []
     stream_id_counter = 0
+    streams_with_epg = 0
     epg_url = ""
 
     lines = content.strip().split("\n")
@@ -56,7 +86,8 @@ def parse_m3u(content: str, source_id: str) -> tuple[list[dict], list[dict], str
         if line.startswith("#EXTM3U"):
             match = re.search(r'(?:url-tvg|x-tvg-url)="([^"]*)"', line)
             if match:
-                epg_url = match.group(1)
+                # Typeshed types a group as ``str | Any``; this one always matched.
+                epg_url = str(match.group(1))
         elif line.startswith("#EXTINF:"):
             attrs: dict[str, str] = {}
             match = re.search(r"#EXTINF:[^,]*,(.*)", line)
@@ -78,9 +109,9 @@ def parse_m3u(content: str, source_id: str) -> tuple[list[dict], list[dict], str
                 i -= 1
 
             group = attrs.get("group-title", "Uncategorized")
+            cat_slug = re.sub(r"[^a-zA-Z0-9]+", "_", group).strip("_").lower()
+            cat_id = f"{source_id}_{cat_slug}"
             if group not in categories:
-                cat_slug = re.sub(r"[^a-zA-Z0-9]+", "_", group).strip("_").lower()
-                cat_id = f"{source_id}_{cat_slug}"
                 categories[group] = {
                     "category_id": cat_id,
                     "category_name": group,
@@ -89,20 +120,22 @@ def parse_m3u(content: str, source_id: str) -> tuple[list[dict], list[dict], str
                 }
 
             stream_id_counter += 1
+            epg_channel_id = attrs.get("tvg-id", "")
+            if epg_channel_id:
+                streams_with_epg += 1
             streams.append(
                 {
                     "stream_id": f"{source_id}_{stream_id_counter}",
                     "name": name,
                     "stream_icon": attrs.get("tvg-logo", ""),
-                    "epg_channel_id": attrs.get("tvg-id", ""),
-                    "category_ids": [categories[group]["category_id"]],
+                    "epg_channel_id": epg_channel_id,
+                    "category_ids": [cat_id],
                     "direct_url": url,
                     "source_id": source_id,
                 },
             )
         i += 1
 
-    streams_with_epg = sum(1 for s in streams if s.get("epg_channel_id"))
     log.debug(
         "M3U parsed: %d streams (%d with tvg-id, %d without), %d categories",
         len(streams),
@@ -113,7 +146,11 @@ def parse_m3u(content: str, source_id: str) -> tuple[list[dict], list[dict], str
     return list(categories.values()), streams, epg_url
 
 
-def fetch_m3u(url: str, source_id: str, timeout: int = 30) -> tuple[list[dict], list[dict], str]:
+def fetch_m3u(
+    url: str,
+    source_id: str,
+    timeout: int = 30,
+) -> tuple[list[ProviderRecord], list[ProviderRecord], str]:
     """Fetch and parse M3U from URL, return (categories, streams, epg_url)."""
     with safe_urlopen(url, timeout=timeout, user_agent=get_user_agent()) as resp:
         content = resp.read().decode("utf-8")
@@ -121,9 +158,9 @@ def fetch_m3u(url: str, source_id: str, timeout: int = 30) -> tuple[list[dict], 
 
 
 def fetch_source_live_data(
-    source: Any,
+    source: Source,
     persist_epg_url: bool = True,
-) -> tuple[list[dict], list[dict], str | None, int]:
+) -> tuple[list[ProviderRecord], list[ProviderRecord], str | None, int]:
     """Fetch live data for a single source.
 
     Args:
@@ -136,8 +173,8 @@ def fetch_source_live_data(
         epg_url: Enabled guide URL, or None.
         epg_timeout: Source's guide request timeout in seconds.
     """
-    cats: list[dict] = []
-    streams: list[dict] = []
+    cats: list[ProviderRecord] = []
+    streams: list[ProviderRecord] = []
     epg_url: str | None = None
 
     if source.type == "xtream":
@@ -153,8 +190,11 @@ def fetch_source_live_data(
             s["source_url"] = source.url
             s["source_username"] = source.username
             s["source_password"] = source.password
-            orig_cats = s.get("category_ids") or [s.get("category_id")]
-            s["category_ids"] = [f"{source.id}_{c}" for c in orig_cats if c]
+            ids = s.get("category_ids")
+            orig_cats = ids if isinstance(ids, list) and ids else [s.get("category_id")]
+            s["category_ids"] = [
+                f"{source.id}_{c}" for c in orig_cats if c is not None and c not in ("", 0)
+            ]
         detected_epg = client.epg_url
         if persist_epg_url:
             update_source_epg_url(source.id, detected_epg)
@@ -170,7 +210,7 @@ def fetch_source_live_data(
     return cats, streams, epg_url, source.epg_timeout
 
 
-def fetch_source_vod_data(source: Any) -> tuple[list[dict], list[dict]]:
+def fetch_source_vod_data(source: Source) -> tuple[list[ProviderRecord], list[ProviderRecord]]:
     """Fetch VOD data for a single Xtream source.
 
     Args:
@@ -193,15 +233,82 @@ def fetch_source_vod_data(source: Any) -> tuple[list[dict], list[dict]]:
     return cats, streams
 
 
-def parse_epg_urls(raw: list) -> list[tuple[str, int, str]]:
-    """Convert JSON list back to tuples (JSON stores tuples as lists)."""
-    return [(u[0], u[1], u[2]) for u in raw if isinstance(u, (list, tuple)) and len(u) >= 3]
+def parse_epg_urls(raw: Sequence[object]) -> list[tuple[str, int, str]]:
+    """Convert JSON lists back to guide URL tuples, skipping malformed ones.
+
+    Args:
+        raw: Stored entries, each ``[url, timeout, source_id]``.
+
+    Returns:
+        epg_urls: The well-formed entries as ``(url, timeout, source_id)``.
+    """
+    epg_urls: list[tuple[str, int, str]] = []
+    for entry in raw:
+        match entry:
+            case [str() as url, int() as timeout, str() as source_id, *_]:
+                epg_urls.append((url, timeout, source_id))
+            case _:
+                pass
+    return epg_urls
+
+
+def cached_live_data() -> tuple[LiveData, float] | None:
+    """Read the live data file cache.
+
+    Returns:
+        cached: Data and write time, or None when absent or unreadable.
+    """
+    cached = load_file_cache("live_data")
+    if cached is None:
+        return None
+    tree, timestamp = cached
+    try:
+        data = from_plain(tree, _LiveFile)
+    except ReadError:
+        return None
+    return {
+        "cats": data["cats"],
+        "streams": data["streams"],
+        "epg_urls": parse_epg_urls(data.get("epg_urls", [])),
+    }, timestamp
+
+
+def cached_vod_data() -> tuple[VodData, float] | None:
+    """Read the VOD data file cache.
+
+    Returns:
+        cached: Data and write time, or None when absent or unreadable.
+    """
+    cached = load_file_cache("vod_data")
+    if cached is None:
+        return None
+    tree, timestamp = cached
+    try:
+        return from_plain(tree, VodData), timestamp
+    except ReadError:
+        return None
+
+
+def cached_series_data() -> tuple[SeriesData, float] | None:
+    """Read the series data file cache.
+
+    Returns:
+        cached: Data and write time, or None when absent or unreadable.
+    """
+    cached = load_file_cache("series_data")
+    if cached is None:
+        return None
+    tree, timestamp = cached
+    try:
+        return from_plain(tree, SeriesData), timestamp
+    except ReadError:
+        return None
 
 
 def load_all_live_data(
     *,
     ttl_seconds: float = 2 * 3600,
-) -> tuple[list[dict], list[dict], list[tuple[str, int, str]]]:
+) -> tuple[list[ProviderRecord], list[ProviderRecord], list[tuple[str, int, str]]]:
     """Load live data with file cache and stale-while-revalidate.
 
     Args:
@@ -214,13 +321,11 @@ def load_all_live_data(
     """
     _cache = get_cache()
     _cache_lock = get_cache_lock()
-    cached = load_file_cache("live_data")
+    cached = cached_live_data()
     now = time.time()
 
-    if cached:
+    if cached is not None:
         data, ts = cached
-        cats, streams = data["cats"], data["streams"]
-        epg_urls = parse_epg_urls(data.get("epg_urls", []))
         age = now - ts
 
         if age > ttl_seconds and "live" not in _refresh_in_progress:
@@ -244,20 +349,23 @@ def load_all_live_data(
 
             threading.Thread(target=refresh, daemon=True).start()
 
-        return cats, streams, epg_urls
+        return data["cats"], data["streams"], data["epg_urls"]
 
     with _fetch_locks["live"]:
-        cached = load_file_cache("live_data")
-        if cached:
+        cached = cached_live_data()
+        if cached is not None:
             data, _ = cached
-            return data["cats"], data["streams"], parse_epg_urls(data.get("epg_urls", []))
+            return data["cats"], data["streams"], data["epg_urls"]
         log.info("No live cache, fetching")
         cats, streams, epg_urls = _fetch_all_live_data()
         save_file_cache("live_data", {"cats": cats, "streams": streams, "epg_urls": epg_urls})
         return cats, streams, epg_urls
 
 
-def load_vod_data(*, ttl_seconds: float = 12 * 3600) -> tuple[list[dict], list[dict]]:
+def load_vod_data(
+    *,
+    ttl_seconds: float = 12 * 3600,
+) -> tuple[list[ProviderRecord], list[ProviderRecord]]:
     """Load VOD data with file cache and stale-while-revalidate.
 
     Args:
@@ -269,12 +377,11 @@ def load_vod_data(*, ttl_seconds: float = 12 * 3600) -> tuple[list[dict], list[d
     """
     _cache = get_cache()
     _cache_lock = get_cache_lock()
-    cached = load_file_cache("vod_data")
+    cached = cached_vod_data()
     now = time.time()
 
-    if cached:
+    if cached is not None:
         data, ts = cached
-        cats, streams = data["cats"], data["streams"]
         age = now - ts
 
         if age > ttl_seconds and "vod" not in _refresh_in_progress:
@@ -294,11 +401,11 @@ def load_vod_data(*, ttl_seconds: float = 12 * 3600) -> tuple[list[dict], list[d
 
             threading.Thread(target=refresh, daemon=True).start()
 
-        return cats, streams
+        return data["cats"], data["streams"]
 
     with _fetch_locks["vod"]:
-        cached = load_file_cache("vod_data")
-        if cached:
+        cached = cached_vod_data()
+        if cached is not None:
             data, _ = cached
             return data["cats"], data["streams"]
         log.info("No VOD cache, fetching")
@@ -308,7 +415,10 @@ def load_vod_data(*, ttl_seconds: float = 12 * 3600) -> tuple[list[dict], list[d
         return cats, streams
 
 
-def load_series_data(*, ttl_seconds: float = 12 * 3600) -> tuple[list[dict], list[dict]]:
+def load_series_data(
+    *,
+    ttl_seconds: float = 12 * 3600,
+) -> tuple[list[ProviderRecord], list[ProviderRecord]]:
     """Load series data with file cache and stale-while-revalidate.
 
     Args:
@@ -320,12 +430,11 @@ def load_series_data(*, ttl_seconds: float = 12 * 3600) -> tuple[list[dict], lis
     """
     _cache = get_cache()
     _cache_lock = get_cache_lock()
-    cached = load_file_cache("series_data")
+    cached = cached_series_data()
     now = time.time()
 
-    if cached:
+    if cached is not None:
         data, ts = cached
-        cats, series = data["cats"], data["series"]
         age = now - ts
 
         if age > ttl_seconds and "series" not in _refresh_in_progress:
@@ -345,11 +454,11 @@ def load_series_data(*, ttl_seconds: float = 12 * 3600) -> tuple[list[dict], lis
 
             threading.Thread(target=refresh, daemon=True).start()
 
-        return cats, series
+        return data["cats"], data["series"]
 
     with _fetch_locks["series"]:
-        cached = load_file_cache("series_data")
-        if cached:
+        cached = cached_series_data()
+        if cached is not None:
             data, _ = cached
             return data["cats"], data["series"]
         log.info("No series cache, fetching")
@@ -380,7 +489,13 @@ def get_refresh_in_progress() -> set[str]:
     return _refresh_in_progress
 
 
-def _make_client(source: Any) -> XtreamClient:
+class _LiveFile(TypedDict):
+    cats: list[ProviderRecord]
+    streams: list[ProviderRecord]
+    epg_urls: NotRequired[list[MutablePlainTree]]
+
+
+def _make_client(source: Source) -> XtreamClient:
     """Build an Xtream client using the configured User-Agent."""
     return XtreamClient(
         base_url=source.url,
@@ -390,10 +505,14 @@ def _make_client(source: Any) -> XtreamClient:
     )
 
 
-def _fetch_all_live_data() -> tuple[list[dict], list[dict], list[tuple[str, int, str]]]:
+def _fetch_all_live_data() -> tuple[
+    list[ProviderRecord],
+    list[ProviderRecord],
+    list[tuple[str, int, str]],
+]:
     """Fetch live categories/streams from all sources."""
-    all_categories: list[dict] = []
-    all_streams: list[dict] = []
+    all_categories: list[ProviderRecord] = []
+    all_streams: list[ProviderRecord] = []
     epg_urls: list[tuple[str, int, str]] = []
 
     for source in get_sources():
@@ -401,7 +520,7 @@ def _fetch_all_live_data() -> tuple[list[dict], list[dict], list[tuple[str, int,
             cats, streams, epg_url, timeout = fetch_source_live_data(source, persist_epg_url=False)
             all_categories.extend(cats)
             all_streams.extend(streams)
-            if epg_url and source.epg_enabled:
+            if epg_url is not None and epg_url and source.epg_enabled:
                 epg_urls.append((epg_url, timeout, source.id))
         except Exception as e:
             log.error("Error loading source %s: %s", source.name, e)
@@ -409,10 +528,10 @@ def _fetch_all_live_data() -> tuple[list[dict], list[dict], list[tuple[str, int,
     return all_categories, all_streams, epg_urls
 
 
-def _fetch_vod_data() -> tuple[list[dict], list[dict]]:
+def _fetch_vod_data() -> tuple[list[ProviderRecord], list[ProviderRecord]]:
     """Fetch VOD categories and streams from all Xtream sources."""
-    all_cats: list[dict] = []
-    all_streams: list[dict] = []
+    all_cats: list[ProviderRecord] = []
+    all_streams: list[ProviderRecord] = []
     for source in get_sources():
         if source.type != "xtream":
             continue
@@ -425,10 +544,10 @@ def _fetch_vod_data() -> tuple[list[dict], list[dict]]:
     return all_cats, all_streams
 
 
-def _fetch_series_data() -> tuple[list[dict], list[dict]]:
+def _fetch_series_data() -> tuple[list[ProviderRecord], list[ProviderRecord]]:
     """Fetch series categories and list from all Xtream sources."""
-    all_cats: list[dict] = []
-    all_series: list[dict] = []
+    all_cats: list[ProviderRecord] = []
+    all_series: list[ProviderRecord] = []
     for source in get_sources():
         if source.type != "xtream":
             continue

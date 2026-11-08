@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from datetime import datetime
+from datetime import datetime, tzinfo
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal, override
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib import error
 
@@ -19,7 +19,8 @@ from fastapi.testclient import TestClient
 
 import pytest
 
-from cache import Source
+from cache import MemoryCache, Source, SourceConfig
+from handoff import Releaser, Resolver
 from main import PlayerInfo
 
 import cache as cache_module
@@ -69,8 +70,9 @@ class _ScriptedEvent:
 
 
 class _Noon(datetime):
+    @override
     @classmethod
-    def now(cls, tz: Any = None) -> _Noon:
+    def now(cls, tz: tzinfo | None = None) -> _Noon:
         del tz
         return cls(2026, 1, 1, 12, 0)
 
@@ -80,13 +82,15 @@ def _json(resp: Any) -> dict[str, Any]:
 
 
 @pytest.fixture
-def fresh_cache() -> Iterator[dict[str, Any]]:
-    cache_module.get_cache().clear()
+def fresh_cache() -> Iterator[MemoryCache]:
+    cache_module.clear_all_caches()
+    cache_module.get_cache().pop("epg", None)
     yield cache_module.get_cache()
-    cache_module.get_cache().clear()
+    cache_module.clear_all_caches()
+    cache_module.get_cache().pop("epg", None)
 
 
-def _settings_with_sources(*sources: dict[str, Any]) -> None:
+def _settings_with_sources(*sources: SourceConfig) -> None:
     settings = cache_module.load_server_settings()
     settings["sources"] = list(sources)
     cache_module.save_server_settings(settings)
@@ -97,7 +101,7 @@ def _settings_with_sources(*sources: dict[str, Any]) -> None:
 # =============================================================================
 
 
-def test_lifespan_runs_workers_and_shuts_down(fresh_cache: dict[str, Any]) -> None:
+def test_lifespan_runs_workers_and_shuts_down(fresh_cache: MemoryCache) -> None:
     fake_thread, targets = _thread_recorder()
     events: list[_ScriptedEvent] = []
 
@@ -123,7 +127,7 @@ def test_lifespan_runs_workers_and_shuts_down(fresh_cache: dict[str, Any]) -> No
 
     xtream = MagicMock(epg_url="http://x/epg")
 
-    def sweep_then_fail(resolve, release):
+    def sweep_then_fail(resolve: Resolver, release: Releaser) -> None:
         del resolve
         release("viewer", "http://x/1.m3u8")
         raise RuntimeError("sweep failed")
@@ -161,7 +165,7 @@ def test_lifespan_runs_workers_and_shuts_down(fresh_cache: dict[str, Any]) -> No
             patch("main.ffmpeg_session.stop_user_stream", new_callable=AsyncMock),
         )
         handoff_shutdown = stack.enter_context(patch("main.handoff.shutdown"))
-        cast_close = stack.enter_context(patch("main.casting.manager.close"))
+        cast_close = stack.enter_context(patch("main.chromecast.manager.close"))
         preload_live = stack.enter_context(patch("main._preload_live"))
         prune = stack.enter_context(patch("main._prune_epg"))
         preload_epg = stack.enter_context(patch("main._preload_epg"))
@@ -199,10 +203,10 @@ def test_lifespan_runs_workers_and_shuts_down(fresh_cache: dict[str, Any]) -> No
         preload_live.assert_called_once()
         prune.assert_called_once()
         preload_epg.assert_called_once()
-        assert fresh_cache["vod_categories"] == ["vc"]
-        assert fresh_cache["vod_streams"] == ["vs"]
-        assert fresh_cache["series_categories"] == ["sc"]
-        assert fresh_cache["series"] == ["ss"]
+        assert fresh_cache.get("vod_categories") == ["vc"]
+        assert fresh_cache.get("vod_streams") == ["vs"]
+        assert fresh_cache.get("series_categories") == ["sc"]
+        assert fresh_cache.get("series") == ["ss"]
         cleanup_expired.assert_called_once()
         sweep.assert_called_once()
         release.assert_awaited_once_with("viewer", "http://x/1.m3u8")
@@ -247,20 +251,20 @@ def test_kill_orphaned_ffmpeg_skips_bad_pids_and_stops_on_permission_error() -> 
     assert [c.args[0] for c in kill.call_args_list] == [12, 13, 14]
 
 
-def test_preload_live_fills_cache_and_clears_flag(fresh_cache: dict[str, Any]) -> None:
+def test_preload_live_fills_cache_and_clears_flag(fresh_cache: MemoryCache) -> None:
     def load() -> tuple[list[str], list[str], list[str]]:
         assert "guide_load" in m3u_module.get_refresh_in_progress()
         return ["c"], ["s"], ["u"]
 
     with patch("main.load_all_live_data", side_effect=load):
         main._preload_live()
-    assert fresh_cache["live_categories"] == ["c"]
-    assert fresh_cache["live_streams"] == ["s"]
-    assert fresh_cache["epg_urls"] == ["u"]
+    assert fresh_cache.get("live_categories") == ["c"]
+    assert fresh_cache.get("live_streams") == ["s"]
+    assert fresh_cache.get("epg_urls") == ["u"]
     assert "guide_load" not in m3u_module.get_refresh_in_progress()
 
 
-def test_preload_epg_notifies_subscribers(fresh_cache: dict[str, Any]) -> None:
+def test_preload_epg_notifies_subscribers(fresh_cache: MemoryCache) -> None:
     fresh_cache["epg_urls"] = [("http://e", 5, "s")]
     queue: asyncio.Queue[str] = asyncio.Queue()
     broken = MagicMock()
@@ -276,7 +280,7 @@ def test_preload_epg_notifies_subscribers(fresh_cache: dict[str, Any]) -> None:
 
 
 def test_preload_epg_logs_errors(
-    fresh_cache: dict[str, Any],
+    fresh_cache: MemoryCache,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     fresh_cache["epg_urls"] = [("http://e", 5, "s")]
@@ -297,13 +301,13 @@ def test_load_all_epg_skips_when_another_thread_filled_it() -> None:
     fetch_all.assert_not_called()
 
 
-def test_load_all_epg_records_fetch_error(fresh_cache: dict[str, Any]) -> None:
+def test_load_all_epg_records_fetch_error(fresh_cache: MemoryCache) -> None:
     with (
         patch("main._epg_is_fresh", return_value=False),
         patch("main._fetch_all_epg", side_effect=RuntimeError("boom")),
     ):
         main.load_all_epg([("http://e", 5, "s")])
-    assert fresh_cache["epg_error"] == "boom"
+    assert fresh_cache.get("epg_error") == "boom"
 
 
 def test_epg_events_registers_subscriber() -> None:
@@ -348,7 +352,7 @@ def test_setup_post_redirects_once_users_exist(api: TestClient) -> None:
 # Guide, VOD and series pages
 # =============================================================================
 
-_LIVE_FILE_CACHE = (
+_LIVE_FILE_CACHE: tuple[dict[str, list[dict[str, object]]], int] = (
     {
         "cats": [{"category_id": "1", "category_name": "News"}],
         "streams": [
@@ -362,17 +366,19 @@ _LIVE_FILE_CACHE = (
 
 def test_guide_page_loads_file_cache(api: TestClient) -> None:
     with (
-        patch("main.load_file_cache", return_value=_LIVE_FILE_CACHE),
+        patch("m3u.load_file_cache", return_value=_LIVE_FILE_CACHE),
         patch("main.epg.has_programs", return_value=True),
     ):
         resp = api.get("/guide?cats=1")
     assert resp.status_code == 200
     assert "CachedCNN" in resp.text
-    assert cache_module.get_cache()["live_streams"][0]["name"] == "CachedCNN"
+    store = cache_module.get_cache()
+    assert "live_streams" in store
+    assert store["live_streams"][0]["name"] == "CachedCNN"
 
 
 def test_guide_rows_api_loads_file_cache(api: TestClient) -> None:
-    with patch("main.load_file_cache", return_value=_LIVE_FILE_CACHE):
+    with patch("m3u.load_file_cache", return_value=_LIVE_FILE_CACHE):
         resp = api.get("/api/guide/rows?cats=1")
     assert resp.status_code == 200
     assert _json(resp)["total"] == 1
@@ -389,11 +395,11 @@ def _vod_streams() -> list[dict[str, Any]]:
 
 def test_vod_page_loads_file_cache(api: TestClient) -> None:
     data = {"cats": [{"category_id": "1", "category_name": "Films"}], "streams": _vod_streams()}
-    with patch("main.load_file_cache", return_value=(data, 0)):
+    with patch("m3u.load_file_cache", return_value=(data, 0)):
         resp = api.get("/vod?sort=alpha")
     assert resp.status_code == 200
     assert "MovieAlpha" in resp.text
-    assert cache_module.get_cache()["vod_streams"] == _vod_streams()
+    assert cache_module.get_cache().get("vod_streams") == _vod_streams()
 
 
 def test_vod_page_restricted(api: TestClient) -> None:
@@ -411,7 +417,9 @@ def test_vod_page_applies_filter_and_sorts(api: TestClient) -> None:
         ],
         vod_streams=_vod_streams(),
     )
-    cache_module.save_user_settings("testuser", {"vod_filter": ["1"]})
+    settings = cache_module.load_user_settings("testuser")
+    settings["vod_filter"] = ["1"]
+    cache_module.save_user_settings("testuser", settings)
     by_rating = api.get("/vod?sort=rating").text
     newest = api.get("/vod?sort=newest").text
     assert "MovieGamma" not in by_rating
@@ -430,11 +438,11 @@ def _series_list() -> list[dict[str, Any]]:
 
 def test_series_page_loads_file_cache(api: TestClient) -> None:
     data = {"cats": [{"category_id": "1", "category_name": "Drama"}], "series": _series_list()}
-    with patch("main.load_file_cache", return_value=(data, 0)):
+    with patch("m3u.load_file_cache", return_value=(data, 0)):
         resp = api.get("/series?sort=alpha")
     assert resp.status_code == 200
     assert "ShowA" in resp.text
-    assert cache_module.get_cache()["series"] == _series_list()
+    assert cache_module.get_cache().get("series") == _series_list()
 
 
 def test_series_page_restricted(api: TestClient) -> None:
@@ -452,7 +460,9 @@ def test_series_page_applies_filter_category_and_sorts(api: TestClient) -> None:
         ],
         series=_series_list(),
     )
-    cache_module.save_user_settings("testuser", {"series_filter": ["1", "2"]})
+    settings = cache_module.load_user_settings("testuser")
+    settings["series_filter"] = ["1", "2"]
+    cache_module.save_user_settings("testuser", settings)
     alpha = api.get("/series?sort=alpha&category=1").text
     rating = api.get("/series?sort=rating&category=1").text
     newest = api.get("/series?sort=newest&category=1").text
@@ -460,7 +470,9 @@ def test_series_page_applies_filter_category_and_sorts(api: TestClient) -> None:
     assert alpha.index("ShowA") < alpha.index("ShowB")
     assert rating.index("ShowB") < rating.index("ShowA")
     assert newest.index("ShowA") < newest.index("ShowB")
-    cache_module.save_user_settings("testuser", {"series_filter": ["2"]})
+    settings = cache_module.load_user_settings("testuser")
+    settings["series_filter"] = ["2"]
+    cache_module.save_user_settings("testuser", settings)
     filtered = api.get("/series?sort=alpha").text
     assert "ShowC" in filtered
     assert "ShowA" not in filtered
@@ -541,7 +553,7 @@ def test_movie_detail_loads_vod_and_restricts(api: TestClient) -> None:
     ):
         resp = api.get("/movie/7")
     assert resp.status_code == 403
-    assert cache_module.get_cache()["vod_streams"] == [movie]
+    assert cache_module.get_cache().get("vod_streams") == [movie]
 
 
 def test_movie_detail_tolerates_provider_error(api: TestClient) -> None:
@@ -663,10 +675,11 @@ def test_search_loads_data_and_applies_filters(api: TestClient) -> None:
         {"series_id": 5, "name": "News Show", "category_id": "1"},
         {"series_id": 6, "name": "News Serial", "category_id": "2"},
     ]
-    cache_module.save_user_settings(
-        "testuser",
-        {"guide_filter": ["1"], "vod_filter": ["1"], "series_filter": ["1"]},
-    )
+    settings = cache_module.load_user_settings("testuser")
+    settings["guide_filter"] = ["1"]
+    settings["vod_filter"] = ["1"]
+    settings["series_filter"] = ["1"]
+    cache_module.save_user_settings("testuser", settings)
     with (
         patch("main.load_all_live_data", return_value=([], live, [])),
         patch("main.load_vod_data", return_value=([], vod)),
@@ -678,9 +691,9 @@ def test_search_loads_data_and_applies_filters(api: TestClient) -> None:
         assert shown in resp.text
     for hidden in ("News Two", "News Film", "News Serial"):
         assert hidden not in resp.text
-    assert cache_module.get_cache()["live_streams"] == live
-    assert cache_module.get_cache()["vod_streams"] == vod
-    assert cache_module.get_cache()["series"] == series
+    assert cache_module.get_cache().get("live_streams") == live
+    assert cache_module.get_cache().get("vod_streams") == vod
+    assert cache_module.get_cache().get("series") == series
 
 
 def test_stream_redirect_without_xtream(api: TestClient) -> None:
@@ -721,7 +734,7 @@ def test_stream_redirect_to_provider(api: TestClient) -> None:
 def test_transcode_start_passes_stream_limits(api: TestClient) -> None:
     start = AsyncMock(return_value={"session_id": "abc"})
     with (
-        patch("main.casting.manager.owns_url", return_value=False),
+        patch("main.chromecast.manager.owns_url", return_value=False),
         patch("main.auth.get_user_limits", return_value={"max_streams_per_source": {"s1": 2}}),
         patch(
             "main.load_server_settings",
@@ -737,7 +750,7 @@ def test_transcode_start_passes_stream_limits(api: TestClient) -> None:
 
 def test_transcode_seek_and_progress(api: TestClient) -> None:
     with (
-        patch("main.casting.manager.owns_session", return_value=False),
+        patch("main.chromecast.manager.owns_session", return_value=False),
         patch("main.ffmpeg_session.seek_transcode", AsyncMock(return_value={"ok": True})) as seek,
         patch("main.ffmpeg_session.get_session_progress", return_value={"segments": 3}),
     ):
@@ -810,14 +823,14 @@ def test_subtitle_file_undecodable_returns_empty_vtt(tmp_path: Path) -> None:
 
 
 def test_transcode_clear_refuses_cast_url(api: TestClient) -> None:
-    with patch("main.casting.manager.owns_url", return_value=True):
+    with patch("main.chromecast.manager.owns_url", return_value=True):
         resp = api.delete("/transcode-clear", params={"url": "http://up/x"})
     assert resp.status_code == 409
 
 
 def test_transcode_clear_stops_cached_session(api: TestClient) -> None:
     with (
-        patch("main.casting.manager.owns_url", return_value=False),
+        patch("main.chromecast.manager.owns_url", return_value=False),
         patch("main.ffmpeg_session.clear_url_session", return_value="sid") as clear,
         patch("main.ffmpeg_session.stop_session") as stop,
     ):
@@ -833,7 +846,7 @@ def test_transcode_clear_stops_cached_session(api: TestClient) -> None:
 
 
 def test_settings_page_loads_file_caches(api: TestClient) -> None:
-    files = {
+    files: dict[str, tuple[dict[str, list[dict[str, str]]], int]] = {
         "live_data": (
             {"cats": [{"category_id": "1", "category_name": "LiveCat"}], "streams": []},
             0,
@@ -844,22 +857,22 @@ def test_settings_page_loads_file_caches(api: TestClient) -> None:
             0,
         ),
     }
-    with patch("main.load_file_cache", side_effect=files.get):
+    with patch("m3u.load_file_cache", side_effect=files.get):
         resp = api.get("/settings")
     assert resp.status_code == 200
     for name in ("LiveCat", "VodCat", "SeriesCat"):
         assert name in resp.text
     data = cache_module.get_cache()
-    assert data["epg_urls"] == []
-    assert data["vod_streams"] == []
-    assert data["series"] == []
+    assert data.get("epg_urls") == []
+    assert data.get("vod_streams") == []
+    assert data.get("series") == []
 
 
 def test_settings_page_starts_background_load_without_cache(
     api: TestClient,
 ) -> None:
     with (
-        patch("main.load_file_cache", return_value=None),
+        patch("m3u.load_file_cache", return_value=None),
         patch("main._start_guide_background_load") as start,
     ):
         resp = api.get("/settings")
@@ -868,10 +881,14 @@ def test_settings_page_starts_background_load_without_cache(
 
 
 @pytest.mark.parametrize(("path", "setting"), [("vod", "vod_filter"), ("series", "series_filter")])
-def test_settings_category_filters(api: TestClient, path: str, setting: str) -> None:
+def test_settings_category_filters(
+    api: TestClient,
+    path: str,
+    setting: Literal["vod_filter", "series_filter"],
+) -> None:
     resp = api.post(f"/settings/{path}-filter", json={"cats": ["1", "2"]})
     assert resp.json() == {"status": "ok"}
-    assert cache_module.load_user_settings("testuser")[setting] == ["1", "2"]
+    assert cache_module.load_user_settings("testuser").get(setting) == ["1", "2"]
 
 
 def _source_form(**overrides: Any) -> dict[str, Any]:
@@ -892,7 +909,7 @@ def test_add_source_normalizes_schedule(api: TestClient) -> None:
     assert resp.status_code == 303
     clear.assert_called_once()
     source = cache_module.load_server_settings()["sources"][-1]
-    assert source["epg_schedule"] == ["08:00", "23:30"]
+    assert source.get("epg_schedule") == ["08:00", "23:30"]
     assert source["url"] == "http://up.example"
 
 
@@ -931,9 +948,9 @@ def test_edit_source_updates_matching_source(api: TestClient) -> None:
     assert edited["name"] == "New"
     assert edited["type"] == "xtream"
     assert edited["url"] == "http://up.example"
-    assert edited["epg_schedule"] == ["07:15"]
-    assert edited["epg_url"] == "http://epg.example"
-    assert edited["max_streams"] == 0
+    assert edited.get("epg_schedule") == ["07:15"]
+    assert edited.get("epg_url") == "http://epg.example"
+    assert edited.get("max_streams") == 0
 
 
 def test_delete_source_clears_its_data(api: TestClient) -> None:
@@ -979,7 +996,7 @@ def test_guide_refresh_workers(
         patch("main.save_file_cache") as save,
     ):
         refresh_live()
-    assert data["live_streams"] == ["s"]
+    assert data.get("live_streams") == ["s"]
     save.assert_called_once_with(
         "live_data",
         {"cats": ["c"], "streams": ["s"], "epg_urls": [("http://e", 5, "x")]},
@@ -1000,7 +1017,8 @@ def test_guide_refresh_workers(
         with patch("main.epg.clear"), patch("main._fetch_all_epg", side_effect=RuntimeError("x")):
             refresh_epg()
         assert data["epg_error"] == "x"
-        data["epg_urls"] = []
+        no_epg_urls: list[tuple[str, int, str]] = []
+        data["epg_urls"] = no_epg_urls
         refresh_epg()
     assert "Live refresh failed: live down" in caplog.text
     assert "EPG refresh: no EPG URLs available" in caplog.text

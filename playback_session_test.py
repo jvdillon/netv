@@ -1,5 +1,7 @@
 """Verify the fallback changes the actual encoder configuration."""
 
+from collections.abc import Coroutine
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
@@ -17,12 +19,16 @@ import ffmpeg_session
     "configured_resolution,expected_resolution",
     [("4k", "720p"), ("480p", "480p")],
 )
-async def test_fallback_command_and_cleanup(tmp_path, configured_resolution, expected_resolution):
+async def test_fallback_command_and_cleanup(
+    tmp_path: Path,
+    configured_resolution: str,
+    expected_resolution: str,
+):
     settings = {"max_resolution": configured_resolution, "quality": "high", "sr_model": "nomos"}
     with (
         patch("ffmpeg_session.get_settings", return_value=settings),
         patch("ffmpeg_session.get_transcode_dir", return_value=tmp_path),
-        patch("ffmpeg_session.resolve_hls_master_playlist", side_effect=lambda url: url),
+        patch("ffmpeg_session.resolve_hls_master_playlist", side_effect=_same_url),
         patch(
             "ffmpeg_session.build_hls_ffmpeg_cmd",
             return_value=["ffmpeg", "-i", "stream"],
@@ -34,7 +40,7 @@ async def test_fallback_command_and_cleanup(tmp_path, configured_resolution, exp
         ),
         patch(
             "ffmpeg_session._spawn_background_task",
-            side_effect=lambda coroutine: coroutine.close(),
+            side_effect=_close_coroutine,
         ),
         patch("ffmpeg_session._wait_for_playlist", new_callable=AsyncMock, return_value=True),
     ):
@@ -52,7 +58,7 @@ async def test_fallback_command_and_cleanup(tmp_path, configured_resolution, exp
             }
             session = ffmpeg_session.get_session(result["session_id"])
             assert session is not None
-            assert session["bandwidth_saver"] is True
+            assert session.get("bandwidth_saver") is True
         finally:
             await ffmpeg_session.stop_session(result["session_id"], force=True)
         assert not list(tmp_path.iterdir())
@@ -84,18 +90,18 @@ async def test_fallback_does_not_reuse_high_quality_stream():
 
 
 @pytest.mark.asyncio
-async def test_legacy_saver_session_can_request_recovery(tmp_path):
+async def test_legacy_saver_session_can_request_recovery(tmp_path: Path):
 
     with (
         patch("ffmpeg_session.get_settings", return_value={"max_resolution": "1080p"}),
         patch("ffmpeg_session.get_transcode_dir", return_value=tmp_path),
-        patch("ffmpeg_session.resolve_hls_master_playlist", side_effect=lambda url: url),
+        patch("ffmpeg_session.resolve_hls_master_playlist", side_effect=_same_url),
         patch("ffmpeg_session.build_hls_ffmpeg_cmd", return_value=["ffmpeg", "-i", "stream"]),
         patch(
             "ffmpeg_session.asyncio.create_subprocess_exec",
             new=AsyncMock(return_value=FakeProcess()),
         ),
-        patch("ffmpeg_session._spawn_background_task", side_effect=lambda coro: coro.close()),
+        patch("ffmpeg_session._spawn_background_task", side_effect=_close_coroutine),
         patch("ffmpeg_session._wait_for_playlist", new=AsyncMock(return_value=True)),
     ):
         result = await ffmpeg_session.start_transcode(
@@ -215,6 +221,14 @@ async def test_starting_passthrough_session_is_not_reused_by_aac_client():
     finally:
         ffmpeg_session._transcode_sessions.pop("pending", None)
         ffmpeg_session._url_to_session.pop("stream", None)
+
+
+def _same_url(url: str) -> str:
+    return url
+
+
+def _close_coroutine(coroutine: Coroutine[object, object, object]) -> None:
+    coroutine.close()
 
 
 if __name__ == "__main__":

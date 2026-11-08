@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TypeVar, cast
 from unittest.mock import MagicMock, patch
@@ -26,7 +27,7 @@ class TestStop:
     def test_stop_without_a_watch_is_ignored(self):
         assert _stop(_channel(catchup_days=2)) is None
 
-    def test_archived_channel_resumes_as_catchup(self, state):
+    def test_archived_channel_resumes_as_catchup(self, state: Path):
         _watch(600)
         record = _some(_stop(_channel(catchup_days=2)))
         assert record["mode"] == "catchup"
@@ -170,7 +171,7 @@ class TestSweep:
         handoff.sweep(MagicMock(), MagicMock(), now=NOW + 24 * 3600 + 1)
         assert handoff._records == {}
 
-    def test_finished_recorder_is_marked_and_kept(self, tmp_path):
+    def test_finished_recorder_is_marked_and_kept(self, tmp_path: Path):
         _watch(600)
         with patch("handoff._start_recorder", return_value=_process()):
             record = _some(_stop(_channel()))
@@ -192,7 +193,7 @@ class TestSweep:
 
 
 class TestRecordingFiles:
-    def test_only_known_recordings_are_served(self, tmp_path):
+    def test_only_known_recordings_are_served(self, tmp_path: Path):
         directory = handoff.recording_dir("abc123")
         directory.mkdir()
         (directory / "stream.m3u8").write_text("#EXTM3U\n")
@@ -202,7 +203,7 @@ class TestRecordingFiles:
         assert handoff.recording_file("abc123", "../stream.m3u8") is None
         assert handoff.recording_file("../x", "stream.m3u8") is None
 
-    def test_orphaned_recordings_are_deleted(self, tmp_path):
+    def test_orphaned_recordings_are_deleted(self, tmp_path: Path):
         kept = handoff.recording_dir("kept")
         orphan = handoff.recording_dir("orphan")
         kept.mkdir()
@@ -212,10 +213,10 @@ class TestRecordingFiles:
         assert kept.exists()
         assert not orphan.exists()
 
-    def test_recorder_stops_at_the_requested_time(self, tmp_path):
+    def test_recorder_stops_at_the_requested_time(self, tmp_path: Path):
         with (
             patch("ffmpeg_command.get_settings", return_value={"probe_live": False}),
-            patch("ffmpeg_command.resolve_hls_master_playlist", side_effect=lambda u: u),
+            patch("ffmpeg_command.resolve_hls_master_playlist", side_effect=_same_url),
             patch("ffmpeg_command.get_user_agent", return_value=None),
         ):
             cmd = handoff._recorder_command("http://upstream.test/7.m3u8", tmp_path, 1800.4)
@@ -226,7 +227,7 @@ class TestRecordingFiles:
 
 
 class TestLoad:
-    def test_load_restores_valid_records_only(self, state):
+    def test_load_restores_valid_records_only(self, state: Path):
         (state / "ann" / "handoff.json").write_text(
             json.dumps({"id": "h1", "recording_live": True}),
         )
@@ -250,13 +251,13 @@ class TestShutdown:
 
 
 class TestSave:
-    def test_without_users_dir_is_noop(self, state):
+    def test_without_users_dir_is_noop(self, state: Path):
         handoff._users_dir = None
         handoff._records["ann"] = {"id": "h"}
         handoff._save("ann")
         assert not (state / "ann" / "handoff.json").exists()
 
-    def test_write_failure_is_logged(self, state, caplog):
+    def test_write_failure_is_logged(self, state: Path, caplog: pytest.LogCaptureFixture):
         handoff._records["zed"] = {"id": "h"}  # No user directory to write into.
         with patch("handoff.atomic_write_json", side_effect=OSError("disk full")):
             handoff._save("zed")
@@ -264,7 +265,7 @@ class TestSave:
 
 
 class TestRecorderProcess:
-    def test_start_recorder_launches_ffmpeg_with_log(self, tmp_path):
+    def test_start_recorder_launches_ffmpeg_with_log(self, tmp_path: Path):
         with (
             patch("handoff._recorder_command", return_value=["ffmpeg", "-x"]) as command,
             patch("subprocess.Popen") as popen,
@@ -275,7 +276,7 @@ class TestRecorderProcess:
         assert popen.call_args.args == (["ffmpeg", "-x"],)
         assert (directory / "ffmpeg.log").exists()
 
-    def test_stop_recorder_kills_unresponsive_process(self, tmp_path):
+    def test_stop_recorder_kills_unresponsive_process(self, tmp_path: Path):
         directory = handoff.recording_dir("rid")
         directory.mkdir()
         process = _process()
@@ -313,7 +314,7 @@ def _some(value: T | None) -> T:
 
 
 @pytest.fixture(autouse=True)
-def state(tmp_path: Path):
+def state(tmp_path: Path) -> Iterator[Path]:
     users = tmp_path / "users"
     (users / "ann").mkdir(parents=True)
     handoff.load(users)
@@ -328,19 +329,22 @@ def state(tmp_path: Path):
     handoff._recorders.clear()
 
 
-def _channel(catchup_days: int = 0, **overrides) -> handoff.Channel:
-    channel = handoff.Channel(
+def _channel(
+    catchup_days: int = 0,
+    *,
+    program_title: str = "Evening News",
+    program_start: float = NOW - 1800,
+    program_end: float = NOW + 1800,
+) -> handoff.Channel:
+    return handoff.Channel(
         stream_id="7",
         name="News",
         url="http://upstream.test/live/u/p/7.m3u8",
         catchup_days=catchup_days,
-        program_title="Evening News",
-        program_start=NOW - 1800,
-        program_end=NOW + 1800,
+        program_title=program_title,
+        program_start=program_start,
+        program_end=program_end,
     )
-    for key, value in overrides.items():
-        setattr(channel, key, value)
-    return channel
 
 
 def _process(running: bool = True) -> MagicMock:
@@ -359,7 +363,13 @@ def _watch(
     handoff.report_watch("ann", "7", position, handoff_id, now=now)
 
 
-def _stop(channel, position: float = NOW - 5, handoff_id: str = "", release=None, now=NOW):
+def _stop(
+    channel: handoff.Channel | None,
+    position: float = NOW - 5,
+    handoff_id: str = "",
+    release: handoff.Releaser | None = None,
+    now: float = NOW,
+):
     return handoff.stop_watch(
         "ann",
         "7",
@@ -369,6 +379,10 @@ def _stop(channel, position: float = NOW - 5, handoff_id: str = "", release=None
         handoff_id,
         now=now,
     )
+
+
+def _same_url(url: str) -> str:
+    return url
 
 
 if __name__ == "__main__":

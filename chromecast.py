@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from ipaddress import ip_address, ip_network
-from typing import Literal
+from typing import Literal, NotRequired, TypedDict
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -60,7 +60,8 @@ def media_origin(address: str) -> str:
         raise HTTPException(400, "Invalid neTV server address.") from exc
     if (
         parsed.scheme not in ("http", "https")
-        or not hostname
+        or hostname is None
+        or hostname == ""
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path not in ("", "/")
@@ -86,6 +87,19 @@ def media_origin(address: str) -> str:
             "Set the neTV server address to an address reachable by the TV, not localhost.",
         )
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+class CastStatus(TypedDict):
+    """Cast state reported to the browser for one user."""
+
+    active: bool
+    connecting: NotRequired[bool]
+    host: NotRequired[str]
+    name: NotRequired[str]
+    session_id: NotRequired[str]
+    state: NotRequired[str]
+    current_time: NotRequired[float | None]
+    volume: NotRequired[float]
 
 
 @dataclass(kw_only=True, slots=True)
@@ -153,12 +167,12 @@ class CastManager:
         origin: str,
         title: str,
         current_time: float,
-    ) -> dict:
+    ) -> CastStatus:
         host = lan_host(host)
         origin = media_origin(origin)
         with self._operations:
             session = ffmpeg_session.get_session(session_id)
-            if not session or session.get("username") != username:
+            if session is None or session.get("username") != username:
                 raise HTTPException(
                     404,
                     "Playback session not found. Start playback and try again.",
@@ -168,7 +182,7 @@ class CastManager:
                     s.username == username for s in self._sessions.values()
                 ):
                     raise HTTPException(409, "Stop the existing cast before starting another.")
-                filename = "master.m3u8" if session.get("fast_start") else "stream.m3u8"
+                filename = "master.m3u8" if session.get("fast_start", False) else "stream.m3u8"
                 record = CastSession(
                     username=username,
                     host=host,
@@ -195,8 +209,8 @@ class CastManager:
                     record.url,
                     "application/x-mpegurl",
                     title=title,
-                    stream_type="BUFFERED" if session.get("is_vod") else "LIVE",
-                    current_time=current_time if session.get("is_vod") else None,
+                    stream_type="BUFFERED" if session.get("is_vod", False) else "LIVE",
+                    current_time=current_time if session.get("is_vod", False) else None,
                     media_info={"hlsSegmentFormat": "TS", "hlsVideoSegmentFormat": "MPEG2_TS"},
                 )
                 deadline = time.monotonic() + 15
@@ -227,7 +241,7 @@ class CastManager:
                 if record.starting:
                     self._forget(record)
 
-    def status(self, username: str) -> dict:
+    def status(self, username: str) -> CastStatus:
         with self._lock:
             record = next((s for s in self._sessions.values() if s.username == username), None)
             if not record:
@@ -240,11 +254,7 @@ class CastManager:
                 "host": record.host,
                 "name": record.name,
                 "session_id": record.session_id,
-                "state": "CONNECTING"
-                if record.starting
-                else status.player_state
-                if status
-                else "UNKNOWN",
+                "state": status.player_state if status else "UNKNOWN",
                 "current_time": status.adjusted_current_time if status else 0,
                 "volume": record.cast.status.volume_level
                 if record.cast and record.cast.status
@@ -258,7 +268,7 @@ class CastManager:
         volume: float | None = None,
         *,
         release: Callable[[str], None],
-    ) -> dict:
+    ) -> CastStatus:
         """Control the user's cast.
 
         Args:
@@ -290,7 +300,7 @@ class CastManager:
                     cast.media_controller.play()
                 elif action == "pause":
                     cast.media_controller.pause()
-                elif action == "volume":
+                else:
                     if volume is None:
                         raise HTTPException(400, "A volume between 0 and 1 is required.")
                     cast.set_volume(volume)
@@ -320,23 +330,19 @@ class CastManager:
 
     def _save_position(self, record: CastSession) -> None:
         session = ffmpeg_session.get_session(record.session_id)
-        if not session or not session.get("is_vod") or not record.cast:
+        if session is None or not session.get("is_vod", False) or not record.cast:
             return
         status = record.cast.media_controller.status
         if status.content_id != record.url:
             return
         position = (status.adjusted_current_time or 0) + session.get("seek_offset", 0)
-        if session.get("duration", 0) > 0:
-            position = min(position, session["duration"])
+        duration = session.get("duration", 0)
+        if duration > 0:
+            position = min(position, duration)
         if position < 5:
             return
         try:
-            save_watch_position(
-                record.username,
-                record.source_url,
-                position,
-                session.get("duration", 0),
-            )
+            save_watch_position(record.username, record.source_url, position, duration)
         except OSError:
             log.exception("Could not save Chromecast watch position")
 

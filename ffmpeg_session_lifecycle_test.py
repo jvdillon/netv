@@ -1,5 +1,6 @@
 """Fast-start sessions start once per URL and never outlive their pipeline."""
 
+from collections.abc import Coroutine, Iterator
 from unittest.mock import patch
 
 import asyncio
@@ -84,8 +85,12 @@ def _ingest_command(
     return ["ingest", url]
 
 
+def _close(coro: Coroutine[object, object, None]) -> None:
+    coro.close()
+
+
 @pytest.fixture
-def startup(tmp_path):
+def startup(tmp_path: pathlib.Path) -> Iterator[Startup]:
     runtime = Startup()
     with (
         patch.dict(ffmpeg_session._transcode_sessions, {}, clear=True),
@@ -100,12 +105,12 @@ def startup(tmp_path):
         patch("ffmpeg_session.probe_audio", return_value=None),
         patch("ffmpeg_session.probe_closed_captions", return_value=False),
         patch("ffmpeg_session.probe_video_codec", return_value="h264"),
-        patch("ffmpeg_session._spawn_background_task", side_effect=lambda coro: coro.close()),
+        patch("ffmpeg_session._spawn_background_task", side_effect=_close),
     ):
         yield runtime
 
 
-def _start(user_max_streams: int = 0) -> asyncio.Task:
+def _start(user_max_streams: int = 0) -> asyncio.Task[ffmpeg_session.TranscodeResponse]:
     return asyncio.create_task(
         ffmpeg_session.start_transcode(
             URL,
@@ -117,7 +122,7 @@ def _start(user_max_streams: int = 0) -> asyncio.Task:
 
 
 @pytest.mark.asyncio
-async def test_second_request_waits_for_startup_then_reuses_it(startup):
+async def test_second_request_waits_for_startup_then_reuses_it(startup: Startup):
     first = _start()
     await asyncio.sleep(0.01)
     second = _start()
@@ -130,7 +135,7 @@ async def test_second_request_waits_for_startup_then_reuses_it(startup):
 
 
 @pytest.mark.asyncio
-async def test_failed_startup_is_not_handed_to_a_waiting_request(startup):
+async def test_failed_startup_is_not_handed_to_a_waiting_request(startup: Startup):
     startup.failures = 1
     first = _start()
     await asyncio.sleep(0.01)
@@ -145,7 +150,7 @@ async def test_failed_startup_is_not_handed_to_a_waiting_request(startup):
 
 
 @pytest.mark.asyncio
-async def test_concurrent_starts_open_one_upstream_within_stream_limits(startup):
+async def test_concurrent_starts_open_one_upstream_within_stream_limits(startup: Startup):
     requests = [_start(user_max_streams=1), _start(user_max_streams=1)]
     await asyncio.sleep(0.01)
     startup.gate.set()
@@ -155,7 +160,7 @@ async def test_concurrent_starts_open_one_upstream_within_stream_limits(startup)
     assert not ffmpeg_session._startup_guards
 
 
-def _dead_fast_session(tmp_path: pathlib.Path) -> dict[str, object]:
+def _dead_fast_session(tmp_path: pathlib.Path) -> ffmpeg_session.FastLiveSession:
     now = time.monotonic()
     return {
         "dir": str(tmp_path),
@@ -168,6 +173,7 @@ def _dead_fast_session(tmp_path: pathlib.Path) -> dict[str, object]:
         "last_access": time.time(),
         "fast_start": True,
         "playback_policy": PlaybackPolicy(),
+        "ingest_restart_command": ["ingest"],
         # The restart budget is spent: three attempts inside the window.
         "live_recovery": LiveRecoveryPolicy(
             failures={"input": now - 10},
@@ -177,7 +183,10 @@ def _dead_fast_session(tmp_path: pathlib.Path) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-async def test_watchdog_releases_a_pipeline_it_can_no_longer_restart(startup, tmp_path):
+async def test_watchdog_releases_a_pipeline_it_can_no_longer_restart(
+    startup: Startup,
+    tmp_path: pathlib.Path,
+):
     ffmpeg_session._transcode_sessions["dead"] = _dead_fast_session(tmp_path)
     ffmpeg_session._url_to_session[URL] = "dead"
     with patch("ffmpeg_session.ready_bitrate", return_value=0):
