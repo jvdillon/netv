@@ -30,6 +30,9 @@ jobs:
   # skip it here and let the workflow_run trigger build once FFmpeg Base publishes.
   gate:
     runs-on: ubuntu-26.04
+    permissions:
+      actions: read
+      contents: read
     outputs:
       run: ${{ steps.decide.outputs.run }}
     steps:
@@ -42,12 +45,20 @@ jobs:
           EVENT: ${{ github.event_name }}
           BEFORE: ${{ github.event.before }}
           RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           case "$EVENT" in
             workflow_run)
               [ "$RUN_CONCLUSION" = success ] && run=true || run=false ;;
             push)
-              if git cat-file -e "$BEFORE^{commit}" 2>/dev/null && \
+              # An FFmpeg Base run still in flight (this push or an earlier one) is about to
+              # publish images; its completion triggers this workflow again.
+              pending=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ffmpeg-base.yml --branch main \
+                --limit 20 --json status --jq '[.[] | select(.status != "completed")] | length')
+              if [ "$pending" -gt 0 ]; then
+                echo "FFmpeg Base run in progress; building after it finishes"
+                run=false
+              elif git cat-file -e "$BEFORE^{commit}" 2>/dev/null && \
                  git diff --name-only "$BEFORE" "$GITHUB_SHA" -- \
                    docker/Dockerfile.ffmpeg scripts/install-ffmpeg.sh docker/patches \
                    .github/workflows/ffmpeg-base.yml | grep -q .; then
