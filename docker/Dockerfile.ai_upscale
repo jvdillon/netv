@@ -23,7 +23,7 @@ ARG FFMPEG_IMAGE=ghcr.io/jvdillon/netv-ffmpeg:latest
 FROM ${FFMPEG_IMAGE}
 
 # Build metadata (passed from workflow, used for documentation/debugging)
-ARG NVIDIA=cuda:13.0
+ARG NVIDIA=cuda:13.2
 ARG BASE_IMAGE=ubuntu:26.04
 
 # Store build info as labels

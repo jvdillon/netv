@@ -29,8 +29,8 @@ jobs:
       fail-fast: false
       matrix:
         # Mirrors ffmpeg-base.yml: each image builds on the ffmpeg image of the same CUDA and OS.
-        nvidia: ['cuda:12.4', 'cuda:12.6', 'cuda:12.8', 'cuda:13.0']
-        base_image: ['ubuntu:22.04', 'ubuntu:24.04', 'ubuntu:26.04']
+        nvidia: ['cuda:12.4', 'cuda:12.6', 'cuda:12.8', 'cuda:13.0', 'cuda:13.2']
+        base_image: ['ubuntu:24.04', 'ubuntu:26.04']
 
     steps:
       - name: Free disk space
@@ -71,7 +71,7 @@ jobs:
           tags: |
             type=raw,value=cuda${{ steps.cuda.outputs.version }}-${{ steps.cuda.outputs.os }}
             type=raw,value=cuda${{ steps.cuda.outputs.version }},enable=${{ matrix.base_image == env.DEFAULT_BASE }}
-            type=raw,value=latest,enable=${{ matrix.base_image == env.DEFAULT_BASE && steps.cuda.outputs.version == '13.0' }}
+            type=raw,value=latest,enable=${{ matrix.base_image == env.DEFAULT_BASE && steps.cuda.outputs.version == '13.2' }}
 
       - name: Build and push
         uses: docker/build-push-action@v7
