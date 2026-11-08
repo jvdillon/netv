@@ -5,9 +5,11 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import call, patch
 
 import gc
 import gzip
+import logging
 import sqlite3
 import threading
 import warnings
@@ -608,11 +610,11 @@ XMLTV = """<?xml version="1.0"?>
   <programme start="20241130120000 +0000" stop="20241130130000 +0000" channel="ch1">
     <title>News</title><desc>Daily news</desc>
   </programme>
-  <programme start="20241130130000 +0000" stop="20241130140000 +0000" channel="ch1">
-    <title></title>
-  </programme>
   <programme start="bogus-timestamp" stop="20241130140000 +0000" channel="ch2">
     <title>Broken</title>
+  </programme>
+  <programme start="20241130130000 +0000" stop="20241130140000 +0000" channel="ch1">
+    <title></title>
   </programme>
 </tv>
 """
@@ -626,8 +628,10 @@ class TestFetchEpg:
         db: None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ):
         calls = _fake_urlopen(monkeypatch, XMLTV.encode())
+        caplog.set_level(logging.DEBUG, logger="netv.epg")
 
         count = epg.fetch_epg(
             "http://epg.example/guide.xml",
@@ -638,6 +642,9 @@ class TestFetchEpg:
         )
 
         assert count == 2
+        assert caplog.messages == [
+            "EPG parsed: 3 channels, 2 unique program channel IDs, 2 programs",
+        ]
         assert calls == [("http://epg.example/guide.xml", 7, "UA/1")]
         conn = epg._get_conn()
         names = dict(conn.execute("SELECT id, name FROM channels").fetchall())
@@ -651,8 +658,42 @@ class TestFetchEpg:
         ]
 
     def test_decompresses_gzip(self, db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        _fake_urlopen(monkeypatch, gzip.compress(XMLTV.encode()))
+        calls = _fake_urlopen(monkeypatch, gzip.compress(XMLTV.encode()))
         assert epg.fetch_epg("http://epg.example/guide.xml.gz", tmp_path) == 2
+        assert calls == [("http://epg.example/guide.xml.gz", 120, None)]
+        conn = epg._get_conn()
+        assert {row[0] for row in conn.execute("SELECT source_id FROM channels")} == {""}
+        assert {row[0] for row in conn.execute("SELECT source_id FROM programs")} == {""}
+
+    def test_missing_attributes_use_empty_defaults(
+        self,
+        db: None,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        body = (
+            "<tv><channel><icon/></channel>"
+            "<programme><title>Untimed</title></programme>"
+            '<programme start="start" stop="stop" channel="named"/>'
+            "</tv>"
+        )
+        _fake_urlopen(monkeypatch, body.encode())
+        instant = datetime(2024, 11, 30, 12, tzinfo=timezone.utc)
+        with patch.object(epg, "_parse_epg_time", return_value=instant) as parse_time:
+            assert epg.fetch_epg("http://epg.example/defaults.xml", tmp_path) == 2
+        assert parse_time.call_args_list == [call(""), call(""), call("start"), call("stop")]
+        conn = epg._get_conn()
+        assert [tuple(row) for row in conn.execute("SELECT * FROM channels")] == [("", "", "")]
+        assert [tuple(row) for row in conn.execute("SELECT * FROM icons")] == [("", "")]
+        assert [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT channel_id, title, start_ts, stop_ts, desc, source_id FROM programs ORDER BY id",
+            )
+        ] == [
+            ("", "Untimed", instant.timestamp(), instant.timestamp(), "", ""),
+            ("named", "Unknown", instant.timestamp(), instant.timestamp(), "", ""),
+        ]
 
     def test_inserts_in_batches(self, db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         n = 10_001
@@ -675,7 +716,14 @@ class TestFetchEpg:
         assert inserted == [10_000, 1]
         assert epg.get_program_count() == n
 
-    def test_sanitizes_corrupt_xml(self, db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def test_sanitizes_corrupt_xml(
+        self,
+        db: None,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        caplog.set_level(logging.INFO, logger="netv.epg")
         body = (
             '<?xml version="1.0"?><tv>'
             '<channel id="ch1"><display-name>One</display-name></channel>'
@@ -691,18 +739,27 @@ class TestFetchEpg:
         assert len(debug_files) == 1
         assert debug_files[0].read_text() == body
         assert epg.get_channel_count() == 1
+        with pytest.raises(ET.ParseError) as original:
+            ET.fromstring(body)
+        assert caplog.messages == [
+            f"EPG parse failed ({original.value}), attempting sanitization...",
+            "Sanitized EPG: extracted 1 channels, 1 programmes",
+            "Sanitized EPG parsed successfully",
+        ]
 
     def test_raises_when_sanitized_xml_also_fails(
         self,
         db: None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ):
         body = '<tv><channel id="ch1"><bad></channel>'
         _fake_urlopen(monkeypatch, body.encode())
-        with pytest.raises(ET.ParseError):
+        with pytest.raises(ET.ParseError) as error:
             epg.fetch_epg("http://epg.example/worse.xml", tmp_path)
         assert len(list(tmp_path.glob("epg_debug_*.xml"))) == 1
+        assert caplog.messages[-1] == f"Sanitized EPG also failed: {error.value}"
 
 
 class TestSanitize:

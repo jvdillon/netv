@@ -437,7 +437,7 @@ def fetch_epg(
         content = resp.read()
         with contextlib.suppress(Exception):
             content = gzip.decompress(content)
-        xml_str = content.decode("utf-8")
+        xml_str = content.decode()
 
     try:
         root = ET.fromstring(xml_str)

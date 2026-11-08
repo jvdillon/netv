@@ -1,10 +1,11 @@
 """Tests for ffmpeg session management."""
 
 from collections.abc import Coroutine, Iterator
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import asyncio
 import json
+import logging
 import pathlib
 import tempfile
 import time
@@ -805,6 +806,30 @@ class TestGetUserSessions:
         sessions = get_user_sessions("nobody")
         assert sessions == []
 
+    def test_sort_uses_start_time_with_zero_for_legacy_session(self, tmp_path: pathlib.Path):
+        recent = TranscodeSession(
+            username="alice",
+            started=0.5,
+            dir=str(tmp_path),
+            process=None,
+            url="live",
+        )
+        legacy = TranscodeSession(
+            username="alice",
+            started=99,
+            dir=str(tmp_path),
+            process=None,
+            url="live",
+        )
+        with (
+            patch.dict(_transcode_sessions, {"a": recent, "z": legacy}, clear=True),
+            patch.dict(legacy, {"username": "alice"}, clear=True),
+        ):
+            sessions = get_user_sessions("alice")
+        assert [sid for sid, _ in sessions] == ["z", "a"]
+        assert sessions[0][1] is legacy
+        assert sessions[1][1] is recent
+
 
 class TestGetSourceSessions:
     """Tests for get_source_sessions."""
@@ -1348,6 +1373,171 @@ class TestPlaybackFeedback:
             with pytest.raises(HTTPException) as error:
                 report_playback_health(session_id, username, health)
             assert error.value.status_code == status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale_after", [None, 47.5])
+@pytest.mark.parametrize(
+    "ingest_alive,low_alive,input_rate,low_rate",
+    [
+        (True, True, 700, 900),
+        (True, True, 0, 900),
+        (True, True, 700, 0),
+        (False, True, 700, 900),
+        (True, False, 700, 900),
+        (None, None, 700, 900),
+    ],
+)
+async def test_watchdog_checks_live_media_and_persists_each_observation(
+    tmp_path: pathlib.Path,
+    stale_after: float | None,
+    ingest_alive: bool | None,
+    low_alive: bool | None,
+    input_rate: int,
+    low_rate: int,
+):
+    initial = MagicMock()
+    after_input = MagicMock()
+    after_low = MagicMock()
+    initial.stalled.return_value = after_input, False
+    after_input.stalled.return_value = after_low, False
+    session = ffmpeg_session.FastLiveSession(
+        dir=str(tmp_path),
+        process=None if low_alive is None else FakeProcess(alive=low_alive),
+        started=0,
+        url="https://stream.test/live",
+        live_recovery=initial,
+        ingest_restart_command=["ingest"],
+    )
+    if ingest_alive is not None:
+        session["ingest_process"] = FakeProcess(alive=ingest_alive)
+    if stale_after is not None:
+        session["watchdog_stale_after"] = stale_after
+
+    def bitrate(directory: str, name: str, **kwargs: object) -> int:
+        del directory, kwargs
+        return {"input.m3u8": input_rate, "low.m3u8": low_rate}[name]
+
+    with (
+        patch("netv.ffmpeg_session.time.monotonic", return_value=123.5),
+        patch("netv.ffmpeg_session.ready_bitrate", side_effect=bitrate) as ready,
+        patch("netv.ffmpeg_session._restart_fast_pipeline", new=AsyncMock()) as restart,
+        patch("netv.ffmpeg_session.stop_session", new=AsyncMock()) as stop,
+        patch("netv.ffmpeg_session._log_watchdog_delay") as delay,
+    ):
+        await ffmpeg_session._check_fast_live_session("media-check", session)
+    expected_calls = []
+    max_age = 10 if stale_after is None else stale_after
+    if ingest_alive is True:
+        expected_calls.append(
+            call(str(tmp_path), "input.m3u8", minimum_segments=1, max_age=max_age),
+        )
+    if low_alive is True:
+        expected_calls.append(call(str(tmp_path), "low.m3u8", max_age=max_age))
+    assert ready.call_args_list == expected_calls
+    initial.stalled.assert_called_once_with(
+        "input",
+        bool(ingest_alive),
+        bool(ingest_alive and input_rate),
+        123.5,
+    )
+    after_input.stalled.assert_called_once_with(
+        "low",
+        bool(low_alive),
+        bool(low_alive and low_rate),
+        123.5,
+    )
+    assert session["live_recovery"] is after_low
+    after_low.permit_restart.assert_not_called()
+    restart.assert_not_awaited()
+    stop.assert_not_awaited()
+    delay.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "input_stalled,low_stalled,permitted,pending,exhausted,action",
+    [
+        (True, False, True, False, False, "restart"),
+        (False, True, True, False, False, "restart"),
+        (True, True, True, False, False, "restart"),
+        (True, False, False, True, True, "pending"),
+        (False, True, False, False, True, "stop"),
+        (True, False, False, False, True, "stop"),
+        (False, True, False, False, False, "delay"),
+    ],
+)
+async def test_watchdog_dispatches_recovery_with_updated_policy(
+    tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+    input_stalled: bool,
+    low_stalled: bool,
+    permitted: bool,
+    pending: bool,
+    exhausted: bool,
+    action: str,
+):
+    initial, after_input, after_low, after_permit = [MagicMock() for _ in range(4)]
+    initial.stalled.return_value = after_input, input_stalled
+    after_input.stalled.return_value = after_low, low_stalled
+    after_low.permit_restart.return_value = after_permit, permitted
+    after_permit.pending = {"pipeline"} if pending else {"other"}
+    after_permit.exhausted.return_value = exhausted
+    session = ffmpeg_session.FastLiveSession(
+        dir=str(tmp_path),
+        process=None,
+        started=0,
+        url="https://stream.test/live",
+        live_recovery=initial,
+        ingest_restart_command=["ingest"],
+    )
+    with (
+        patch("netv.ffmpeg_session.time.monotonic", return_value=321.5),
+        patch("netv.ffmpeg_session.ready_bitrate") as ready,
+        patch("netv.ffmpeg_session._restart_fast_pipeline", new=AsyncMock()) as restart,
+        patch("netv.ffmpeg_session.stop_session", new=AsyncMock()) as stop,
+        patch("netv.ffmpeg_session._log_watchdog_delay") as delay,
+        caplog.at_level(logging.ERROR, logger="netv.ffmpeg_session"),
+    ):
+        await ffmpeg_session._check_fast_live_session("dispatch-check", session)
+    stage = "input" if input_stalled else "low output"
+    ready.assert_not_called()
+    initial.stalled.assert_called_once_with("input", False, False, 321.5)
+    after_input.stalled.assert_called_once_with("low", False, False, 321.5)
+    after_low.permit_restart.assert_called_once_with("pipeline", 321.5)
+    assert session["live_recovery"] is after_permit
+    if action == "restart":
+        restart.assert_awaited_once_with("dispatch-check", session, stage)
+    else:
+        restart.assert_not_awaited()
+    if action == "stop":
+        stop.assert_awaited_once_with("dispatch-check", force=True)
+        assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+            (
+                logging.ERROR,
+                f"Live watchdog dispatch-check stopped the session: {stage} stalled "
+                "and its restart budget is spent",
+            ),
+        ]
+    else:
+        stop.assert_not_awaited()
+        assert not caplog.records
+    if action == "delay":
+        delay.assert_called_once_with("dispatch-check", session, "pipeline", 321.5)
+    else:
+        delay.assert_not_called()
+    if action in {"restart", "pending"}:
+        after_permit.exhausted.assert_not_called()
+    else:
+        after_permit.exhausted.assert_called_once_with("pipeline", 321.5)
+
+
+@pytest.mark.asyncio
+async def test_watchdog_missing_recovery_names_the_required_field(tmp_path: pathlib.Path):
+    session = TranscodeSession(dir=str(tmp_path), process=None, started=0, url="live")
+    with pytest.raises(KeyError) as error:
+        await ffmpeg_session._check_fast_live_session("missing-policy", session)
+    assert error.value.args == ("live_recovery",)
 
 
 def _clear_session_state():
