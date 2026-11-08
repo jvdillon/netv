@@ -10,6 +10,7 @@ on:
       - "Dockerfile"
       - "*.py"
       - "pyproject.toml"
+      - "uv.lock"
       - "templates/**"
       - "static/**"
       - "entrypoint.sh"
@@ -24,32 +25,34 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync --group dev
+        run: uv sync --frozen --group pre-commit
 
       - name: Lint with ruff
-        run: uv run ruff check .
+        run: uv --quiet run --frozen --group pre-commit ruff check .
 
       - name: Type check with basedpyright
-        run: uv run basedpyright
+        run: uv --quiet run --frozen --group pre-commit basedpyright
 
       - name: Run tests
-        run: uv run pytest
+        run: uv --quiet run --frozen --group pre-commit pytest
 
   build:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     needs: test
     permissions:
       contents: read
