@@ -23,7 +23,6 @@ cache/
 **/*.m3u
 !assets/example.m3u
 **/*.xml
-tools/.zap2xml/
 
 # macOS
 .DS_Store

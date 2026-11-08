@@ -214,6 +214,13 @@ def test_source_countries(tmp_path: pathlib.Path) -> None:
     assert remap_epg.source_countries(tmp_path) == {"gb": "UK"}
 
 
+def test_source_countries_skips_source_without_id(tmp_path: pathlib.Path) -> None:
+    (tmp_path / "server_settings.json").write_text(
+        json.dumps({"sources": [{"type": "epg", "url": "http://x/epg_US.xml"}]}),
+    )
+    assert remap_epg.source_countries(tmp_path) == {}
+
+
 def test_load_candidates_and_upcoming(tmp_path: pathlib.Path) -> None:
     future = time.time() + 3600
     db = tmp_path / "epg.db"

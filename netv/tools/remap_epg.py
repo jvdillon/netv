@@ -202,8 +202,9 @@ def source_countries(cache_dir: pathlib.Path) -> dict[str, str]:
         if s.get("type") != "epg":
             continue
         m = re.search(r"epg_([A-Za-z]{2})\.", s.get("url", ""))
-        if m:
-            result[s["id"]] = _country(m.group(1))
+        source_id = s.get("id")
+        if m and source_id is not None:
+            result[source_id] = _country(m.group(1))
     return result
 
 

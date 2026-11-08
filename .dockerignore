@@ -17,7 +17,6 @@ settings.json
 *.pem
 
 # Local data and scripts not needed in the images
-tools/
 scripts/*
 !scripts/install-ffmpeg.sh
 !scripts/install-ai_upscale.sh
