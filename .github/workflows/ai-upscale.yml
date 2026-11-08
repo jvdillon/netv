@@ -18,6 +18,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}-ai-upscale
+  DEFAULT_BASE: ubuntu:26.04
 
 jobs:
   build:
@@ -26,18 +27,12 @@ jobs:
       contents: read
       packages: write
     strategy:
+      # One failing combination must not cancel the others.
+      fail-fast: false
       matrix:
-        include:
-          - nvidia: 'cuda:12.4'
-            base_image: 'ubuntu:22.04'
-          - nvidia: 'cuda:12.6'
-            base_image: 'ubuntu:24.04'
-          # base_image must match the OS of the unsuffixed ffmpeg:cudaX.Y tag (see ffmpeg-base.yml)
-          - nvidia: 'cuda:12.8'
-            base_image: 'ubuntu:26.04'
-          - nvidia: 'cuda:13.0'
-            base_image: 'ubuntu:26.04'
-            latest: true
+        # Mirrors ffmpeg-base.yml: each image builds on the ffmpeg image of the same CUDA and OS.
+        nvidia: ['cuda:12.4', 'cuda:12.6', 'cuda:12.8', 'cuda:13.0']
+        base_image: ['ubuntu:22.04', 'ubuntu:24.04', 'ubuntu:26.04']
 
     steps:
       - name: Free disk space
@@ -66,6 +61,9 @@ jobs:
           CUDA_VER="${{ matrix.nvidia }}"
           CUDA_VER="${CUDA_VER#cuda:}"
           echo "version=$CUDA_VER" >> $GITHUB_OUTPUT
+          # "ubuntu:26.04" -> "ubuntu26.04"
+          OS="${{ matrix.base_image }}"
+          echo "os=${OS/:/}" >> $GITHUB_OUTPUT
 
       - name: Extract metadata
         id: meta
@@ -73,8 +71,9 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=cuda${{ steps.cuda.outputs.version }}
-            type=raw,value=latest,enable=${{ matrix.latest == true }}
+            type=raw,value=cuda${{ steps.cuda.outputs.version }}-${{ steps.cuda.outputs.os }}
+            type=raw,value=cuda${{ steps.cuda.outputs.version }},enable=${{ matrix.base_image == env.DEFAULT_BASE }}
+            type=raw,value=latest,enable=${{ matrix.base_image == env.DEFAULT_BASE && steps.cuda.outputs.version == '13.0' }}
 
       - name: Build and push
         uses: docker/build-push-action@v7
@@ -85,7 +84,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            FFMPEG_IMAGE=ghcr.io/${{ github.repository }}-ffmpeg:cuda${{ steps.cuda.outputs.version }}
+            FFMPEG_IMAGE=ghcr.io/${{ github.repository }}-ffmpeg:cuda${{ steps.cuda.outputs.version }}-${{ steps.cuda.outputs.os }}
             NVIDIA=${{ matrix.nvidia }}
             BASE_IMAGE=${{ matrix.base_image }}
           no-cache: true
@@ -96,10 +95,11 @@ jobs:
           docker buildx prune -af || true
           docker system prune -af || true
           df -h
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cuda${{ steps.cuda.outputs.version }}
+          IMG=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cuda${{ steps.cuda.outputs.version }}-${{ steps.cuda.outputs.os }}
+          docker pull $IMG
           # Verify everything that should be enabled is actually linked
           # Note: --entrypoint bypasses the default entrypoint which tries to build TensorRT engines (requires GPU)
-          docker run --rm --entrypoint sh ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cuda${{ steps.cuda.outputs.version }} -c "
+          docker run --rm --entrypoint sh "$IMG" -c "
             echo '=== Verifying AI Upscale build ==='
             LDD_OUTPUT=\$(ldd /usr/local/bin/ffmpeg)
 

@@ -478,6 +478,22 @@ step_mark() {
     echo "$2" > "$STAMP_DIR/$1"
 }
 
+# trt_pick_version <pkg> <cuda X-Y>: TensorRT 10.x version string of <pkg> built for this
+# CUDA major: the newest whose +cudaA.B tag is <= X.Y, else the newest with the lowest tag.
+trt_pick_version() {
+    local pkg="$1" cuda="${2//-/.}" major="${2%%[-.]*}"
+    local versions
+    versions=$(apt-cache madison "$pkg" 2>/dev/null | awk '{print $3}' | grep -E "^10\..*\+cuda${major}\.[0-9]+$" | sort -uV)
+    [ -n "$versions" ] || return 0
+    local v pick="" low_tag low_pick=""
+    low_tag=$(sed 's/.*+cuda//' <<< "$versions" | sort -V | head -1)
+    while read -r v; do
+        version_ge "$cuda" "${v##*+cuda}" && pick="$v"
+        [ "${v##*+cuda}" = "$low_tag" ] && low_pick="$v"
+    done <<< "$versions"
+    echo "${pick:-$low_pick}"
+}
+
 version_ge() {
     [ "$(printf '%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
 }
@@ -712,45 +728,62 @@ if [ "$ENABLE_NVIDIA_CUDA" = "1" ]; then
             fi
         fi
 
-        # NVIDIA's repo for newer Ubuntu may lack older toolkits (ubuntu2604 has only CUDA 13+,
-        # which dropped Maxwell/Pascal/Volta). Fall back to the ubuntu2404 repo for those.
+        # Each NVIDIA repo carries only the toolkits current for its release: ubuntu2604 has
+        # CUDA 13+, ubuntu2404 has 12.5+, ubuntu2204 still has 12.4. Older toolkits install
+        # fine on newer Ubuntu (self-contained under /usr/local/cuda-X.Y), so walk back
+        # through older repos until the requested version is found.
         cuda_pkg_available() {
             apt-cache policy "cuda-nvcc-$CUDA_VERSION" 2>/dev/null | awk '/Candidate:/{print $2}' | grep -qv '(none)'
         }
-        if ! cuda_pkg_available; then
-            echo "cuda-nvcc-$CUDA_VERSION not in this release's CUDA repo; adding NVIDIA ubuntu2404 repo"
-            # ubuntu2404 is signed with a different key than newer repos; install it side by side
-            CUDA2404_KEY=/usr/share/keyrings/cuda-archive-keyring-ubuntu2404.gpg
-            if [ ! -f "$CUDA2404_KEY" ]; then
+        for CUDA_FALLBACK_REL in 2404 2204; do
+            cuda_pkg_available && break
+            CUDA_FALLBACK_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${CUDA_FALLBACK_REL}/x86_64/"
+            # Already configured (e.g. native repo on that release): adding it again would
+            # conflict on Signed-By.
+            if grep -rqs "repos/ubuntu${CUDA_FALLBACK_REL}/x86_64" /etc/apt/sources.list /etc/apt/sources.list.d/; then
+                continue
+            fi
+            echo "cuda-nvcc-$CUDA_VERSION not found; adding NVIDIA ubuntu${CUDA_FALLBACK_REL} repo"
+            # Older repos are signed with a different key than newer ones; install side by side
+            CUDA_FALLBACK_KEY="/usr/share/keyrings/cuda-archive-keyring-ubuntu${CUDA_FALLBACK_REL}.gpg"
+            if [ ! -f "$CUDA_FALLBACK_KEY" ]; then
                 CUDA_KEY_TMP=$(mktemp -d)
-                if ! wget -q -O "$CUDA_KEY_TMP/k.deb" https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb; then
-                    log_error "Failed to download ubuntu2404 CUDA keyring"
+                if ! wget -q -O "$CUDA_KEY_TMP/k.deb" "${CUDA_FALLBACK_URL}cuda-keyring_1.1-1_all.deb"; then
+                    log_error "Failed to download ubuntu${CUDA_FALLBACK_REL} CUDA keyring"
                     exit 1
                 fi
                 dpkg-deb -x "$CUDA_KEY_TMP/k.deb" "$CUDA_KEY_TMP/x"
-                sudo install -m 644 "$CUDA_KEY_TMP/x/usr/share/keyrings/cuda-archive-keyring.gpg" "$CUDA2404_KEY"
+                sudo install -m 644 "$CUDA_KEY_TMP/x/usr/share/keyrings/cuda-archive-keyring.gpg" "$CUDA_FALLBACK_KEY"
                 rm -rf "$CUDA_KEY_TMP"
             fi
-            sudo tee /etc/apt/sources.list.d/cuda-ubuntu2404-x86_64.sources >/dev/null <<SRCEOF
+            sudo tee "/etc/apt/sources.list.d/cuda-ubuntu${CUDA_FALLBACK_REL}-x86_64.sources" >/dev/null <<SRCEOF
 Types: deb
-URIs: https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/
+URIs: $CUDA_FALLBACK_URL
 Suites: /
-Signed-By: $CUDA2404_KEY
+Signed-By: $CUDA_FALLBACK_KEY
 SRCEOF
             sudo apt-get update
-            if ! cuda_pkg_available; then
-                log_error "cuda-nvcc-$CUDA_VERSION not available from NVIDIA's repos"
-                exit 1
-            fi
+        done
+        if ! cuda_pkg_available; then
+            log_error "cuda-nvcc-$CUDA_VERSION not available from NVIDIA's repos"
+            exit 1
         fi
 
         # Install CUDA packages
         sudo apt-get install -y libffmpeg-nvenc-dev cuda-nvcc-$CUDA_VERSION cuda-cudart-dev-$CUDA_VERSION
 
         # Install TensorRT headers only (requires NVIDIA repo set up above)
-        # We only need headers for compilation - libnvinfer is loaded via dlopen at runtime
+        # We only need headers for compilation - libnvinfer is loaded via dlopen at runtime.
+        # The backend dlopens libnvinfer.so.10, so headers must be TensorRT 10, built for
+        # this CUDA (newest build tagged <= this CUDA in the same major; else oldest of it).
         if [ "$ENABLE_TENSORRT" = "1" ]; then
-            sudo apt-get install -y libnvinfer-headers-dev
+            TRT_VERSION=$(trt_pick_version libnvinfer-headers-dev "$CUDA_VERSION")
+            if [ -z "$TRT_VERSION" ]; then
+                log_error "No TensorRT 10 headers for CUDA $CUDA_VERSION in NVIDIA's repos"
+                exit 1
+            fi
+            echo "TensorRT headers: $TRT_VERSION"
+            sudo apt-get install -y --allow-downgrades "libnvinfer-headers-dev=$TRT_VERSION"
         fi
     fi
     echo "Using CUDA version: $CUDA_VERSION"
@@ -862,7 +895,14 @@ SRCEOF
         if [ "${FFMPEG_IMAGE:-}" = "netv-ffmpeg:cuda12.4" ] || [ "${CUDA_VERSION:-}" = "12-4" ]; then
             NV_CODEC_REF="sdk/12.2"
         elif [ -z "$NV_DRIVER" ]; then
-            NV_CODEC_REF="sdk/13.0"   # no driver to probe: target 570+, not bleeding edge
+            # No driver to probe (e.g. image builds): target the minimum driver this CUDA
+            # needs anyway, so old-hardware images keep working NVENC.
+            # CUDA <12.8 runs on 550+ drivers (sdk/12.2); 12.8+ needs 570+ (sdk/13.0).
+            if version_ge "${CUDA_VERSION//-/.}" 12.8; then
+                NV_CODEC_REF="sdk/13.0"
+            else
+                NV_CODEC_REF="sdk/12.2"
+            fi
         elif version_ge "$NV_DRIVER" 610.0; then
             NV_CODEC_REF="master"
         elif version_ge "$NV_DRIVER" 570.0; then

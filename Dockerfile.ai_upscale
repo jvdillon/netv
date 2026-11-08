@@ -35,10 +35,18 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Install dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     gosu \
-    python3 \
-    python3-pip \
     && rm -rf /var/lib/apt/lists/*
+
+# Python comes from uv, not the distro, so every base (22.04 ships 3.10) gets the same
+# interpreter. The venv is first on PATH, so `python3`/`pip3` resolve to it everywhere.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+ARG PYTHON_VERSION=3.14
+ENV UV_PYTHON_INSTALL_DIR=/opt/python \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
+RUN uv venv --seed --python "$PYTHON_VERSION" /opt/venv && python3 --version
 
 # App setup
 WORKDIR /app
@@ -54,31 +62,20 @@ COPY tools/ tools/
 RUN test -f pyproject.toml || { echo "ERROR: pyproject.toml not found"; exit 1; } && \
     test -f tools/export-tensorrt.py || { echo "ERROR: export-tensorrt.py not found"; exit 1; }
 
-# Install Python dependencies with version constraints for stability
-# --ignore-installed: avoids "Cannot uninstall X, RECORD file not found" for apt packages
-# --break-system-packages: required for PEP 668 (Ubuntu 24.04+), doesn't exist in pip 22.0 (Ubuntu 22.04)
-# Version constraints: use compatible versions that work together
-RUN if python3 -m pip install --help 2>&1 | grep -q -- '--break-system-packages'; then \
-        PIP_OPTS="--no-cache-dir --ignore-installed --break-system-packages"; \
-    else \
-        PIP_OPTS="--no-cache-dir --ignore-installed"; \
-    fi && \
-    # Install with minimum version constraints for compatibility
-    python3 -m pip install $PIP_OPTS \
+# Install Python dependencies with minimum version constraints for compatibility.
+# set -e: a failed install must fail the build (a trailing `|| true` used to mask it).
+RUN set -e; \
+    uv pip install --no-cache \
         'torch>=2.1.0' \
         'onnx>=1.14.0' \
         'onnxconverter-common>=1.14' \
         'safetensors>=0.4' \
         'tensorrt>=9.0' \
-        . && \
-    # Verify packages installed correctly
-    python3 -c "import torch; import onnx; import tensorrt; print(f'Installed: torch={torch.__version__}, onnx={onnx.__version__}, tensorrt={tensorrt.__version__}')" && \
+        .; \
+    python3 -c "import torch; import onnx; import tensorrt; print(f'Installed: torch={torch.__version__}, onnx={onnx.__version__}, tensorrt={tensorrt.__version__}')"; \
     # Remove Windows-only TensorRT libraries to save ~500MB
-    # Log what we're deleting for debugging
-    echo "Removing Windows-only TensorRT libraries..." && \
-    find /usr -name '*_win_*.so*' -type f 2>/dev/null | head -5 | xargs -I{} echo "  Removing: {}" && \
-    find /usr -name '*_win_*.so*' -type f -delete 2>/dev/null || true && \
-    find /usr -name '*_win.so*' -type f -delete 2>/dev/null || true && \
+    echo "Removing Windows-only TensorRT libraries..."; \
+    find /opt/venv /usr \( -name '*_win_*.so*' -o -name '*_win.so*' \) -type f -print -delete 2>/dev/null | head -5 | sed 's/^/  Removed: /'; \
     echo "Cleanup complete"
 
 # Runtime config

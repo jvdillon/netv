@@ -23,14 +23,22 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Note: The conditional must be evaluated in shell, not in Dockerfile syntax
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        gosu \
-        python3 \
-        python3-pip && \
+        ca-certificates \
+        gosu && \
     # Conditionally install ffmpeg if not present from base image
     if [ ! -x /usr/local/bin/ffmpeg ] && [ ! -x /usr/bin/ffmpeg ]; then \
         apt-get install -y --no-install-recommends ffmpeg; \
     fi && \
     rm -rf /var/lib/apt/lists/*
+
+# Python comes from uv, not the distro, so every base (22.04 ships 3.10) gets the same
+# interpreter. The venv is first on PATH, so `python3`/`pip3` resolve to it everywhere.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+ARG PYTHON_VERSION=3.14
+ENV UV_PYTHON_INSTALL_DIR=/opt/python \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
+RUN uv venv --seed --python "$PYTHON_VERSION" /opt/venv && python3 --version
 
 # App setup
 WORKDIR /app
@@ -45,14 +53,7 @@ COPY static/ static/
 RUN test -f pyproject.toml || { echo "ERROR: pyproject.toml not found"; exit 1; }
 
 # Install Python dependencies
-# --ignore-installed: avoids "Cannot uninstall X, RECORD file not found" for apt packages
-# --break-system-packages: required for PEP 668 (Ubuntu 24.04+), doesn't exist in pip 22.0 (Ubuntu 22.04)
-# Using try-fallback approach for maximum compatibility
-RUN if python3 -m pip install --help 2>&1 | grep -q -- '--break-system-packages'; then \
-        python3 -m pip install --no-cache-dir --ignore-installed --break-system-packages .; \
-    else \
-        python3 -m pip install --no-cache-dir --ignore-installed .; \
-    fi
+RUN uv pip install --no-cache .
 
 # Runtime config
 EXPOSE 8000 8100

@@ -157,34 +157,45 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # Add NVIDIA repo and install TensorRT runtime (for TensorRT DNN backend)
 # Note: TensorRT is loaded via dlopen, so ffmpeg works even if these aren't installed,
-# but including them means the Docker image works out of the box with --gpus all
+# but including them means the Docker image works out of the box with --gpus all.
+# The backend dlopens libnvinfer.so.10, built for this image's CUDA: the newest TensorRT 10
+# tagged <= this CUDA in the same major (else the newest with the lowest tag), so old-driver
+# images don't get a TensorRT that needs a newer CUDA. NVIDIA repos only carry builds current
+# for their release, so older repos (own signing key) are added alongside the native one.
 ARG ENABLE_TENSORRT=1
+ARG NVIDIA=cuda:12.8
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     if [ "$ENABLE_TENSORRT" = "1" ]; then \
-        . /etc/os-release && \
-        UBUNTU_VER=$(echo "$VERSION_ID" | tr -d '.') && \
-        apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
-        curl -fsSL "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${UBUNTU_VER}/x86_64/cuda-keyring_1.1-1_all.deb" \
-            -o /tmp/cuda-keyring.deb && \
-        dpkg -i /tmp/cuda-keyring.deb && rm /tmp/cuda-keyring.deb && \
-        apt-get update && \
-        # Newer Ubuntu repos may not carry TensorRT yet (ubuntu2604 lacks libnvinfer10);
-        # fall back to ubuntu2404, which is signed with its own key.
-        if [ "$VERSION_CODENAME" != "jammy" ] && ! apt-cache show libnvinfer10 >/dev/null 2>&1; then \
-            curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -o /tmp/k2404.deb && \
-            dpkg-deb -x /tmp/k2404.deb /tmp/k2404 && \
-            install -m 644 /tmp/k2404/usr/share/keyrings/cuda-archive-keyring.gpg /usr/share/keyrings/cuda-archive-keyring-ubuntu2404.gpg && \
-            rm -rf /tmp/k2404 /tmp/k2404.deb && \
-            printf 'Types: deb\nURIs: https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/\nSuites: /\nSigned-By: /usr/share/keyrings/cuda-archive-keyring-ubuntu2404.gpg\n' \
-                > /etc/apt/sources.list.d/cuda-ubuntu2404-x86_64.sources && \
-            apt-get update; \
-        fi && \
-        if [ "$VERSION_CODENAME" = "jammy" ]; then \
-            apt-get install -y --no-install-recommends libnvinfer8 libnvinfer-plugin8; \
-        else \
-            apt-get install -y --no-install-recommends libnvinfer10 libnvinfer-plugin10; \
-        fi && \
+        set -e; \
+        . /etc/os-release; \
+        NATIVE=$(echo "$VERSION_ID" | tr -d '.'); \
+        apt-get update && apt-get install -y --no-install-recommends ca-certificates curl; \
+        for REL in $NATIVE 2404 2204; do \
+            URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${REL}/x86_64/"; \
+            grep -rqs "repos/ubuntu${REL}/x86_64" /etc/apt/sources.list.d/ && continue; \
+            curl -fsSL "${URL}cuda-keyring_1.1-1_all.deb" -o /tmp/k.deb; \
+            rm -rf /tmp/k && dpkg-deb -x /tmp/k.deb /tmp/k; \
+            install -m 644 /tmp/k/usr/share/keyrings/cuda-archive-keyring.gpg "/usr/share/keyrings/cuda-archive-keyring-ubuntu${REL}.gpg"; \
+            printf 'Types: deb\nURIs: %s\nSuites: /\nSigned-By: /usr/share/keyrings/cuda-archive-keyring-ubuntu%s.gpg\n' "$URL" "$REL" \
+                > "/etc/apt/sources.list.d/cuda-ubuntu${REL}-x86_64.sources"; \
+        done; \
+        rm -rf /tmp/k /tmp/k.deb; \
+        apt-get update; \
+        CUDA="${NVIDIA#cuda:}"; MAJOR="${CUDA%%.*}"; \
+        VERSIONS=$(apt-cache madison libnvinfer10 | awk '{print $3}' | grep -E "^10\..*\+cuda${MAJOR}\.[0-9]+$" | sort -uV); \
+        PICK=""; \
+        for V in $VERSIONS; do \
+            T="${V##*+cuda}"; \
+            [ "$(printf '%s\n%s\n' "$T" "$CUDA" | sort -V | head -1)" = "$T" ] && PICK="$V"; \
+        done; \
+        if [ -z "$PICK" ]; then \
+            LOW=$(echo "$VERSIONS" | sed 's/.*+cuda//' | sort -V | head -1); \
+            PICK=$(echo "$VERSIONS" | grep "+cuda${LOW}\$" | tail -1); \
+        fi; \
+        [ -n "$PICK" ] || { echo "ERROR: no TensorRT 10 for CUDA $CUDA"; exit 1; }; \
+        echo "TensorRT runtime for CUDA $CUDA: $PICK"; \
+        apt-get install -y --no-install-recommends "libnvinfer10=$PICK" "libnvinfer-plugin10=$PICK"; \
         rm -rf /var/lib/apt/lists/*; \
     fi
 

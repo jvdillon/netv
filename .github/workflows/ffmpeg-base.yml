@@ -21,6 +21,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}-ffmpeg
+  DEFAULT_BASE: ubuntu:26.04
 
 jobs:
   build:
@@ -29,27 +30,13 @@ jobs:
       contents: read
       packages: write
     strategy:
+      # One failing combination must not cancel the others.
+      fail-fast: false
       matrix:
-        # default: owns the unsuffixed cudaX.Y tag (newest LTS that has that CUDA)
-        include:
-          - nvidia: 'cuda:12.4'
-            base_image: 'ubuntu:22.04'
-            default: true
-          - nvidia: 'cuda:12.6'
-            base_image: 'ubuntu:24.04'
-            default: true
-          - nvidia: 'cuda:12.8'
-            base_image: 'ubuntu:24.04'
-            default: false
-          - nvidia: 'cuda:12.8'
-            base_image: 'ubuntu:26.04'
-            default: true
-          - nvidia: 'cuda:13.0'
-            base_image: 'ubuntu:24.04'
-            default: false
-          - nvidia: 'cuda:13.0'
-            base_image: 'ubuntu:26.04'
-            default: true
+        # Every CUDA on every supported LTS; older CUDA serves older drivers/GPUs.
+        # The newest LTS owns the unsuffixed cudaX.Y and latest tags (see DEFAULT_BASE).
+        nvidia: ['cuda:12.4', 'cuda:12.6', 'cuda:12.8', 'cuda:13.0']
+        base_image: ['ubuntu:22.04', 'ubuntu:24.04', 'ubuntu:26.04']
 
     steps:
       - uses: actions/checkout@v7
@@ -99,8 +86,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=cuda${{ steps.cuda.outputs.version }}-${{ steps.cuda.outputs.os }}
-            type=raw,value=cuda${{ steps.cuda.outputs.version }},enable=${{ matrix.default }}
-            type=raw,value=latest,enable=${{ matrix.default && steps.cuda.outputs.version == '13.0' }}
+            type=raw,value=cuda${{ steps.cuda.outputs.version }},enable=${{ matrix.base_image == env.DEFAULT_BASE }}
+            type=raw,value=latest,enable=${{ matrix.base_image == env.DEFAULT_BASE && steps.cuda.outputs.version == '13.0' }}
             type=raw,value=${{ steps.date.outputs.date }}-cuda${{ steps.cuda.outputs.version }}-${{ steps.cuda.outputs.os }},enable=${{ steps.version.outputs.version == 'snapshot' }}
 
       - name: Build and push
