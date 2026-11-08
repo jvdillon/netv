@@ -462,6 +462,282 @@ class TestBuildAudioArgs:
 # =============================================================================
 
 
+@pytest.fixture
+def hls_helpers(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
+    helpers = {
+        "_can_copy_video": MagicMock(return_value=False),
+        "_can_copy_audio": MagicMock(return_value=False),
+        "_build_video_args": MagicMock(return_value=(["video-pre"], ["video-post"])),
+        "_build_audio_args": MagicMock(return_value=["audio-args"]),
+        "_get_gpu_nvdec_codecs": MagicMock(return_value={"h264"}),
+        "get_hls_segment_duration": MagicMock(return_value=3.75),
+        "get_live_hls_list_size": MagicMock(return_value=17),
+        "http_reconnect_args": MagicMock(return_value=["reconnect-args"]),
+        "limit_live_video_bitrate": MagicMock(),
+    }
+    for name, helper in helpers.items():
+        monkeypatch.setattr(ffmpeg_command, name, helper)
+    return helpers
+
+
+class TestHlsAssemblyContract:
+    @pytest.mark.parametrize("is_vod", [False, True])
+    @pytest.mark.parametrize("has_media", [False, True])
+    @pytest.mark.parametrize("sr", [False, True])
+    @pytest.mark.parametrize("user_agent", [None, "", "custom-agent"])
+    def test_exact_command(
+        self,
+        hls_helpers: dict[str, MagicMock],
+        is_vod: bool,
+        has_media: bool,
+        sr: bool,
+        user_agent: str | None,
+    ):
+        post = ["video-post", "dnn_processing=model=test"] if sr else ["video-post"]
+        hls_helpers["_build_video_args"].return_value = (["video-pre"], post)
+        media = _media_info(is_hls=True) if has_media else None
+        cmd = build_hls_ffmpeg_cmd(
+            "https://source/stream",
+            "software",
+            "/output",
+            is_vod=is_vod,
+            media_info=media,
+            user_agent=user_agent,
+            subtitles=[
+                SubtitleStream(index=4, lang="eng", name="English"),
+                SubtitleStream(index=7, lang="fra", name="French"),
+            ],
+            sr_segment_duration=2.5,
+        )
+        expected = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate", "video-pre"]
+        if not has_media:
+            expected += [
+                "-probesize",
+                "50000" if is_vod else "5000000",
+                "-analyzeduration",
+                "500000" if is_vod else "5000000",
+            ]
+        expected += [
+            "-fflags",
+            "+discardcorrupt+genpts",
+            "-err_detect",
+            "ignore_err",
+            "reconnect-args",
+        ]
+        if user_agent is not None:
+            expected += ["-user_agent", user_agent]
+        if has_media:
+            expected += ["-f", "hls", "-extension_picky", "0"]
+        expected += ["-i", "https://source/stream"]
+        for number, index in [(0, 4), (1, 7)]:
+            expected += [
+                "-map",
+                f"0:{index}",
+                "-c:s",
+                "webvtt",
+                "-flush_packets",
+                "1",
+                f"/output/sub{number}.vtt",
+                "-map",
+                f"0:{index}",
+                "-c:s",
+                "webvtt",
+                "-f",
+                "segment",
+                "-segment_time",
+                "2" if sr else "3",
+                "-segment_list",
+                f"/output/sub{number}.m3u8",
+                "-segment_list_type",
+                "m3u8",
+                "-segment_list_size",
+                "0" if is_vod else "17",
+                "-segment_format",
+                "webvtt",
+            ]
+            if not is_vod:
+                expected += ["-segment_list_flags", "+live"]
+            expected += [f"/output/sub{number}_%06d.vtt"]
+        expected += [
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            *post,
+            "audio-args",
+            "-max_delay",
+            "5000000",
+            "-f",
+            "hls",
+            "-hls_time",
+            "2" if sr else "3",
+            "-hls_list_size",
+            "0" if is_vod else "17",
+            "-hls_segment_filename",
+            "/output/seg%03d.ts",
+        ]
+        expected += (
+            [
+                "-hls_init_time",
+                "2",
+                "-hls_flags",
+                "independent_segments",
+                "-hls_playlist_type",
+                "event",
+            ]
+            if is_vod
+            else ["-hls_init_time", "1", "-hls_flags", "delete_segments"]
+        )
+        expected += ["/output/stream.m3u8"]
+        assert cmd == expected
+        hls_helpers["http_reconnect_args"].assert_called_once_with("https://source/stream")
+        if is_vod:
+            hls_helpers["get_live_hls_list_size"].assert_not_called()
+        else:
+            assert hls_helpers["get_live_hls_list_size"].call_count == 3
+            for args in hls_helpers["get_live_hls_list_size"].call_args_list:
+                assert args.args == (2.5 if sr else 3.75,)
+                assert args.kwargs == {}
+        if sr:
+            hls_helpers["get_hls_segment_duration"].assert_not_called()
+        else:
+            hls_helpers["get_hls_segment_duration"].assert_called_once_with()
+        if sr and not is_vod:
+            hls_helpers["limit_live_video_bitrate"].assert_called_once_with(cmd, "1080p")
+        else:
+            hls_helpers["limit_live_video_bitrate"].assert_not_called()
+
+    def test_default_forwarding(self, hls_helpers: dict[str, MagicMock]):
+        cmd = build_hls_ffmpeg_cmd("input", "software", "/output")
+        hls_helpers["_can_copy_video"].assert_called_once_with(None, "1080p", allow_upscale=True)
+        hls_helpers["_can_copy_audio"].assert_called_once_with(None, passthrough=False)
+        hls_helpers["_build_video_args"].assert_called_once_with(
+            copy_video=False,
+            hw="software",
+            deinterlace=True,
+            use_hw_pipeline=False,
+            max_resolution="1080p",
+            quality="high",
+            is_hdr=False,
+            source_height=0,
+            allow_upscale=True,
+        )
+        hls_helpers["_build_audio_args"].assert_called_once_with(
+            copy_audio=False,
+            audio_sample_rate=0,
+            audio_channels=0,
+        )
+        assert "-user_agent" not in cmd
+        assert "-c:s" not in cmd
+
+    @pytest.mark.parametrize("separate_audio", [False, True])
+    def test_explicit_forwarding(self, hls_helpers: dict[str, MagicMock], separate_audio: bool):
+        media = _media_info(height=720, is_hdr=True, audio_sample_rate=44_100, audio_channels=6)
+        audio = _media_info(audio_sample_rate=32_000, audio_channels=1) if separate_audio else None
+        hls_helpers["_can_copy_video"].return_value = True
+        hls_helpers["_can_copy_audio"].return_value = True
+        build_hls_ffmpeg_cmd(
+            "input",
+            "qsv",
+            "/output",
+            media_info=media,
+            audio_info=audio,
+            max_resolution="720p",
+            quality="low",
+            allow_upscale=False,
+            audio_passthrough=True,
+        )
+        hls_helpers["_can_copy_video"].assert_called_once_with(media, "720p", allow_upscale=False)
+        hls_helpers["_can_copy_audio"].assert_called_once_with(audio or media, passthrough=True)
+        hls_helpers["_build_video_args"].assert_called_once_with(
+            copy_video=True,
+            hw="qsv",
+            deinterlace=False,
+            use_hw_pipeline=False,
+            max_resolution="720p",
+            quality="low",
+            is_hdr=True,
+            source_height=720,
+            allow_upscale=False,
+        )
+        hls_helpers["_build_audio_args"].assert_called_once_with(
+            copy_audio=True,
+            audio_sample_rate=32_000 if separate_audio else 44_100,
+            audio_channels=1 if separate_audio else 6,
+        )
+
+    @pytest.mark.parametrize("hw", ["nvenc+software", "vaapi", "qsv", "amf+software", "software"])
+    @pytest.mark.parametrize(
+        "codec",
+        ["h264", "hevc", "mpeg2video", "vp8", "vp9", "vc1", "av1", "unknown", ""],
+    )
+    @pytest.mark.parametrize("copy_video", [False, True])
+    def test_hardware_pipeline(
+        self,
+        hls_helpers: dict[str, MagicMock],
+        hw: HwAccel,
+        codec: str,
+        copy_video: bool,
+    ):
+        hls_helpers["_can_copy_video"].return_value = copy_video
+        build_hls_ffmpeg_cmd("input", hw, "/output", video_codec=codec)
+        supported = {
+            "nvenc+software": {"h264"},
+            "vaapi": {"h264", "hevc", "mpeg2video", "vp8", "vp9", "vc1", "av1"},
+            "qsv": {"h264", "hevc", "mpeg2video", "vp9", "vc1", "av1"},
+            "amf+software": set(),
+            "software": set(),
+        }
+        assert hls_helpers["_build_video_args"].call_args.kwargs["use_hw_pipeline"] is (
+            not copy_video and codec in supported[hw]
+        )
+
+    def test_media_codec_overrides_hint(self, hls_helpers: dict[str, MagicMock]):
+        build_hls_ffmpeg_cmd(
+            "input",
+            "qsv",
+            "/output",
+            media_info=_media_info(video_codec="vp8"),
+            video_codec="h264",
+        )
+        assert hls_helpers["_build_video_args"].call_args.kwargs["use_hw_pipeline"] is False
+
+    @pytest.mark.parametrize("is_vod", [False, True])
+    @pytest.mark.parametrize("fallback", [None, False, True])
+    @pytest.mark.parametrize("height", [None, 0, 1])
+    @pytest.mark.parametrize("interlaced", [False, True])
+    def test_deinterlace_selection(
+        self,
+        hls_helpers: dict[str, MagicMock],
+        is_vod: bool,
+        fallback: bool | None,
+        height: int | None,
+        interlaced: bool,
+    ):
+        media = None if height is None else _media_info(height=height, interlaced=interlaced)
+        build_hls_ffmpeg_cmd(
+            "input",
+            "software",
+            "/output",
+            is_vod=is_vod,
+            media_info=media,
+            deinterlace_fallback=fallback,
+        )
+        expected = interlaced if height == 1 else (not is_vod if fallback is None else fallback)
+        assert hls_helpers["_build_video_args"].call_args.kwargs["deinterlace"] is expected
+
+    def test_default_sr_duration(self, hls_helpers: dict[str, MagicMock]):
+        video_args: list[str] = []
+        hls_helpers["_build_video_args"].return_value = (video_args, ["dnn_processing=model=test"])
+        build_hls_ffmpeg_cmd("input", "software", "/output")
+        hls_helpers["get_live_hls_list_size"].assert_called_once_with(2.0)
+
+    def test_missing_codec_does_not_probe_gpu(self, hls_helpers: dict[str, MagicMock]):
+        build_hls_ffmpeg_cmd("input", "nvenc+software", "/output")
+        hls_helpers["_get_gpu_nvdec_codecs"].assert_not_called()
+        assert hls_helpers["_build_video_args"].call_args.kwargs["use_hw_pipeline"] is False
+
+
 class TestBuildHlsFfmpegCmd:
     """Tests for build_hls_ffmpeg_cmd."""
 
@@ -901,6 +1177,19 @@ class TestTranscodeDir:
 
 
 class TestHlsListSize:
+    @pytest.mark.parametrize(
+        ("dvr", "duration", "expected"),
+        [(0, 1.0, 30), (0, 4.0, 7), (1, 4.0, 15), (2, 7.0, 17), (-1, 4.0, 7)],
+    )
+    def test_duration_arithmetic(self, dvr: int, duration: float, expected: int):
+        with patch("netv.ffmpeg_command._load_settings", return_value={"live_dvr_mins": dvr}):
+            assert get_live_hls_list_size(duration) == expected
+
+    @pytest.mark.parametrize(("dvr", "expected"), [(0, 5), (1, 15)])
+    def test_custom_live_buffer(self, dvr: int, expected: int):
+        with patch("netv.ffmpeg_command._load_settings", return_value={"live_dvr_mins": dvr}):
+            assert get_live_hls_list_size(4.0, live_buffer_secs=23.0) == expected
+
     """Tests for HLS list size calculation."""
 
     def test_default_list_size(self):
