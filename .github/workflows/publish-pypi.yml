@@ -1,0 +1,50 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Build distributions
+        run: uv build
+      - name: Check package metadata
+        run: uvx --from twine twine check --strict dist/*
+      - name: Smoke test installed commands
+        env:
+          NETV_DATA_DIR: ${{ runner.temp }}/netv-data
+        run: |
+          uvx --isolated --from "$PWD"/dist/*.whl netv --help
+          uvx --isolated --from "$PWD"/dist/*.whl netv-gateway --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pynetv
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

@@ -1365,150 +1365,6 @@ wheels = [
 ]
 
 [[package]]
-name = "netv"
-version = "0.4.1"
-source = { editable = "." }
-dependencies = [
-    { name = "cryptography" },
-    { name = "defusedxml" },
-    { name = "fastapi" },
-    { name = "jinja2" },
-    { name = "pychromecast" },
-    { name = "python-multipart" },
-    { name = "treekle" },
-    { name = "uvicorn", extra = ["standard"] },
-    { name = "wrapt" },
-]
-
-[package.dev-dependencies]
-ai-upscale = [
-    { name = "onnx" },
-    { name = "onnxconverter-common" },
-    { name = "safetensors" },
-    { name = "tensorrt" },
-    { name = "torch" },
-]
-ipython = [
-    { name = "gnureadline" },
-    { name = "ipython" },
-]
-lint = [
-    { name = "codespell" },
-    { name = "ruff" },
-]
-pre-commit = [
-    { name = "basedpyright" },
-    { name = "codedoctor", extra = ["coverage", "mutation", "notebook"] },
-    { name = "codespell" },
-    { name = "hatchling" },
-    { name = "httpx2" },
-    { name = "onnx" },
-    { name = "onnxconverter-common" },
-    { name = "pre-commit" },
-    { name = "pyrefly" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-cov" },
-    { name = "pytest-testmon" },
-    { name = "pytest-timeout" },
-    { name = "pytest-xdist" },
-    { name = "rekursiv-ai-typings" },
-    { name = "ruff" },
-    { name = "treekle" },
-    { name = "ty" },
-    { name = "wrapt" },
-]
-test = [
-    { name = "httpx2" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-cov" },
-    { name = "pytest-testmon" },
-    { name = "pytest-timeout" },
-    { name = "pytest-xdist" },
-]
-typecheck = [
-    { name = "basedpyright" },
-    { name = "hatchling" },
-    { name = "pyrefly" },
-    { name = "ty" },
-]
-
-[package.group-requires-python]
-pre-commit = ">=3.12"
-
-[package.metadata]
-requires-dist = [
-    { name = "cryptography", specifier = ">=43.0" },
-    { name = "defusedxml", specifier = ">=0.7" },
-    { name = "fastapi", specifier = ">=0.115" },
-    { name = "jinja2", specifier = ">=3.1" },
-    { name = "pychromecast", specifier = ">=13.1" },
-    { name = "python-multipart", specifier = ">=0.0.9" },
-    { name = "treekle", specifier = ">=0.4.4" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
-    { name = "wrapt", specifier = ">=2.5.2" },
-]
-
-[package.metadata.requires-dev]
-ai-upscale = [
-    { name = "onnx", specifier = ">=1.14" },
-    { name = "onnxconverter-common", specifier = ">=1.14" },
-    { name = "safetensors", specifier = ">=0.4" },
-    { name = "tensorrt", specifier = ">=10.0" },
-    { name = "torch", specifier = ">=2.0" },
-]
-ipython = [
-    { name = "gnureadline", specifier = ">=8.3.3" },
-    { name = "ipython", specifier = ">=9.18.0" },
-]
-lint = [
-    { name = "codespell", specifier = ">=2.4.3" },
-    { name = "ruff", specifier = ">=0.17.3" },
-]
-pre-commit = [
-    { name = "basedpyright", marker = "python_full_version >= '3.12'", specifier = ">=1.40.2" },
-    { name = "codedoctor", extras = ["coverage", "mutation", "notebook"], marker = "python_full_version >= '3.12'", specifier = ">=0.1.4" },
-    { name = "codespell", marker = "python_full_version >= '3.12'", specifier = ">=2.4.3" },
-    { name = "hatchling", marker = "python_full_version >= '3.12'", specifier = ">=1.33.0" },
-    { name = "httpx2", marker = "python_full_version >= '3.12'", specifier = ">=2.16.0" },
-    { name = "onnx", marker = "python_full_version >= '3.12'", specifier = ">=1.23.2" },
-    { name = "onnxconverter-common", marker = "python_full_version >= '3.12'", specifier = ">=1.16.0" },
-    { name = "pre-commit", marker = "python_full_version >= '3.12'", specifier = ">=4.7.0" },
-    { name = "pyrefly", marker = "python_full_version >= '3.12'", specifier = ">=1.4.0" },
-    { name = "pyrefly", marker = "python_full_version >= '3.12'", specifier = ">=1.4.1" },
-    { name = "pytest", marker = "python_full_version >= '3.12'", specifier = ">=9.1.1" },
-    { name = "pytest", marker = "python_full_version >= '3.12'", specifier = ">=9.2.0" },
-    { name = "pytest-asyncio", marker = "python_full_version >= '3.12'", specifier = ">=1.4.1" },
-    { name = "pytest-cov", marker = "python_full_version >= '3.12'", specifier = ">=7.1.0" },
-    { name = "pytest-testmon", marker = "python_full_version >= '3.12'", specifier = ">=2.3.0" },
-    { name = "pytest-timeout", marker = "python_full_version >= '3.12'", specifier = ">=2.4.0" },
-    { name = "pytest-xdist", marker = "python_full_version >= '3.12'", specifier = ">=3.8.0" },
-    { name = "rekursiv-ai-typings", marker = "python_full_version >= '3.12'", specifier = ">=0.1.16" },
-    { name = "ruff", marker = "python_full_version >= '3.12'", specifier = ">=0.17.3" },
-    { name = "ruff", marker = "python_full_version >= '3.12'", specifier = ">=0.17.4" },
-    { name = "treekle", marker = "python_full_version >= '3.12'", specifier = ">=0.4.4" },
-    { name = "ty", marker = "python_full_version >= '3.12'", specifier = ">=0.0.95" },
-    { name = "ty", marker = "python_full_version >= '3.12'", specifier = ">=0.0.99" },
-    { name = "wrapt", marker = "python_full_version >= '3.12'", specifier = ">=2.5.2" },
-]
-test = [
-    { name = "httpx2", specifier = ">=2.16.0" },
-    { name = "pytest", specifier = ">=9.1.1" },
-    { name = "pytest-asyncio", specifier = ">=1.4.1" },
-    { name = "pytest-cov", specifier = ">=7.1.0" },
-    { name = "pytest-testmon", specifier = ">=2.3.0" },
-    { name = "pytest-timeout", specifier = ">=2.4.0" },
-    { name = "pytest-xdist", specifier = ">=3.8.0" },
-]
-typecheck = [
-    { name = "basedpyright", specifier = ">=1.40.2" },
-    { name = "hatchling", specifier = ">=1.33.0" },
-    { name = "pyrefly", specifier = ">=1.4.0" },
-    { name = "ty", specifier = ">=0.0.95" },
-]
-
-[[package]]
 name = "networkx"
 version = "3.7"
 source = { registry = "https://pypi.org/simple" }
@@ -2122,6 +1978,150 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/49/2e/ced460408999b33da6b31b0021b0f37d329e202d4169aeb164493778f25b/pygments-2.21.0.tar.gz", hash = "sha256:610ca751c9bc2492b38eb9a38a7fbc93edbbb2d7182edaf34e66ae493dee5c8c", size = 5005329, upload-time = "2026-08-17T08:02:48.824Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/71/46/17f022dd3e953bf20a04a028a21ec746d942f8d2af30fa0f124fa0e6a684/pygments-2.21.0-py3-none-any.whl", hash = "sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9", size = 1250147, upload-time = "2026-08-17T08:02:44.912Z" },
+]
+
+[[package]]
+name = "pynetv"
+version = "0.4.1"
+source = { editable = "." }
+dependencies = [
+    { name = "cryptography" },
+    { name = "defusedxml" },
+    { name = "fastapi" },
+    { name = "jinja2" },
+    { name = "pychromecast" },
+    { name = "python-multipart" },
+    { name = "treekle" },
+    { name = "uvicorn", extra = ["standard"] },
+    { name = "wrapt" },
+]
+
+[package.dev-dependencies]
+ai-upscale = [
+    { name = "onnx" },
+    { name = "onnxconverter-common" },
+    { name = "safetensors" },
+    { name = "tensorrt" },
+    { name = "torch" },
+]
+ipython = [
+    { name = "gnureadline" },
+    { name = "ipython" },
+]
+lint = [
+    { name = "codespell" },
+    { name = "ruff" },
+]
+pre-commit = [
+    { name = "basedpyright" },
+    { name = "codedoctor", extra = ["coverage", "mutation", "notebook"] },
+    { name = "codespell" },
+    { name = "hatchling" },
+    { name = "httpx2" },
+    { name = "onnx" },
+    { name = "onnxconverter-common" },
+    { name = "pre-commit" },
+    { name = "pyrefly" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+    { name = "pytest-testmon" },
+    { name = "pytest-timeout" },
+    { name = "pytest-xdist" },
+    { name = "rekursiv-ai-typings" },
+    { name = "ruff" },
+    { name = "treekle" },
+    { name = "ty" },
+    { name = "wrapt" },
+]
+test = [
+    { name = "httpx2" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+    { name = "pytest-testmon" },
+    { name = "pytest-timeout" },
+    { name = "pytest-xdist" },
+]
+typecheck = [
+    { name = "basedpyright" },
+    { name = "hatchling" },
+    { name = "pyrefly" },
+    { name = "ty" },
+]
+
+[package.group-requires-python]
+pre-commit = ">=3.12"
+
+[package.metadata]
+requires-dist = [
+    { name = "cryptography", specifier = ">=43.0" },
+    { name = "defusedxml", specifier = ">=0.7" },
+    { name = "fastapi", specifier = ">=0.115" },
+    { name = "jinja2", specifier = ">=3.1" },
+    { name = "pychromecast", specifier = ">=13.1" },
+    { name = "python-multipart", specifier = ">=0.0.9" },
+    { name = "treekle", specifier = ">=0.4.4" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
+    { name = "wrapt", specifier = ">=2.5.2" },
+]
+
+[package.metadata.requires-dev]
+ai-upscale = [
+    { name = "onnx", specifier = ">=1.14" },
+    { name = "onnxconverter-common", specifier = ">=1.14" },
+    { name = "safetensors", specifier = ">=0.4" },
+    { name = "tensorrt", specifier = ">=10.0" },
+    { name = "torch", specifier = ">=2.0" },
+]
+ipython = [
+    { name = "gnureadline", specifier = ">=8.3.3" },
+    { name = "ipython", specifier = ">=9.18.0" },
+]
+lint = [
+    { name = "codespell", specifier = ">=2.4.3" },
+    { name = "ruff", specifier = ">=0.17.3" },
+]
+pre-commit = [
+    { name = "basedpyright", marker = "python_full_version >= '3.12'", specifier = ">=1.40.2" },
+    { name = "codedoctor", extras = ["coverage", "mutation", "notebook"], marker = "python_full_version >= '3.12'", specifier = ">=0.1.4" },
+    { name = "codespell", marker = "python_full_version >= '3.12'", specifier = ">=2.4.3" },
+    { name = "hatchling", marker = "python_full_version >= '3.12'", specifier = ">=1.33.0" },
+    { name = "httpx2", marker = "python_full_version >= '3.12'", specifier = ">=2.16.0" },
+    { name = "onnx", marker = "python_full_version >= '3.12'", specifier = ">=1.23.2" },
+    { name = "onnxconverter-common", marker = "python_full_version >= '3.12'", specifier = ">=1.16.0" },
+    { name = "pre-commit", marker = "python_full_version >= '3.12'", specifier = ">=4.7.0" },
+    { name = "pyrefly", marker = "python_full_version >= '3.12'", specifier = ">=1.4.0" },
+    { name = "pyrefly", marker = "python_full_version >= '3.12'", specifier = ">=1.4.1" },
+    { name = "pytest", marker = "python_full_version >= '3.12'", specifier = ">=9.1.1" },
+    { name = "pytest", marker = "python_full_version >= '3.12'", specifier = ">=9.2.0" },
+    { name = "pytest-asyncio", marker = "python_full_version >= '3.12'", specifier = ">=1.4.1" },
+    { name = "pytest-cov", marker = "python_full_version >= '3.12'", specifier = ">=7.1.0" },
+    { name = "pytest-testmon", marker = "python_full_version >= '3.12'", specifier = ">=2.3.0" },
+    { name = "pytest-timeout", marker = "python_full_version >= '3.12'", specifier = ">=2.4.0" },
+    { name = "pytest-xdist", marker = "python_full_version >= '3.12'", specifier = ">=3.8.0" },
+    { name = "rekursiv-ai-typings", marker = "python_full_version >= '3.12'", specifier = ">=0.1.16" },
+    { name = "ruff", marker = "python_full_version >= '3.12'", specifier = ">=0.17.3" },
+    { name = "ruff", marker = "python_full_version >= '3.12'", specifier = ">=0.17.4" },
+    { name = "treekle", marker = "python_full_version >= '3.12'", specifier = ">=0.4.4" },
+    { name = "ty", marker = "python_full_version >= '3.12'", specifier = ">=0.0.95" },
+    { name = "ty", marker = "python_full_version >= '3.12'", specifier = ">=0.0.99" },
+    { name = "wrapt", marker = "python_full_version >= '3.12'", specifier = ">=2.5.2" },
+]
+test = [
+    { name = "httpx2", specifier = ">=2.16.0" },
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "pytest-asyncio", specifier = ">=1.4.1" },
+    { name = "pytest-cov", specifier = ">=7.1.0" },
+    { name = "pytest-testmon", specifier = ">=2.3.0" },
+    { name = "pytest-timeout", specifier = ">=2.4.0" },
+    { name = "pytest-xdist", specifier = ">=3.8.0" },
+]
+typecheck = [
+    { name = "basedpyright", specifier = ">=1.40.2" },
+    { name = "hatchling", specifier = ">=1.33.0" },
+    { name = "pyrefly", specifier = ">=1.4.0" },
+    { name = "ty", specifier = ">=0.0.95" },
 ]
 
 [[package]]
