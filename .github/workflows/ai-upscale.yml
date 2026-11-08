@@ -3,6 +3,12 @@ name: AI Upscale Image
 on:
   # Run manually when an FFmpeg base-image update should be published immediately.
   workflow_dispatch:
+  # Each image builds FROM the matching netv-ffmpeg image, so rebuild after FFmpeg Base
+  # publishes new ones.
+  workflow_run:
+    workflows: ["FFmpeg Base Image"]
+    types: [completed]
+    branches: [main]
   push:
     branches: [main]
     paths:
@@ -10,7 +16,8 @@ on:
       - "docker/entrypoint-ai_upscale.sh"
       - "netv/**"
       - "pyproject.toml"
-      - "scripts/**"
+      - "uv.lock"
+      - "scripts/install-ai_upscale.sh"
       - ".github/workflows/ai-upscale.yml"
 
 env:
@@ -19,7 +26,43 @@ env:
   DEFAULT_BASE: ubuntu:26.04
 
 jobs:
+  # A push that also changes FFmpeg Base inputs would build on the previous ffmpeg images;
+  # skip it here and let the workflow_run trigger build once FFmpeg Base publishes.
+  gate:
+    runs-on: ubuntu-26.04
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          case "$EVENT" in
+            workflow_run)
+              [ "$RUN_CONCLUSION" = success ] && run=true || run=false ;;
+            push)
+              if git cat-file -e "$BEFORE^{commit}" 2>/dev/null && \
+                 git diff --name-only "$BEFORE" "$GITHUB_SHA" -- \
+                   docker/Dockerfile.ffmpeg scripts/install-ffmpeg.sh docker/patches \
+                   .github/workflows/ffmpeg-base.yml | grep -q .; then
+                echo "FFmpeg Base inputs changed; building after FFmpeg Base finishes"
+                run=false
+              else
+                run=true
+              fi ;;
+            *) run=true ;;
+          esac
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -41,6 +84,9 @@ jobs:
           df -h
 
       - uses: actions/checkout@v7
+        with:
+          # workflow_run checks out the default branch tip; build the commit FFmpeg Base built.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
