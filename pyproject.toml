@@ -32,6 +32,7 @@ cu126 = ["torch"]
 cu128 = ["torch"]
 cu130 = ["torch"]
 cu132 = ["torch"]
+cu134 = ["torch"]
 xtream2m3u = ["treekle>=0.4.4"]
 server = [
     "PyChromecast>=13.1",
@@ -126,8 +127,8 @@ exclude = ["*_test.py", "/netv/testing.py"]
 package = true
 default-groups = ["dev", "cuda"]
 conflicts = [
-    [{extra = "cpu"}, {extra = "cu126"}, {extra = "cu128"}, {extra = "cu130"}, {extra = "cu132"}],
-    [{group = "cuda"}, {extra = "cpu"}, {extra = "cu128"}, {extra = "cu130"}, {extra = "cu132"}],
+    [{extra = "cpu"}, {extra = "cu126"}, {extra = "cu128"}, {extra = "cu130"}, {extra = "cu132"}, {extra = "cu134"}],
+    [{group = "cuda"}, {extra = "cpu"}, {extra = "cu128"}, {extra = "cu130"}, {extra = "cu132"}, {extra = "cu134"}],
 ]
 
 [[tool.uv.index]]
@@ -155,6 +156,11 @@ name = "pytorch-cu132"
 url = "https://download.pytorch.org/whl/cu132"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-cu134"
+url = "https://download.pytorch.org/whl/cu134"
+explicit = true
+
 [tool.uv.sources]
 torch = [
     {index = "pytorch-cu126", group = "cuda", marker = "sys_platform == 'linux'"},
@@ -163,6 +169,7 @@ torch = [
     {index = "pytorch-cu128", extra = "cu128", marker = "sys_platform == 'linux'"},
     {index = "pytorch-cu130", extra = "cu130", marker = "sys_platform == 'linux'"},
     {index = "pytorch-cu132", extra = "cu132", marker = "sys_platform == 'linux'"},
+    {index = "pytorch-cu134", extra = "cu134", marker = "sys_platform == 'linux'"},
 ]
 
 [tool.uv.dependency-groups.pre-commit]
