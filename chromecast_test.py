@@ -1,6 +1,7 @@
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
@@ -11,9 +12,9 @@ import pytest
 import chromecast
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class MediaStatus:
-    """Mutable stand-in for a receiver's media status."""
+    """One receiver media-status snapshot."""
 
     content_id: str | None = None
     player_state: str = "IDLE"
@@ -28,12 +29,15 @@ class CastEnv:
 
     manager: chromecast.CastManager
     cast: MagicMock
-    status: MediaStatus
     session: dict[str, object]
     connect: MagicMock
     touch: MagicMock
     stop: MagicMock
     save: MagicMock
+
+    @property
+    def status(self) -> MediaStatus:
+        return cast(MediaStatus, self.cast.media_controller.status)
 
 
 @pytest.fixture
@@ -47,8 +51,7 @@ def cast_env() -> Iterator[CastEnv]:
     cast.media_controller.status = status
 
     def load(url: str, *_args: object, **_kwargs: object) -> None:
-        status.content_id = url
-        status.player_state = "PLAYING"
+        cast.media_controller.status = replace(status, content_id=url, player_state="PLAYING")
 
     cast.media_controller.play_media.side_effect = load
     session: dict[str, object] = {
@@ -68,7 +71,6 @@ def cast_env() -> Iterator[CastEnv]:
         yield CastEnv(
             manager=manager,
             cast=cast,
-            status=status,
             session=session,
             connect=connect,
             touch=touch,
@@ -202,8 +204,11 @@ def test_load_timeout_does_not_report_success(cast_env: CastEnv):
 
 def test_receiver_load_error_fails_fast(cast_env: CastEnv):
     def load(url: str, *_args: object, **_kwargs: object) -> None:
-        cast_env.status.content_id = url
-        cast_env.status.idle_reason = "ERROR"
+        cast_env.cast.media_controller.status = replace(
+            cast_env.status,
+            content_id=url,
+            idle_reason="ERROR",
+        )
 
     cast_env.cast.media_controller.play_media.side_effect = load
     with (
@@ -222,8 +227,11 @@ def test_start_polls_until_receiver_plays(cast_env: CastEnv):
 
     def wait(secs: float) -> None:
         del secs
-        status.content_id = "http://192.168.1.10:8000/transcode/session123/stream.m3u8"
-        status.player_state = "BUFFERING"
+        cast_env.cast.media_controller.status = replace(
+            status,
+            content_id="http://192.168.1.10:8000/transcode/session123/stream.m3u8",
+            player_state="BUFFERING",
+        )
 
     with (
         patch("chromecast.time.monotonic", side_effect=[0, 1, 2]),
@@ -244,7 +252,7 @@ def test_status_while_connecting_and_unknown(cast_env: CastEnv):
     )
     cast_env.manager._sessions[record.host] = record
     assert cast_env.manager.status("alice") == {"active": False, "connecting": True}
-    record.starting = False
+    cast_env.manager._sessions[record.host] = replace(record, starting=False)
     assert cast_env.manager.status("alice") == {
         "active": True,
         "host": "192.168.1.50",
@@ -254,6 +262,20 @@ def test_status_while_connecting_and_unknown(cast_env: CastEnv):
         "current_time": 0,
         "volume": 1,
     }
+
+
+def test_session_replacement_keeps_previous_snapshots_and_does_not_restore_removed_sessions(
+    cast_env: CastEnv,
+):
+    start(cast_env)
+    record = cast_env.manager._sessions["192.168.1.50"]
+    updated = replace(record, name="Bedroom")
+    assert cast_env.manager._replace_session(record, updated) is updated
+    assert cast_env.manager._sessions[record.host] is updated
+    assert record.name == "Living Room"
+    cast_env.manager._forget(updated)
+    assert cast_env.manager._replace_session(record, updated) is updated
+    assert cast_env.manager._sessions == {}
 
 
 def test_starting_session_is_kept_alive(cast_env: CastEnv):
@@ -291,14 +313,17 @@ def test_save_position_skips_foreign_media_and_early_positions(cast_env: CastEnv
     cast_env.session["is_vod"] = True
     start(cast_env)
     record = next(iter(cast_env.manager._sessions.values()))
-    cast_env.status.content_id = "another-app"
+    cast_env.cast.media_controller.status = replace(cast_env.status, content_id="another-app")
     cast_env.manager._save_position(record)
-    cast_env.status.content_id = record.url
     cast_env.session["seek_offset"] = 0
-    cast_env.status.adjusted_current_time = 2
+    cast_env.cast.media_controller.status = replace(
+        cast_env.status,
+        content_id=record.url,
+        adjusted_current_time=2,
+    )
     cast_env.manager._save_position(record)
     cast_env.save.assert_not_called()
-    cast_env.status.adjusted_current_time = 9999
+    cast_env.cast.media_controller.status = replace(cast_env.status, adjusted_current_time=9999)
     cast_env.manager._save_position(record)
     cast_env.save.assert_called_once_with("alice", "http://provider/live", 3600, 3600)
 
@@ -342,7 +367,7 @@ def test_monitor_maintains_until_stopped():
 def test_server_keeps_cast_alive_without_browser(cast_env: CastEnv):
     start(cast_env)
     cast_env.touch.reset_mock()
-    cast_env.status.player_state = "PAUSED"
+    cast_env.cast.media_controller.status = replace(cast_env.status, player_state="PAUSED")
     cast_env.manager.maintain_sessions()
     cast_env.touch.assert_called_once_with("session123")
     assert cast_env.manager.status("alice")["active"]
@@ -357,7 +382,7 @@ def test_disconnected_receiver_releases_ownership(cast_env: CastEnv):
 
 def test_other_receiver_app_is_not_stopped(cast_env: CastEnv):
     start(cast_env)
-    cast_env.status.content_id = "another-app"
+    cast_env.cast.media_controller.status = replace(cast_env.status, content_id="another-app")
     with pytest.raises(HTTPException) as error:
         cast_env.manager.command("alice", "stop", release=cast_env.stop)
     assert error.value.status_code == 409

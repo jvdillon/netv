@@ -1,6 +1,7 @@
 """Coverage-focused tests for ffmpeg session management."""
 
 from collections.abc import Awaitable, Callable, Collection, Coroutine, Iterable, Iterator
+from dataclasses import replace
 from types import CoroutineType
 from typing import Any, cast, override
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -895,7 +896,7 @@ async def test_seek_caption_preparation_failure(
 def test_fast_start_health_learns_bitrate_from_live_encoder(state: _State, tmp_path: pathlib.Path):
     sessions, _ = state
     policy = MagicMock(spec=PlaybackPolicy, bandwidth_saver=False)
-    policy.observe.return_value = False
+    policy.observe.return_value = PlaybackPolicy()
     encoder = FakeProcess()
     sessions["f"] = fs.TranscodeSession(
         username="u",
@@ -1046,7 +1047,7 @@ async def test_startup_wait_ready_paths(tmp_path: pathlib.Path):
         await startup.wait_ready("low.m3u8", _proc(FakeProcess(alive=False)))
     assert error.value.status_code == 500
 
-    startup.is_disconnected = AsyncMock(return_value=True)
+    startup = replace(startup, is_disconnected=AsyncMock(return_value=True))
     with pytest.raises(HTTPException) as error:
         await startup.wait_ready("low.m3u8", _proc(FakeProcess()))
     assert error.value.status_code == 499
@@ -1958,12 +1959,12 @@ def _recovery(
 ) -> MagicMock:
     recovery = MagicMock()
 
-    def is_stalled(stage: str, alive: bool, ready: bool, now: float) -> bool:
+    def is_stalled(stage: str, alive: bool, ready: bool, now: float) -> tuple[MagicMock, bool]:
         del alive, ready, now
-        return stage in stalled
+        return recovery, stage in stalled
 
     recovery.stalled.side_effect = is_stalled
-    recovery.permit_restart.return_value = permit
+    recovery.permit_restart.return_value = recovery, permit
     recovery.exhausted.return_value = exhausted
     recovery.pending = set(pending)
     return recovery

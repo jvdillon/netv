@@ -40,7 +40,7 @@ def category_ids(record: Mapping[str, MutablePlainTree]) -> list[str]:
     return [str(c) for c in list_field(record, "category_ids")]
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class XtreamClient:
     """Client for Xtream Codes API.
 
@@ -54,7 +54,7 @@ class XtreamClient:
     user_agent: str | None = None
 
     def __post_init__(self) -> None:
-        self.base_url = self.base_url.rstrip("/")
+        object.__setattr__(self, "base_url", self.base_url.rstrip("/"))
 
     @property
     def api_url(self) -> str:

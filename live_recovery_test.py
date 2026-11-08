@@ -195,7 +195,11 @@ async def test_pipeline_restart_replaces_dependencies_without_second_upstream_re
         recovery_session["process"],
     }
     new_ingest, new_low = process(), process()
-    recovery_session["live_recovery"].permit_restart("pipeline", 100)
+    recovery_session["live_recovery"], permitted = recovery_session["live_recovery"].permit_restart(
+        "pipeline",
+        100,
+    )
+    assert permitted
 
     with (
         patch(
@@ -241,7 +245,11 @@ async def test_repeated_pipeline_recovery_advances_generation(
     recovery_session: ffmpeg_session.FastLiveSession,
 ):
     recovery_session["playlist_generation"] = 7
-    recovery_session["live_recovery"].permit_restart("pipeline", 100)
+    recovery_session["live_recovery"], permitted = recovery_session["live_recovery"].permit_restart(
+        "pipeline",
+        100,
+    )
+    assert permitted
     new_ingest, new_low = process(), process()
 
     with (
@@ -277,7 +285,11 @@ async def test_failed_pipeline_recovery_keeps_generation(
     recovery_session: ffmpeg_session.FastLiveSession,
 ):
     recovery_session["playlist_generation"] = 5
-    recovery_session["live_recovery"].permit_restart("pipeline", 100)
+    recovery_session["live_recovery"], permitted = recovery_session["live_recovery"].permit_restart(
+        "pipeline",
+        100,
+    )
+    assert permitted
     new_ingest, new_low = process(), process()
 
     with (

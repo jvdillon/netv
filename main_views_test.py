@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -1035,11 +1035,14 @@ def test_movie_player_info_survives_upstream_error():
 _SERIES: ProviderRecord = {
     "info": {"name": "Show", "year": "2020"},
     "episodes": {
-        "2": [{"id": 21, "episode_num": 1, "title": "S02E01 - Show - Finale"}],
+        "2": [{"id": 21, "episode_num": 1, "title": "S02E01 - Show - Season Two - Grand Finale"}],
+        "10": [{"id": 101, "episode_num": 1, "title": "Last"}],
         "1": [
             {"id": 12, "episode_num": 2, "title": "Second", "container_extension": "mp4"},
-            {"id": 11, "episode_num": 1, "title": "S01E01 - Pilot", "info": {"plot": "Start"}},
+            {"id": 11, "episode_num": 1, "title": "S01E01 -Pilot", "info": {"plot": "Start"}},
+            {"id": 10, "title": "Prologue"},
         ],
+        "3": None,
     },
 }
 
@@ -1049,19 +1052,29 @@ def test_series_player_info_without_client():
         assert main._get_series_player_info("1", None, "") == (PlayerInfo(), None)
 
 
-def test_series_player_info_without_series_id():
-    with patch("main.get_first_xtream_client", return_value=_xtream()):
-        info, next_url = main._get_series_player_info("1", None, "")
-    assert info.url == "http://x/series/1.mkv"
+@pytest.mark.parametrize("series_id", [None, 0])
+def test_series_player_info_without_series_id(series_id: int | None):
+    cache_module.get_cache()["series"] = [{"series_id": series_id, "source_id": "ignored"}]
+    with (
+        patch("main.get_first_xtream_client", return_value=_xtream()),
+        patch("main.get_xtream_client_by_source") as by_source,
+        patch("main.get_cached_info") as cached,
+    ):
+        info, next_url = main._get_series_player_info("1", series_id, "")
+    assert info == PlayerInfo(url="http://x/series/1.mkv")
     assert next_url is None
+    by_source.assert_not_called()
+    cached.assert_not_called()
 
 
 @pytest.mark.parametrize(
     ("stream_id", "title", "desc", "next_url"),
     [
-        ("11", "S01E01 -- Pilot", "Start", "/play/series/12?series_id=9&ext=mp4"),
-        ("12", "S01E02 -- Second", "", "/play/series/21?series_id=9&ext=mkv"),
-        ("21", "S02E01 -- Finale", "", None),
+        ("10", "S01E00 -- Prologue", "", "/play/series/11?series_id=1&ext=mkv"),
+        ("11", "S01E01 -- Pilot", "Start", "/play/series/12?series_id=1&ext=mp4"),
+        ("12", "S01E02 -- Second", "", "/play/series/21?series_id=1&ext=mkv"),
+        ("21", "S02E01 -- Grand Finale", "", "/play/series/101?series_id=1&ext=mkv"),
+        ("101", "S10E01 -- Last", "", None),
     ],
 )
 def test_series_player_info_episodes(
@@ -1070,15 +1083,19 @@ def test_series_player_info_episodes(
     desc: str,
     next_url: str | None,
 ):
-    cache_module.get_cache()["series"] = [{"series_id": 9, "source_id": "s1"}]
+    cache_module.get_cache()["series"] = [{"series_id": 1, "source_id": "s1"}]
+    client = _xtream(_SERIES)
     with (
-        patch("main.get_xtream_client_by_source", return_value=_xtream(_SERIES)),
-        patch("main.get_cached_info", side_effect=_fetch_uncached),
+        patch("main.get_xtream_client_by_source", return_value=client) as by_source,
+        patch("main.get_cached_info", side_effect=_fetch_uncached) as cached,
     ):
-        info, url = main._get_series_player_info(stream_id, 9, "")
+        info, url = main._get_series_player_info(stream_id, 1, "")
     assert info.source_id == "s1"
     assert info.channel_name == "Show (2020)"
     assert (info.program_title, info.program_desc, url) == (title, desc, next_url)
+    by_source.assert_called_once_with("s1")
+    assert cached.call_args.args[0] == "series_info_s1_1"
+    client.get_series_info.assert_called_once_with(1)
 
 
 @pytest.mark.parametrize(
@@ -1087,17 +1104,32 @@ def test_series_player_info_episodes(
         (error.URLError("down"), ""),
         (None, ""),
         ({"info": {"name": "Untimed"}}, "Untimed"),
+        ({"info": {"plot": "Unnamed"}}, ""),
     ],
 )
-def test_series_player_info_partial_data(series: ProviderRecord | Exception | None, name: str):
-    cache_module.get_cache()["series"] = []
+def test_series_player_info_partial_data(
+    series: ProviderRecord | Exception | None,
+    name: str,
+    caplog: pytest.LogCaptureFixture,
+):
+    cache_module.get_cache().pop("series", None)
+    client = _xtream(series)
     with (
-        patch("main.get_first_xtream_client", return_value=_xtream(series)),
-        patch("main.get_cached_info", side_effect=_fetch_uncached),
+        patch("main.get_first_xtream_client", return_value=client),
+        patch("main.get_xtream_client_by_source") as by_source,
+        patch("main.get_cached_info", side_effect=_fetch_uncached) as cached,
+        caplog.at_level(logging.WARNING, logger="main"),
     ):
         info, url = main._get_series_player_info("1", 9, "")
-    assert info.channel_name == name
+    assert info == PlayerInfo(url="http://x/series/1.mkv", channel_name=name)
     assert url is None
+    by_source.assert_not_called()
+    assert cached.call_args.args[0] == "series_info__9"
+    client.get_series_info.assert_called_once_with(9)
+    if isinstance(series, Exception):
+        assert [record.getMessage() for record in caplog.records] == [
+            f"Failed to fetch series info 9: {series}",
+        ]
 
 
 def test_ensure_live_cache_loads_streams_and_epg():
@@ -1135,22 +1167,45 @@ def _live_info(**overrides: Any) -> PlayerInfo:
 
 
 def test_handoff_channel_unknown_stream():
-    with patch("main._get_live_player_info", return_value=PlayerInfo()):
+    with (
+        patch("main._get_live_player_info", return_value=PlayerInfo()),
+        patch("main._find_live_stream") as find,
+    ):
         assert main._handoff_channel("x", time.time()) is None
+    find.assert_not_called()
 
 
-def test_handoff_channel_within_current_program():
+@pytest.mark.parametrize("position", [100, 150])
+def test_handoff_channel_within_current_program(position: int):
+    stream = main_test._archive_stream()
+    info = _live_info(program_start=100, program_end=200)
+    with (
+        patch("main._get_live_player_info", return_value=info) as live,
+        patch("main._find_live_stream", return_value=stream) as find,
+        patch("main._find_archived_program") as archived,
+        patch("main.catchup.can_play", return_value=True) as can_play,
+    ):
+        channel = main._handoff_channel("src1_42", position)
+    assert channel == handoff.Channel(
+        stream_id="src1_42",
+        name="Channel",
+        url=info.url,
+        source_id="src1",
+        catchup_days=2,
+        program_title="Now",
+        program_start=100,
+        program_end=200,
+    )
+    assert info.program_start == 100
+    live.assert_called_once_with("src1_42")
+    find.assert_called_once_with("src1_42")
+    archived.assert_not_called()
+    can_play.assert_called_once_with(stream, datetime.fromtimestamp(position - 60, timezone.utc))
+
+
+@pytest.mark.parametrize("position", [50, 200])
+def test_handoff_channel_looks_up_earlier_program(position: int):
     cache_module.get_cache()["live_streams"] = [main_test._archive_stream()]
-    with patch("main._get_live_player_info", return_value=_live_info()):
-        channel = main._handoff_channel("src1_42", time.time() - 120)
-    assert channel is not None
-    assert channel.program_title == "Now"
-    assert channel.catchup_days == 2
-
-
-def test_handoff_channel_looks_up_earlier_program():
-    cache_module.get_cache()["live_streams"] = [main_test._archive_stream()]
-    position = time.time() - 3600
     program = Program(
         channel_id="ch1",
         title="Earlier",
@@ -1158,14 +1213,22 @@ def test_handoff_channel_looks_up_earlier_program():
         stop=datetime.fromtimestamp(position + 60, timezone.utc),
     )
     with (
-        patch("main._get_live_player_info", return_value=_live_info()),
-        patch("main._find_archived_program", return_value=program),
+        patch(
+            "main._get_live_player_info",
+            return_value=_live_info(program_start=100, program_end=200),
+        ),
+        patch("main._find_archived_program", return_value=program) as archived,
+        patch("main.catchup.can_play", return_value=True),
     ):
         channel = main._handoff_channel("src1_42", position)
     assert channel is not None
     assert channel.program_title == "Earlier"
     assert channel.program_start == program.start.timestamp()
     assert channel.program_end == program.stop.timestamp()
+    archived.assert_called_once_with(
+        main_test._archive_stream(),
+        datetime.fromtimestamp(position, timezone.utc),
+    )
 
 
 def test_handoff_channel_outside_archive():
@@ -1185,6 +1248,69 @@ def test_handoff_player_info_without_live_url(clean_handoff: None):
     with patch("main._get_live_player_info", return_value=PlayerInfo()):
         info = main._get_handoff_player_info("testuser", "src1_42", "h1", None)
     assert info == PlayerInfo()
+
+
+@pytest.mark.parametrize(("start", "position"), [(None, 150), (0, 0), (200, 200)])
+@pytest.mark.parametrize("title", ["Saved program", ""])
+def test_handoff_recording_publishes_a_replacement(
+    start: int | None,
+    position: int,
+    title: str,
+):
+    record = main_test._handoff_record()
+    record.update(
+        position=150,
+        recording_start=100,
+        program_title=title,
+        program_start=90,
+        program_end=300,
+    )
+    original = PlayerInfo(url="upstream", channel_name="Channel", program_title="Live")
+    with (
+        patch("handoff.claim", return_value=record) as claim,
+        patch("main._get_live_player_info", return_value=original) as live,
+    ):
+        result = main._get_handoff_player_info("viewer", "src1_42", "h1", start)
+    assert result == replace(
+        original,
+        url="/handoff/rec1/stream.m3u8",
+        program_title=title or "Live",
+        program_start=90,
+        program_end=300,
+        catchup_start=100,
+        catchup_seek=max(0, position - 100),
+        handoff_recording=True,
+    )
+    assert original == PlayerInfo(url="upstream", channel_name="Channel", program_title="Live")
+    claim.assert_called_once_with("viewer", "h1")
+    live.assert_called_once_with("src1_42")
+
+
+@pytest.mark.parametrize(("start", "expected"), [(None, 60), (0, 0), (200, 60)])
+def test_handoff_catchup_respects_explicit_start_and_default_archive_lag(
+    start: int | None,
+    expected: int,
+):
+    original = PlayerInfo(url="archive")
+    with (
+        patch(
+            "handoff.claim",
+            return_value=main_test._handoff_record(mode="catchup", position=100),
+        ),
+        patch("main.time.time", return_value=120),
+        patch("main._get_catchup_player_info", return_value=original) as catchup,
+    ):
+        assert main._get_handoff_player_info("viewer", "src1_42", "h1", start) is original
+    catchup.assert_called_once_with("src1_42", expected)
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_handoff_rejects_missing_or_wrong_stream(missing: bool):
+    record = None if missing else main_test._handoff_record(stream_id="other")
+    with patch("handoff.claim", return_value=record), pytest.raises(HTTPException) as error_info:
+        main._get_handoff_player_info("viewer", "src1_42", "h1", None)
+    assert error_info.value.status_code == 404
+    assert error_info.value.detail == "This program is no longer available to resume"
 
 
 def test_handoff_stream_allowed(auth_client: TestClient):

@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Callable, Coroutine, Mapping
 from concurrent import futures
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Annotated, Literal, NotRequired, Protocol, TypedDict, cast
 from urllib import error, parse
@@ -1237,7 +1237,7 @@ class PlaylistCategory(TypedDict):
     kind: str
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class PlayerInfo:
     """Info needed to render the player page."""
 
@@ -4048,34 +4048,39 @@ def _get_live_player_info(stream_id: str) -> PlayerInfo:
 
     direct_url = text_field(stream, "direct_url")
     if direct_url:
-        info.url = direct_url
-        info.is_m3u = True
+        info = replace(info, url=direct_url, is_m3u=True)
     elif stream.get("source_type") == "xtream":
         base = text_field(stream, "source_url")
         orig_id = stream_id.split("_")[-1] if "_" in stream_id else stream_id
         # URL-encode username/password to handle special chars like # in passwords.
         user = parse.quote(text_field(stream, "source_username"), safe="")
         pwd = parse.quote(text_field(stream, "source_password"), safe="")
-        info.url = f"{base}/live/{user}/{pwd}/{orig_id}.m3u8"
+        info = replace(info, url=f"{base}/live/{user}/{pwd}/{orig_id}.m3u8")
 
     # Look up source settings.
     source_id = text_field(stream, "source_id")
-    info.source_id = source_id
     stream_category_ids = stream.get("category_ids")
-    info.category_ids = stream_category_ids if isinstance(stream_category_ids, list) else None
+    info = replace(
+        info,
+        source_id=source_id,
+        category_ids=stream_category_ids if isinstance(stream_category_ids, list) else None,
+    )
     if source_id:
         sources = load_server_settings().get("sources", [])
         source = next((s for s in sources if s.get("id") == source_id), None)
         if source is not None:
-            info.deinterlace_fallback = source.get("deinterlace_fallback", True)
+            info = replace(info, deinterlace_fallback=source.get("deinterlace_fallback", True))
 
     # Look up current program from EPG.
     program = _get_current_program(_live_epg_id(stream))
     if program is not None:
-        info.program_title = program["title"]
-        info.program_desc = program["desc"]
-        info.program_start = program["start"]
-        info.program_end = program["end"]
+        info = replace(
+            info,
+            program_title=program["title"],
+            program_desc=program["desc"],
+            program_start=program["start"],
+            program_end=program["end"],
+        )
     return info
 
 
@@ -4113,15 +4118,17 @@ def _get_catchup_player_info(stream_id: str, start_ts: float) -> PlayerInfo:
     source_id = text_field(stream, "source_id")
     client = get_xtream_client_by_source(source_id)
     tz = catchup.server_timezone(source_id, client.get_server_info) if client else timezone.utc
-    info.url = catchup.timeshift_url(stream, begin, catchup.duration_minutes(begin, stop), tz)
-    info.is_m3u = False
-    info.catchup_start = begin.timestamp()
-    info.catchup_seek = (start - begin).total_seconds()
-    info.program_title = program.title if program else ""
-    info.program_desc = program.desc if program else ""
-    info.program_start = program.start.timestamp() if program else begin.timestamp()
-    info.program_end = stop.timestamp()
-    return info
+    return replace(
+        info,
+        url=catchup.timeshift_url(stream, begin, catchup.duration_minutes(begin, stop), tz),
+        is_m3u=False,
+        catchup_start=begin.timestamp(),
+        catchup_seek=(start - begin).total_seconds(),
+        program_title=program.title if program else "",
+        program_desc=program.desc if program else "",
+        program_start=program.start.timestamp() if program else begin.timestamp(),
+        program_end=stop.timestamp(),
+    )
 
 
 def _get_movie_player_info(stream_id: str, ext: str) -> PlayerInfo:
@@ -4142,8 +4149,10 @@ def _get_movie_player_info(stream_id: str, ext: str) -> PlayerInfo:
     client = xtream
 
     ext = ext or "mkv"
-    info = PlayerInfo(url=client.build_stream_url("movie", int(stream_id), ext))
-    info.source_id = source_id
+    info = PlayerInfo(
+        url=client.build_stream_url("movie", int(stream_id), ext),
+        source_id=source_id,
+    )
 
     cache_key = f"vod_info_{source_id}_{stream_id}"
     try:
@@ -4155,8 +4164,11 @@ def _get_movie_player_info(stream_id: str, ext: str) -> PlayerInfo:
         name = m.get("name", "")
         year_value = m.get("year")
         year = str(year_value if _present(year_value) else m.get("releasedate", ""))[:4]
-        info.channel_name = f"{name} ({year})" if year else str(name)
-        info.program_desc = str(_first_present(m, "plot", "description"))
+        info = replace(
+            info,
+            channel_name=f"{name} ({year})" if year else str(name),
+            program_desc=str(_first_present(m, "plot", "description")),
+        )
     return info
 
 
@@ -4185,8 +4197,10 @@ def _get_series_player_info(
     client = xtream
 
     ext = ext or "mkv"
-    info = PlayerInfo(url=client.build_stream_url("series", int(stream_id), ext))
-    info.source_id = source_id
+    info = PlayerInfo(
+        url=client.build_stream_url("series", int(stream_id), ext),
+        source_id=source_id,
+    )
 
     if series_id is None or series_id == 0:
         return info, None
@@ -4204,15 +4218,15 @@ def _get_series_player_info(
     series_info = record_field(series, "info")
     if series_info:
         name = series_info.get("name", "")
-        year = series_info.get("year", "")
-        info.channel_name = f"{name} ({year})" if _present(year) else str(name)
+        year = series_info.get("year")
+        info = replace(info, channel_name=f"{name} ({year})" if _present(year) else str(name))
 
     # Build flat list of all episodes in order (season, episode)
     all_episodes: list[tuple[int, ProviderRecord]] = []
     seasons = record_field(series, "episodes")
     for season_num, eps in sorted(seasons.items(), key=lambda x: int(x[0])):
         season_eps = [ep for ep in eps if isinstance(ep, dict)] if isinstance(eps, list) else []
-        for ep in sorted(season_eps, key=lambda e: _int_value(e.get("episode_num", 0))):
+        for ep in sorted(season_eps, key=lambda e: _int_value(e.get("episode_num"))):
             all_episodes.append((int(season_num), ep))
 
     # Find current episode and next.
@@ -4222,9 +4236,12 @@ def _get_series_player_info(
             title = re.sub(r"^S\d+E\d+\s*-\s*", "", text_field(ep, "title"))
             if " - " in title:
                 title = title.split(" - ")[-1]
-            episode_num = _int_value(ep.get("episode_num", 0))
-            info.program_title = f"S{season_num:02d}E{episode_num:02d} -- {title.strip()}"
-            info.program_desc = _get_episode_desc(ep)
+            episode_num = _int_value(ep.get("episode_num"))
+            info = replace(
+                info,
+                program_title=f"S{season_num:02d}E{episode_num:02d} -- {title.strip()}",
+                program_desc=_get_episode_desc(ep),
+            )
             # Get next episode URL.
             if i + 1 < len(all_episodes):
                 _, next_ep = all_episodes[i + 1]
@@ -4272,15 +4289,18 @@ def _handoff_channel(
     )
     if math.isnan(position) or position < info.program_start or position >= info.program_end:
         program = _find_archived_program(stream, datetime.fromtimestamp(position, timezone.utc))
-        channel.program_title = program.title if program else ""
-        channel.program_start = program.start.timestamp() if program else 0.0
-        channel.program_end = program.stop.timestamp() if program else 0.0
+        channel = replace(
+            channel,
+            program_title=program.title if program else "",
+            program_start=program.start.timestamp() if program else 0.0,
+            program_end=program.stop.timestamp() if program else 0.0,
+        )
     # Catchup only reaches back as far as the archive holds.
     if channel.catchup_days and not catchup.can_play(
         stream,
         datetime.fromtimestamp(position - archive_lag_secs, timezone.utc),
     ):
-        channel.catchup_days = 0
+        channel = replace(channel, catchup_days=0)
     return channel
 
 
@@ -4307,14 +4327,16 @@ def _get_handoff_player_info(
     if not info.url:
         return info
     recording_start = record["recording_start"]
-    info.url = f"/handoff/{record['recording_id']}/stream.m3u8"
-    info.program_title = record["program_title"] or info.program_title
-    info.program_start = record["program_start"]
-    info.program_end = record["program_end"]
-    info.catchup_start = recording_start
-    info.catchup_seek = max(0.0, position - recording_start)
-    info.handoff_recording = True
-    return info
+    return replace(
+        info,
+        url=f"/handoff/{record['recording_id']}/stream.m3u8",
+        program_title=record["program_title"] or info.program_title,
+        program_start=record["program_start"],
+        program_end=record["program_end"],
+        catchup_start=recording_start,
+        catchup_seek=max(0.0, position - recording_start),
+        handoff_recording=True,
+    )
 
 
 def _is_xtream_source_url(url: str, source: Source) -> bool:

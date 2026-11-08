@@ -114,7 +114,7 @@ package = true
 requires-python = ">=3.12"
 
 [tool.uv.sources]
-codedoctor = { path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-policy-v5/codedoctor-0.1.3-py3-none-any.whl" }
+codedoctor = { path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-policy-v6/codedoctor-0.1.3-py3-none-any.whl" }
 [tool.ruff]
 fix = true
 show-fixes = true

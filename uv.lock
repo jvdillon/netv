@@ -326,7 +326,7 @@ wheels = [
 [[package]]
 name = "codedoctor"
 version = "0.1.3"
-source = { path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-policy-v5/codedoctor-0.1.3-py3-none-any.whl" }
+source = { path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-policy-v6/codedoctor-0.1.3-py3-none-any.whl" }
 dependencies = [
     { name = "pyyaml" },
     { name = "rignore" },
@@ -336,7 +336,7 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { filename = "codedoctor-0.1.3-py3-none-any.whl", hash = "sha256:7e92605342a9280189b5700719209a571a52ed92b3e1e13449e55718b6bea92b" },
+    { filename = "codedoctor-0.1.3-py3-none-any.whl", hash = "sha256:769b0618d638fb40d4495b60e6c90601af6a6b63a8a4a3a5b9520981d69197e8" },
 ]
 
 [package.optional-dependencies]
@@ -1505,7 +1505,7 @@ lint = [
 ]
 pre-commit = [
     { name = "basedpyright", marker = "python_full_version >= '3.12'", specifier = ">=1.40.2" },
-    { name = "codedoctor", extras = ["coverage", "mutation", "notebook"], marker = "python_full_version >= '3.12'", path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-policy-v5/codedoctor-0.1.3-py3-none-any.whl" },
+    { name = "codedoctor", extras = ["coverage", "mutation", "notebook"], marker = "python_full_version >= '3.12'", path = "/opt/scratch/artifacts/codedoctor/install-20261107-1200/dist-policy-v6/codedoctor-0.1.3-py3-none-any.whl" },
     { name = "codespell", marker = "python_full_version >= '3.12'", specifier = ">=2.4.3" },
     { name = "hatchling", marker = "python_full_version >= '3.12'", specifier = ">=1.33.0" },
     { name = "httpx2", marker = "python_full_version >= '3.12'", specifier = ">=2.16.0" },

@@ -10,7 +10,7 @@ resume from the recording. Starting anything else cancels the handoff.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import json
@@ -41,7 +41,7 @@ class HandoffPolicy:
     program_end_margin_secs: float = 30.0
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class Channel:
     """A live channel and the program airing at the handoff position."""
 
@@ -55,7 +55,7 @@ class Channel:
     program_end: float = 0.0
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class _Watch:
     stream_id: str
     position: float
@@ -174,8 +174,7 @@ def report_watch(
     with _lock:
         watch = _watches.get(username)
         if watch and watch.stream_id == stream_id and watch.handoff_id == handoff_id:
-            watch.position = position
-            watch.last_seen = now
+            _watches[username] = replace(watch, position=position, last_seen=now)
         else:
             _watches[username] = _Watch(
                 stream_id=stream_id,
@@ -219,8 +218,7 @@ def stop_watch(
         if watch is None or watch.stream_id != stream_id or watch.handoff_id != handoff_id:
             return None
         del _watches[username]
-    watch.position = position
-    watch.last_seen = now
+    watch = replace(watch, position=position, last_seen=now)
     return _hand_off(username, watch, resolve, release, now, policy=policy)
 
 

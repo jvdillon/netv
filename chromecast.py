@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from ipaddress import ip_address, ip_network
 from typing import Literal, NotRequired, TypedDict
 from urllib.parse import urlsplit
@@ -102,7 +102,7 @@ class CastStatus(TypedDict):
     volume: NotRequired[float]
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class CastSession:
     username: str
     host: str
@@ -201,9 +201,12 @@ class CastManager:
                     timeout=5,
                     retry_wait=1,
                 )
-                record.cast = cast
+                record = self._replace_session(record, replace(record, cast=cast))
                 cast.wait(timeout=10)
-                record.name = cast.cast_info.friendly_name or host
+                record = self._replace_session(
+                    record,
+                    replace(record, name=cast.cast_info.friendly_name or host),
+                )
                 cast.media_controller.app_must_match = True
                 cast.media_controller.play_media(
                     record.url,
@@ -221,7 +224,7 @@ class CastManager:
                         "PAUSED",
                         "BUFFERING",
                     ):
-                        record.starting = False
+                        record = self._replace_session(record, replace(record, starting=False))
                         return self.status(username)
                     if status.content_id == record.url and status.idle_reason == "ERROR":
                         break
@@ -316,6 +319,12 @@ class CastManager:
                     "The Chromecast did not respond. Check the TV and network.",
                 ) from exc
             return self.status(username)
+
+    def _replace_session(self, record: CastSession, updated: CastSession) -> CastSession:
+        with self._lock:
+            if self._sessions.get(record.host) is record:
+                self._sessions[record.host] = updated
+        return updated
 
     def _forget(self, record: CastSession) -> None:
         with self._lock:

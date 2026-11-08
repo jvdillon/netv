@@ -1721,7 +1721,11 @@ class TestFastStartRoutes:
 
         with patch.dict(ffmpeg_session._transcode_sessions, {"fast": session}, clear=True):
             before = _program_dates(auth_client.get("/transcode/fast/low.m3u8").text)
-            session["live_recovery"].permit_restart("pipeline", time.monotonic())
+            session["live_recovery"], permitted = session["live_recovery"].permit_restart(
+                "pipeline",
+                time.monotonic(),
+            )
+            assert permitted
             with (
                 patch("ffmpeg_session._launch_ffmpeg", side_effect=launch),
                 patch(

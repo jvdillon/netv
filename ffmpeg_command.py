@@ -45,14 +45,14 @@ _load_settings: Callable[[], ServerSettings] = cache.load_server_settings
 _sr_engine_dir: str | None = None
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class SubtitleStream:
     index: int
     lang: str
     name: str
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class MediaInfo:
     video_codec: str
     audio_codec: str

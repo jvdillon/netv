@@ -1,6 +1,7 @@
 """Fast start must keep one upstream reader and exactly one local encoder."""
 
 from collections.abc import Coroutine
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncio
@@ -398,7 +399,8 @@ def test_health_learns_full_quality_bitrate_then_saver_recovers(tmp_path: pathli
         assert result == {"bandwidth_saver": False, "playlist": "/transcode/fast/low.m3u8"}
         assert "recovery_bitrate" in session
         assert session["recovery_bitrate"] == 7520
-        policy.bandwidth_saver = True
+        assert "playback_policy" in session
+        session["playback_policy"] = replace(session["playback_policy"], bandwidth_saver=True)
         for now in range(2, 62, 2):
             clock.return_value = now
             result = ffmpeg_session.report_playback_health("fast", "u", good)

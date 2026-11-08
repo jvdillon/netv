@@ -518,7 +518,7 @@ def hw_accel(value: str) -> HwAccel:
             return _default_encoder()
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class Source:
     id: str
     name: str

@@ -177,7 +177,7 @@ def _dead_fast_session(tmp_path: pathlib.Path) -> ffmpeg_session.FastLiveSession
         # The restart budget is spent: three attempts inside the window.
         "live_recovery": LiveRecoveryPolicy(
             failures={"input": now - 10},
-            attempts={"pipeline": [now - 40, now - 30, now - 15]},
+            attempts={"pipeline": (now - 40, now - 30, now - 15)},
         ),
     }
 

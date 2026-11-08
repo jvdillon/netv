@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, Required, TypedDict, TypeGuard
 from urllib import parse
 
@@ -640,7 +640,7 @@ def add_webvtt_timestamp_map(content: str, origin_pts: float | None) -> str:
 # ===========================================================================
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class _SessionSnapshot:
     """Immutable snapshot of session state for lock-free access."""
 
@@ -787,7 +787,7 @@ def clear_url_session(url: str) -> str | None:
 # ===========================================================================
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class _SeekSessionInfo:
     """Snapshot of session info needed for seek."""
 
@@ -1013,7 +1013,9 @@ def report_playback_health(
                 ready_bitrate(session["dir"], "low.m3u8"),
             )
         # The single encoder has no second rendition to wait for.
-        saver = policy.observe(health, now, session.get("recovery_bitrate", 0))
+        policy = policy.observe(health, now, session.get("recovery_bitrate", 0))
+        session["playback_policy"] = policy
+        saver = policy.bandwidth_saver
         result: HealthResponse = {"bandwidth_saver": saver}
         # A saver change needs a differently configured encoder. Without a
         # playlist, clients retune to a new session instead of staying here.
@@ -1029,7 +1031,7 @@ def report_playback_health(
         return result
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class _FastLiveStartup:
     """Own startup process tracking and readiness deadlines."""
 
@@ -2293,7 +2295,8 @@ async def _restart_fast_pipeline(
             if _transcode_sessions.get(session_id) is not session:
                 raise asyncio.CancelledError
             session["playlist_generation"] = session.get("playlist_generation", 0) + 1
-        recovery.reset_pipeline()
+            recovery = recovery.reset_pipeline()
+            session["live_recovery"] = recovery
         success = True
         log.warning(
             "Live watchdog %s recovered pipeline generation %d after %s stalled",
@@ -2325,9 +2328,9 @@ async def _restart_fast_pipeline(
                         if all(process is not replacement for replacement in replacements)
                     ]
             await _terminate_processes(replacements)
-        recovery.finish_restart("pipeline")
         with _transcode_lock:
             if _transcode_sessions.get(session_id) is session:
+                session["live_recovery"] = recovery.finish_restart("pipeline")
                 session.pop("watchdog_recovering", None)
 
 
@@ -2384,12 +2387,15 @@ async def _check_fast_live_session(session_id: str, session: TranscodeSession) -
     )
     low_ready = bool(low_alive and ready_bitrate(directory, "low.m3u8", max_age=stale_after))
 
-    input_stalled = recovery.stalled("input", ingest_alive, input_ready, now)
-    low_stalled = recovery.stalled("low", low_alive, low_ready, now)
+    recovery, input_stalled = recovery.stalled("input", ingest_alive, input_ready, now)
+    recovery, low_stalled = recovery.stalled("low", low_alive, low_ready, now)
+    session["live_recovery"] = recovery
     if not (input_stalled or low_stalled):
         return
     stage = "input" if input_stalled else "low output"
-    if recovery.permit_restart("pipeline", now):
+    recovery, permitted = recovery.permit_restart("pipeline", now)
+    session["live_recovery"] = recovery
+    if permitted:
         await _restart_fast_pipeline(session_id, session, stage)
     elif "pipeline" in recovery.pending:
         return
@@ -2598,7 +2604,7 @@ async def _start_or_reuse(
         )
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class _StartupGuard:
     """Serializes one URL's lookup-or-start; removed when no request holds it."""
 
@@ -2609,14 +2615,16 @@ class _StartupGuard:
 @contextlib.asynccontextmanager
 async def _url_startup(url: str) -> AsyncGenerator[None]:
     guard = _startup_guards.setdefault(url, _StartupGuard())
-    guard.users += 1
+    _startup_guards[url] = replace(guard, users=guard.users + 1)
     try:
         async with guard.lock:
             yield
     finally:
-        guard.users -= 1
-        if not guard.users:
+        guard = _startup_guards[url]
+        if guard.users == 1:
             del _startup_guards[url]
+        else:
+            _startup_guards[url] = replace(guard, users=guard.users - 1)
 
 
 class _SessionInfo(TypedDict, total=False):
