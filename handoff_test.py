@@ -225,6 +225,88 @@ class TestRecordingFiles:
         assert cmd[-1] == f"{tmp_path}/stream.m3u8"
 
 
+class TestLoad:
+    def test_load_restores_valid_records_only(self, state):
+        (state / "ann" / "handoff.json").write_text(
+            json.dumps({"id": "h1", "recording_live": True}),
+        )
+        for name, text in [("bob", "not json"), ("cat", "[1]"), ("dan", '{"x": 1}')]:
+            (state / name).mkdir()
+            (state / name / "handoff.json").write_text(text)
+        (state / "eve").mkdir()
+        (state / "eve" / "handoff.json").mkdir()  # Reading a directory raises OSError.
+        handoff.load(state)
+        assert handoff._records == {"ann": {"id": "h1", "recording_live": False}}
+
+
+class TestShutdown:
+    def test_terminates_only_running_recorders(self):
+        running, done = _process(), _process(running=False)
+        handoff._recorders.update(a=running, b=done)
+        handoff.shutdown()
+        running.terminate.assert_called_once()
+        done.terminate.assert_not_called()
+        assert handoff._recorders == {}
+
+
+class TestSave:
+    def test_without_users_dir_is_noop(self, state):
+        handoff._users_dir = None
+        handoff._records["ann"] = {"id": "h"}
+        handoff._save("ann")
+        assert not (state / "ann" / "handoff.json").exists()
+
+    def test_write_failure_is_logged(self, state, caplog):
+        handoff._records["zed"] = {"id": "h"}  # No user directory to write into.
+        with patch("handoff.atomic_write_json", side_effect=OSError("disk full")):
+            handoff._save("zed")
+        assert "Could not save handoff for zed" in caplog.text
+
+
+class TestRecorderProcess:
+    def test_start_recorder_launches_ffmpeg_with_log(self, tmp_path):
+        with (
+            patch("handoff._recorder_command", return_value=["ffmpeg", "-x"]) as command,
+            patch("subprocess.Popen") as popen,
+        ):
+            assert handoff._start_recorder("http://u.test/7", "rid", 60) is popen.return_value
+        directory = tmp_path / "netv_handoff_rid"
+        command.assert_called_once_with("http://u.test/7", directory, 60)
+        assert popen.call_args.args == (["ffmpeg", "-x"],)
+        assert (directory / "ffmpeg.log").exists()
+
+    def test_stop_recorder_kills_unresponsive_process(self, tmp_path):
+        directory = handoff.recording_dir("rid")
+        directory.mkdir()
+        process = _process()
+        process.wait.side_effect = handoff.subprocess.TimeoutExpired("ffmpeg", 5)
+        handoff._recorders["rid"] = process
+        handoff._stop_recorder("rid")
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        assert not directory.exists()
+
+
+class TestHandOffRaces:
+    def test_unresolvable_channel_cancels(self):
+        handoff._records["ann"] = {"id": "old", "mode": "catchup", "expires": NOW + 100}
+        _watch(600)
+        assert _stop(None) is None
+        assert handoff._records == {}
+
+    def test_cancel_while_building_record_discards_it(self):
+        _watch(600)
+        real_uuid4 = handoff.uuid.uuid4
+
+        def uuid4():
+            handoff.cancel("ann")  # Another device starts playing meanwhile.
+            return real_uuid4()
+
+        with patch("handoff.uuid.uuid4", side_effect=uuid4):
+            assert _stop(_channel(catchup_days=2)) is None
+        assert handoff._records == {}
+
+
 def _some(value: T | None) -> T:
     assert value is not None
     return value

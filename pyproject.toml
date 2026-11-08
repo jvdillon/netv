@@ -147,6 +147,9 @@ pythonpath = ["."]
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = ["ignore::pytest.PytestUnraisableExceptionWarning:coroutine.*was never awaited"]
 
+[tool.coverage-floor]
+floor = ["=100"]
+
 [tool.houselint]
 select = "ALL"
 fix = "ALL"

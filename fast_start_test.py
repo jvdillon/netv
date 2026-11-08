@@ -63,6 +63,59 @@ def test_timeline_and_readiness(tmp_path):
     assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8") == 0
 
 
+def test_playlist_duration_sums_entries_and_tolerates_missing(tmp_path):
+    playlist(tmp_path, "low")
+    assert fast_start.playlist_duration(str(tmp_path), "low.m3u8") == 6
+    assert fast_start.playlist_duration(str(tmp_path), "absent.m3u8") == 0
+
+
+def test_segment_pts_skips_non_video_packets(tmp_path):
+    assert fast_start.segment_pts(tmp_path / "absent.ts") is None
+    no_sync = b"\x00" * 188
+    no_payload_start = b"\x47\x01\x00\x10".ljust(188, b"\xff")
+    adaptation_only = b"\x47\x41\x00\x20\xb7".ljust(188, b"\xff")
+    no_pts = (b"\x47\x41\x00\x10\x00\x00\x01\xe0\x00\x00\x80\x00\x00").ljust(188, b"\xff")
+    audio = (b"\x47\x41\x00\x10\x00\x00\x01\xc0\x00\x00\x80\x80\x05").ljust(188, b"\xff")
+    junk = tmp_path / "junk.ts"
+    junk.write_bytes(no_sync + no_payload_start + adaptation_only + no_pts + audio)
+    assert fast_start.segment_pts(junk) is None
+    # Adaptation field plus payload: PES starts after the field's length byte.
+    packet = video_packet(7)
+    with_adaptation = (b"\x47\x41\x00\x30\x01\x00" + packet[4:]).ljust(188, b"\xff")[:188]
+    junk.write_bytes(no_pts + with_adaptation)
+    assert fast_start.segment_pts(junk) == 7
+
+
+def test_dated_playlist_keeps_clock_when_discontinuous_segment_vanishes(tmp_path):
+    content = "#EXTM3U\n#EXT-X-DISCONTINUITY\n#EXTINF:2,\ngone.ts\n"
+    with patch("fast_start.segment_pts", return_value=12):
+        dated = fast_start.dated_playlist(str(tmp_path), content, 10, 0)
+    assert "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:02.000+00:00" in dated
+
+
+def test_aligned_rejects_unreadable_renditions(tmp_path):
+    assert not fast_start.aligned(str(tmp_path))
+    playlist(tmp_path, "low")
+    playlist(tmp_path, "high")
+    (tmp_path / "high_2.ts").write_bytes(b"\x00" * 188)
+    assert not fast_start.aligned(str(tmp_path))
+
+
+def test_ready_bitrate_rejects_unsafe_or_empty_entries(tmp_path):
+    playlist(tmp_path, "low")
+    path = tmp_path / "low.m3u8"
+    content = path.read_text()
+    path.write_text(content.replace("low_2.ts", "../low_2.ts"))
+    assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8") == 0
+    path.write_text(content.replace("#EXTINF:2,\nlow_2.ts", "#EXTINF:0,\nlow_2.ts"))
+    assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8") == 0
+
+
+def test_live_start_offset_requires_playlist_header():
+    content = "#EXT-X-VERSION:3\n#EXTM3U\n"
+    assert fast_start.add_live_start_offset(content, 24) == content
+
+
 def test_live_buffers_follow_upstream_segment_cadence():
     assert fast_start.live_buffer_durations([4]) == (8, 12)
     assert fast_start.live_buffer_durations([6]) == (12, 12)
@@ -102,6 +155,8 @@ def test_commands_only_ingest_opens_upstream(tmp_path):
         assert cmd[cmd.index("-i") + 1] == f"{tmp_path}/input.m3u8"
         assert "-reconnect" not in cmd
         assert "-copyts" in cmd
+        assert cmd[cmd.index("-probesize") + 1] == "5000000"
+        assert cmd[cmd.index("-analyzeduration") + 1] == "2000000"
         duration = float(cmd[cmd.index("-hls_time") + 1])
         assert duration * int(cmd[cmd.index("-hls_list_size") + 1]) >= 30
 
@@ -661,6 +716,56 @@ def test_real_local_encoders_share_timestamps(tmp_path):
             if process.poll() is None:
                 process.kill()
             process.wait()
+
+
+def test_real_encoder_probes_past_late_mpeg2_sequence_header(tmp_path):
+    """HDHomeRun MPEG-2 joined mid-GOP: the first sequence header is >500KB in."""
+    source = tmp_path / "source.ts"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1280x720:rate=60",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=sample_rate=48000",
+            "-t",
+            "4",
+            "-c:v",
+            "mpeg2video",
+            "-b:v",
+            "15M",
+            "-minrate",
+            "15M",
+            "-maxrate",
+            "15M",
+            "-bufsize",
+            "8M",
+            "-g",
+            "60",
+            "-c:a",
+            "ac3",
+            str(source),
+        ],
+        check=True,
+    )
+    joined = tmp_path / "joined.ts"
+    joined.write_bytes(source.read_bytes()[188 * 3000 :])
+    subprocess.run(fast_start.ingest_command(str(joined), str(tmp_path), None), check=True)
+    result = subprocess.run(
+        fast_start.encoder_command(str(tmp_path), "software", "720p", "low", False, False),
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    assert b"frames duplicated" not in result.stderr
+    assert fast_start.playlist_duration(str(tmp_path), "low.m3u8") > 2
 
 
 def test_saver_does_not_recover_when_high_encoder_has_failed(tmp_path):

@@ -60,6 +60,160 @@ class TestUserManagement:
         assert not auth_module.verify_password("admin", "wrongpass")
         assert not auth_module.verify_password("nobody", "password123")
 
+    def test_second_user_not_admin_and_usernames(self, auth_module):
+        auth_module.create_user("alice", "pw")
+        auth_module.create_user("bob", "pw")
+        assert auth_module.get_all_usernames() == ["alice", "bob"]
+        assert auth_module.is_admin("alice")
+        assert not auth_module.is_admin("bob")
+        assert not auth_module.is_admin("nobody")
+        assert (auth_module.USERS_DIR / "bob").is_dir()
+
+    def test_invalid_stored_hash_rejected(self, auth_module):
+        assert not auth_module._verify_hashed_password("pw", "nocolon")
+
+
+class TestDeleteUser:
+    def test_no_settings_file(self, auth_module):
+        assert not auth_module.delete_user("alice")
+
+    def test_unknown_user(self, auth_module):
+        auth_module.create_user("alice", "pw")
+        assert not auth_module.delete_user("bob")
+
+    def test_delete_promotes_admin_and_scrubs_sources(self, auth_module):
+        auth_module.create_user("alice", "pw")
+        auth_module.create_user("bob", "pw")
+        auth_module.create_user("carol", "pw")
+        f = auth_module.SERVER_SETTINGS_FILE
+        settings = json.loads(f.read_text())
+        settings["sources"] = [
+            {"name": "a", "users": ["alice", "bob"]},
+            {"name": "b", "users": ["bob"]},
+            {"name": "c"},
+            {"name": "d", "users": "alice"},
+        ]
+        f.write_text(json.dumps(settings))
+        assert auth_module.delete_user("alice")
+        assert auth_module.get_all_usernames() == ["bob", "carol"]
+        assert auth_module.is_admin("bob")
+        assert not auth_module.is_admin("carol")
+        sources = json.loads(f.read_text())["sources"]
+        assert sources[0]["users"] == ["bob"]
+        assert sources[1]["users"] == ["bob"]
+        assert "users" not in sources[2]
+        assert sources[3]["users"] == "alice"
+
+    def test_delete_last_user(self, auth_module):
+        auth_module.create_user("alice", "pw")
+        assert auth_module.delete_user("alice")
+        assert auth_module.is_setup_required()
+
+
+class TestChangePassword:
+    def test_no_settings_file(self, auth_module):
+        assert not auth_module.change_password("alice", "new")
+
+    def test_unknown_user(self, auth_module):
+        auth_module.create_user("alice", "pw")
+        assert not auth_module.change_password("bob", "new")
+
+    def test_changes_password(self, auth_module):
+        auth_module.create_user("alice", "pw")
+        assert auth_module.change_password("alice", "new")
+        assert auth_module.verify_password("alice", "new")
+        assert not auth_module.verify_password("alice", "pw")
+
+
+class TestSetAdmin:
+    def test_no_settings_file(self, auth_module):
+        assert not auth_module.set_admin("alice", True)
+
+    def test_unknown_user(self, auth_module):
+        auth_module.create_user("alice", "pw")
+        assert not auth_module.set_admin("bob", True)
+
+    def test_grant_and_revoke(self, auth_module):
+        auth_module.create_user("alice", "pw")
+        auth_module.create_user("bob", "pw")
+        assert auth_module.set_admin("bob", True)
+        assert auth_module.is_admin("bob")
+        assert auth_module.set_admin("alice", False)
+        assert not auth_module.is_admin("alice")
+
+    def test_revoking_last_admin_keeps_one(self, auth_module):
+        auth_module.create_user("alice", "pw")
+        auth_module.create_user("bob", "pw")
+        assert auth_module.set_admin("alice", False)
+        assert auth_module.is_admin("alice")
+        assert not auth_module.is_admin("bob")
+
+
+class TestUserLimits:
+    def test_defaults(self, auth_module):
+        auth_module.create_user("alice", "pw")
+        assert auth_module.get_user_limits("alice") == {
+            "max_streams_per_source": {},
+            "unavailable_groups": [],
+        }
+        assert auth_module.get_user_limits("nobody") == {
+            "max_streams_per_source": {},
+            "unavailable_groups": [],
+        }
+
+    def test_no_settings_file(self, auth_module):
+        assert not auth_module.set_user_limits("alice", {"s": 1})
+
+    def test_unknown_user(self, auth_module):
+        auth_module.create_user("alice", "pw")
+        assert not auth_module.set_user_limits("bob", {"s": 1})
+
+    def test_set_and_preserve(self, auth_module):
+        auth_module.create_user("alice", "pw")
+        assert auth_module.set_user_limits("alice", {"s": 2}, ["Adult"])
+        assert auth_module.set_user_limits("alice")
+        assert auth_module.get_user_limits("alice") == {
+            "max_streams_per_source": {"s": 2},
+            "unavailable_groups": ["Adult"],
+        }
+        assert auth_module.set_user_limits("alice", unavailable_groups=[])
+        assert auth_module.get_users_with_admin() == [
+            {
+                "username": "alice",
+                "admin": True,
+                "max_streams_per_source": {"s": 2},
+                "unavailable_groups": [],
+            },
+        ]
+
+
+class TestGetSettingsFile:
+    def test_legacy_dir_used_when_present(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(auth, "APP_DIR", tmp_path)
+        monkeypatch.setattr(auth, "CACHE_DIR", tmp_path / ".cache")
+        monkeypatch.setattr(
+            auth,
+            "SERVER_SETTINGS_FILE",
+            tmp_path / ".cache" / "server_settings.json",
+        )
+        monkeypatch.setattr(auth, "USERS_DIR", tmp_path / ".cache" / "users")
+        (tmp_path / "cache").mkdir()
+        assert auth._get_settings_file() == tmp_path / "cache" / "server_settings.json"
+        assert tmp_path / "cache" == auth.CACHE_DIR
+        assert tmp_path / "cache" / "users" == auth.USERS_DIR
+
+    def test_default_dir_without_legacy(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(auth, "APP_DIR", tmp_path)
+        monkeypatch.setattr(auth, "CACHE_DIR", tmp_path / ".cache")
+        monkeypatch.setattr(
+            auth,
+            "SERVER_SETTINGS_FILE",
+            tmp_path / ".cache" / "server_settings.json",
+        )
+        monkeypatch.setattr(auth, "USERS_DIR", tmp_path / ".cache" / "users")
+        assert auth._get_settings_file() == tmp_path / ".cache" / "server_settings.json"
+        assert tmp_path / ".cache" / "users" == auth.USERS_DIR
+
 
 class TestTokens:
     def test_create_and_verify_token(self, auth_module):

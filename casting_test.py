@@ -176,6 +176,142 @@ def test_load_timeout_does_not_report_success(cast_env):
     cast_env.cast.disconnect.assert_called_once()
 
 
+def test_receiver_load_error_fails_fast(cast_env):
+    def load(url, *_args, **_kwargs):
+        cast_env.status.content_id = url
+        cast_env.status.idle_reason = "ERROR"
+
+    cast_env.cast.media_controller.play_media.side_effect = load
+    with (
+        patch("casting.time.monotonic", side_effect=[0, 1]),
+        pytest.raises(HTTPException) as error,
+    ):
+        start(cast_env)
+    assert error.value.status_code == 502
+    assert "could not load" in error.value.detail
+    assert not cast_env.manager.owns_session("session123")
+
+
+def test_start_polls_until_receiver_plays(cast_env):
+    status = cast_env.status
+    cast_env.cast.media_controller.play_media.side_effect = None
+
+    def wait(secs):
+        del secs
+        status.content_id = "http://192.168.1.10:8000/transcode/session123/stream.m3u8"
+        status.player_state = "BUFFERING"
+
+    with (
+        patch("casting.time.monotonic", side_effect=[0, 1, 2]),
+        patch.object(cast_env.manager._stop, "wait", side_effect=wait) as waited,
+    ):
+        assert start(cast_env)["state"] == "BUFFERING"
+    waited.assert_called_once_with(0.1)
+
+
+def test_status_while_connecting_and_unknown(cast_env):
+    record = casting.CastSession(
+        username="alice",
+        host="192.168.1.50",
+        session_id="s",
+        url="u",
+        source_url="p",
+        name="TV",
+    )
+    cast_env.manager._sessions[record.host] = record
+    assert cast_env.manager.status("alice") == {"active": False, "connecting": True}
+    record.starting = False
+    assert cast_env.manager.status("alice") == {
+        "active": True,
+        "host": "192.168.1.50",
+        "name": "TV",
+        "session_id": "s",
+        "state": "UNKNOWN",
+        "current_time": 0,
+        "volume": 1,
+    }
+
+
+def test_starting_session_is_kept_alive(cast_env):
+    record = casting.CastSession(
+        username="alice",
+        host="192.168.1.50",
+        session_id="s",
+        url="u",
+        source_url="p",
+        name="TV",
+    )
+    cast_env.manager._sessions[record.host] = record
+    cast_env.manager.maintain_sessions()
+    cast_env.touch.assert_called_once_with("s")
+    assert cast_env.manager._sessions == {record.host: record}
+
+
+def test_volume_requires_a_level(cast_env):
+    start(cast_env)
+    with pytest.raises(HTTPException) as error:
+        cast_env.manager.command("alice", "volume")
+    assert error.value.status_code == 400
+    cast_env.cast.set_volume.assert_not_called()
+
+
+def test_unresponsive_receiver_command_fails(cast_env):
+    start(cast_env)
+    cast_env.cast.media_controller.pause.side_effect = NotConnected()
+    with pytest.raises(HTTPException) as error:
+        cast_env.manager.command("alice", "pause")
+    assert error.value.status_code == 502
+
+
+def test_save_position_skips_foreign_media_and_early_positions(cast_env):
+    cast_env.session["is_vod"] = True
+    start(cast_env)
+    record = next(iter(cast_env.manager._sessions.values()))
+    cast_env.status.content_id = "another-app"
+    cast_env.manager._save_position(record)
+    cast_env.status.content_id = record.url
+    cast_env.session["seek_offset"] = 0
+    cast_env.status.adjusted_current_time = 2
+    cast_env.manager._save_position(record)
+    cast_env.save.assert_not_called()
+    cast_env.status.adjusted_current_time = 9999
+    cast_env.manager._save_position(record)
+    cast_env.save.assert_called_once_with("alice", "http://provider/live", 3600, 3600)
+
+
+def test_save_position_write_failure_is_logged(cast_env, caplog):
+    cast_env.session["is_vod"] = True
+    start(cast_env)
+    record = next(iter(cast_env.manager._sessions.values()))
+    cast_env.save.side_effect = OSError("disk full")
+    cast_env.manager._save_position(record)
+    assert "Could not save Chromecast watch position" in caplog.text
+
+
+def test_worker_started_once_and_joined_on_close():
+    manager = casting.CastManager()
+    with patch("casting.threading.Thread") as thread_type:
+        worker = thread_type.return_value
+        worker.is_alive.return_value = True
+        manager._ensure_worker()
+        manager._ensure_worker()
+    thread_type.assert_called_once_with(target=manager._monitor, daemon=True, name="cast-monitor")
+    worker.start.assert_called_once()
+    manager.close()
+    worker.join.assert_called_once_with(timeout=6)
+    assert manager._stop.is_set()
+
+
+def test_monitor_maintains_until_stopped():
+    manager = casting.CastManager()
+    with (
+        patch.object(manager._stop, "wait", side_effect=[False, False, True]),
+        patch.object(manager, "maintain_sessions") as maintain,
+    ):
+        manager._monitor()
+    assert maintain.call_count == 2
+
+
 def test_server_keeps_cast_alive_without_browser(cast_env):
     start(cast_env)
     cast_env.touch.reset_mock()

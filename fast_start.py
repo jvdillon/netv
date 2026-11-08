@@ -158,8 +158,10 @@ def encoder_command(
     )
     index = cmd.index("-i")
     cmd[index:index] = ["-live_start_index", "-3" if restarting else "0"]
-    cmd[cmd.index("-probesize") + 1] = "500000"
-    cmd[cmd.index("-analyzeduration") + 1] = "500000"
+    # MPEG-2 (HDHomeRun) sequence headers can arrive ~1MB in; probing less
+    # leaves the size unknown and yields 90000fps garbage output.
+    cmd[cmd.index("-probesize") + 1] = "5000000"
+    cmd[cmd.index("-analyzeduration") + 1] = "2000000"
     # Preserve the shared source timeline through both independent encoders.
     cmd[1:1] = ["-copyts"]
     prefix = "high" if high else "low"

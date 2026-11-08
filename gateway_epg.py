@@ -59,7 +59,11 @@ def build_filtered_xmltv(
         raise EpgUnavailableError("EPG database is not ready")
 
     try:
-        connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True, timeout=10)
+        connection = sqlite3.connect(
+            f"{database_path.absolute().as_uri()}?mode=ro",
+            uri=True,
+            timeout=10,
+        )
         connection.row_factory = sqlite3.Row
     except sqlite3.Error as exc:
         raise EpgUnavailableError("EPG database is not available") from exc

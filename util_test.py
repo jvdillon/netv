@@ -109,6 +109,54 @@ def test_redact_url_credentials():
     )
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["http://[::1", "rtmp://user:pass@host/live/a/b/c", "not a url"],
+)
+def test_redact_url_credentials_passes_through_invalid_and_non_http(value: str):
+    assert util.redact_url_credentials(value) == value
+
+
+def test_redact_url_credentials_keeps_ipv6_and_port():
+    assert (
+        util.redact_url_credentials("http://u:p@[::1]:8080/movie/u/p/1.mkv?token=x")
+        == "http://***:***@[::1]:8080/movie/***/***/1.mkv?token=%2A%2A%2A"
+    )
+
+
+def test_safe_urlopen_rejects_unsafe_scheme():
+    with pytest.raises(error.URLError, match="Unsafe URL scheme: file"):
+        util.safe_urlopen("file:///etc/passwd")
+
+
+@pytest.mark.parametrize(
+    ("user_agent", "expected"),
+    [(None, "VLC/3.0.20 LibVLC/3.0.20"), ("Custom/1.0", "Custom/1.0")],
+)
+def test_safe_urlopen_uses_safe_opener(
+    monkeypatch: pytest.MonkeyPatch,
+    user_agent: str | None,
+    expected: str,
+):
+    calls: list[tuple[Any, ...]] = []
+
+    class _Opener:
+        def open(self, req: Any, timeout: int) -> str:
+            calls.append((req, timeout))
+            return "response"
+
+    def _build_opener(*handlers: Any) -> _Opener:
+        assert [type(h) for h in handlers] == [util._SafeRedirectHandler]
+        return _Opener()
+
+    monkeypatch.setattr(util.request, "build_opener", _build_opener)
+    assert util.safe_urlopen("https://example.com/x", 7, user_agent) == "response"
+    [(req, timeout)] = calls
+    assert timeout == 7
+    assert req.full_url == "https://example.com/x"
+    assert req.get_header("User-agent") == expected
+
+
 def _fake_request(url: str) -> Any:
     """Create a minimal request object for testing."""
 

@@ -227,6 +227,41 @@ def test_live_restarts_have_cooldowns_and_sliding_budget():
     assert policy.permit_restart("pipeline", 20)
 
 
+def test_upgrade_reports_missing_4k_target():
+    policy = UpgradePolicy()
+    assert not policy.observe(health(buffer=10, waiting=False, observed=50), 0, True, 0)
+    assert policy.reason == "4K segments unavailable"
+
+
+def test_upgrade_rechecks_retained_samples_against_raised_target():
+    policy = UpgradePolicy()
+    assert not policy.observe(health(buffer=10, waiting=False, observed=20), 10, True, 0)
+    assert policy.samples == [(0, 20)]
+    assert not policy.observe(health(buffer=10, waiting=False), 20, True, 1)
+    assert policy.reason == "insufficient bandwidth headroom"
+
+
+def test_live_recovery_finish_mark_and_reset():
+    policy = LiveRecoveryPolicy(high_started=0)
+    assert policy.permit_restart("high", 0)
+    assert not policy.permit_restart("high", 100)
+    policy.finish_restart("high")
+    assert policy.permit_restart("high", 100)
+
+    policy.failures = {"high": 1, "low": 2}
+    policy.mark_stage_started("low", 50)
+    assert policy.failures == {"high": 1}
+    assert policy.high_started == 0
+    policy.mark_stage_started("high", 60)
+    assert policy.failures == {}
+    assert policy.high_started == 60
+
+    policy.failures = {"low": 3}
+    policy.reset_pipeline(70)
+    assert policy.failures == {}
+    assert policy.high_started == 70
+
+
 if __name__ == "__main__":
     from codedoctor.lib.testing.runner import test_main
 

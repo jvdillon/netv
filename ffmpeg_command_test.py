@@ -1473,6 +1473,507 @@ def test_probe_closed_captions_reads_video_side_data(side_data_type, expected):
     assert command[command.index("-show_entries") + 1] == "frame=side_data_list"
 
 
+# =============================================================================
+# Module state, caches, persistence, and probing edge cases
+# =============================================================================
+
+
+@pytest.fixture
+def probe_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Isolate probe caches, settings, and the on-disk cache directory."""
+    monkeypatch.setattr(ffmpeg_command, "_probe_cache", {})
+    monkeypatch.setattr(ffmpeg_command, "_series_probe_cache", {})
+    monkeypatch.setattr(ffmpeg_command, "_load_settings", dict)
+    monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", None)
+    monkeypatch.setattr(ffmpeg_command, "get_user_agent", lambda: None)
+    monkeypatch.setattr(ffmpeg_command.cache, "CACHE_DIR", tmp_path)
+    return tmp_path
+
+
+_VIDEO = {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p", "height": 720}
+
+
+def test_init_sets_settings_and_engine_dir(monkeypatch: pytest.MonkeyPatch, probe_state: Path):
+    initialized = []
+    monkeypatch.setattr(ffmpeg_command.cache, "initialize", lambda: initialized.append(1))
+    settings = {"sr_model": "x"}
+
+    ffmpeg_command.init(lambda: settings, sr_engine_dir="/engines")
+    assert initialized == [1]
+    assert ffmpeg_command._sr_engine_dir == "/engines"
+    assert ffmpeg_command.get_settings() is settings
+
+
+def test_init_without_engine_dir_disables_upscale(
+    monkeypatch: pytest.MonkeyPatch,
+    probe_state: Path,
+):
+    monkeypatch.setattr(ffmpeg_command.cache, "initialize", lambda: None)
+    monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", "/stale")
+    ffmpeg_command.init(dict)
+    assert ffmpeg_command._sr_engine_dir is None
+    assert ffmpeg_command.get_settings() == {}
+
+
+def test_transcode_dir_falls_back_when_inaccessible(probe_state: Path):
+    blocker = probe_state / "file"
+    blocker.write_text("")
+    with patch("ffmpeg_command._load_settings", return_value={"transcode_dir": str(blocker / "x")}):
+        assert get_transcode_dir() == Path(tempfile.gettempdir())
+
+
+def test_series_stats_skip_empty_and_unprobed_series(probe_state: Path):
+    ffmpeg_command._series_probe_cache.update(
+        {
+            1: {"name": "Empty", "episodes": {}},
+            2: {"name": "Unprobed", "episodes": {1: (5, None, [])}},
+            3: {
+                "episodes": {
+                    2: (2, _media_info(), [SubtitleStream(index=1, lang="eng", name="E")]),
+                    1: (1, None, []),
+                },
+            },
+        },
+    )
+    stats = get_series_probe_cache_stats()
+    assert [s["series_id"] for s in stats] == [3]
+    assert stats[0]["episode_count"] == 2
+    assert stats[0]["subtitle_count"] == 1
+    assert stats[0]["episodes"] == [{"episode_id": 2, "duration": 0.0, "subtitle_count": 1}]
+
+
+def test_cache_mutators_ignore_unknown_series(probe_state: Path):
+    with patch("ffmpeg_command._save_series_probe_cache") as save:
+        invalidate_series_probe_cache(999)
+        invalidate_series_probe_cache(999, episode_id=1)
+        clear_series_mru(999)
+    save.assert_not_called()
+    assert ffmpeg_command._series_probe_cache == {}
+
+
+def test_master_playlist_without_variant_urls_returns_original(probe_state: Path):
+    response = MagicMock()
+    response.read.return_value = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=abc\n#comment\n"
+    response.__enter__.return_value = response
+    url = "http://example.com/master.m3u8"
+    with (
+        patch("ffmpeg_command.get_user_agent", return_value="UA/1"),
+        patch("ffmpeg_command.request.urlopen", return_value=response) as urlopen,
+    ):
+        assert resolve_hls_master_playlist(url) == url
+    assert urlopen.call_args.args[0].get_header("User-agent") == "UA/1"
+
+
+class TestProbeMediaSeriesCache:
+    """Series/episode cache paths in probe_media."""
+
+    def test_exact_episode_hit_updates_mru_and_saves(self, probe_state: Path):
+        info = _media_info()
+        ffmpeg_command._series_probe_cache[7] = {
+            "name": "S",
+            "mru": 1,
+            "episodes": {2: (time.time(), info, [])},
+        }
+        with patch("subprocess.run") as run:
+            assert probe_media("http://x", series_id=7, episode_id=2) == (info, [])
+            # Same MRU now: hit without another save.
+            assert probe_media("http://x", series_id=7, episode_id=2) == (info, [])
+        run.assert_not_called()
+        saved = json.loads((probe_state / "series_probe_cache.json").read_text())
+        assert saved["7"]["mru"] == 2
+
+    def test_mru_fallback_hit(self, probe_state: Path):
+        info = _media_info()
+        ffmpeg_command._series_probe_cache[7] = {
+            "mru": 1,
+            "episodes": {1: (time.time(), info, [])},
+        }
+        with patch("subprocess.run") as run:
+            assert probe_media("http://x", series_id=7, episode_id=99) == (info, [])
+        run.assert_not_called()
+
+    @pytest.mark.parametrize("episode_id", [1, 99])
+    def test_expired_series_entries_fall_through_to_probe(self, probe_state: Path, episode_id):
+        ffmpeg_command._series_probe_cache[7] = {
+            "mru": 1,
+            "episodes": {1: (0, _media_info(video_codec="old"), [])},
+        }
+        with patch(
+            "subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout=json.dumps({"streams": [_VIDEO], "format": {}}),
+            ),
+        ):
+            info, _ = probe_media("http://x", series_id=7, episode_id=episode_id, series_name="N")
+        assert info is not None and info.video_codec == "h264"
+        series = ffmpeg_command._series_probe_cache[7]
+        assert series["name"] == "N"
+        assert series["mru"] == episode_id
+        assert series["episodes"][episode_id][1] is info
+
+    def test_new_series_is_cached_and_persisted(self, probe_state: Path):
+        with patch(
+            "subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout=json.dumps({"streams": [_VIDEO], "format": {}}),
+            ),
+        ):
+            info, _ = probe_media("http://x", series_id=8, series_name="New")
+        series = ffmpeg_command._series_probe_cache[8]
+        assert series["name"] == "New"
+        assert series["mru"] == 0
+        assert series["episodes"][0][1] is info
+        saved = json.loads((probe_state / "series_probe_cache.json").read_text())
+        assert saved["8"]["episodes"]["0"]["video_codec"] == "h264"
+
+    def test_existing_named_series_keeps_name(self, probe_state: Path):
+        ffmpeg_command._series_probe_cache[8] = {"name": "Kept", "episodes": {}}
+        with patch(
+            "subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout=json.dumps({"streams": [_VIDEO], "format": {}}),
+            ),
+        ):
+            probe_media("http://x", series_id=8, episode_id=3, series_name="Other")
+        assert ffmpeg_command._series_probe_cache[8]["name"] == "Kept"
+        assert 3 in ffmpeg_command._series_probe_cache[8]["episodes"]
+
+
+class TestProbeMediaEdgeCases:
+    def test_subprocess_exceptions_yield_none(self, probe_state: Path):
+        with patch("subprocess.run", side_effect=OSError("boom")) as run:
+            assert probe_media("http://x") == (None, [])
+        assert run.call_count == 2
+        assert run.call_args.args[0][-5:] == ["-f", "hls", "-extension_picky", "0", "http://x"]
+
+    def test_user_agent_and_format_bitrate_fallback(self, probe_state: Path):
+        fmt = {"bit_rate": "1234", "format_name": "hls"}
+        with (
+            patch("ffmpeg_command.get_user_agent", return_value="UA/1"),
+            patch(
+                "subprocess.run",
+                return_value=MagicMock(
+                    returncode=0,
+                    stdout=json.dumps({"streams": [_VIDEO], "format": fmt}),
+                ),
+            ) as run,
+        ):
+            info, _ = probe_media("http://x")
+        assert info is not None
+        assert info.video_bitrate == 1234
+        assert info.is_hls
+        cmd = run.call_args.args[0]
+        assert cmd[cmd.index("-user_agent") + 1] == "UA/1"
+
+    def test_invalid_format_bitrate_ignored(self, probe_state: Path):
+        with patch(
+            "subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout=json.dumps({"streams": [_VIDEO], "format": {"bit_rate": "n/a"}}),
+            ),
+        ):
+            info, _ = probe_media("http://x")
+        assert info is not None and info.video_bitrate == 0
+
+    def test_audio_only_returns_none(self, probe_state: Path):
+        audio = {"codec_type": "audio", "codec_name": "aac", "channels": 2}
+        with patch(
+            "subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout=json.dumps({"streams": [audio], "format": {}}),
+            ),
+        ):
+            assert probe_media("http://x") == (None, [])
+
+    def test_zero_height_not_cached(self, probe_state: Path):
+        with patch(
+            "subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout=json.dumps({"streams": [{**_VIDEO, "height": 0}], "format": {}}),
+            ),
+        ):
+            info, _ = probe_media("http://x", series_id=1)
+        assert info is not None and info.height == 0
+        assert ffmpeg_command._probe_cache == {}
+        assert ffmpeg_command._series_probe_cache == {}
+
+
+def test_uses_audio_passthrough():
+    assert ffmpeg_command.uses_audio_passthrough(_media_info(audio_codec="eac3"), True)
+    assert not ffmpeg_command.uses_audio_passthrough(_media_info(audio_codec="eac3"), False)
+    assert not ffmpeg_command.uses_audio_passthrough(_media_info(audio_codec="aac"), True)
+    assert not ffmpeg_command.uses_audio_passthrough(None, True)
+
+
+def test_probe_closed_captions_reports_ffprobe_failure(caplog):
+    result = MagicMock(returncode=1, stderr="  bad input \n", stdout="")
+    with patch("ffmpeg_command.subprocess.run", return_value=result):
+        assert probe_closed_captions("/tmp/dir/a.ts") is False
+    assert "a.ts: bad input" in caplog.text
+
+    result = MagicMock(returncode=2, stderr="", stdout="")
+    with patch("ffmpeg_command.subprocess.run", return_value=result):
+        assert probe_closed_captions("/tmp/dir/a.ts") is False
+    assert "ffprobe exited 2" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "run_kwargs",
+    [
+        {"side_effect": subprocess.TimeoutExpired("ffprobe", 5)},
+        {"return_value": MagicMock(returncode=0, stdout="not json")},
+    ],
+)
+def test_probe_closed_captions_handles_errors(run_kwargs, caplog):
+    with patch("ffmpeg_command.subprocess.run", **run_kwargs):
+        assert probe_closed_captions("/tmp/a.ts") is False
+    assert "Could not inspect embedded captions in a.ts" in caplog.text
+
+
+def test_hls_media_info_adds_hls_demuxer_options():
+    cmd = build_hls_ffmpeg_cmd(
+        "http://x/live.m3u8",
+        "software",
+        "/out",
+        media_info=_media_info(is_hls=True),
+    )
+    i = cmd.index("-i")
+    assert cmd[i - 4 : i] == ["-f", "hls", "-extension_picky", "0"]
+
+
+class TestSrEngineSelection:
+    def test_no_engine_dir(self, probe_state: Path):
+        assert _find_sr_engine(720) is None
+        assert _build_sr_filter(720, 1080) == ""
+
+    def test_missing_engine_dir(self, probe_state: Path):
+        with patch("ffmpeg_command._sr_engine_dir", str(probe_state / "missing")):
+            assert _find_sr_engine(720) is None
+
+    def test_no_valid_engines(self, probe_state: Path):
+        (probe_state / "2x-nomosuni-compact_bigp_fp16.engine").write_bytes(b"")
+        with (
+            patch("ffmpeg_command._sr_engine_dir", str(probe_state)),
+            patch("ffmpeg_command._load_settings", return_value={"sr_model": "on"}),
+        ):
+            assert _find_sr_engine(720) is None
+            assert _build_sr_filter(720, 1080) == ""
+
+    def test_failed_probe_uses_largest_engine(self, probe_state: Path):
+        for height in (480, 1080):
+            (probe_state / f"2x-nomosuni-compact_{height}p_fp16.engine").write_bytes(b"")
+        with patch("ffmpeg_command._sr_engine_dir", str(probe_state)):
+            result = _find_sr_engine(0)
+        assert result is not None
+        assert result[1:] == (1080, 1920, 2)
+
+    def test_source_larger_than_engines_uses_largest(self, probe_state: Path):
+        (probe_state / "2x-nomosuni-compact_480p_fp16.engine").write_bytes(b"")
+        with patch("ffmpeg_command._sr_engine_dir", str(probe_state)):
+            result = _find_sr_engine(1080)
+        assert result is not None and result[1] == 480
+
+    def test_filter_disabled_without_model(self, probe_state: Path):
+        (probe_state / "2x-nomosuni-compact_720p_fp16.engine").write_bytes(b"")
+        with patch("ffmpeg_command._sr_engine_dir", str(probe_state)):
+            assert _build_sr_filter(480, 1080) == ""
+
+    def test_filter_skipped_when_source_meets_target(self, probe_state: Path):
+        (probe_state / "2x-nomosuni-compact_1080p_fp16.engine").write_bytes(b"")
+        with (
+            patch("ffmpeg_command._sr_engine_dir", str(probe_state)),
+            patch("ffmpeg_command._load_settings", return_value={"sr_model": "on"}),
+        ):
+            assert _build_sr_filter(1080, 1080) == ""
+            no_target = _build_sr_filter(720, 0)
+        assert no_target.endswith(
+            "dnn_processing=dnn_backend=tensorrt:model="
+            + str(
+                probe_state / "2x-nomosuni-compact_1080p_fp16.engine",
+            ),
+        )
+        assert "scale_cuda" not in no_target
+
+
+class TestHardwareProbes:
+    def test_nvidia_smi_unparseable_output(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(ffmpeg_command, "_gpu_nvdec_codecs", None)
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="GPU only\n")):
+            assert _get_gpu_nvdec_codecs() == set()
+
+    def test_nvidia_smi_missing(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(ffmpeg_command, "_gpu_nvdec_codecs", None)
+        with patch("subprocess.run", side_effect=FileNotFoundError("nvidia-smi")):
+            assert _get_gpu_nvdec_codecs() == set()
+        # Cached: no second probe.
+        with patch("subprocess.run") as run:
+            assert _get_gpu_nvdec_codecs() == set()
+        run.assert_not_called()
+
+    @pytest.mark.parametrize(("stdout", "expected"), [("... libplacebo ...", True), ("", False)])
+    def test_libplacebo_probe(self, monkeypatch: pytest.MonkeyPatch, stdout, expected):
+        monkeypatch.setattr(ffmpeg_command, "_has_libplacebo", None)
+        with patch("subprocess.run", return_value=MagicMock(stdout=stdout)) as run:
+            assert ffmpeg_command._has_libplacebo_filter() is expected
+            assert ffmpeg_command._has_libplacebo_filter() is expected
+        assert run.call_count == 1
+        assert run.call_args.args[0] == ["ffmpeg", "-filters"]
+
+    def test_libplacebo_probe_failure(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(ffmpeg_command, "_has_libplacebo", None)
+        with patch("subprocess.run", side_effect=OSError("no ffmpeg")):
+            assert ffmpeg_command._has_libplacebo_filter() is False
+
+
+class TestSeriesProbeCachePersistence:
+    def test_load_missing_file_is_noop(self, probe_state: Path):
+        ffmpeg_command._load_series_probe_cache()
+        assert ffmpeg_command._series_probe_cache == {}
+
+    def test_load_corrupt_file_is_logged(self, probe_state: Path, caplog):
+        (probe_state / "series_probe_cache.json").write_text("{not json")
+        ffmpeg_command._load_series_probe_cache()
+        assert ffmpeg_command._series_probe_cache == {}
+        assert "Failed to load series probe cache" in caplog.text
+
+    def test_round_trip_and_merge(self, probe_state: Path):
+        info = MediaInfo(
+            video_codec="hevc",
+            audio_codec="eac3",
+            pix_fmt="yuv420p10le",
+            audio_channels=6,
+            audio_sample_rate=48_000,
+            subtitle_codecs=["subrip"],
+            duration=42.5,
+            height=2160,
+            video_bitrate=9_000,
+            interlaced=True,
+            is_10bit=True,
+            is_hdr=True,
+        )
+        subs = [SubtitleStream(index=3, lang="eng", name="English")]
+        ffmpeg_command._series_probe_cache.update(
+            {
+                5: {"name": "Show", "mru": 2, "episodes": {2: (123.0, info, subs)}},
+                6: {"episodes": {1: (1.0, None, [])}},
+            },
+        )
+        ffmpeg_command._save_series_probe_cache()
+        saved = json.loads((probe_state / "series_probe_cache.json").read_text())
+        assert saved["6"] == {"name": "", "mru": None, "episodes": {}}
+        assert saved["5"]["episodes"]["2"]["subtitles"] == [
+            {"index": 3, "lang": "eng", "name": "English"},
+        ]
+
+        # Add entries the loader must skip or default.
+        saved["5"]["episodes"]["4"] = {"audio_codec": "aac"}
+        saved["5"]["episodes"]["5"] = {"video_codec": "h264", "subtitles": [{"index": 1}]}
+        (probe_state / "series_probe_cache.json").write_text(json.dumps(saved))
+
+        existing = _media_info(video_codec="mpeg2video")
+        ffmpeg_command._series_probe_cache.clear()
+        ffmpeg_command._series_probe_cache[5] = {"episodes": {2: (999.0, existing, [])}}
+        ffmpeg_command._load_series_probe_cache()
+
+        show = ffmpeg_command._series_probe_cache[5]
+        assert show["name"] == "Show"
+        assert show["mru"] == 2
+        assert show["episodes"][2] == (999.0, existing, [])
+        assert 4 not in show["episodes"]
+        time5, info5, subs5 = show["episodes"][5]
+        assert (time5, info5.video_codec, info5.height) == (0, "h264", 0)
+        assert subs5 == [SubtitleStream(index=1, lang="und", name="")]
+        assert ffmpeg_command._series_probe_cache[6] == {"name": "", "mru": None, "episodes": {}}
+
+        ffmpeg_command._series_probe_cache.clear()
+        ffmpeg_command._load_series_probe_cache()
+        _, loaded, loaded_subs = ffmpeg_command._series_probe_cache[5]["episodes"][2]
+        assert loaded == info
+        assert loaded_subs == subs
+
+    def test_save_failure_is_logged(self, monkeypatch: pytest.MonkeyPatch, probe_state, caplog):
+        blocker = probe_state / "file"
+        blocker.write_text("")
+        monkeypatch.setattr(ffmpeg_command.cache, "CACHE_DIR", blocker / "sub")
+        ffmpeg_command._save_series_probe_cache()
+        assert "Failed to save series probe cache" in caplog.text
+
+
+class TestVideoArgsRemainingBranches:
+    def _args(self, hw: str, *, hw_pipeline=False, deinterlace=False, hdr=False, res="1080p"):
+        return _build_video_args(
+            copy_video=False,
+            hw=hw,
+            deinterlace=deinterlace,
+            use_hw_pipeline=hw_pipeline,
+            max_resolution=res,
+            quality="high",
+            is_hdr=hdr,
+        )
+
+    @classmethod
+    def _vf(cls, post: list[str]) -> str:
+        return post[post.index("-vf") + 1]
+
+    def test_missing_vaapi_device_falls_back_to_software(self):
+        with patch("cache.VAAPI_DEVICE", None):
+            pre, post = self._args("vaapi", hw_pipeline=True)
+            assert pre == []
+            assert post[post.index("-c:v") + 1] == "libx264"
+
+            pre, post = self._args("nvenc+vaapi")
+            assert pre == []
+            assert (
+                self._vf(post)
+                == "format=nv12,hwupload_cuda,scale_cuda=-2:min(ih\\,1080):format=nv12"
+            )
+
+    def test_nvenc_software_hdr_zscale_without_libplacebo(self):
+        with patch("ffmpeg_command._has_libplacebo_filter", return_value=False):
+            _, post = self._args("nvenc+software", hdr=True)
+        assert self._vf(post).startswith("zscale=t=linear")
+        assert self._vf(post).endswith("hwupload_cuda,scale_cuda=-2:min(ih\\,1080):format=nv12")
+
+    def test_amf_software_hdr(self):
+        _, post = self._args("amf+software", hdr=True, deinterlace=True)
+        vf = self._vf(post)
+        assert vf.startswith("yadif=0,zscale=t=linear")
+        assert vf.endswith("format=nv12,scale=-2:min(ih\\,1080),format=nv12")
+
+    def test_vaapi_baseline_only(self):
+        with patch.dict("cache.AVAILABLE_ENCODERS", {"vaapi_baseline_only": True}):
+            _, post = self._args("vaapi", hw_pipeline=True)
+        assert post[post.index("-profile:v") + 1] == "constrained_baseline"
+        assert "-bf" not in post
+
+    @pytest.mark.parametrize(
+        ("hw_pipeline", "deinterlace", "hdr", "expected"),
+        [
+            (True, True, True, "vpp_qsv=deinterlace=2:tonemap=1:format=nv12,scale_qsv"),
+            (True, False, True, "vpp_qsv=tonemap=1:format=nv12,scale_qsv"),
+            (False, True, True, "hwupload=extra_hw_frames=64,vpp_qsv=deinterlace=2:tonemap=1"),
+            (False, False, True, "hwupload=extra_hw_frames=64,vpp_qsv=tonemap=1:format=nv12,"),
+        ],
+    )
+    def test_qsv_hdr(self, hw_pipeline, deinterlace, hdr, expected):
+        _, post = self._args("qsv", hw_pipeline=hw_pipeline, deinterlace=deinterlace, hdr=hdr)
+        vf = self._vf(post)
+        assert expected in vf
+        assert vf.startswith("vpp_qsv" if hw_pipeline else "format=nv12,hwupload")
+
+    def test_software_hdr_and_unbounded_resolution(self):
+        _, post = self._args("software", hdr=True)
+        assert self._vf(post).startswith("zscale=t=linear")
+        _, post = self._args("software", res="original")
+        assert self._vf(post) == "format=yuv420p"
+
+
 def _media_info(
     *,
     video_codec: str = "h264",

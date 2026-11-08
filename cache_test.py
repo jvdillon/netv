@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent import futures
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
+import json
 import os
 import subprocess
 import time
@@ -15,9 +18,12 @@ import cache
 
 
 @pytest.fixture
-def cache_module(tmp_path: Path):
+def cache_module(tmp_path: Path, monkeypatch):
     """Import cache module with temp directories."""
 
+    # Skip real ffmpeg hardware probing on first settings load.
+    monkeypatch.setattr(cache, "AVAILABLE_ENCODERS", {"nvenc": False})
+    monkeypatch.setattr(cache, "LOGOS_DIR", tmp_path / "logos")
     # Patch paths to temp locations.
     original_server_settings = cache.SERVER_SETTINGS_FILE
     original_users_dir = cache.USERS_DIR
@@ -674,6 +680,299 @@ class TestLogoCache:
         assert cache_module.save_logo("s", "http://a.com/3", data, "image/webp").suffix == ".webp"
         assert cache_module.save_logo("s", "http://a.com/4", data, "image/svg+xml").suffix == ".svg"
         assert cache_module.save_logo("s", "http://a.com/5", data, "unknown/type").suffix == ".png"
+
+
+class TestFileCacheExtras:
+    def test_load_in_subprocess(self, cache_module, monkeypatch):
+        monkeypatch.setattr(cache.futures, "ProcessPoolExecutor", futures.ThreadPoolExecutor)
+        cache_module.save_file_cache("proc", [1, 2])
+        data, ts = cache_module.load_file_cache("proc", use_process=True)
+        assert data == [1, 2]
+        assert ts > 0
+
+    def test_parse_json_file(self, tmp_path):
+        good = tmp_path / "good.json"
+        good.write_text(json.dumps({"data": {"a": 1}}))
+        assert cache._parse_json_file(str(good)) == ({"a": 1}, 0)
+        bad = tmp_path / "bad.json"
+        bad.write_text("{")
+        assert cache._parse_json_file(str(bad)) is None
+        assert cache._parse_json_file(str(tmp_path / "missing.json")) is None
+
+    def test_clear_all_file_caches(self, cache_module):
+        cache_module.save_file_cache("live_data", [1])
+        cache_module.save_file_cache("vod_data", [2])
+        cache_module.save_file_cache("other", [3])
+        cache_module.get_cache()["live"] = 1
+        assert cache_module.clear_all_file_caches() == 2
+        assert cache_module.load_file_cache("live_data") is None
+        assert cache_module.load_file_cache("other") is not None
+        assert cache_module.get_cache() == {}
+
+    def test_get_cache_lock(self):
+        assert cache.get_cache_lock() is cache._cache_lock
+
+
+class TestStaleWhileRevalidate:
+    def _backdate(self, cache_module, key, data, age):
+        path = cache_module.CACHE_DIR / f"{key}.json"
+        path.write_text(json.dumps({"data": data, "timestamp": time.time() - age}))
+
+    def test_memory_hit_with_stale_file_refreshes_in_background(self, cache_module):
+        self._backdate(cache_module, "k", {"v": "file"}, 2 * 24 * 3600)
+        cache_module.get_cache()["k"] = {"v": "mem"}
+        fetch = mock.Mock()
+        with mock.patch.object(cache.threading, "Thread") as thread:
+            assert cache_module.get_cached_info("k", fetch) == {"v": "mem"}
+        assert thread.call_args.kwargs["args"] == ("k", fetch)
+        thread.return_value.start.assert_called_once()
+        fetch.assert_not_called()
+
+    def test_stale_file_served_and_refreshed(self, cache_module):
+        self._backdate(cache_module, "k", {"v": "file"}, 2 * 24 * 3600)
+        fetch = mock.Mock()
+        with mock.patch.object(cache.threading, "Thread") as thread:
+            assert cache_module.get_cached_info("k", fetch) == {"v": "file"}
+        assert cache_module.get_cache()["k"] == {"v": "file"}
+        thread.return_value.start.assert_called_once()
+
+    def test_fresh_file_served_without_refresh(self, cache_module):
+        self._backdate(cache_module, "k", {"v": "file"}, 60)
+        with mock.patch.object(cache.threading, "Thread") as thread:
+            assert cache_module.get_cached_info("k", mock.Mock()) == {"v": "file"}
+        thread.assert_not_called()
+
+    def test_force_refetches_despite_file(self, cache_module):
+        self._backdate(cache_module, "k", {"v": "file"}, 60)
+        cache_module.get_cache()["k"] = {"v": "mem"}
+        assert cache_module.get_cached_info("k", lambda: {"v": "new"}, force=True) == {"v": "new"}
+        assert cache_module.load_file_cache("k")[0] == {"v": "new"}
+
+    def test_refresh_success_and_failure(self, cache_module, caplog):
+        caplog.set_level("INFO", logger=cache.log.name)
+        cache._refresh_cached_info("k", lambda: [9])
+        assert cache_module.get_cache()["k"] == [9]
+        assert cache_module.load_file_cache("k")[0] == [9]
+        cache._refresh_cached_info("k", mock.Mock(side_effect=RuntimeError("boom")))
+        assert cache_module.get_cache()["k"] == [9]
+        assert "Background refresh failed for k: boom" in caplog.text
+
+
+class TestServerSettingsExtras:
+    @pytest.mark.parametrize(
+        ("old", "encoders", "new"),
+        [
+            ("nvidia", {"vaapi": True}, "nvenc+vaapi"),
+            ("nvidia", {"vaapi": False}, "nvenc+software"),
+            ("intel", {"vaapi": False}, "qsv"),
+            ("vaapi", {"vaapi": False}, "vaapi"),
+        ],
+    )
+    def test_legacy_transcode_hw_migrated(self, cache_module, monkeypatch, old, encoders, new):
+        monkeypatch.setattr(cache, "AVAILABLE_ENCODERS", encoders)
+        cache_module.save_server_settings({"transcode_hw": old})
+        assert cache_module.load_server_settings()["transcode_hw"] == new
+
+    @pytest.mark.parametrize(
+        ("settings", "expected"),
+        [
+            ({"user_agent_preset": "default"}, None),
+            ({"user_agent_preset": "custom", "user_agent_custom": "Mine/1"}, "Mine/1"),
+            ({"user_agent_preset": "custom", "user_agent_custom": ""}, None),
+            ({"user_agent_preset": "vlc"}, "VLC/3.0.20 LibVLC/3.0.20"),
+            ({}, "TiviMate/4.7.0"),
+            ({"user_agent_preset": "bogus"}, None),
+        ],
+    )
+    def test_user_agent(self, cache_module, settings, expected):
+        cache_module.save_server_settings(settings)
+        assert cache_module.get_user_agent() == expected
+
+    def test_hidden_source_ids(self, cache_module):
+        base = {"type": "m3u", "url": "http://x"}
+        cache_module.save_server_settings(
+            {
+                "sources": [
+                    {"id": "all", "name": "A", **base},
+                    {"id": "mine", "name": "B", "users": ["alice"], **base},
+                    {"id": "theirs", "name": "C", "users": ["bob"], **base},
+                ],
+            },
+        )
+        assert cache_module.hidden_source_ids("alice", admin=True) == set()
+        assert cache_module.hidden_source_ids("alice", admin=False) == {"theirs"}
+
+    def test_update_source_epg_url_unknown_source(self, cache_module):
+        cache_module.save_server_settings({"sources": [{"id": "s1", "name": "S1"}]})
+        cache_module.update_source_epg_url("s2", "http://epg")
+        assert "epg_url" not in cache_module.load_server_settings()["sources"][0]
+
+
+class TestUserSettingsExtras:
+    def test_missing_watch_position(self, cache_module):
+        assert cache_module.get_watch_position("user1", "http://none") is None
+
+    def test_watch_position_without_duration_is_kept(self, cache_module):
+        cache_module.save_watch_position("user1", "http://live", 50.0, 0)
+        assert cache_module.get_watch_position("user1", "http://live")["position"] == 50.0
+
+    def test_watch_history_keeps_200_most_recent(self, cache_module):
+        history = {f"u{i}": {"position": 1, "duration": 10, "updated": i} for i in range(200)}
+        cache_module.save_user_settings("user1", {"watch_history": history})
+        cache_module.save_watch_position("user1", "new", 1.0, 10.0)
+        saved = cache_module.load_user_settings("user1")["watch_history"]
+        assert len(saved) == 200
+        assert "new" in saved
+        assert "u0" not in saved
+        assert "u1" in saved
+
+    @pytest.mark.parametrize("username", ["", "a" * 65, "a..b", "a/b", "a\\b"])
+    def test_invalid_usernames_rejected(self, cache_module, username):
+        with pytest.raises(ValueError, match="Invalid username"):
+            cache_module.load_user_settings(username)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            [],
+            {"counts": []},
+            {"counts": {"a:1": True}},
+            {"counts": {"a:1": "3"}},
+            {"counts": {"a:1": -1}},
+        ],
+    )
+    def test_invalid_live_view_counts_rejected(self, cache_module, payload):
+        path = cache_module.USERS_DIR / "user1" / "live_views.json"
+        path.parent.mkdir()
+        path.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match="Invalid live view counts"):
+            cache_module.load_live_view_counts("user1")
+
+
+@pytest.fixture
+def fake_root(tmp_path, monkeypatch):
+    """Redirect cache's absolute system paths under tmp_path."""
+    monkeypatch.setattr(
+        cache,
+        "pathlib",
+        SimpleNamespace(Path=lambda p: tmp_path / str(p).lstrip("/")),
+    )
+    return tmp_path
+
+
+class TestGpuDetection:
+    @pytest.mark.parametrize(
+        ("stdout", "vendor"),
+        [
+            ("00:02.0 VGA compatible controller [0300]: Intel [8086:46a6]\n", "8086"),
+            ("03:00.0 Display controller [0380]: AMD [1002:73ff]\n", "1002"),
+        ],
+    )
+    def test_lspci_vendor(self, fake_root, stdout, vendor):
+        with mock.patch.object(
+            cache.subprocess,
+            "run",
+            return_value=mock.Mock(stdout=("00:1f.0 ISA bridge [8086:7a84]\n" + stdout)),
+        ):
+            assert cache._get_gpu_vendor() == vendor
+
+    def test_sysfs_fallback(self, fake_root):
+        drm = fake_root / "sys/class/drm"
+        for name, vendor in [("card0", "0x10de"), ("card1", "0x1002")]:
+            (drm / name / "device").mkdir(parents=True)
+            (drm / name / "device" / "vendor").write_text(vendor + "\n")
+        (drm / "card2").mkdir()  # No vendor file.
+        (drm / "card1-HDMI-A-1" / "device").mkdir(parents=True)
+        (drm / "card1-HDMI-A-1" / "device" / "vendor").write_text("0x8086\n")
+        (drm / "renderD128").mkdir()
+        with mock.patch.object(cache.subprocess, "run", side_effect=FileNotFoundError):
+            assert cache._get_gpu_vendor() == "1002"
+
+    def test_unknown_gpu(self, fake_root):
+        (fake_root / "sys/class/drm/card0/device").mkdir(parents=True)
+        (fake_root / "sys/class/drm/card0/device/vendor").write_text("0x10de\n")
+        with mock.patch.object(
+            cache.subprocess,
+            "run",
+            return_value=mock.Mock(stdout="01:00.0 3D controller [0302]: NVIDIA [10de:2684]\n"),
+        ):
+            assert cache._get_gpu_vendor() is None
+
+    def test_no_sysfs(self, fake_root):
+        with mock.patch.object(cache.subprocess, "run", return_value=mock.Mock(stdout="")):
+            assert cache._get_gpu_vendor() is None
+
+    def test_unreadable_sysfs(self, fake_root):
+        (fake_root / "sys/class").mkdir(parents=True)
+        (fake_root / "sys/class/drm").write_text("")  # iterdir() raises NotADirectoryError.
+        with mock.patch.object(cache.subprocess, "run", return_value=mock.Mock(stdout="")):
+            assert cache._get_gpu_vendor() is None
+
+    def test_vaapi_device(self, fake_root):
+        assert cache._detect_vaapi_device() is None
+        (fake_root / "dev/dri").mkdir(parents=True)
+        (fake_root / "dev/dri/renderD128").touch()
+        assert cache._detect_vaapi_device() == str(fake_root / "dev/dri/renderD128")
+
+    def test_dri_path(self, fake_root):
+        assert cache._detect_dri_path() is None
+        (fake_root / "usr/lib/dri").mkdir(parents=True)
+        assert cache._detect_dri_path() == "/usr/lib/dri"
+        (fake_root / "usr/lib64/dri").mkdir(parents=True)
+        assert cache._detect_dri_path() == "/usr/lib64/dri"
+
+    @pytest.mark.parametrize(
+        ("vendor", "ihd", "driver"),
+        [
+            ("8086", True, "iHD"),
+            ("8086", False, "i965"),
+            ("1002", False, "radeonsi"),
+            (None, False, None),
+        ],
+    )
+    def test_libva_driver(self, fake_root, monkeypatch, vendor, ihd, driver):
+        monkeypatch.setattr(cache, "_get_gpu_vendor", lambda: vendor)
+        dri = fake_root / "usr/lib/dri"
+        dri.mkdir(parents=True)
+        if ihd:
+            (dri / "iHD_drv_video.so").touch()
+        assert cache._detect_libva_driver() == driver
+
+
+class TestEncoderExtras:
+    def test_vaapi_baseline_fallback(self, monkeypatch):
+        def fake(cmd, timeout=5, env=None):
+            return ("constrained_baseline" in cmd, "no high profile")
+
+        monkeypatch.setattr(cache, "_test_encoder", fake)
+        monkeypatch.setattr(cache, "VAAPI_DEVICE", "/dev/dri/renderD128")
+        monkeypatch.setattr(cache, "LIBVA_DRIVER", "radeonsi")
+        monkeypatch.setattr(cache, "DRI_PATH", "/usr/lib/dri")
+        result = cache.detect_encoders()
+        assert result["vaapi"] is True
+        assert result["vaapi_baseline_only"] is True
+
+    def test_test_encoder_passes_env_and_picks_error_line(self):
+        stderr = b"[h264 @ 0x1] noisy\nNo device available\n"
+        with mock.patch(
+            "subprocess.run",
+            return_value=mock.Mock(returncode=1, stderr=stderr),
+        ) as run:
+            assert cache._test_encoder(["ffmpeg"], env={"LIBVA_DRIVER_NAME": "iHD"}) == (
+                False,
+                "No device available",
+            )
+        assert run.call_args.kwargs["env"]["LIBVA_DRIVER_NAME"] == "iHD"
+
+    def test_test_encoder_bracket_only_and_empty_stderr(self):
+        with mock.patch("subprocess.run", return_value=mock.Mock(returncode=1, stderr=b"[x] y")):
+            assert cache._test_encoder(["ffmpeg"]) == (False, "[x] y")
+        with mock.patch("subprocess.run", return_value=mock.Mock(returncode=1, stderr=b"")):
+            assert cache._test_encoder(["ffmpeg"]) == (False, "unknown error")
+
+    def test_test_encoder_unexpected_error(self):
+        with mock.patch("subprocess.run", side_effect=PermissionError("denied")):
+            assert cache._test_encoder(["ffmpeg"]) == (False, "denied")
 
 
 if __name__ == "__main__":

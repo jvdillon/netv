@@ -188,6 +188,78 @@ def test_index_rebuilds_for_new_stream_list():
         assert stream is not None and stream["name"] == name
 
 
+def test_load_tolerates_corrupt_or_foreign_files(cache_dir):
+    path = cache_dir / "playlists.json"
+    path.write_text("{not json")
+    assert playlists.load() == []
+    path.write_text("[1, 2]")
+    assert playlists.load() == []
+    path.write_text('{"playlists": [{"id": "x", "name": "X"}, {"name": "no id"}, 3]}')
+    assert playlists.load() == [{"id": "x", "name": "X"}]
+
+
+def test_get_by_id():
+    created = playlists.create("News", channels=[{"stream_id": 1, "name": "CNN"}])
+    assert playlists.get(created["id"]) == created
+    assert created["channels"] == [
+        {"stream_id": "1", "name": "CNN", "source_id": "", "epg_channel_id": ""},
+    ]
+    assert playlists.get("missing") is None
+
+
+def test_create_enforces_playlist_limit():
+    playlists.create("One", max_playlists=1)
+    with pytest.raises(ValueError, match="At most 1 playlists"):
+        playlists.create("Two", max_playlists=1)
+    assert [p["name"] for p in playlists.load()] == ["One"]
+
+
+def test_clean_channels_validation():
+    with pytest.raises(ValueError, match="must be a list"):
+        playlists.create("Bad", channels="nope")
+    with pytest.raises(ValueError, match="at most 2 channels"):
+        playlists._clean_channels([{"name": "a"}, {"name": "b"}, {"name": "c"}], max_channels=2)
+    cleaned = playlists._clean_channels(
+        [{"name": "Name Only", "source_id": "s"}, {"name": "Name Only", "source_id": "s"}],
+    )
+    assert cleaned == [
+        {"stream_id": "", "name": "Name Only", "source_id": "s", "epg_channel_id": ""},
+    ]
+
+
+def test_search_respects_limit_and_category_prefix():
+    assert [r["stream_id"] for r in playlists.search(STREAMS, CATEGORY_NAMES, limit=2)] == [
+        "1",
+        "2",
+    ]
+    uk = playlists.search(STREAMS, CATEGORY_NAMES, category_prefix="uk|")
+    assert [r["stream_id"] for r in uk] == ["4"]
+
+
+def test_match_names_dedupes_names_and_caps_candidates():
+    streams = [
+        {"stream_id": 1, "name": "ESPN", "source_id": "a"},
+        {"stream_id": 2, "name": "ESPN", "source_id": "b"},
+        {"stream_id": 3, "name": "ESPN NEWS", "source_id": "a"},
+        {"stream_id": 4, "name": "ESPN 2", "source_id": "a"},
+    ]
+    [result] = playlists.match_names(["  ", "ESPN"], streams, {}, candidates_per_line=2)
+    assert result["query"] == "ESPN"
+    # Exact name scores 150; "ESPN NEWS" gets the prefix bonus: 100 - 3 + 20.
+    assert [(c["stream_id"], c["score"]) for c in result["candidates"]] == [
+        ("1", 150.0),
+        ("3", 117.0),
+    ]
+
+
+def test_score_edge_cases():
+    assert playlists._score([], ["ESPN"]) == 0.0
+    assert playlists._score(["ESPN"], []) == 0.0
+    assert playlists._score(["CNN"], ["ESPN"]) == 0.0
+    assert playlists._score(["ESPN"], ["ESPN", "NEWS"]) == 117.0
+    assert playlists._score(["NEWS"], ["ESPN", "NEWS"]) == 97.0
+
+
 if __name__ == "__main__":
     from codedoctor.lib.testing.runner import test_main
 

@@ -1,0 +1,5 @@
+self-hosted-runner:
+  # GitHub-hosted since 2026-09-17; actionlint v1.7.12 predates them.
+  labels:
+  - ubuntu-26.04
+  - ubuntu-26.04-arm

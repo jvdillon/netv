@@ -67,8 +67,15 @@ def parse_m3u(content: str, source_id: str) -> tuple[list[dict], list[dict], str
 
             i += 1
             while i < len(lines) and (not lines[i].strip() or lines[i].startswith("#")):
+                if lines[i].strip().startswith("#EXTINF:"):
+                    break
                 i += 1
-            url = lines[i].strip() if i < len(lines) else ""
+            url = ""
+            if i < len(lines) and not lines[i].strip().startswith("#EXTINF:"):
+                url = lines[i].strip()
+            else:
+                # URL-less entry: leave the next #EXTINF for the outer loop.
+                i -= 1
 
             group = attrs.get("group-title", "Uncategorized")
             if group not in categories:

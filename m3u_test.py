@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import json
+import time
 
 import pytest
 
@@ -15,19 +16,69 @@ import m3u
 
 
 @pytest.fixture
-def m3u_module(tmp_path: Path):
+def m3u_module(tmp_path: Path, monkeypatch):
     """Import m3u module with mocked cache."""
 
-    cache.SERVER_SETTINGS_FILE = tmp_path / "server_settings.json"
-    cache.USERS_DIR = tmp_path / "users"
+    monkeypatch.setattr(cache, "SERVER_SETTINGS_FILE", tmp_path / "server_settings.json")
+    monkeypatch.setattr(cache, "USERS_DIR", tmp_path / "users")
+    monkeypatch.setattr(cache, "CACHE_DIR", tmp_path / "cache")
+    # Skip hardware encoder detection in cache.initialize().
+    monkeypatch.setattr(cache, "AVAILABLE_ENCODERS", {"software": True})
     cache.USERS_DIR.mkdir(exist_ok=True)
-    cache.CACHE_DIR = tmp_path / "cache"
     cache.CACHE_DIR.mkdir(exist_ok=True)
     cache.get_cache().clear()
+    m3u.get_refresh_in_progress().clear()
 
     yield m3u
 
     cache.get_cache().clear()
+    m3u.get_refresh_in_progress().clear()
+
+
+class _SyncThread:
+    """Thread stand-in that runs its target inline on start()."""
+
+    started: list[_SyncThread] = []
+
+    def __init__(self, target, daemon=False):
+        self.target = target
+        self.daemon = daemon
+
+    def start(self):
+        _SyncThread.started.append(self)
+        try:
+            self.target()
+        except Exception as e:  # A real thread would swallow it too.
+            self.error = e
+
+
+@pytest.fixture
+def sync_thread():
+    _SyncThread.started = []
+    with patch.object(m3u.threading, "Thread", _SyncThread):
+        yield _SyncThread.started
+
+
+def _write_cache(name: str, data: dict, timestamp: float) -> None:
+    (cache.CACHE_DIR / f"{name}.json").write_text(
+        json.dumps({"data": data, "timestamp": timestamp}),
+    )
+
+
+def _read_cache(name: str) -> dict:
+    return json.loads((cache.CACHE_DIR / f"{name}.json").read_text())["data"]
+
+
+def _xtream(source_id: str, **kw) -> cache.Source:
+    return cache.Source(
+        id=source_id,
+        name=source_id,
+        type="xtream",
+        url=f"https://{source_id}.example",
+        username="u",
+        password="p",
+        **kw,
+    )
 
 
 class TestParseM3u:
@@ -295,6 +346,258 @@ class TestAggregateSourceData:
         assert cats == [{"category_id": "films", "source_id": "working"}]
         assert streams == [{"stream_id": 1, "source_id": "working"}]
         assert "Failed to fetch VOD from source broken" in caplog.text
+
+
+class TestParseM3uEdgeCases:
+    def test_skips_blank_and_directive_lines_before_url(self, m3u_module):
+        content = "#EXTM3U\n#EXTINF:-1,Alpha\n\n#EXTVLCOPT:http-user-agent=x\nhttp://a\n"
+        _, streams, _ = m3u_module.parse_m3u(content, "s")
+        assert [(s["name"], s["direct_url"]) for s in streams] == [("Alpha", "http://a")]
+
+    def test_trailing_extinf_without_url(self, m3u_module):
+        _, streams, _ = m3u_module.parse_m3u("#EXTM3U\n#EXTINF:-1,Last\n", "s")
+        assert streams[0]["direct_url"] == ""
+
+    def test_extinf_without_url_does_not_steal_next_entry(self, m3u_module):
+        content = "#EXTM3U\n#EXTINF:-1,A\n#EXTINF:-1,B\nhttp://b\n"
+        _, streams, _ = m3u_module.parse_m3u(content, "s")
+        assert [(s["name"], s["direct_url"]) for s in streams] == [("A", ""), ("B", "http://b")]
+
+    def test_extinf_without_comma_is_unknown(self, m3u_module):
+        _, streams, _ = m3u_module.parse_m3u('#EXTINF:-1 tvg-id="x"\nhttp://x\n', "s")
+        assert streams[0]["name"] == "Unknown"
+        assert streams[0]["epg_channel_id"] == "x"
+
+    def test_category_slug(self, m3u_module):
+        cats, streams, _ = m3u_module.parse_m3u(
+            '#EXTINF:-1 group-title="US | News & Talk!",A\nhttp://a\n'
+            '#EXTINF:-1 group-title="US | News & Talk!",B\nhttp://b\n',
+            "s",
+        )
+        assert [c["category_id"] for c in cats] == ["s_us_news_talk"]
+        assert [s["stream_id"] for s in streams] == ["s_1", "s_2"]
+
+
+class TestFetchSourceLiveDataPersistence:
+    def test_xtream_persists_epg_url_and_respects_disabled_epg(self, m3u_module):
+        source = _xtream("x", epg_enabled=False, epg_timeout=33)
+        client = MagicMock()
+        client.get_live_categories.return_value = [{"category_id": "1"}]
+        client.get_live_streams.return_value = [{"stream_id": 9, "category_id": None}]
+        client.epg_url = "https://x.example/xmltv.php"
+        with (
+            patch.object(m3u_module, "_make_client", return_value=client),
+            patch.object(m3u_module, "update_source_epg_url") as persist,
+        ):
+            cats, streams, epg_url, timeout = m3u_module.fetch_source_live_data(source)
+        persist.assert_called_once_with("x", "https://x.example/xmltv.php")
+        assert cats == [{"category_id": "x_1", "source_id": "x"}]
+        assert streams[0]["category_ids"] == []
+        assert streams[0]["source_username"] == "u"
+        assert streams[0]["source_password"] == "p"
+        assert streams[0]["source_type"] == "xtream"
+        assert (epg_url, timeout) == (None, 33)
+
+    def test_m3u_persists_detected_epg_url(self, m3u_module):
+        source = cache.Source(id="m", name="m", type="m3u", url="https://m.example/list.m3u")
+        with (
+            patch.object(m3u_module, "fetch_m3u", return_value=([], [], "https://m/epg")) as fm,
+            patch.object(m3u_module, "update_source_epg_url") as persist,
+        ):
+            result = m3u_module.fetch_source_live_data(source)
+        fm.assert_called_once_with("https://m.example/list.m3u", "m")
+        persist.assert_called_once_with("m", "https://m/epg")
+        assert result == ([], [], "https://m/epg", 120)
+
+    def test_unknown_type_yields_nothing(self, m3u_module):
+        source = cache.Source(id="z", name="z", type="other", url="https://z")
+        assert m3u_module.fetch_source_live_data(source) == ([], [], None, 120)
+
+    def test_vod_ignores_non_xtream(self, m3u_module):
+        source = cache.Source(id="m", name="m", type="m3u", url="https://m")
+        assert m3u_module.fetch_source_vod_data(source) == ([], [])
+
+
+class TestLoadAllLiveData:
+    DATA = {"cats": [{"category_id": "c"}], "streams": [{"stream_id": 1}], "epg_urls": []}
+
+    def test_fresh_cache_returns_without_refresh(self, m3u_module, sync_thread):
+        _write_cache("live_data", {**self.DATA, "epg_urls": [["http://e", 5, "s"]]}, time.time())
+        with patch.object(m3u_module, "_fetch_all_live_data") as fetch:
+            result = m3u_module.load_all_live_data()
+        assert result == (self.DATA["cats"], self.DATA["streams"], [("http://e", 5, "s")])
+        fetch.assert_not_called()
+        assert sync_thread == []
+
+    def test_stale_cache_refreshes_in_background(self, m3u_module, sync_thread):
+        _write_cache("live_data", self.DATA, time.time() - 100)
+        mem = cache.get_cache()
+        mem.update({"live_categories": 1, "live_streams": 2, "other": 3})
+        new = ([{"category_id": "n"}], [{"stream_id": 2}], [("http://n", 9, "s")])
+        with patch.object(m3u_module, "_fetch_all_live_data", return_value=new):
+            result = m3u_module.load_all_live_data(ttl_seconds=10)
+        assert result == (self.DATA["cats"], self.DATA["streams"], [])
+        assert len(sync_thread) == 1 and sync_thread[0].daemon
+        assert _read_cache("live_data") == {
+            "cats": new[0],
+            "streams": new[1],
+            "epg_urls": [["http://n", 9, "s"]],
+        }
+        assert mem == {"other": 3, "epg_urls": new[2]}
+        assert m3u_module.get_refresh_in_progress() == set()
+
+    def test_failed_refresh_clears_in_progress_flag(self, m3u_module, sync_thread):
+        _write_cache("live_data", self.DATA, 0)
+        with patch.object(m3u_module, "_fetch_all_live_data", side_effect=RuntimeError("boom")):
+            m3u_module.load_all_live_data()
+        assert isinstance(sync_thread[0].error, RuntimeError)
+        assert m3u_module.get_refresh_in_progress() == set()
+        assert _read_cache("live_data") == self.DATA
+
+    def test_stale_cache_skips_refresh_already_running(self, m3u_module, sync_thread):
+        _write_cache("live_data", self.DATA, 0)
+        m3u_module.get_refresh_in_progress().add("live")
+        m3u_module.load_all_live_data()
+        assert sync_thread == []
+
+    def test_no_cache_fetches_and_saves(self, m3u_module):
+        new = ([{"category_id": "n"}], [], [("http://n", 9, "s")])
+        with patch.object(m3u_module, "_fetch_all_live_data", return_value=new):
+            assert m3u_module.load_all_live_data() == new
+        assert _read_cache("live_data")["epg_urls"] == [["http://n", 9, "s"]]
+
+    def test_cache_filled_while_waiting_for_lock(self, m3u_module):
+        filled = ({**self.DATA, "epg_urls": [["http://e", 5, "s"]]}, time.time())
+        with (
+            patch.object(m3u_module, "load_file_cache", side_effect=[None, filled]),
+            patch.object(m3u_module, "_fetch_all_live_data") as fetch,
+        ):
+            result = m3u_module.load_all_live_data()
+        assert result == (self.DATA["cats"], self.DATA["streams"], [("http://e", 5, "s")])
+        fetch.assert_not_called()
+
+
+class TestLoadVodData:
+    DATA = {"cats": [{"category_id": "c"}], "streams": [{"stream_id": 1}]}
+
+    def test_fresh_cache(self, m3u_module, sync_thread):
+        _write_cache("vod_data", self.DATA, time.time())
+        assert m3u_module.load_vod_data() == (self.DATA["cats"], self.DATA["streams"])
+        assert sync_thread == []
+
+    def test_stale_cache_refreshes(self, m3u_module, sync_thread):
+        _write_cache("vod_data", self.DATA, 0)
+        mem = cache.get_cache()
+        mem.update({"vod_categories": 1, "vod_streams": 2, "other": 3})
+        with patch.object(m3u_module, "_fetch_vod_data", return_value=([{"n": 1}], [])):
+            assert m3u_module.load_vod_data() == (self.DATA["cats"], self.DATA["streams"])
+        assert _read_cache("vod_data") == {"cats": [{"n": 1}], "streams": []}
+        assert mem == {"other": 3}
+        assert m3u_module.get_refresh_in_progress() == set()
+
+    def test_stale_cache_skips_refresh_already_running(self, m3u_module, sync_thread):
+        _write_cache("vod_data", self.DATA, 0)
+        m3u_module.get_refresh_in_progress().add("vod")
+        m3u_module.load_vod_data()
+        assert sync_thread == []
+
+    def test_no_cache_fetches_and_saves(self, m3u_module):
+        with patch.object(m3u_module, "_fetch_vod_data", return_value=([{"n": 1}], [])):
+            assert m3u_module.load_vod_data() == ([{"n": 1}], [])
+        assert _read_cache("vod_data") == {"cats": [{"n": 1}], "streams": []}
+
+    def test_empty_fetch_is_not_cached(self, m3u_module):
+        with patch.object(m3u_module, "_fetch_vod_data", return_value=([], [])):
+            assert m3u_module.load_vod_data() == ([], [])
+        assert not (cache.CACHE_DIR / "vod_data.json").exists()
+
+    def test_cache_filled_while_waiting_for_lock(self, m3u_module):
+        with patch.object(m3u_module, "load_file_cache", side_effect=[None, (self.DATA, 0)]):
+            assert m3u_module.load_vod_data() == (self.DATA["cats"], self.DATA["streams"])
+
+
+class TestLoadSeriesData:
+    DATA = {"cats": [{"category_id": "c"}], "series": [{"series_id": 1}]}
+
+    def test_fresh_cache(self, m3u_module, sync_thread):
+        _write_cache("series_data", self.DATA, time.time())
+        assert m3u_module.load_series_data() == (self.DATA["cats"], self.DATA["series"])
+        assert sync_thread == []
+
+    def test_stale_cache_refreshes(self, m3u_module, sync_thread):
+        _write_cache("series_data", self.DATA, 0)
+        mem = cache.get_cache()
+        mem.update({"series_categories": 1, "series": 2, "other": 3})
+        with patch.object(m3u_module, "_fetch_series_data", return_value=([], [{"n": 1}])):
+            assert m3u_module.load_series_data() == (self.DATA["cats"], self.DATA["series"])
+        assert _read_cache("series_data") == {"cats": [], "series": [{"n": 1}]}
+        assert mem == {"other": 3}
+        assert m3u_module.get_refresh_in_progress() == set()
+
+    def test_stale_cache_skips_refresh_already_running(self, m3u_module, sync_thread):
+        _write_cache("series_data", self.DATA, 0)
+        m3u_module.get_refresh_in_progress().add("series")
+        m3u_module.load_series_data()
+        assert sync_thread == []
+
+    def test_no_cache_fetches_and_saves(self, m3u_module):
+        with patch.object(m3u_module, "_fetch_series_data", return_value=([], [{"n": 1}])):
+            assert m3u_module.load_series_data() == ([], [{"n": 1}])
+        assert _read_cache("series_data") == {"cats": [], "series": [{"n": 1}]}
+
+    def test_empty_fetch_is_not_cached(self, m3u_module):
+        with patch.object(m3u_module, "_fetch_series_data", return_value=([], [])):
+            assert m3u_module.load_series_data() == ([], [])
+        assert not (cache.CACHE_DIR / "series_data.json").exists()
+
+    def test_cache_filled_while_waiting_for_lock(self, m3u_module):
+        with patch.object(m3u_module, "load_file_cache", side_effect=[None, (self.DATA, 0)]):
+            assert m3u_module.load_series_data() == (self.DATA["cats"], self.DATA["series"])
+
+
+class TestXtreamClientLookup:
+    SOURCES = [
+        cache.Source(id="m", name="m", type="m3u", url="https://m"),
+        cache.Source(id="a", name="a", type="xtream", url="https://a.example/", username="ua"),
+        cache.Source(id="b", name="b", type="xtream", url="https://b.example", username="ub"),
+    ]
+
+    def test_first_xtream_client(self, m3u_module):
+        with patch.object(m3u_module, "get_sources", return_value=self.SOURCES):
+            client = m3u_module.get_first_xtream_client()
+        assert client is not None
+        assert (client.base_url, client.username) == ("https://a.example", "ua")
+
+    def test_first_xtream_client_none(self, m3u_module):
+        with patch.object(m3u_module, "get_sources", return_value=self.SOURCES[:1]):
+            assert m3u_module.get_first_xtream_client() is None
+
+    def test_client_by_source(self, m3u_module):
+        with patch.object(m3u_module, "get_sources", return_value=self.SOURCES):
+            client = m3u_module.get_xtream_client_by_source("b")
+            assert client is not None and client.username == "ub"
+            assert m3u_module.get_xtream_client_by_source("m") is None
+            assert m3u_module.get_xtream_client_by_source("missing") is None
+
+
+class TestFetchSeriesData:
+    def test_tags_sources_skips_non_xtream_and_survives_failures(self, m3u_module, caplog):
+        sources = [
+            _xtream("broken"),
+            cache.Source(id="m", name="m", type="m3u", url="https://m"),
+            _xtream("ok"),
+        ]
+        client = MagicMock()
+        client.get_series_categories.return_value = [{"category_id": "1"}]
+        client.get_series.return_value = [{"series_id": 5}]
+        with (
+            patch.object(m3u_module, "get_sources", return_value=sources),
+            patch.object(m3u_module, "_make_client", side_effect=[OSError("down"), client]),
+        ):
+            cats, series = m3u_module._fetch_series_data()
+        assert cats == [{"category_id": "1", "source_id": "ok"}]
+        assert series == [{"series_id": 5, "source_id": "ok"}]
+        assert "Failed to fetch series from source broken" in caplog.text
 
 
 if __name__ == "__main__":

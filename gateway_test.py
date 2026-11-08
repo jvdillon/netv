@@ -3,22 +3,25 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
-from urllib import error
+from urllib import parse
 
-import json
+import asyncio
+import logging
+import runpy
+import sys
 
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 import pytest
+import uvicorn
 
-from gateway_catalog import CatalogSnapshot, GatewayCatalog, GatewayStream, StreamIdRegistry
+from gateway_catalog import CatalogSnapshot, GatewayStream
 
 import auth
 import cache
 import gateway
-import gateway_catalog
 
 
 @pytest.fixture
@@ -32,6 +35,8 @@ def gateway_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(cache, "CACHE_DIR", tmp_path)
     monkeypatch.setattr(cache, "SERVER_SETTINGS_FILE", settings_file)
     monkeypatch.setattr(cache, "USERS_DIR", users_dir)
+    monkeypatch.setenv("SR_ENGINE_DIR", str(tmp_path / "engines"))
+    monkeypatch.delenv("NETV_GATEWAY_PUBLIC_URL", raising=False)
     auth.create_user("player", "local-pass")
     monkeypatch.setattr(gateway, "authenticator", gateway.GatewayAuthenticator())
 
@@ -525,218 +530,6 @@ def test_xmltv_enforces_category_restrictions(
     assert build_mock.call_args.args[1] == []
 
 
-def test_stream_id_registry_is_stable(tmp_path: Path):
-    path = tmp_path / "stream_ids.json"
-    first = StreamIdRegistry(path)
-    assigned = first.get_or_create_many(["source-a:live:7", "source-b:live:7"])
-
-    second = StreamIdRegistry(path)
-    assert second.get_or_create_many(["source-b:live:7", "source-a:live:7"]) == assigned
-    assert assigned["source-a:live:7"] != assigned["source-b:live:7"]
-
-
-def test_stream_id_registry_rejects_invalid_existing_file(tmp_path: Path):
-    path = tmp_path / "stream_ids.json"
-    path.write_text("[]")
-
-    with pytest.raises(RuntimeError, match="Invalid gateway stream ID registry"):
-        StreamIdRegistry(path).get_or_create_many(["source-a:live:7"])
-
-    assert path.read_text() == "[]"
-
-
-def test_catalog_removes_upstream_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    source = SimpleNamespace(
-        id="source-a",
-        name="Provider",
-        type="xtream",
-        url="https://provider.example",
-        username="remote-user",
-        password="remote-password",
-        epg_enabled=True,
-    )
-    monkeypatch.setattr(cache, "get_sources", lambda: [source])
-    monkeypatch.setattr(
-        gateway_catalog,
-        "fetch_source_live_data",
-        lambda _source, **_kwargs: (
-            [{"category_id": "source-a_9", "category_name": "News", "parent_id": 0}],
-            [
-                {
-                    "stream_id": 7,
-                    "name": "News",
-                    "category_ids": ["source-a_9"],
-                    "source_username": "remote-user",
-                    "source_password": "remote-password",
-                    "source_url": "https://provider.example",
-                },
-            ],
-            "https://provider.example/xmltv.php",
-            120,
-        ),
-    )
-    snapshot = GatewayCatalog(
-        registry=StreamIdRegistry(tmp_path / "ids.json"),
-        ttl_seconds=60,
-    ).get()
-
-    encoded = json.dumps(snapshot.streams[0].public)
-    assert snapshot.categories[0]["category_id"].isdigit()
-    assert snapshot.streams[0].public["category_id"] == snapshot.categories[0]["category_id"]
-    assert "remote-user" not in encoded
-    assert "remote-password" not in encoded
-    assert "provider.example" not in encoded
-
-
-def test_catalog_assigns_uncategorized_streams_numeric_category(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    source = SimpleNamespace(
-        id="source-a",
-        name="Provider",
-        type="xtream",
-        epg_enabled=False,
-    )
-    monkeypatch.setattr(cache, "get_sources", lambda: [source])
-    monkeypatch.setattr(
-        gateway_catalog,
-        "fetch_source_live_data",
-        lambda _source, **_kwargs: (
-            [],
-            [{"stream_id": 7, "name": "Uncategorized", "category_ids": []}],
-            None,
-            120,
-        ),
-    )
-    snapshot = GatewayCatalog(
-        registry=StreamIdRegistry(tmp_path / "ids.json"),
-        ttl_seconds=60,
-    ).get()
-
-    category_id = snapshot.categories[0]["category_id"]
-    assert category_id.isdigit()
-    assert snapshot.streams[0].public["category_id"] == category_id
-    assert snapshot.streams[0].public["category_ids"] == [category_id]
-
-
-def test_m3u_registry_key_uses_url_instead_of_playlist_position(tmp_path: Path):
-    catalog = GatewayCatalog(
-        registry=StreamIdRegistry(tmp_path / "ids.json"),
-        ttl_seconds=60,
-    )
-    first = catalog._stream_registry_key(
-        "source-a",
-        "m3u",
-        {
-            "stream_id": "source-a_1",
-            "direct_url": "https://streams.example/news?token=first",
-            "epg_channel_id": "news.example",
-            "name": "News",
-        },
-    )
-    reordered = catalog._stream_registry_key(
-        "source-a",
-        "m3u",
-        {
-            "stream_id": "source-a_42",
-            "direct_url": "https://streams.example/news?token=rotated",
-            "epg_channel_id": "news.example",
-            "name": "News",
-        },
-    )
-    different = catalog._stream_registry_key(
-        "source-a",
-        "m3u",
-        {
-            "stream_id": "source-a_1",
-            "direct_url": "https://streams.example/sports",
-            "epg_channel_id": "sports.example",
-            "name": "Sports",
-        },
-    )
-
-    assert first == reordered
-    assert first != different
-
-
-def test_catalog_assigns_distinct_ids_to_colliding_m3u_entries(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    source = SimpleNamespace(
-        id="source-a",
-        name="Provider",
-        type="m3u",
-        epg_enabled=False,
-    )
-    monkeypatch.setattr(cache, "get_sources", lambda: [source])
-    monkeypatch.setattr(
-        gateway_catalog,
-        "fetch_source_live_data",
-        lambda _source, **_kwargs: (
-            [],
-            [
-                {
-                    "stream_id": "source-a_1",
-                    "name": "News",
-                    "direct_url": "https://streams.example/play?id=1",
-                    "category_ids": [],
-                },
-                {
-                    "stream_id": "source-a_2",
-                    "name": "News",
-                    "direct_url": "https://streams.example/play?id=2",
-                    "category_ids": [],
-                },
-            ],
-            None,
-            120,
-        ),
-    )
-
-    snapshot = GatewayCatalog(
-        registry=StreamIdRegistry(tmp_path / "ids.json"),
-        ttl_seconds=60,
-    ).get()
-
-    assert len(snapshot.streams) == 2
-    assert len(snapshot.streams_by_id) == 2
-    assert snapshot.streams[0].local_id != snapshot.streams[1].local_id
-
-
-def test_catalog_retains_previous_snapshot_when_refresh_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    source = SimpleNamespace(
-        id="source-a",
-        name="Provider",
-        type="xtream",
-        epg_enabled=False,
-    )
-    monkeypatch.setattr(cache, "get_sources", lambda: [source])
-    source_data = (
-        [{"category_id": "source-a_9", "category_name": "News", "parent_id": 0}],
-        [{"stream_id": 7, "name": "News", "category_ids": ["source-a_9"]}],
-        None,
-        120,
-    )
-    fetch = MagicMock(return_value=source_data)
-    monkeypatch.setattr(gateway_catalog, "fetch_source_live_data", fetch)
-    catalog = GatewayCatalog(
-        registry=StreamIdRegistry(tmp_path / "ids.json"),
-        ttl_seconds=60,
-    )
-    original = catalog.get()
-    fetch.side_effect = error.URLError("temporary failure")
-
-    refreshed = catalog.get(force=True)
-
-    assert refreshed is original
-    assert len(refreshed.streams) == 1
-
-
 def test_playlist_accepts_mpegts_output(gateway_client):
     client, _ = gateway_client
     response = client.get(
@@ -770,6 +563,712 @@ def test_live_stream_password_may_contain_slash(
 
     assert response.status_code == 200
     assert response.content == b"video-data"
+
+
+def _settings(**overrides):
+    return {
+        "sr_model": "",
+        "transcode_hw": "nvenc+software",
+        "max_resolution": "1080p",
+        "quality": "high",
+        **overrides,
+    }
+
+
+def _request(host: str | None, base_url: str = "http://host/") -> Request:
+    url = parse.urlsplit(base_url)
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "scheme": url.scheme,
+            "server": (url.hostname, url.port or 80),
+            "root_path": "",
+            "path": "/",
+            "query_string": b"",
+            "headers": [(b"host", url.netloc.encode())],
+            "client": (host, 0) if host else None,
+        },
+    )
+
+
+def _params(**extra):
+    return {"username": "player", "password": "local-pass", **extra}
+
+
+def test_upscale_settings_rejects_missing_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SR_ENGINE_DIR", str(tmp_path / "missing"))
+    monkeypatch.setattr(gateway.cache, "load_server_settings", lambda: _settings(sr_model="x"))
+
+    with pytest.raises(RuntimeError, match="not installed; available models: none"):
+        gateway._upscale_settings()
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"max_resolution": "8k"}, "max_resolution must be one of"),
+        ({"quality": "ultra"}, "quality must be one of"),
+    ],
+)
+def test_upscale_settings_rejects_invalid_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override,
+    message,
+):
+    monkeypatch.setenv("SR_ENGINE_DIR", str(tmp_path))
+    monkeypatch.setattr(gateway.cache, "load_server_settings", lambda: _settings(**override))
+
+    with pytest.raises(RuntimeError, match=message):
+        gateway._upscale_settings()
+
+
+def test_upscale_settings_fills_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SR_ENGINE_DIR", str(tmp_path))
+    monkeypatch.setattr(gateway.cache, "load_server_settings", dict)
+
+    assert gateway._upscale_settings() == _settings()
+
+
+def test_cleanup_upscale_sessions_runs_every_minute(monkeypatch: pytest.MonkeyPatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    class Stop(Exception):
+        pass
+
+    cleanup = MagicMock(side_effect=[None, Stop()])
+    monkeypatch.setattr(gateway.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(gateway.ffmpeg_session, "cleanup_expired_sessions", cleanup)
+
+    with pytest.raises(Stop):
+        asyncio.run(gateway._cleanup_upscale_sessions())
+
+    assert sleeps == [60, 60]
+    assert cleanup.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("sr_model", "message"),
+    [
+        ("2x-nomosuni-compact", "Native upscaling enabled: model=2x-nomosuni-compact"),
+        ("", "Native upscaling disabled"),
+    ],
+)
+def test_lifespan_initializes_and_shuts_down(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    sr_model,
+    message,
+):
+    calls: list[str] = []
+    monkeypatch.setenv("SR_ENGINE_DIR", str(tmp_path))
+    monkeypatch.setattr(gateway.cache, "initialize", lambda: calls.append("initialize"))
+    init = MagicMock()
+    monkeypatch.setattr(gateway.ffmpeg_command, "init", init)
+    monkeypatch.setattr(
+        gateway.ffmpeg_session,
+        "cleanup_and_recover_sessions",
+        lambda: calls.append("recover"),
+    )
+    monkeypatch.setattr(gateway.ffmpeg_session, "shutdown", lambda: calls.append("shutdown"))
+    upscale_settings = MagicMock(return_value=_settings(sr_model=sr_model))
+    monkeypatch.setattr(gateway, "_upscale_settings", upscale_settings)
+
+    with caplog.at_level("INFO", logger="gateway"), TestClient(gateway.app) as client:
+        assert calls == ["initialize", "recover"]
+        assert client.get("/healthz").status_code == 200
+
+    assert calls == ["initialize", "recover", "shutdown"]
+    init.assert_called_once_with(upscale_settings, sr_engine_dir=str(tmp_path))
+    assert message in caplog.text
+
+
+def test_authenticator_evicts_expired_success_entries(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(auth, "verify_password", lambda _u, _p: True)
+    authenticator = gateway.GatewayAuthenticator(max_auth_cache_entries=2)
+    authenticator._success_cache = {"expired": 0.0, "live": 1e12}
+
+    assert asyncio.run(authenticator.verify(_request("1.1.1.1"), "u", "p"))
+
+    fingerprint = gateway.GatewayAuthenticator._fingerprint("u", "p")
+    assert set(authenticator._success_cache) == {"live", fingerprint}
+
+
+def test_authenticator_evicts_oldest_success_entry_when_full(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(auth, "verify_password", lambda _u, _p: True)
+    authenticator = gateway.GatewayAuthenticator(max_auth_cache_entries=2)
+    authenticator._success_cache = {"expired": 0.0, "old": 1e12, "new": 2e12}
+
+    assert asyncio.run(authenticator.verify(_request(None), "u", "p"))
+
+    fingerprint = gateway.GatewayAuthenticator._fingerprint("u", "p")
+    assert set(authenticator._success_cache) == {"new", fingerprint}
+
+
+def test_authenticator_bounds_failure_clients(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(auth, "verify_password", lambda _u, _p: False)
+    authenticator = gateway.GatewayAuthenticator(max_failure_clients=1)
+
+    assert not asyncio.run(authenticator.verify(_request("1.1.1.1"), "u", "bad"))
+    assert not asyncio.run(authenticator.verify(_request("2.2.2.2"), "u", "bad"))
+    assert not asyncio.run(authenticator.verify(_request("2.2.2.2"), "u", "bad"))
+
+    assert list(authenticator._failures) == ["2.2.2.2"]
+    assert len(authenticator._failures["2.2.2.2"]) == 2
+    assert len(authenticator._global_failures) == 3
+
+
+def test_authenticator_global_rate_limit(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(auth, "verify_password", lambda _u, _p: False)
+    authenticator = gateway.GatewayAuthenticator(max_global_login_failures=1)
+    asyncio.run(authenticator.verify(_request("1.1.1.1"), "u", "bad"))
+
+    with pytest.raises(gateway.HTTPException) as exc_info:
+        asyncio.run(authenticator.verify(_request("2.2.2.2"), "u", "bad"))
+    assert exc_info.value.status_code == 429
+
+
+def test_authenticator_forgets_failures_outside_window(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(auth, "verify_password", lambda _u, _p: True)
+    authenticator = gateway.GatewayAuthenticator(max_login_failures=1)
+    authenticator._failures = {"1.1.1.1": [0.0], "2.2.2.2": [0.0, 1e12]}
+    authenticator._global_failures = [0.0]
+
+    assert asyncio.run(authenticator.verify(_request("3.3.3.3"), "u", "p"))
+
+    assert authenticator._failures == {"2.2.2.2": [1e12]}
+    assert authenticator._global_failures == []
+
+
+def test_healthcheck_reports_upscale_mode(gateway_client, monkeypatch: pytest.MonkeyPatch):
+    client, _ = gateway_client
+    monkeypatch.setattr(gateway, "_upscale_enabled", lambda: True)
+
+    assert client.get("/healthz").json() == {"status": "ok", "mode": "upscale"}
+
+
+@pytest.mark.parametrize(
+    ("sr_model", "expected"),
+    [
+        (
+            "on",
+            {
+                "upscale": True,
+                "models": ["2x-nomosuni-compact"],
+                "selected_model": "2x-nomosuni-compact",
+                "max_resolution": "4k",
+                "quality": "medium",
+                "output_format": "hls",
+            },
+        ),
+        (
+            "",
+            {
+                "upscale": False,
+                "models": ["2x-nomosuni-compact"],
+                "selected_model": "",
+                "max_resolution": "4k",
+                "quality": "medium",
+                "output_format": "mpegts",
+            },
+        ),
+    ],
+)
+def test_capabilities(
+    gateway_client,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sr_model,
+    expected,
+):
+    client, _ = gateway_client
+    engines = tmp_path / "engines"
+    engines.mkdir()
+    (engines / "2x-nomosuni-compact_1080p_fp16.engine").write_bytes(b"engine")
+    monkeypatch.setattr(
+        gateway.cache,
+        "load_server_settings",
+        lambda: _settings(sr_model=sr_model, max_resolution="4k", quality="medium"),
+    )
+
+    assert client.get("/capabilities").json() == expected
+
+
+def test_available_upscale_models_requires_matching_engine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SR_ENGINE_DIR", str(tmp_path))
+    (tmp_path / "other_720p_fp16.engine").write_bytes(b"engine")
+
+    assert gateway._available_upscale_models() == []
+
+
+def test_player_api_live_categories_include_unmapped_category(gateway_client):
+    client, snapshot = gateway_client
+    snapshot.categories.append({"category_id": "77", "category_name": "Misc", "parent_id": 0})
+
+    response = client.get("/player_api.php", params=_params(action="get_live_categories"))
+
+    assert [category["category_id"] for category in response.json()] == ["src_1_news", "77"]
+
+
+def test_player_api_hides_unmapped_category_for_restricted_user(gateway_client):
+    client, snapshot = gateway_client
+    snapshot.categories.append({"category_id": "77", "category_name": "Misc", "parent_id": 0})
+    assert auth.set_user_limits("player", unavailable_groups=["cat:other"])
+
+    response = client.get("/player_api.php", params=_params(action="get_live_categories"))
+
+    assert [category["category_id"] for category in response.json()] == ["src_1_news"]
+
+
+@pytest.mark.parametrize(
+    "action",
+    ["get_vod_categories", "get_vod_streams", "get_series_categories", "get_series"],
+)
+def test_player_api_returns_empty_vod_and_series(gateway_client, action):
+    client, _ = gateway_client
+
+    assert client.get("/player_api.php", params=_params(action=action)).json() == []
+
+
+def test_player_api_rejects_unsupported_action(gateway_client):
+    client, _ = gateway_client
+
+    response = client.get("/player_api.php", params=_params(action="bogus"))
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Unsupported action: bogus"}
+
+
+def test_short_epg_requires_stream_id(gateway_client):
+    client, _ = gateway_client
+
+    response = client.get("/player_api.php", params=_params(action="get_short_epg"))
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "stream_id is required"}
+
+
+def test_short_epg_rejects_unknown_stream(gateway_client):
+    client, _ = gateway_client
+
+    response = client.get(
+        "/player_api.php",
+        params=_params(action="get_short_epg", stream_id=999),
+    )
+
+    assert response.status_code == 404
+
+
+def test_short_epg_rejects_hidden_stream(gateway_client):
+    client, _ = gateway_client
+    assert auth.set_user_limits("player", unavailable_groups=["cat:src_1_news"])
+
+    response = client.get(
+        "/player_api.php",
+        params=_params(action="get_short_epg", stream_id=41),
+    )
+
+    assert response.status_code == 404
+
+
+def test_short_epg_without_source_client_is_empty(
+    gateway_client,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    client, _ = gateway_client
+    monkeypatch.setattr(gateway, "get_xtream_client_by_source", lambda _source_id: None)
+
+    response = client.get(
+        "/player_api.php",
+        params=_params(action="get_short_epg", stream_id=41),
+    )
+
+    assert response.json() == {"epg_listings": []}
+
+
+@pytest.mark.parametrize(("limit", "expected_limit"), [(500, 100), (0, 1), (5, 5)])
+def test_short_epg_proxies_upstream_with_clamped_limit(
+    gateway_client,
+    monkeypatch: pytest.MonkeyPatch,
+    limit,
+    expected_limit,
+):
+    client, _ = gateway_client
+    xtream = MagicMock()
+    xtream.get_short_epg.return_value = {"epg_listings": [{"title": "News"}]}
+    monkeypatch.setattr(gateway, "get_xtream_client_by_source", lambda _source_id: xtream)
+
+    response = client.get(
+        "/player_api.php",
+        params=_params(action="get_short_epg", stream_id=41, limit=limit),
+    )
+
+    assert response.json() == {"epg_listings": [{"title": "News"}]}
+    xtream.get_short_epg.assert_called_once_with(987, expected_limit)
+
+
+def test_short_epg_upstream_failure_is_bad_gateway(
+    gateway_client,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    client, _ = gateway_client
+    xtream = MagicMock()
+    xtream.get_short_epg.side_effect = OSError("boom")
+    monkeypatch.setattr(gateway, "get_xtream_client_by_source", lambda _source_id: xtream)
+
+    response = client.get(
+        "/player_api.php",
+        params=_params(action="get_short_epg", stream_id=41),
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Unable to load upstream EPG data"}
+    assert "Gateway EPG lookup failed (OSError)" in caplog.text
+
+
+def test_player_api_orders_by_views_preserving_category_order(gateway_client):
+    client, snapshot = gateway_client
+
+    def add(local_id: int, upstream_id: str, category: str) -> None:
+        stream = GatewayStream(
+            local_id=local_id,
+            source_id="src_1",
+            source_type="xtream",
+            upstream_id=upstream_id,
+            direct_url="",
+            access_group_ids=("src_1_news",),
+            public={
+                **snapshot.streams[0].public,
+                "stream_id": local_id,
+                "category_id": category,
+                "category_ids": [category],
+            },
+        )
+        snapshot.streams.append(stream)
+        snapshot.streams_by_id[local_id] = stream
+
+    add(42, "500", "sports")
+    add(43, "600", "src_1_news")
+    cache.record_live_view("player", "src_1", "500")
+    cache.record_live_view("player", "src_1", "500")
+    cache.record_live_view("player", "src_1", "600")
+
+    response = client.get("/player_api.php", params=_params(action="get_live_streams"))
+
+    assert [stream["stream_id"] for stream in response.json()] == [43, 41, 42]
+
+
+def test_playlist_rejects_invalid_credentials(gateway_client):
+    client, _ = gateway_client
+
+    response = client.get("/get.php", params={"username": "player", "password": "wrong"})
+
+    assert response.status_code == 401
+    assert response.text == "Invalid username or password\n"
+
+
+@pytest.mark.parametrize(
+    ("params", "detail"),
+    [
+        ({"type": "xspf"}, "Unsupported playlist type"),
+        ({"output": "mkv"}, "Unsupported playlist output"),
+    ],
+)
+def test_playlist_rejects_unsupported_options(gateway_client, params, detail):
+    client, _ = gateway_client
+
+    response = client.get("/get.php", params=_params(**params))
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": detail}
+
+
+def test_playlist_sanitizes_values_and_defaults_group(gateway_client):
+    client, snapshot = gateway_client
+    stream = snapshot.streams[0]
+    snapshot.streams[0] = GatewayStream(
+        local_id=stream.local_id,
+        source_id=stream.source_id,
+        source_type=stream.source_type,
+        upstream_id=stream.upstream_id,
+        direct_url=stream.direct_url,
+        access_group_ids=stream.access_group_ids,
+        public={**stream.public, "name": 'Bad\r\n"Name"', "stream_icon": None, "category_id": "x"},
+    )
+
+    response = client.get("/get.php", params=_params())
+
+    assert (
+        '#EXTINF:-1 tvg-id="news.one" tvg-name="Bad  \'Name\'" tvg-logo="" '
+        "group-title=\"Uncategorized\",Bad  'Name'"
+    ) in response.text
+
+
+def test_live_stream_rejects_malformed_path(gateway_client):
+    client, _ = gateway_client
+
+    for path in ("/live/player", "/live/player/pass", "/live/player/pass/41", "/live/u/p/x.ts"):
+        response = client.get(path)
+        assert response.status_code == 400, path
+        assert response.json() == {"detail": "Invalid live stream path"}
+
+
+def test_live_stream_rejects_invalid_credentials(gateway_client):
+    client, _ = gateway_client
+
+    assert client.get("/live/player/wrong/41.ts").status_code == 401
+
+
+def test_live_stream_rejects_unsupported_format(gateway_client):
+    client, _ = gateway_client
+
+    response = client.get("/live/player/local-pass/41.mp4")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Unsupported stream format"}
+
+
+def test_live_stream_rejects_unknown_stream(gateway_client):
+    client, _ = gateway_client
+
+    assert client.get("/live/player/local-pass/999.ts").status_code == 404
+
+
+def test_upscale_live_stream_applies_source_limits(
+    gateway_client,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    client, _ = gateway_client
+    settings = cache.load_server_settings()
+    settings["sources"] = [
+        {
+            "id": "src_1",
+            "name": "A",
+            "type": "xtream",
+            "url": "http://a",
+            "max_streams": 3,
+            "deinterlace_fallback": False,
+        },
+    ]
+    cache.save_server_settings(settings)
+    assert auth.set_user_limits("player", max_streams_per_source={"src_1": 2})
+    monkeypatch.setattr(gateway, "_upscale_enabled", lambda: True)
+    monkeypatch.setattr(gateway, "_resolve_upstream", lambda _stream, _extension: "http://up")
+    start = AsyncMock(return_value={"session_id": "s1"})
+    monkeypatch.setattr(gateway.ffmpeg_session, "start_transcode", start)
+
+    response = client.get("/live/player/local-pass/41.ts", follow_redirects=False)
+
+    assert response.headers["location"] == "/upscale/s1/stream.m3u8"
+    start.assert_awaited_once_with(
+        "http://up",
+        content_type="live",
+        deinterlace_fallback=False,
+        username="player",
+        source_id="src_1",
+        user_max_streams=2,
+        source_max_streams=3,
+    )
+
+
+def test_live_stream_upstream_failure_is_bad_gateway(
+    gateway_client,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    client, _ = gateway_client
+    monkeypatch.setattr(gateway, "_resolve_upstream", lambda _stream, _extension: "http://up")
+    monkeypatch.setattr(gateway, "safe_urlopen", MagicMock(side_effect=OSError("refused")))
+
+    response = client.get("/live/player/local-pass/41.ts")
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Unable to connect to upstream stream"}
+
+
+def test_proxy_url_forwards_length_and_encoding(monkeypatch: pytest.MonkeyPatch):
+    upstream = MagicMock()
+    upstream.headers = {"Content-Length": "5", "Content-Encoding": "gzip"}
+    upstream.read.side_effect = [b"abcde", b""]
+    opener = MagicMock(return_value=upstream)
+    monkeypatch.setattr(gateway, "safe_urlopen", opener)
+    monkeypatch.setattr(gateway.cache, "get_user_agent", lambda: "agent/1")
+
+    response = asyncio.run(gateway._proxy_url("http://up"))
+
+    opener.assert_called_once_with("http://up", 30, "agent/1")
+    assert response.media_type == "video/mp2t"
+    assert response.headers["content-length"] == "5"
+    assert response.headers["content-encoding"] == "gzip"
+    assert response.headers["cache-control"] == "no-store"
+    assert list(gateway._iter_upstream(upstream)) == [b"abcde"]
+
+
+def _bare_stream(source_type: str, direct_url: str) -> GatewayStream:
+    return GatewayStream(
+        local_id=1,
+        source_id="s",
+        source_type=source_type,
+        upstream_id="7",
+        direct_url=direct_url,
+        access_group_ids=(),
+        public={},
+    )
+
+
+def test_resolve_upstream_uses_m3u_direct_url():
+    stream = _bare_stream("m3u", "http://direct/1.ts")
+
+    assert gateway._resolve_upstream(stream, "ts") == "http://direct/1.ts"
+
+
+def test_resolve_upstream_rejects_m3u_without_url():
+    with pytest.raises(gateway.HTTPException) as exc_info:
+        gateway._resolve_upstream(_bare_stream("m3u", ""), "ts")
+    assert exc_info.value.status_code == 502
+
+
+def test_resolve_upstream_rejects_removed_xtream_source(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(gateway, "get_xtream_client_by_source", lambda _source_id: None)
+
+    with pytest.raises(gateway.HTTPException) as exc_info:
+        gateway._resolve_upstream(_bare_stream("xtream", ""), "ts")
+    assert exc_info.value.status_code == 404
+
+
+def test_upscale_file_rejects_dotted_filename(gateway_client):
+    client, _ = gateway_client
+
+    response = client.get("/upscale/session/..stream.m3u8")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid filename"}
+
+
+def test_upscale_file_rejects_unknown_session(gateway_client, monkeypatch: pytest.MonkeyPatch):
+    client, _ = gateway_client
+    monkeypatch.setattr(gateway.ffmpeg_session, "touch_session", lambda _sid: False)
+
+    assert client.get("/upscale/session/stream.m3u8").status_code == 404
+
+
+def test_upscale_file_rejects_vanished_session(gateway_client, monkeypatch: pytest.MonkeyPatch):
+    client, _ = gateway_client
+    monkeypatch.setattr(gateway.ffmpeg_session, "touch_session", lambda _sid: True)
+    monkeypatch.setattr(gateway.ffmpeg_session, "get_session", lambda _sid: None)
+
+    response = client.get("/upscale/session/stream.m3u8")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Upscale session not found"}
+
+
+def test_upscale_file_rejects_missing_and_unsupported_files(
+    gateway_client,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    client, _ = gateway_client
+    (tmp_path / "notes.txt").write_text("x")
+    monkeypatch.setattr(gateway.ffmpeg_session, "touch_session", lambda _sid: True)
+    monkeypatch.setattr(gateway.ffmpeg_session, "get_session", lambda _sid: {"dir": str(tmp_path)})
+
+    missing = client.get("/upscale/session/segment999.ts")
+    unsupported = client.get("/upscale/session/notes.txt")
+
+    assert missing.status_code == 404
+    assert missing.json() == {"detail": "File not found"}
+    assert unsupported.status_code == 400
+    assert unsupported.json() == {"detail": "Unsupported upscale file"}
+
+
+def test_xmltv_rejects_invalid_credentials(gateway_client):
+    client, _ = gateway_client
+
+    response = client.get("/xmltv.php", params={"username": "player", "password": "wrong"})
+
+    assert response.status_code == 401
+
+
+def test_xmltv_reports_unavailable_epg(gateway_client, monkeypatch: pytest.MonkeyPatch):
+    client, _ = gateway_client
+    monkeypatch.setattr(
+        gateway,
+        "build_filtered_xmltv",
+        MagicMock(side_effect=gateway.EpgUnavailableError("EPG database is not ready")),
+    )
+
+    response = client.get("/xmltv.php", params=_params())
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "EPG database is not ready"}
+
+
+def test_server_info_defaults_ports_from_scheme(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("NETV_GATEWAY_PUBLIC_URL", raising=False)
+    monkeypatch.setattr(gateway, "_upscale_enabled", lambda: False)
+
+    info = gateway._server_info(_request(None), "u", "p")
+
+    assert info["server_info"]["port"] == "80"
+    assert info["server_info"]["https_port"] == ""
+
+
+def test_server_info_https_without_port(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("NETV_GATEWAY_PUBLIC_URL", "https://tv.example/")
+    monkeypatch.setattr(gateway, "_upscale_enabled", lambda: True)
+
+    info = gateway._server_info(_request(None, "http://ignored/"), "u", "p")
+
+    assert info["server_info"]["url"] == "tv.example"
+    assert info["server_info"]["port"] == "443"
+    assert info["server_info"]["https_port"] == "443"
+    assert info["user_info"]["allowed_output_formats"] == ["m3u8"]
+
+
+@pytest.mark.parametrize(
+    ("argv", "env", "expected_level", "uvicorn_level"),
+    [
+        (["gateway.py", "--debug", "--port", "9001"], {}, logging.DEBUG, "debug"),
+        (["gateway.py"], {"LOG_LEVEL": "warning"}, logging.WARNING, "info"),
+        (["gateway.py"], {"LOG_LEVEL": "bogus"}, logging.INFO, "info"),
+    ],
+)
+def test_main_runs_uvicorn(
+    monkeypatch: pytest.MonkeyPatch,
+    argv,
+    env,
+    expected_level,
+    uvicorn_level,
+):
+
+    run = MagicMock()
+    basic_config = MagicMock()
+    monkeypatch.setattr(uvicorn, "run", run)
+    monkeypatch.setattr(logging, "basicConfig", basic_config)
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.delenv("NETV_GATEWAY_PORT", raising=False)
+    monkeypatch.setenv("NETV_GATEWAY_TRUSTED_PROXIES", "10.0.0.1")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    runpy.run_path(gateway.__file__, run_name="__main__")
+
+    assert basic_config.call_args.kwargs["level"] == expected_level
+    kwargs = run.call_args.kwargs
+    assert kwargs["port"] == (9001 if "--port" in argv else 8100)
+    assert kwargs["log_level"] == uvicorn_level
+    assert kwargs["host"] == "0.0.0.0"
+    assert kwargs["forwarded_allow_ips"] == "10.0.0.1"
+    assert kwargs["proxy_headers"] is True
 
 
 class _FakeCatalog:

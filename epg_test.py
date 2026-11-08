@@ -6,10 +6,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import gc
+import gzip
 import sqlite3
 import threading
 import warnings
 
+import defusedxml.ElementTree as ET
 import pytest
 
 from epg import Program
@@ -463,6 +465,245 @@ class TestProgram:
         p = Program(channel_id="ch1", title="Test", start=now, stop=now + timedelta(hours=1))
         assert p.desc == ""
         assert p.source_id == ""
+
+
+class TestBatchPreferredSources:
+    """Tests for get_programs_batch deduplication."""
+
+    def test_batch_dedupes_only_channels_with_preference(self, db):
+        now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        hour = (now + timedelta(hours=1)).timestamp()
+        later = (now + timedelta(hours=2)).timestamp()
+        db.insert_programs(
+            [
+                ("ch1", "Src1 Show", now.timestamp(), hour, "", "src1"),
+                ("ch1", "Src2 Show", now.timestamp(), hour, "", "src2"),
+                ("ch1", "Src1 Later", hour, later, "", "src1"),
+                ("ch2", "A", now.timestamp(), hour, "", "src1"),
+                ("ch2", "B", now.timestamp(), hour, "", "src2"),
+                ("ch3", "Only", now.timestamp(), hour, "", "src1"),
+            ],
+        )
+        db.commit()
+
+        result = db.get_programs_batch(
+            ["ch1", "ch2", "ch3", "ch4"],
+            now,
+            now + timedelta(hours=2),
+            preferred_sources={"ch1": "src2", "ch3": "src2", "ch4": "src1"},
+        )
+
+        assert [p.title for p in result["ch1"]] == ["Src2 Show", "Src1 Later"]
+        assert sorted(p.title for p in result["ch2"]) == ["A", "B"]
+        assert [p.title for p in result["ch3"]] == ["Only"]
+        assert result["ch4"] == []
+
+    def test_batch_keeps_existing_when_preferred_comes_first(self, db):
+        now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        hour = (now + timedelta(hours=1)).timestamp()
+        db.insert_programs(
+            [
+                ("ch1", "Pref", now.timestamp(), hour, "", "src1"),
+                ("ch1", "Other", now.timestamp(), hour, "", "src2"),
+            ],
+        )
+        db.commit()
+        result = db.get_programs_batch(
+            ["ch1"],
+            now,
+            now + timedelta(hours=1),
+            preferred_sources={"ch1": "src1"},
+        )
+        assert [p.title for p in result["ch1"]] == ["Pref"]
+
+    def test_dedupe_without_preference_is_identity(self):
+        now = datetime.now(timezone.utc)
+        programs = [
+            Program(channel_id="c", title="a", start=now, stop=now + timedelta(hours=1)),
+            Program(channel_id="c", title="b", start=now, stop=now + timedelta(hours=1)),
+        ]
+        assert epg._dedupe_programs(programs, "") is programs
+
+    def test_batch_chunks_channel_ids(self, db):
+        now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        hour = (now + timedelta(hours=1)).timestamp()
+        db.insert_programs([(f"ch{i}", f"S{i}", now.timestamp(), hour, "", "s") for i in range(5)])
+        db.insert_icon("ch4", "http://i/4.png")
+        db.commit()
+        ids = [f"ch{i}" for i in range(5)]
+        result = db.get_programs_batch(ids, now, now + timedelta(hours=1), chunk_size=2)
+        assert [result[i][0].title for i in ids] == [f"S{i}" for i in range(5)]
+        assert db.get_icons_batch(ids, chunk_size=2) == {"ch4": "http://i/4.png"}
+
+
+class TestParseEpgTime:
+    """Tests for XMLTV timestamp parsing."""
+
+    def test_positive_offset(self):
+        dt = epg._parse_epg_time("20241130120000 +0530")
+        assert dt == datetime(2024, 11, 30, 6, 30, tzinfo=timezone.utc)
+
+    def test_negative_offset(self):
+        dt = epg._parse_epg_time("20241130120000-0800")
+        assert dt == datetime(2024, 11, 30, 20, 0, tzinfo=timezone.utc)
+
+    def test_hours_only_offset(self):
+        dt = epg._parse_epg_time("20241130120000+05")
+        assert dt.utcoffset() == timedelta(hours=5)
+
+    def test_sign_only_offset_is_utc(self):
+        dt = epg._parse_epg_time("20241130120000Z")
+        assert dt.utcoffset() == timedelta(0)
+
+    def test_no_offset_is_naive(self):
+        assert epg._parse_epg_time("20241130120000") == datetime(2024, 11, 30, 12, 0)
+
+    def test_short_string_returns_now(self):
+        before = datetime.now(timezone.utc)
+        dt = epg._parse_epg_time("2024")
+        assert before <= dt <= datetime.now(timezone.utc)
+
+    def test_garbage_raises(self):
+        with pytest.raises(ValueError):
+            epg._parse_epg_time("abcdefghijklmn")
+
+
+class _Resp:
+    def __init__(self, body: bytes):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self) -> bytes:
+        return self.body
+
+
+def _fake_urlopen(monkeypatch, body: bytes) -> list[dict]:
+    calls: list[dict] = []
+
+    def fake(url, timeout, user_agent):
+        calls.append({"url": url, "timeout": timeout, "user_agent": user_agent})
+        return _Resp(body)
+
+    monkeypatch.setattr(epg, "safe_urlopen", fake)
+    return calls
+
+
+XMLTV = """<?xml version="1.0"?>
+<tv>
+  <channel id="ch1"><display-name>Channel One</display-name><icon src="http://i/1.png"/></channel>
+  <channel id="ch2"><display-name></display-name></channel>
+  <channel id="ch3"/>
+  <programme start="20241130120000 +0000" stop="20241130130000 +0000" channel="ch1">
+    <title>News</title><desc>Daily news</desc>
+  </programme>
+  <programme start="20241130130000 +0000" stop="20241130140000 +0000" channel="ch1">
+    <title></title>
+  </programme>
+  <programme start="bogus-timestamp" stop="20241130140000 +0000" channel="ch2">
+    <title>Broken</title>
+  </programme>
+</tv>
+"""
+
+
+class TestFetchEpg:
+    """Tests for fetch_epg with mocked HTTP."""
+
+    def test_parses_channels_icons_and_programs(self, db, tmp_path, monkeypatch):
+        calls = _fake_urlopen(monkeypatch, XMLTV.encode())
+
+        count = db.fetch_epg(
+            "http://epg.example/guide.xml",
+            tmp_path,
+            timeout=7,
+            source_id="src1",
+            user_agent="UA/1",
+        )
+
+        assert count == 2
+        assert calls == [
+            {"url": "http://epg.example/guide.xml", "timeout": 7, "user_agent": "UA/1"},
+        ]
+        conn = db._get_conn()
+        names = dict(conn.execute("SELECT id, name FROM channels").fetchall())
+        assert names == {"ch1": "Channel One", "ch2": "ch2", "ch3": "ch3"}
+        assert db.get_icons_batch(["ch1", "ch2", "ch3"]) == {"ch1": "http://i/1.png"}
+        start = datetime(2024, 11, 30, 12, tzinfo=timezone.utc)
+        progs = db.get_programs_in_range("ch1", start, start + timedelta(hours=2))
+        assert [(p.title, p.desc, p.source_id) for p in progs] == [
+            ("News", "Daily news", "src1"),
+            ("Unknown", "", "src1"),
+        ]
+
+    def test_decompresses_gzip(self, db, tmp_path, monkeypatch):
+        _fake_urlopen(monkeypatch, gzip.compress(XMLTV.encode()))
+        assert db.fetch_epg("http://epg.example/guide.xml.gz", tmp_path) == 2
+
+    def test_inserts_in_batches(self, db, tmp_path, monkeypatch):
+        n = 10_001
+        prog = (
+            '<programme start="20241130120000 +0000" stop="20241130130000 +0000" channel="c">'
+            "<title>T</title></programme>"
+        )
+        body = "<tv>" + prog * n + "</tv>"
+        _fake_urlopen(monkeypatch, body.encode())
+        inserted: list[int] = []
+        real_insert = epg.insert_programs
+        monkeypatch.setattr(
+            epg,
+            "insert_programs",
+            lambda batch: (inserted.append(len(batch)), real_insert(batch)),
+        )
+
+        assert db.fetch_epg("http://epg.example/big.xml", tmp_path) == n
+        assert inserted == [10_000, 1]
+        assert db.get_program_count() == n
+
+    def test_sanitizes_corrupt_xml(self, db, tmp_path, monkeypatch):
+        body = (
+            '<?xml version="1.0"?><tv>'
+            '<channel id="ch1"><display-name>One</display-name></channel>'
+            "<garbage & stuff"
+            '<programme start="20241130120000 +0000" stop="20241130130000 +0000" channel="ch1">'
+            "<title>Kept</title></programme>"
+            "</tv>"
+        )
+        _fake_urlopen(monkeypatch, body.encode())
+
+        assert db.fetch_epg("http://epg.example/bad.xml", tmp_path) == 1
+        debug_files = list(tmp_path.glob("epg_debug_*.xml"))
+        assert len(debug_files) == 1
+        assert debug_files[0].read_text() == body
+        assert db.get_channel_count() == 1
+
+    def test_raises_when_sanitized_xml_also_fails(self, db, tmp_path, monkeypatch):
+        body = '<tv><channel id="ch1"><bad></channel>'
+        _fake_urlopen(monkeypatch, body.encode())
+        with pytest.raises(ET.ParseError):
+            db.fetch_epg("http://epg.example/worse.xml", tmp_path)
+        assert len(list(tmp_path.glob("epg_debug_*.xml"))) == 1
+
+
+class TestSanitize:
+    def test_extracts_only_well_formed_elements(self):
+        xml = (
+            '<channel id="a"><display-name>A</display-name></channel>'
+            "junk<<<"
+            '<programme start="1" stop="2" channel="a"><title>T</title></programme>'
+            '<programme channel="a"><title>no times</title></programme>'
+        )
+        out = epg._sanitize_epg_xml(xml)
+        assert out.startswith('<?xml version="1.0"?>\n<tv>\n')
+        assert out.endswith("\n</tv>")
+        assert '<channel id="a">' in out
+        assert '<programme start="1"' in out
+        assert "no times" not in out
+        assert "junk" not in out
 
 
 if __name__ == "__main__":
