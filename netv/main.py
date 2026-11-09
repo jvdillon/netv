@@ -5,8 +5,8 @@
 exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P -m netv.main "$@"
 neTV web app: live TV, EPG guide, VOD, and Chromecast for your IPTV sources.
 
-Settings and caches live in $NETV_DATA_DIR when set; otherwise in ./cache or
-./.cache of a source checkout, or ~/.local/share/netv for an installed package.
+Settings and caches live in $NETV_DATA_DIR when set; otherwise in
+~/.local/share/netv (Linux) or ~/Library/Application Support/netv (macOS).
 
 Examples:
   netv                              # HTTP on port 8000

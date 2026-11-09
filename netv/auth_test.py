@@ -206,23 +206,10 @@ class TestUserLimits:
 
 
 class TestGetSettingsFile:
-    def test_legacy_dir_used_when_present(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(auth, "APP_DIR", tmp_path)
-        monkeypatch.setattr(auth, "CACHE_DIR", tmp_path / ".cache")
-        monkeypatch.setattr(
-            auth,
-            "SERVER_SETTINGS_FILE",
-            tmp_path / ".cache" / "server_settings.json",
-        )
-        monkeypatch.setattr(auth, "USERS_DIR", tmp_path / ".cache" / "users")
-        (tmp_path / "cache").mkdir()
-        assert auth._get_settings_file() == tmp_path / "cache" / "server_settings.json"
-        assert tmp_path / "cache" == auth.CACHE_DIR
-        assert tmp_path / "cache" / "users" == auth.USERS_DIR
-
-    def test_default_dir_without_legacy(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        (tmp_path / "pyproject.toml").touch()
+    @pytest.fixture(autouse=True)
+    def _isolated(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("NETV_DATA_DIR", raising=False)
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
         monkeypatch.setattr(auth, "APP_DIR", tmp_path)
         monkeypatch.setattr(auth, "CACHE_DIR", tmp_path / ".cache")
         monkeypatch.setattr(
@@ -231,8 +218,21 @@ class TestGetSettingsFile:
             tmp_path / ".cache" / "server_settings.json",
         )
         monkeypatch.setattr(auth, "USERS_DIR", tmp_path / ".cache" / "users")
-        assert auth._get_settings_file() == tmp_path / ".cache" / "server_settings.json"
-        assert tmp_path / ".cache" / "users" == auth.USERS_DIR
+
+    def test_legacy_dir_moved_to_user_data_dir(self, tmp_path: Path):
+        (tmp_path / "cache").mkdir()
+        (tmp_path / "cache" / "server_settings.json").write_text("{}")
+        state = tmp_path / "xdg" / "netv"
+        assert auth._get_settings_file() == state / "server_settings.json"
+        assert state == auth.CACHE_DIR
+        assert state / "users" == auth.USERS_DIR
+        assert (state / "server_settings.json").exists()
+
+    def test_default_dir_without_legacy(self, tmp_path: Path):
+        (tmp_path / "pyproject.toml").touch()
+        state = tmp_path / "xdg" / "netv"
+        assert auth._get_settings_file() == state / "server_settings.json"
+        assert state / "users" == auth.USERS_DIR
 
 
 @pytest.mark.usefixtures("auth_module")

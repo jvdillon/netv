@@ -33,46 +33,76 @@ class TestDataDir:
         monkeypatch.setenv("NETV_DATA_DIR", "~/netv-state")
         assert util.data_dir(tmp_path) == pathlib.Path("~/netv-state").expanduser()
 
-    def test_legacy_cache_wins_over_dot_cache(self, tmp_path: pathlib.Path):
-        (tmp_path / "cache").mkdir()
-        (tmp_path / ".cache").mkdir()
-        assert util.data_dir(tmp_path) == tmp_path / "cache"
-
-    def test_existing_dot_cache_is_kept(self, tmp_path: pathlib.Path):
-        (tmp_path / ".cache").mkdir()
-        assert util.data_dir(tmp_path) == tmp_path / ".cache"
-
-    def test_fresh_source_checkout_uses_dot_cache(self, tmp_path: pathlib.Path):
+    def test_defaults_to_user_data_dir(self, tmp_path: pathlib.Path):
         (tmp_path / "pyproject.toml").touch()
-        assert util.data_dir(tmp_path) == tmp_path / ".cache"
+        assert util.data_dir(tmp_path / "netv") == tmp_path / "xdg" / "netv"
+        assert not (tmp_path / "xdg").exists()
 
-    @pytest.mark.parametrize("existing_cache", [None, "cache", ".cache"])
-    def test_source_package_keeps_checkout_state(
-        self,
-        tmp_path: pathlib.Path,
-        existing_cache: str | None,
-    ):
-        (tmp_path / "pyproject.toml").touch()
-        package = tmp_path / "netv"
-        package.mkdir()
-        if existing_cache is not None:
-            (tmp_path / existing_cache).mkdir()
-        expected = ".cache" if existing_cache is None else existing_cache
-        assert util.data_dir(package) == tmp_path / expected
-
-    def test_installed_package_uses_user_data_dir(self, tmp_path: pathlib.Path):
-        site_packages = tmp_path / "site-packages"
-        site_packages.mkdir()
-        assert util.data_dir(site_packages) == tmp_path / "xdg" / "netv"
-
-    def test_installed_package_without_xdg_uses_local_share(
+    def test_without_xdg_uses_local_share(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: pathlib.Path,
     ):
         monkeypatch.delenv("XDG_DATA_HOME")
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setattr(util.userdirs.sys, "platform", "linux")
         assert util.data_dir(tmp_path) == tmp_path / "home" / ".local" / "share" / "netv"
+
+    @pytest.mark.parametrize("legacy", ["cache", ".cache"])
+    def test_moves_legacy_checkout_state(self, tmp_path: pathlib.Path, legacy: str):
+        (tmp_path / "pyproject.toml").touch()
+        (tmp_path / legacy).mkdir()
+        (tmp_path / legacy / "server_settings.json").write_text("{}")
+        assert util.data_dir(tmp_path / "netv") == tmp_path / "xdg" / "netv"
+        assert (tmp_path / "xdg" / "netv" / "server_settings.json").read_text() == "{}"
+        assert not (tmp_path / legacy).exists()
+
+    def test_move_creates_missing_parents(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: pathlib.Path,
+    ):
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "a" / "b"))
+        (tmp_path / ".cache").mkdir()
+        (tmp_path / ".cache" / "server_settings.json").write_text("{}")
+        assert util.data_dir(tmp_path) == tmp_path / "a" / "b" / "netv"
+        assert (tmp_path / "a" / "b" / "netv" / "server_settings.json").exists()
+
+    def test_move_into_existing_base_dir(self, tmp_path: pathlib.Path):
+        (tmp_path / "xdg").mkdir()
+        (tmp_path / ".cache").mkdir()
+        (tmp_path / ".cache" / "server_settings.json").write_text("{}")
+        assert util.data_dir(tmp_path) == tmp_path / "xdg" / "netv"
+        assert (tmp_path / "xdg" / "netv" / "server_settings.json").exists()
+
+    def test_empty_env_falls_back_to_user_data_dir(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: pathlib.Path,
+    ):
+        monkeypatch.setenv("NETV_DATA_DIR", "")
+        assert util.data_dir(tmp_path) == tmp_path / "xdg" / "netv"
+
+    def test_moves_legacy_cache_before_dot_cache(self, tmp_path: pathlib.Path):
+        for legacy in ("cache", ".cache"):
+            (tmp_path / legacy).mkdir()
+            (tmp_path / legacy / "server_settings.json").write_text(legacy)
+        util.data_dir(tmp_path)
+        assert (tmp_path / "xdg" / "netv" / "server_settings.json").read_text() == "cache"
+        assert (tmp_path / ".cache").exists()
+
+    def test_keeps_existing_user_data_dir(self, tmp_path: pathlib.Path):
+        (tmp_path / "xdg" / "netv").mkdir(parents=True)
+        (tmp_path / ".cache").mkdir()
+        (tmp_path / ".cache" / "server_settings.json").write_text("{}")
+        assert util.data_dir(tmp_path) == tmp_path / "xdg" / "netv"
+        assert (tmp_path / ".cache" / "server_settings.json").exists()
+
+    def test_ignores_legacy_dir_without_settings(self, tmp_path: pathlib.Path):
+        (tmp_path / ".cache" / "tools").mkdir(parents=True)
+        assert util.data_dir(tmp_path) == tmp_path / "xdg" / "netv"
+        assert (tmp_path / ".cache" / "tools").exists()
+        assert not (tmp_path / "xdg").exists()
 
 
 def test_atomic_write_json_replaces_file_and_preserves_permissions(tmp_path: pathlib.Path):

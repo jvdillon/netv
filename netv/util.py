@@ -10,9 +10,12 @@ from urllib import error, parse, request
 import json
 import os
 import pathlib
+import shutil
 import tempfile
 
 from treekle import MutablePlainTree, json_loads, mutable, to_plain
+
+from netv import userdirs
 
 
 def redact_url_credentials(value: str) -> str:
@@ -65,26 +68,30 @@ def redact_url_credentials(value: str) -> str:
 def data_dir(app_dir: pathlib.Path) -> pathlib.Path:
     """Return where neTV keeps settings, users, and caches.
 
+    State lives outside the source tree, so ``git clean -X`` or a reinstall
+    cannot delete it. A ``cache``/``.cache`` left in a checkout by an older
+    neTV is moved into the per-user directory the first time it is resolved.
+
     Args:
         app_dir: Directory holding the neTV modules.
 
     Returns:
-        directory: ``$NETV_DATA_DIR``; else the legacy ``cache`` (Docker
-            volume) or ``.cache`` of a source checkout; else, for an installed
-            package (pip, uv tool, uvx), the per-user data directory (e.g.
-            ``~/.local/share/netv``), so state survives reinstalls.
+        directory: ``$NETV_DATA_DIR`` when set; else the per-user data
+            directory (``~/.local/share/netv`` on Linux,
+            ``~/Library/Application Support/netv`` on macOS).
     """
-    configured = os.environ.get("NETV_DATA_DIR", "")
+    configured = os.environ.get("NETV_DATA_DIR") or ""
     if configured:
         return pathlib.Path(configured).expanduser()
-    if (app_dir.parent / "pyproject.toml").is_file():
-        app_dir = app_dir.parent
-    if (app_dir / "cache").exists():
-        return app_dir / "cache"
-    if (app_dir / ".cache").exists() or (app_dir / "pyproject.toml").exists():
-        return app_dir / ".cache"
-    base = os.environ.get("XDG_DATA_HOME", "")
-    return (pathlib.Path(base) if base else pathlib.Path.home() / ".local" / "share") / "netv"
+    target = userdirs.data_dir() / "netv"
+    if not target.exists():
+        root = app_dir.parent if (app_dir.parent / "pyproject.toml").is_file() else app_dir
+        for legacy in (root / "cache", root / ".cache"):
+            if (legacy / "server_settings.json").is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(legacy, target)
+                break
+    return target
 
 
 def atomic_write_json(path: pathlib.Path, value: object) -> None:

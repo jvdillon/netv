@@ -768,9 +768,10 @@ For a released version, use `uv tool install 'pynetv[server]'` instead.
 
 Open http://localhost:8000, create an admin account, and add your IPTV source.
 
-Settings, users, and caches live in `$NETV_DATA_DIR` when set. Otherwise a
-source checkout uses `./cache` (if present) or `./.cache`, and an installed
-package uses `~/.local/share/netv`.
+Settings, users, and caches live in `$NETV_DATA_DIR` when set, otherwise in
+`~/.local/share/netv` (Linux) or `~/Library/Application Support/netv` (macOS),
+outside the source tree so `git clean` cannot remove them. A `./cache` or
+`./.cache` left in a checkout by an older neTV is moved there on first start.
 
 Web playback regression checks use Node's built-in runner (Node 18+):
 

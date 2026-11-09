@@ -560,18 +560,22 @@ def _point_paths_at(monkeypatch: pytest.MonkeyPatch, app_dir: Path, cache_dir: P
 
 
 class TestInitialize:
-    def test_initialize_paths_prefers_legacy_cache_dir(
+    def test_initialize_paths_moves_legacy_cache_dir(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ):
+        monkeypatch.delenv("NETV_DATA_DIR", raising=False)
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
         (tmp_path / "cache").mkdir()
+        (tmp_path / "cache" / "server_settings.json").write_text("{}")
         _point_paths_at(monkeypatch, tmp_path, tmp_path / ".cache")
         cache.initialize_paths()
-        assert tmp_path / "cache" == cache.CACHE_DIR
-        assert tmp_path / "cache/server_settings.json" == cache.SERVER_SETTINGS_FILE
-        assert tmp_path / "cache/users" == cache.USERS_DIR
-        assert tmp_path / "cache/logos" == cache.LOGOS_DIR
+        state = tmp_path / "xdg" / "netv"
+        assert state == cache.CACHE_DIR
+        assert state / "server_settings.json" == cache.SERVER_SETTINGS_FILE
+        assert (state / "server_settings.json").exists()
+        assert not (tmp_path / "cache").exists()
 
     def test_initialize_paths_puts_installed_state_in_user_data_dir(
         self,
