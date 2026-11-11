@@ -1,7 +1,7 @@
 """Per-user filesystem locations following OS conventions.
 
-Copied from ``loop/lib/userdirs.py``. These helpers satisfy the XDG Base
-Directory Specification: https://specifications.freedesktop.org/basedir/latest/
+These helpers satisfy the XDG Base Directory Specification:
+https://specifications.freedesktop.org/basedir/latest/
 
 Each function returns a BASE directory. The caller joins its own namespace::
 

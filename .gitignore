@@ -30,10 +30,11 @@ cache/
 # Local App Store source material
 /apple/AppStoreScreenshots/**/*.pdf
 
+# Codedoctor
 .testmondata
 .codegraph
 .coverage
 .testmondata*
-.codegraph/
+.codegraph
 .coverage.*
 .coverage-*
