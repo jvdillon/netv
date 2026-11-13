@@ -44,7 +44,7 @@ def redact_url_credentials(value: str) -> str:
         netloc = f"***:***@{netloc}"
 
     path_parts = parsed.path.split("/")
-    if len(path_parts) >= 5 and path_parts[1] in ("live", "movie", "series"):
+    if len(path_parts) >= 5 and path_parts[1] in ("live", "movie", "series", "timeshift"):
         path_parts[2:4] = ["***", "***"]
 
     query = parse.parse_qsl(parsed.query, keep_blank_values=True)
