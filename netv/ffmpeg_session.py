@@ -552,7 +552,9 @@ def cleanup_and_recover_sessions() -> None:
                 )
             recovered += 1
             log.debug(
-                "Recovered VOD session %s for %s", session_id, redact_url_credentials(url)[:50]
+                "Recovered VOD session %s for %s",
+                session_id,
+                redact_url_credentials(url)[:50],
             )
         except Exception as e:
             log.warning("Failed to recover session from %s: %s", d, e)

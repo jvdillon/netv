@@ -414,7 +414,9 @@ def resolve_hls_master_playlist(url: str) -> str:
 
     except Exception as e:
         log.warning(
-            "Failed to resolve HLS master playlist %s: %s", redact_url_credentials(url)[:80], e
+            "Failed to resolve HLS master playlist %s: %s",
+            redact_url_credentials(url)[:80],
+            e,
         )
         return url
 
