@@ -1481,6 +1481,7 @@ def _run_cli(
         assert main.main() == 0
     kwargs = dict(run.call_args.kwargs)
     kwargs["log_level_configured"] = basic_config.call_args.kwargs["level"]
+    kwargs["log_handlers"] = basic_config.call_args.kwargs["handlers"]
     return kwargs
 
 
@@ -1492,6 +1493,12 @@ def test_cli_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert kwargs["access_log"] is False
     assert kwargs["ssl_certfile"] is None
     assert kwargs["log_level_configured"] == logging.INFO
+    [handler] = kwargs["log_handlers"]
+    assert isinstance(handler, logging.Handler)
+    record = logging.makeLogRecord(
+        {"msg": "Play http://p.example/live/remote-user/remote-pass/1.ts"},
+    )
+    assert handler.format(record).endswith(" | Play http://p.example/live/***/***/1.ts")
 
 
 def test_cli_env_log_level_and_custom_certs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

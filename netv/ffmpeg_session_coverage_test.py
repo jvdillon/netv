@@ -1759,8 +1759,10 @@ async def test_monitor_fast_process(
         await fs._monitor_fast_process(_proc(AsyncProcess(exit_code=1)), "720p", "f")
     warnings = [r.getMessage() for r in caplog.records]
     assert len(warnings) == 1
-    assert "Fast-start 720p exited for f (code 1)" in warnings[0]
-    assert "secret" not in warnings[0]
+    assert (
+        warnings[0]
+        == "Fast-start 720p exited for f (code 1): open http://user:secret@host/x failed"
+    )
     process.stderr = None
     with pytest.raises(ValueError):
         await fs._monitor_fast_process(_proc(process), "720p", "f")

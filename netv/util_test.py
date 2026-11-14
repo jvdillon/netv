@@ -9,6 +9,7 @@ from urllib import error, request
 
 import io
 import json
+import logging
 import pathlib
 
 from treekle import MutablePlainTree
@@ -266,6 +267,54 @@ def test_redact_url_credentials_keeps_ipv6_and_port():
 
 def test_redact_url_credentials_drops_zero_port():
     assert util.redact_url_credentials("http://host:0/x") == "http://host/x"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            "http://provider.example/xc/live/remote-user/remote-pass/42.ts",
+            "http://provider.example/xc/live/***/***/42.ts",
+        ),
+        (
+            "http://provider.example/live/remote-user/remote-pa",
+            "http://provider.example/live/***/***",
+        ),
+        ("http://provider.example/live/remote-us", "http://provider.example/live/***"),
+    ],
+)
+def test_redact_url_credentials_masks_prefixed_and_truncated_paths(value: str, expected: str):
+    assert util.redact_url_credentials(value) == expected
+
+
+@pytest.fixture
+def _restore_root_logger():
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    yield
+    root.handlers[:] = handlers
+    root.setLevel(level)
+
+
+@pytest.mark.usefixtures("_restore_root_logger")
+def test_configure_logging_redacts_messages_and_tracebacks(capsys: pytest.CaptureFixture[str]):
+    util.configure_logging(logging.INFO)
+    log = logging.getLogger("netv.test")
+    log.info("ffmpeg:s http://provider.example/live/remote-user/remote-pass/1.ts: 403")
+    log.debug("hidden http://provider.example/live/remote-user/remote-pass/2.ts")
+    try:
+        raise OSError(
+            "Error opening input 'http://provider.example/movie/remote-user/remote-pass/3.mkv'",
+        )
+    except OSError:
+        log.exception("Probe failed")
+
+    err = capsys.readouterr().err
+    assert " | INFO | ffmpeg:s http://provider.example/live/***/***/1.ts: 403\n" in err
+    assert "hidden" not in err
+    assert "'http://provider.example/movie/***/***/3.mkv'" in err
+    assert "remote-user" not in err
+    assert "remote-pass" not in err
 
 
 def test_safe_urlopen_rejects_unsafe_scheme():

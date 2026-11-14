@@ -45,7 +45,7 @@ from netv.cache import ServerSettings
 from netv.gateway_catalog import CatalogSnapshot, GatewayCatalog, GatewayStream
 from netv.gateway_epg import EpgUnavailableError, build_filtered_xmltv
 from netv.m3u import get_xtream_client_by_source
-from netv.util import safe_urlopen
+from netv.util import configure_logging, safe_urlopen
 
 
 if TYPE_CHECKING:
@@ -482,12 +482,7 @@ def main() -> int:
             logging.INFO,
         )
     )
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%H:%M:%S",
-        force=True,
-    )
+    configure_logging(level)
     uvicorn.run(
         app,
         host="0.0.0.0",

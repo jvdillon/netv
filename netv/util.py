@@ -8,8 +8,10 @@ from typing import IO, cast, get_args, get_origin, get_type_hints, is_typeddict,
 from urllib import error, parse, request
 
 import json
+import logging
 import os
 import pathlib
+import re
 import shutil
 import tempfile
 
@@ -44,8 +46,16 @@ def redact_url_credentials(value: str) -> str:
         netloc = f"***:***@{netloc}"
 
     path_parts = parsed.path.split("/")
-    if len(path_parts) >= 5 and path_parts[1] in ("live", "movie", "series", "timeshift"):
-        path_parts[2:4] = ["***", "***"]
+    kind = next(
+        (
+            i
+            for i, part in enumerate(path_parts)
+            if part in ("live", "movie", "series", "timeshift")
+        ),
+        len(path_parts),
+    )
+    # Callers truncate URLs before logging, so a lone username must still be masked.
+    path_parts[kind + 1 : kind + 3] = ["***"] * len(path_parts[kind + 1 : kind + 3])
 
     query = parse.parse_qsl(parsed.query, keep_blank_values=True)
     redacted_query = parse.urlencode(
@@ -63,6 +73,22 @@ def redact_url_credentials(value: str) -> str:
             parsed.fragment,
         ),
     )
+
+
+def configure_logging(level: int) -> None:
+    """Send every log record to stderr with provider credentials in URLs masked.
+
+    Redacting the formatted line, not each call's arguments, also covers ffmpeg
+    stderr, exception text, and third-party loggers.
+
+    Args:
+        level: Root logger level.
+    """
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        _RedactingFormatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S"),
+    )
+    logging.basicConfig(level=level, handlers=[handler], force=True)
 
 
 def data_dir(app_dir: pathlib.Path) -> pathlib.Path:
@@ -233,6 +259,18 @@ class _SafeRedirectHandler(request.HTTPRedirectHandler):
         if parsed.scheme not in ("http", "https"):
             raise error.URLError(f"Unsafe redirect scheme: {parsed.scheme}")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class _RedactingFormatter(logging.Formatter):
+    """Formatter that masks credentials in every http(s) URL of the output."""
+
+    @override
+    def format(self, record: logging.LogRecord) -> str:
+        return re.sub(
+            r"https?://[^\s'\"<>\]]+",
+            lambda match: redact_url_credentials(match.group()),
+            super().format(record),
+        )
 
 
 def _item_id(item: MutablePlainTree) -> str:

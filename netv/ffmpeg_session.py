@@ -55,7 +55,6 @@ from netv.ffmpeg_command import (
     uses_audio_passthrough,
 )
 from netv.playback_policy import LiveRecoveryPolicy, PlaybackHealth, PlaybackPolicy
-from netv.util import redact_url_credentials
 
 
 if TYPE_CHECKING:
@@ -551,11 +550,7 @@ def cleanup_and_recover_sessions() -> None:
                     info.get("episode_id"),
                 )
             recovered += 1
-            log.debug(
-                "Recovered VOD session %s for %s",
-                session_id,
-                redact_url_credentials(url)[:50],
-            )
+            log.debug("Recovered VOD session %s for %s", session_id, url[:50])
         except Exception as e:
             log.warning("Failed to recover session from %s: %s", d, e)
             shutil.rmtree(d, ignore_errors=True)
@@ -931,7 +926,7 @@ async def seek_transcode(
         session_id,
         seek_time,
         segment_num,
-        " ".join(redact_url_credentials(arg) for arg in cmd),
+        " ".join(cmd),
     )
 
     process = await _launch_ffmpeg(cmd)
@@ -1993,7 +1988,7 @@ async def _do_start_transcode(
         "Starting transcode session %s (vod=%s): %s",
         session_id,
         is_vod,
-        " ".join(redact_url_credentials(arg) for arg in cmd),
+        " ".join(cmd),
     )
 
     process = await _launch_ffmpeg(cmd)
@@ -2187,12 +2182,7 @@ async def _monitor_fast_process(
         raise ValueError("Expected process.stderr is not None.")
     recent: list[str] = []
     while line := await process.stderr.readline():
-        message = re.sub(
-            r"https?://[^\s\]]+",
-            lambda match: redact_url_credentials(match.group()),
-            line.decode(errors="replace").rstrip(),
-        )
-        recent = (recent + [message])[-10:]
+        recent = (recent + [line.decode(errors="replace").rstrip()])[-10:]
     await process.wait()
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
@@ -2557,7 +2547,7 @@ async def _start_or_reuse(
         if remux:
             log.info(
                 "DVR live session uses a stream-copy remux instead of fast-start: %s",
-                redact_url_credentials(url),
+                url,
             )
         else:
             return await _start_fast_live(

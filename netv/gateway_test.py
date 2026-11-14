@@ -1304,6 +1304,12 @@ def test_main_runs_uvicorn(
 
     assert exit_info.value.code == 0
     assert basic_config.call_args.kwargs["level"] == expected_level
+    [handler] = basic_config.call_args.kwargs["handlers"]
+    assert isinstance(handler, logging.Handler)
+    record = logging.makeLogRecord(
+        {"msg": "Stream http://p.example/live/remote-user/remote-pass/1.ts"},
+    )
+    assert handler.format(record).endswith(" | Stream http://p.example/live/***/***/1.ts")
     kwargs = run.call_args.kwargs
     assert kwargs["port"] == (9001 if "--port" in argv else 8100)
     assert kwargs["log_level"] == uvicorn_level
