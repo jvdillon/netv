@@ -276,11 +276,11 @@ python-version = "3.12"
 include = ["*_test.py"]
 
 [tool.ty.overrides.rules]
-invalid-key = "ignore"
+invalid-typed-dict-key = "ignore"
 
 [tool.ty.rules]
 all = "warn"
-invalid-attribute-override = "ignore"
+incompatible-attribute-override = "ignore"
 
 [tool.ty.src]
 exclude = [".venv/", ".venv-ci312/", "*.egg-info/", ".pytest_cache/", "build/", "dist/", "**/third_party/", "**/typings/"]
