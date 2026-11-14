@@ -240,6 +240,15 @@ def test_redact_url_credentials():
     )
 
 
+def test_redact_url_credentials_masks_timeshift_path():
+    assert (
+        util.redact_url_credentials(
+            "http://provider.example/timeshift/remote-user/remote-pass/120/2026-11-12:20-00/42.ts",
+        )
+        == "http://provider.example/timeshift/***/***/120/2026-11-12:20-00/42.ts"
+    )
+
+
 @pytest.mark.parametrize(
     "value",
     ["http://[::1", "rtmp://user:pass@host/live/a/b/c", "not a url"],

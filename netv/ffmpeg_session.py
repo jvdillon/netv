@@ -551,7 +551,9 @@ def cleanup_and_recover_sessions() -> None:
                     info.get("episode_id"),
                 )
             recovered += 1
-            log.debug("Recovered VOD session %s for %s", session_id, url[:50])
+            log.debug(
+                "Recovered VOD session %s for %s", session_id, redact_url_credentials(url)[:50]
+            )
         except Exception as e:
             log.warning("Failed to recover session from %s: %s", d, e)
             shutil.rmtree(d, ignore_errors=True)
@@ -927,7 +929,7 @@ async def seek_transcode(
         session_id,
         seek_time,
         segment_num,
-        " ".join(cmd),
+        " ".join(redact_url_credentials(arg) for arg in cmd),
     )
 
     process = await _launch_ffmpeg(cmd)

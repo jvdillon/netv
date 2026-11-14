@@ -21,6 +21,7 @@ from treekle import json_loads
 
 from netv import cache
 from netv.cache import HwAccel, ServerSettings, clamp_live_dvr_mins, get_user_agent
+from netv.util import redact_url_credentials
 
 
 log = logging.getLogger(__name__)
@@ -397,7 +398,7 @@ def resolve_hls_master_playlist(url: str) -> str:
                         break
 
         if not variants:
-            log.warning("HLS master playlist has no variants: %s", url[:80])
+            log.warning("HLS master playlist has no variants: %s", redact_url_credentials(url)[:80])
             return url
 
         # Select highest bandwidth variant.
@@ -407,12 +408,14 @@ def resolve_hls_master_playlist(url: str) -> str:
             "HLS master playlist resolved: %d variants, selected %d bps: %s",
             len(variants),
             best_bandwidth,
-            best_url[:80],
+            redact_url_credentials(best_url)[:80],
         )
         return best_url
 
     except Exception as e:
-        log.warning("Failed to resolve HLS master playlist %s: %s", url[:80], e)
+        log.warning(
+            "Failed to resolve HLS master playlist %s: %s", redact_url_credentials(url)[:80], e
+        )
         return url
 
 
@@ -486,11 +489,11 @@ def probe_media(
         if cached:
             cache_time, media_info, subtitles = cached
             if time.time() - cache_time < probe_cache_ttl_sec:
-                log.info("Probe cache hit for %s", url[:50])
+                log.info("Probe cache hit for %s", redact_url_credentials(url)[:50])
                 return media_info, subtitles
     log.info(
         "Probe cache miss for %s (series=%s, episode=%s)",
-        url[:50],
+        redact_url_credentials(url)[:50],
         series_id,
         episode_id,
     )
@@ -524,7 +527,11 @@ def probe_media(
             if force_hls:
                 cmd.extend(["-f", "hls", "-extension_picky", "0"])
             cmd.append(url)
-            log.info("Probing%s: %s", " (HLS mode)" if force_hls else "", " ".join(cmd))
+            log.info(
+                "Probing%s: %s",
+                " (HLS mode)" if force_hls else "",
+                " ".join(redact_url_credentials(arg) for arg in cmd),
+            )
             result = subprocess.run(
                 cmd,
                 check=False,
@@ -628,7 +635,11 @@ def probe_media(
     )
     # Only cache if we got valid video info (height > 0)
     if height <= 0:
-        log.warning("Probe returned invalid height=%d, not caching: %s", height, url[:80])
+        log.warning(
+            "Probe returned invalid height=%d, not caching: %s",
+            height,
+            redact_url_credentials(url)[:80],
+        )
         return media_info, subtitles
     with _probe_lock:
         _probe_cache[url] = (time.time(), media_info, subtitles)

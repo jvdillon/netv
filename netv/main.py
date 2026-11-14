@@ -102,7 +102,7 @@ from netv.m3u import (
     load_vod_data,
 )
 from netv.playback_policy import PlaybackHealth
-from netv.util import safe_urlopen
+from netv.util import redact_url_credentials, safe_urlopen
 from netv.xtream import (
     ProviderRecord,
     XtreamClient,
@@ -1339,7 +1339,7 @@ async def player_page(
         ):
             raise HTTPException(403, "Access to series is restricted")
 
-    log.info("Play %s/%s: %s", stream_type, stream_id, info.url)
+    log.info("Play %s/%s: %s", stream_type, stream_id, redact_url_credentials(info.url))
 
     if stream_type == "live":
         await asyncio.to_thread(record_live_view, username, info.source_id, stream_id)
@@ -2719,10 +2719,10 @@ async def get_logo(
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
     except error.URLError as e:
-        log.debug("Logo fetch failed for %s: %s", url, e)
+        log.debug("Logo fetch failed for %s: %s", redact_url_credentials(url), e)
         raise HTTPException(502, "Failed to fetch logo") from None
     except Exception as e:
-        log.debug("Logo fetch error for %s: %s", url, e)
+        log.debug("Logo fetch error for %s: %s", redact_url_credentials(url), e)
         raise HTTPException(500, "Logo fetch error") from None
 
 
@@ -3625,7 +3625,7 @@ def _fetch_all_epg(epg_urls: list[tuple[str, int, str]]) -> int:
     def fetch_one(url_timeout_source: tuple[str, int, str]) -> tuple[str, int]:
         url, timeout, source_id = url_timeout_source
         try:
-            log.info("Fetching EPG (timeout=%ds): %s", timeout, url[:80])
+            log.info("Fetching EPG (timeout=%ds): %s", timeout, redact_url_credentials(url)[:80])
             count = fetch_epg(
                 url,
                 cache.CACHE_DIR,
@@ -3633,10 +3633,10 @@ def _fetch_all_epg(epg_urls: list[tuple[str, int, str]]) -> int:
                 source_id=source_id,
                 user_agent=user_agent,
             )
-            log.info("EPG done: %d programs from %s", count, url[:50])
+            log.info("EPG done: %d programs from %s", count, redact_url_credentials(url)[:50])
             return url, count
         except Exception as e:
-            log.error("EPG failed: %s - %s", url[:50], e)
+            log.error("EPG failed: %s - %s", redact_url_credentials(url)[:50], e)
             return url, 0
 
     total = 0

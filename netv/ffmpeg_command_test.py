@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import json
+import logging
 import subprocess
 import tempfile
 import time
@@ -1256,6 +1257,30 @@ class TestProbeMedia:
         assert media_info.height == 1080
         assert media_info.duration == 3600.0
         assert not media_info.interlaced
+
+    def test_probe_log_redacts_provider_credentials(self, caplog: pytest.LogCaptureFixture):
+        """The logged ffprobe command must not carry the provider username or password."""
+
+        ffmpeg_command._probe_cache.clear()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = json.dumps(
+            {
+                "streams": [{"codec_type": "video", "codec_name": "h264", "height": 720}],
+                "format": {},
+            },
+        )
+
+        with (
+            caplog.at_level(logging.INFO, logger="netv.ffmpeg_command"),
+            patch("subprocess.run", return_value=mock_result),
+            patch("netv.ffmpeg_command._load_settings", return_value={}),
+        ):
+            probe_media("http://provider.example:8080/live/remote-user/remote-pass/42.ts")
+
+        assert "provider.example:8080/live/***/***/42.ts" in caplog.text
+        assert "remote-user" not in caplog.text
+        assert "remote-pass" not in caplog.text
 
     def test_probe_interlaced_detection(self):
         """Test interlaced content detection."""
