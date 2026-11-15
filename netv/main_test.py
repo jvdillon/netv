@@ -906,22 +906,23 @@ class TestGuide:
             {"category_id": "3", "category_name": "Unavailable"},
         ]
         cache_module.get_cache()["live_categories"] = categories
+        # Page 1 holds only News channels; Sports first appears on page 2.
         cache_module.get_cache()["live_streams"] = [
             {
                 "stream_id": index,
                 "name": f"Channel {index}",
-                "category_ids": ["1" if index < 500 else "2"],
+                "category_ids": ["1" if index < 2 else "2"],
             }
-            for index in range(501)
+            for index in range(3)
         ] + [{"stream_id": 999, "name": "Hidden", "category_ids": ["3"]}]
         auth.set_user_limits("testuser", unavailable_groups=["cat:3"])
 
         first = _body(
-            auth_client.get("/api/guide/rows?cats=1,2,3&count=500"),
+            auth_client.get("/api/guide/rows?cats=1,2,3&count=2"),
             GuideRowsResponse,
         )
         second = _body(
-            auth_client.get("/api/guide/rows?cats=1,2,3&start=500&count=500"),
+            auth_client.get("/api/guide/rows?cats=1,2,3&start=2&count=2"),
             GuideRowsResponse,
         )
         reordered = _body(
@@ -929,18 +930,18 @@ class TestGuide:
             GuideRowsResponse,
         )
 
-        assert first["total"] == second["total"] == 501
-        assert len(first["rows"]) == 500
+        assert first["total"] == second["total"] == 3
+        assert len(first["rows"]) == 2
         assert len(second["rows"]) == 1
-        assert second["rows"][0]["channel"]["stream_id"] == 500
+        assert second["rows"][0]["channel"]["stream_id"] == 2
         assert first["categories"] == second["categories"] == categories[:2]
         assert reordered["categories"] == categories[1::-1]
-        assert reordered["rows"][0]["channel"]["stream_id"] == 500
+        assert reordered["rows"][0]["channel"]["stream_id"] == 2
         past_end = _body(
-            auth_client.get("/api/guide/rows?cats=1,2,3&start=600&count=10"),
+            auth_client.get("/api/guide/rows?cats=1,2,3&start=10&count=10"),
             GuideRowsResponse,
         )
-        assert (past_end["rows"], past_end["total"]) == ([], 501)
+        assert (past_end["rows"], past_end["total"]) == ([], 3)
 
     def test_guide_rows_timestamps_anchor_local_timeline(
         self,

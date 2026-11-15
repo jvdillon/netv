@@ -1790,9 +1790,9 @@ def test_archive_policy_copies_compatible_source_without_ai_upscaling(
 
 @pytest.mark.cli_ffmpeg
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-def test_probe_audio_reads_local_surround_segment(tmp_path: Path):
-    """probe_audio reports the layout that decides 5.1 handling."""
-
+def test_probes_read_local_segment(tmp_path: Path):
+    """The real ffprobe output parses into the video codec and surround audio layout."""
+    # Each ffmpeg/ffprobe launch costs ~0.45 s here, so one segment serves both probes.
     path = tmp_path / "input.ts"
     subprocess.run(
         [
@@ -1802,21 +1802,25 @@ def test_probe_audio_reads_local_surround_segment(tmp_path: Path):
             "-f",
             "lavfi",
             "-i",
-            "sine=sample_rate=48000",
+            "testsrc=size=64x64:duration=0.2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=sample_rate=48000:duration=0.2",
             "-af",
             "pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0",
-            "-t",
-            "1",
+            "-c:v",
+            "mpeg2video",
             "-c:a",
             "ac3",
             str(path),
         ],
         check=True,
     )
+    assert probe_video_codec(str(path)) == "mpeg2video"
     info = probe_audio(str(path))
     assert info is not None
     assert (info.audio_codec, info.audio_channels, info.audio_sample_rate) == ("ac3", 6, 48_000)
-    assert probe_audio(str(tmp_path / "missing.ts")) is None
 
 
 @pytest.mark.parametrize(
@@ -1911,32 +1915,6 @@ def test_probe_audio_parses_first_stream(
 def test_probe_audio_unreadable_returns_none(fake_run: FakeRun, outcome: Program):
     fake_run.program("ffprobe", outcome)
     assert probe_audio("input.ts") is None
-
-
-@pytest.mark.cli_ffmpeg
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-def test_probe_video_codec_reads_local_segment(tmp_path: Path):
-
-    path = tmp_path / "input.ts"
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=size=64x64",
-            "-t",
-            "1",
-            "-c:v",
-            "mpeg2video",
-            str(path),
-        ],
-        check=True,
-    )
-    assert probe_video_codec(str(path)) == "mpeg2video"
-    assert probe_video_codec(str(tmp_path / "missing.ts")) == ""
 
 
 @pytest.mark.parametrize(
