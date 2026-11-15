@@ -30,6 +30,7 @@ import hashlib
 import importlib
 import inspect
 import os
+import queue
 import subprocess
 import threading
 import time
@@ -56,6 +57,98 @@ class FakeStream:
         data = b"".join(self._lines)
         self._lines.clear()
         return data
+
+
+def probed_video_json() -> str:
+    """What ffprobe reports for a sample holding a video frame size and no audio."""
+    return '{"streams": [{"codec_type": "video", "codec_name": "mpeg2video", "height": 1080}]}'
+
+
+def pat_packet() -> bytes:
+    """A PAT naming program 1 at PMT PID 0x30."""
+    return b"\x47\x40\x00\x10\x00\x00\xb0\x0d\x00\x01\xc1\x00\x00\x00\x01\xe0\x30".ljust(
+        188,
+        b"\xff",
+    )
+
+
+def pmt_packet() -> bytes:
+    """A PMT packet on PID 0x30."""
+    return b"\x47\x40\x30\x10\x00\x02\xb0\x12\x00\x01\xc1\x00\x00".ljust(188, b"\xff")
+
+
+def ts_source(seconds: float = 10, packets: int = 100) -> bytes:
+    """MPEG-TS opening at a keyframe whose timestamp is ``seconds``, as a tuner sends it.
+
+    Args:
+        seconds: Presentation time of the first video frame.
+        packets: Non-key video packets following the keyframe.
+
+    Returns:
+        stream: PAT, PMT, the keyframe packet, then the other packets.
+    """
+    keyframe = video_packet(seconds, keyframe=True)
+    return pat_packet() + pmt_packet() + keyframe + video_packet(seconds) * packets
+
+
+def video_packet(seconds: float, *, keyframe: bool = False) -> bytes:
+    """A video PES start packet; a keyframe carries the random-access indicator.
+
+    Args:
+        seconds: Presentation time stamped on the packet.
+        keyframe: Mark the packet as a random-access point.
+
+    Returns:
+        packet: One 188-byte transport packet.
+    """
+    pts = int(seconds * 90_000)
+    encoded = bytes(
+        [
+            0x21 | ((pts >> 29) & 14),
+            (pts >> 22) & 255,
+            ((pts >> 14) & 254) | 1,
+            (pts >> 7) & 255,
+            ((pts << 1) & 254) | 1,
+        ],
+    )
+    pes = b"\x00\x00\x01\xe0\x00\x00\x80\x80\x05" + encoded
+    header = b"\x47\x41\x00\x30\x01\x40" if keyframe else b"\x47\x41\x00\x10"
+    return (header + pes).ljust(188, b"\xff")
+
+
+class FakeSink:
+    """An asyncio ``StreamWriter`` (a worker's stdin) recording what it receives.
+
+    Args:
+        blocked: ``drain`` never completes, as for a worker that stopped reading.
+        error: Raise this from ``write``, as for a worker that exited.
+    """
+
+    def __init__(self, *, blocked: bool = False, error: Exception | None = None) -> None:
+        self.written = bytearray()
+        self.closed = False
+        self.blocked = blocked
+        self.error = error
+        self._changed = asyncio.Event()
+
+    def write(self, data: bytes, /) -> None:
+        if self.error is not None:
+            raise self.error
+        self.written += data
+        self._changed.set()
+
+    async def drain(self) -> None:
+        if self.blocked:
+            await asyncio.Event().wait()
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_for(self, size: int) -> None:
+        """Wait until at least ``size`` bytes were written."""
+        while len(self.written) < size:
+            self._changed.clear()
+            await asyncio.wait_for(self._changed.wait(), timeout=1)
 
 
 class FakeProcess:
@@ -86,6 +179,7 @@ class FakeProcess:
     ) -> None:
         self.pid = pid
         self.exit_code = exit_code
+        self.stdin = FakeSink()
         self.stderr: FakeStream | None = FakeStream(stderr)
         self.signals: list[str] = []
         self.waits = 0
@@ -231,6 +325,7 @@ class FakePopen:
     def __init__(self, command: Sequence[str], **options: object) -> None:
         self.args = list(command)
         self.options = options
+        self.stdout = FakeUpstream()
         self.returncode: int | None = None
         self.signals: list[str] = []
         self.ignores_terminate = False
@@ -302,6 +397,9 @@ class FakeResponse:
         self._offset += len(chunk)
         return chunk
 
+    def read1(self, amt: int = -1, /) -> bytes:
+        return self.read(amt)
+
     def getcode(self) -> int:
         return self.status
 
@@ -321,6 +419,68 @@ class FakeResponse:
         tb: TracebackType | None,
     ) -> None:
         self.close()
+
+
+class FakeUpstream(FakeResponse):
+    """A live upstream body (an ``HTTPResponse``) that the test feeds chunk by chunk.
+
+    ``read1`` blocks until the test calls ``feed``, ``end``, or ``fail``, as a
+    socket read waits for the network; ``close`` unblocks a pending read.
+    """
+
+    def __init__(self, *, headers: Mapping[str, str] | None = None) -> None:
+        super().__init__(headers=headers)
+        self._items: queue.Queue[bytes | Exception] = queue.Queue()
+
+    def feed(self, data: bytes) -> None:
+        self._items.put(data)
+
+    def end(self) -> None:
+        self._items.put(b"")
+
+    def fail(self, error: Exception) -> None:
+        self._items.put(error)
+
+    @override
+    def read1(self, amt: int = -1, /) -> bytes:
+        del amt
+        item = self._items.get()
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    @override
+    def close(self) -> None:
+        super().close()
+        self._items.put(b"")
+
+
+def ended_upstream(data: bytes | None = None) -> FakeUpstream:
+    """A provider connection that sends ``data`` (default ``ts_source()``), then ends."""
+    upstream = FakeUpstream()
+    upstream.feed(ts_source() if data is None else data)
+    upstream.end()
+    return upstream
+
+
+class FakeUpstreams:
+    """A ``FakeWeb`` route opening a fresh ``FakeUpstream`` per request, keeping each.
+
+    Live upstreams block their readers until fed or closed; ``close`` them all
+    before the event loop ends so no reader thread outlives the test.
+    """
+
+    def __init__(self) -> None:
+        self.opened: list[FakeUpstream] = []
+
+    def __call__(self) -> FakeUpstream:
+        upstream = FakeUpstream()
+        self.opened.append(upstream)
+        return upstream
+
+    def close(self) -> None:
+        for upstream in self.opened:
+            upstream.close()
 
 
 Route = FakeResponse | Exception | Callable[[], FakeResponse]

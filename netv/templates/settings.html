@@ -602,13 +602,6 @@
         <p class="text-xs text-gray-400 mt-1">Keep transcoded VOD for reuse (0 = disabled)</p>
       </div>
       <div>
-        <label class="block text-sm font-medium mb-2">Live Session Timeout (seconds)</label>
-        <input type="number" name="live_transcode_cache_secs" value="{{ live_transcode_cache_secs }}"
-               min="0" max="300" step="5"
-               class="setting-input w-32 px-3 py-2 bg-gray-700 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm">
-        <p class="text-xs text-gray-400 mt-1">Keep dead session for reconnect (0 = immediate cleanup)</p>
-      </div>
-      <div>
         <label class="block text-sm font-medium mb-2">Live DVR Buffer (minutes)</label>
         <input type="number" name="live_dvr_mins" value="{{ live_dvr_mins }}"
                min="0" step="5"

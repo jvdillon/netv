@@ -64,7 +64,6 @@ class ServerSettings(TypedDict):
     transcode_mode: str
     transcode_hw: HwAccel
     vod_transcode_cache_mins: int
-    live_transcode_cache_secs: int
     live_dvr_mins: int
     transcode_dir: str
     probe_live: bool
@@ -555,8 +554,6 @@ def load_server_settings() -> ServerSettings:
         {
             "transcode_mode": "auto",
             "vod_transcode_cache_mins": 60,
-            # 0 = no caching (dead sessions cleaned immediately)
-            "live_transcode_cache_secs": 0,
             "transcode_dir": "",  # Empty = system temp dir.
             "probe_live": True,
             "probe_movies": True,

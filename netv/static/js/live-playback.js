@@ -79,12 +79,11 @@
   }
 
   class AdaptiveLivePlayback {
-    constructor({ video, hls, sessionId, playlist, onPlaylist }) {
+    constructor({ video, hls, sessionId, playlist }) {
       this.video = video;
       this.hls = hls;
       this.sessionId = sessionId;
-      this.onPlaylist = onPlaylist;
-      this.requestedPlaylist = null;
+      this.playlist = new URL(playlist, window.location.href).href;
       this.bytes = 0;
       this.downloadMs = 0;
       this.requiredBitrate = 0;
@@ -105,49 +104,17 @@
         this.requiredBitrate = duration > 0 ? stats.loaded * 8 / duration : 0;
         this.lastDownloadAt = performance.now();
       };
-      this.onManifest = () => {
-        try {
-          this.selectPlaylist(playlist);
-        } catch (error) {
-          console.warn('[LIVE] Unable to select initial rendition:', error);
-        }
-      };
-      this.onLevel = (_event, data) => {
-        const level = this.hls.levels[data.level];
-        if (level) this.onPlaylist(this.levelUrl(level).pathname);
-      };
-      if (hls) {
-        hls.startLevel = 0;
-        hls.autoLevelCapping = 0;
-        hls.on(Hls.Events.FRAG_LOADED, this.onFragment);
-        hls.on(Hls.Events.MANIFEST_PARSED, this.onManifest);
-        hls.on(Hls.Events.LEVEL_SWITCHED, this.onLevel);
-      }
+      if (hls) hls.on(Hls.Events.FRAG_LOADED, this.onFragment);
       this.poll();
     }
 
-    levelUrl(level) {
-      const url = level.uri || (Array.isArray(level.url) ? level.url[0] : level.url);
-      return new URL(url, window.location.href);
-    }
-
-    selectPlaylist(playlist) {
-      if (!this.hls || !this.hls.levels.length) return;
-      const url = new URL(playlist, window.location.href);
-      const prefix = `/transcode/${this.sessionId}/`;
-      if (url.origin !== window.location.origin || url.pathname !== `${prefix}low.m3u8`) {
-        throw new Error('Server returned an invalid live rendition');
-      }
-      const index = this.hls.levels.findIndex(level => {
-        const levelUrl = this.levelUrl(level);
-        return levelUrl.origin === url.origin && levelUrl.pathname === url.pathname;
-      });
-      if (index < 0) throw new Error('Requested live rendition is missing from the master playlist');
-      if (this.requestedPlaylist === url.href) return;
-      // A recovery generation reselects the level in place, without reopening input.
-      this.hls.autoLevelCapping = index;
-      this.hls.nextLevel = index;
-      this.requestedPlaylist = url.href;
+    // The session has one rendition; a new playlist URL marks a recovered pipeline
+    // generation, which reloads that rendition in place without reopening input.
+    followPlaylist(playlist) {
+      const url = new URL(playlist, window.location.href).href;
+      if (url === this.playlist) return;
+      this.playlist = url;
+      if (this.hls) this.hls.nextLevel = 0;
     }
 
     sample() {
@@ -191,7 +158,7 @@
         const feedback = await response.json();
         if (this.closed) return;
         if (feedback.playlist && !this.video.paused && !this.video.ended) {
-          this.selectPlaylist(feedback.playlist);
+          this.followPlaylist(feedback.playlist);
         }
         this.lastError = null;
       } catch (error) {
@@ -211,11 +178,7 @@
       this.abort.abort();
       clearTimeout(this.timer);
       clearTimeout(this.requestTimer);
-      if (this.hls) {
-        this.hls.off(Hls.Events.FRAG_LOADED, this.onFragment);
-        this.hls.off(Hls.Events.MANIFEST_PARSED, this.onManifest);
-        this.hls.off(Hls.Events.LEVEL_SWITCHED, this.onLevel);
-      }
+      if (this.hls) this.hls.off(Hls.Events.FRAG_LOADED, this.onFragment);
     }
   }
 

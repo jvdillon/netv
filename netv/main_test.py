@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -17,10 +17,11 @@ import time
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
-from starlette.types import Message
+from starlette.types import Message, Scope
 from treekle import MutablePlainTree, json_loads
 
 import pytest
+import pytest_asyncio
 
 from netv import (
     auth,
@@ -37,10 +38,8 @@ from netv import (
     util,
 )
 from netv.epg import Program
-from netv.fast_start_test import video_packet
 from netv.ffmpeg_command import MediaInfo
 from netv.main import CatchupListing, GuideRowsResponse, PlayerInfo, PlaylistPayload
-from netv.playback_policy import LiveRecoveryPolicy, PlaybackPolicy
 from netv.playlists import NameMatch, StreamSummary
 from netv.xtream import ProviderRecord
 
@@ -597,7 +596,7 @@ def test_adaptive_start_uses_shared_backend(auth_client: TestClient, tmp_path: P
     _add_fast_session("shared", tmp_path)
     response = auth_client.get(
         "/transcode/start",
-        params={"url": ADAPTIVE_URL, "fast_start": "true"},
+        params={"url": ADAPTIVE_URL},
     )
     assert response.status_code == 200
     assert response.json() == {
@@ -611,25 +610,27 @@ def test_adaptive_start_uses_shared_backend(auth_client: TestClient, tmp_path: P
     }
 
 
-@pytest.mark.parametrize("fast_start", [True, False])
-def test_disconnected_adaptive_start_is_cleaned_up(
-    mock_deps: None,
-    tmp_path: Path,
-    fast_start: bool,
-):
-    session = _add_fast_session("shared", tmp_path)
-    request = Request({"type": "http", "method": "GET", "headers": [], "query_string": b""}, _gone)
-    start = main.transcode_start(request, {"sub": "testuser"}, ADAPTIVE_URL, fast_start=fast_start)
-    if fast_start:
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disconnected", [True, False])
+async def test_disconnected_adaptive_start_is_cleaned_up(fast_live: _FastLive, disconnected: bool):
+    session_id = await fast_live.start()
+    [worker] = fast_live.launcher.processes
+    scope: Scope = {"type": "http", "method": "GET", "headers": [], "query_string": b""}
+    request = Request(scope, _gone if disconnected else _connected)
+    start = main.transcode_start(request, {"sub": "testuser"}, PROVIDER)
+    if disconnected:
         with pytest.raises(HTTPException) as excinfo:
-            asyncio.run(start)
+            await start
         assert excinfo.value.status_code == 499
-        assert "shared" not in ffmpeg_session._transcode_sessions
-        assert _signals(session) == ["TERM"]
+        assert session_id not in ffmpeg_session._transcode_sessions
+        assert worker.signals == ["TERM"]
+        assert fast_live.upstreams.opened[0].closed
+        assert worker.stdin.closed
     else:
-        assert asyncio.run(start)["session_id"] == "shared"
-        assert ffmpeg_session._transcode_sessions["shared"] is session
-        assert _signals(session) == []
+        assert (await start)["session_id"] == session_id
+        assert session_id in ffmpeg_session._transcode_sessions
+        assert worker.signals == []
+        await ffmpeg_session.stop_session(session_id, force=True)
 
 
 @pytest.mark.parametrize("owner,status", [("testuser", 200), ("other", 404)])
@@ -1128,6 +1129,19 @@ class TestVod:
         assert resp.status_code == 200
         assert "Movie 1" in resp.text
 
+    def test_vod_loads_movies_from_file_cache(self, auth_client: TestClient):
+        cats: list[ProviderRecord] = [{"category_id": "10", "category_name": "Westerns"}]
+        streams: list[ProviderRecord] = [{"stream_id": 100, "name": "Movie 1", "category_id": "10"}]
+        cache_module.save_file_cache("vod_data", {"cats": cats, "streams": streams})
+
+        resp = auth_client.get("/vod?sort=alpha")
+
+        assert resp.status_code == 200
+        assert "Westerns" in resp.text
+        assert "Movie 1" in resp.text
+        store = cache_module.get_cache()
+        assert (store.get("vod_categories"), store.get("vod_streams")) == (cats, streams)
+
     def test_vod_filters_by_category(self, auth_client: TestClient):
         cache_module.get_cache()["vod_categories"] = [
             {"category_id": "10", "category_name": "Action", "source_id": "src1"},
@@ -1537,13 +1551,18 @@ class TestTranscodeRoutes:
         assert resp.status_code == 404
 
     @pytest.mark.parametrize("method", ["DELETE", "POST"])
-    def test_transcode_stop(self, auth_client: TestClient, tmp_path: Path, method: str):
-        session = _add_session("test-session", tmp_path, last_access=0.0)
+    @pytest.mark.parametrize("vod", [True, False])
+    def test_transcode_stop(self, auth_client: TestClient, tmp_path: Path, method: str, vod: bool):
+        session = _add_session("test-session", tmp_path, last_access=0.0, fast_start=not vod)
+        session["is_vod"] = vod
         path = "/transcode/test-session" + ("/stop" if method == "POST" else "")
         resp = auth_client.request(method, path)
         assert resp.status_code == 200
         assert _fields(resp)["status"] == "stopped"
-        _assert_stopped("test-session", session, stopped=True)
+        assert _signals(session) == ["TERM"]
+        # A stopped movie keeps its segments to resume; a live session cannot resume.
+        assert ("test-session" in ffmpeg_session._transcode_sessions) is vod
+        assert tmp_path.exists() is vod
 
     def test_transcode_progress_not_found(self, auth_client: TestClient):
         resp = auth_client.get("/transcode/progress/invalid-session")
@@ -1597,15 +1616,11 @@ def _fast_session(
     *,
     origin_pts: float | None = None,
     origin_time: float = 0.0,
-    process: ffmpeg_session.ManagedProcess | None = None,
-    ingest_process: ffmpeg_session.ManagedProcess | None = None,
-    extra_processes: Sequence[ffmpeg_session.ManagedProcess] = (),
-) -> ffmpeg_session.FastLiveSession:
+) -> ffmpeg_session.TranscodeSession:
+    """A running fast-start session as playlist routes see it: a worker and a clock."""
     return {
         "dir": str(directory),
-        "process": process if process is not None else testing.FakeProcess(exit_code=None),
-        "extra_processes": list(extra_processes),
-        "ingest_process": ingest_process,
+        "process": testing.FakeProcess(exit_code=None),
         "origin_pts": origin_pts,
         "origin_time": origin_time,
         "url": "https://upstream.example/live/1.m3u8",
@@ -1613,16 +1628,13 @@ def _fast_session(
         "started": 0,
         "last_access": 0,
         "fast_start": True,
-        "live_recovery": LiveRecoveryPolicy(),
-        "ingest_restart_command": ["ingest"],
-        "low_restart_command": ["encoder", "low.m3u8"],
         "playlist_generation": 0,
     }
 
 
 def _write_segments(directory: Path, names_and_pts: list[tuple[str, float]]) -> str:
     for name, pts in names_and_pts:
-        (directory / name).write_bytes(video_packet(pts) * 10)
+        (directory / name).write_bytes(testing.video_packet(pts) * 10)
     return "".join(f"#EXTINF:2.000000,\n{name}\n" for name, _ in names_and_pts)
 
 
@@ -1639,64 +1651,128 @@ def _program_dates(text: str) -> dict[str, float]:
     return dates
 
 
-class _RestartedPipeline:
-    """Fake ffmpeg that writes what a restarted ingest and encoder would publish."""
+PROVIDER = "https://provider/live"
+LOW_HEADER = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n"
 
-    def __init__(self, directory: Path, restarted: list[tuple[str, float]]) -> None:
-        self.directory = directory
-        self.restarted = restarted
 
-    def __call__(self, command: list[str]) -> None:
-        if command[0] == "ingest":
-            (self.directory / "input_000001.ts").write_bytes(video_packet(1.48) * 10)
-            (self.directory / "input.m3u8").write_text("#EXTINF:2,\ninput_000001.ts\n")
-        else:
-            text = (self.directory / "low.m3u8").read_text()
-            (self.directory / "low.m3u8").write_text(
-                text + "#EXT-X-DISCONTINUITY\n" + _write_segments(self.directory, self.restarted),
-            )
+@pytest_asyncio.fixture
+async def upstreams(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[testing.FakeUpstreams]:
+    """The provider's live connections; closed before the loop ends to free reader threads."""
+    opened = testing.FakeUpstreams()
+    testing.install_web(monkeypatch, testing.FakeWeb({PROVIDER: opened}), util)
+    yield opened
+    opened.close()
+
+
+class _FastLive:
+    """The provider, probe and ffmpeg workers behind a real fast-start session.
+
+    Each worker launch publishes the next entry of ``renditions`` to low.m3u8, after
+    a discontinuity when an earlier worker already published there.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, upstreams: testing.FakeUpstreams) -> None:
+        self.upstreams = upstreams
+        self.clock = testing.FakeClock()
+        testing.install_clock(monkeypatch, self.clock, ffmpeg_session)
+        probe = testing.FakeRun()
+        probe.program("ffprobe", testing.Program(stdout=testing.probed_video_json()))
+        testing.install_subprocess(monkeypatch, ffmpeg_command, run=probe)
+        self.tasks = testing.BackgroundTasks()
+        monkeypatch.setattr(ffmpeg_session, "_spawn_background_task", self.tasks)
+        monkeypatch.setattr(ffmpeg_session, "_startup_guards", {})
+        self.renditions: list[list[tuple[str, float]]] = [[("low_0.ts", 10.0), ("low_1.ts", 12.0)]]
+        self.launcher = testing.ProcessLauncher(on_launch=self._publish)
+        testing.install_launcher(monkeypatch, self.launcher, ffmpeg_session)
+
+    async def start(self, *, seconds: float = 10.0) -> str:
+        """Start testuser's session of the provider, whose source opens at ``seconds``."""
+        task = asyncio.create_task(
+            ffmpeg_session.start_transcode(PROVIDER, username="testuser"),
+        )
+        await self.feed(task, connection=0, data=testing.ts_source(seconds=seconds))
+        return (await task)["session_id"]
+
+    async def feed(self, task: asyncio.Task[object], *, connection: int, data: bytes) -> None:
+        """Wait until ``task`` opens upstream ``connection``, then deliver ``data`` on it."""
+        await _until(lambda: len(self.upstreams.opened) > connection, task)
+        self.upstreams.opened[connection].feed(data)
+
+    def _publish(self, command: list[str]) -> None:
+        directory = Path(command[-1]).parent
+        playlist = directory / "low.m3u8"
+        listed = (
+            playlist.read_text() + "#EXT-X-DISCONTINUITY\n" if playlist.exists() else LOW_HEADER
+        )
+        playlist.write_text(listed + _write_segments(directory, self.renditions.pop(0)))
+
+
+@pytest.fixture
+def fast_live(
+    mock_deps: None,
+    monkeypatch: pytest.MonkeyPatch,
+    upstreams: testing.FakeUpstreams,
+) -> Iterator[_FastLive]:
+    fake = _FastLive(monkeypatch, upstreams)
+    yield fake
+    fake.tasks.discard()
+
+
+async def _until(condition: Callable[[], bool], task: asyncio.Task[object]) -> None:
+    """Yield to ``task`` until ``condition`` holds, surfacing the task's failure."""
+    for _ in range(100_000):
+        if condition():
+            return
+        if task.done():
+            task.result()
+            raise AssertionError("task finished before the condition held")
+        await asyncio.sleep(0)
+    raise AssertionError("condition never held")
 
 
 class TestFastStartRoutes:
-    def test_program_dates_stay_monotonic_after_pipeline_restart(
+    @pytest.mark.asyncio
+    async def test_program_dates_stay_monotonic_after_pipeline_restart(
         self,
-        auth_client: TestClient,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
+        client: TestClient,
+        fast_live: _FastLive,
     ):
-        directory = tmp_path / "fast"
-        directory.mkdir()
-        header = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n"
-        old = _write_segments(directory, [(f"low_{i}.ts", 5000 + 2 * i) for i in range(3)])
-        (directory / "low.m3u8").write_text(header + old)
-        session = _fast_session(directory, origin_pts=5000.0, origin_time=time.time() - 100)
-        ffmpeg_session._transcode_sessions["fast"] = session
         restarted = [(f"low_{i}.ts", 1.48 + 2 * (i - 100)) for i in range(100, 103)]
-        launcher = testing.ProcessLauncher(on_launch=_RestartedPipeline(directory, restarted))
-        testing.install_launcher(monkeypatch, launcher, ffmpeg_session)
-        tasks = testing.BackgroundTasks()
-        monkeypatch.setattr(ffmpeg_session, "_spawn_background_task", tasks)
+        fast_live.renditions = [[(f"low_{i}.ts", 5000 + 2 * i) for i in range(3)], restarted]
+        session_id = await fast_live.start(seconds=5000)
+        session = ffmpeg_session._transcode_sessions[session_id]
+        assert ffmpeg_session._is_fast_live(session)
+        listing = f"/transcode/{session_id}/low.m3u8"
+        # No client listed the old segments yet; they still keep the old clock's dates.
+        first_byte_at = session.get("origin_time", 0)
 
-        before = _program_dates(auth_client.get("/transcode/fast/low.m3u8").text)
+        # The upstream stalls for a minute, then the watchdog reconnects it.
+        fast_live.clock.advance(60)
         session["live_recovery"], permitted = session["live_recovery"].permit_restart(
             "pipeline",
-            time.monotonic(),
+            fast_live.clock.monotonic(),
         )
         assert permitted
-        asyncio.run(ffmpeg_session._restart_fast_pipeline("fast", session, "input"))
-        tasks.discard()
-        restart_time = time.time()
-        during = _program_dates(auth_client.get("/transcode/fast/low.m3u8").text)
-        (directory / "low.m3u8").write_text(
-            header + "".join(f"#EXTINF:2.000000,\n{name}\n" for name, _ in restarted),
+        restart = asyncio.create_task(
+            ffmpeg_session._restart_fast_pipeline(session_id, session, "input"),
         )
-        after = _program_dates(auth_client.get("/transcode/fast/low.m3u8").text)
+        await fast_live.feed(restart, connection=1, data=testing.ts_source(seconds=1.48))
+        await restart
+        during = _program_dates(client.get(listing).text)
+        # The old segments age out of the window.
+        (Path(session["dir"]) / "low.m3u8").write_text(
+            LOW_HEADER + "".join(f"#EXTINF:2.000000,\n{name}\n" for name, _ in restarted),
+        )
+        after = _program_dates(client.get(listing).text)
 
-        assert [c[0] for c in launcher.commands] == ["ingest", "encoder"]
+        assert len(fast_live.launcher.launches) == 2
+        assert fast_live.upstreams.opened[0].closed
         assert session.get("playlist_generation") == 1
-        assert during["low_0.ts"] == pytest.approx(before["low_0.ts"])
-        assert before["low_2.ts"] < during["low_100.ts"] <= restart_time + 1
+        assert during["low_0.ts"] == pytest.approx(first_byte_at)
+        assert during["low_2.ts"] == pytest.approx(first_byte_at + 4)
+        assert during["low_2.ts"] < during["low_100.ts"] <= fast_live.clock.now
         assert after == {name: during[name] for name, _ in restarted}
+        await ffmpeg_session.stop_session(session_id, force=True)
 
     def test_listing_reads_each_segment_timestamp_once(
         self,
@@ -1719,30 +1795,28 @@ class TestFastStartRoutes:
         assert len(_program_dates(first.text)) == 4
         assert first.text == second.text
 
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("force", [False, True])
-    def test_stop_removes_fast_session_and_lets_encoders_exit(
+    async def test_stop_removes_fast_session_and_lets_its_worker_exit(
         self,
-        auth_client: TestClient,
-        tmp_path: Path,
+        fast_live: _FastLive,
         force: bool,
     ):
+        # Even with a VOD cache window a fast-start session cannot resume, so it is not kept.
         settings = cache_module.load_server_settings()
-        settings["live_transcode_cache_secs"] = 30
+        settings["vod_transcode_cache_mins"] = 30
         cache_module.save_server_settings(settings)
-        directory = tmp_path / "fast"
-        directory.mkdir()
-        processes = [testing.FakeProcess(exit_code=None) for _ in range(3)]
-        ffmpeg_session._transcode_sessions["fast"] = _fast_session(
-            directory,
-            process=processes[0],
-            ingest_process=processes[1],
-            extra_processes=processes[1:],
-        )
-        response = auth_client.delete(f"/transcode/fast?force={str(force).lower()}")
-        assert response.status_code == 200
-        assert "fast" not in ffmpeg_session._transcode_sessions
-        assert [process.signals for process in processes] == [["TERM"]] * 3
-        assert [process.returncode for process in processes] == [-15] * 3
+        session_id = await fast_live.start()
+        directory = Path(ffmpeg_session._transcode_sessions[session_id]["dir"])
+        [worker] = fast_live.launcher.processes
+
+        stopped = await main.transcode_stop(session_id, {"sub": "testuser"}, force=force)
+
+        assert stopped == {"status": "stopped"}
+        assert session_id not in ffmpeg_session._transcode_sessions
+        assert (worker.signals, worker.returncode) == (["TERM"], -15)
+        assert worker.stdin.closed
+        assert fast_live.upstreams.opened[0].closed
         assert not directory.exists()
 
 
@@ -1811,24 +1885,31 @@ class TestPlaybackHealth:
         )
         assert response.status_code == 422
 
-    def test_feedback_is_passed_to_backend(self, auth_client: TestClient, tmp_path: Path):
-        policy = PlaybackPolicy()
-        session = _add_session("live", tmp_path, last_access=0.0, playback_policy=policy)
-        response = auth_client.post(
-            "/transcode/live/health",
-            json={"buffer_seconds": 0, "waiting": True},
-        )
-        assert response.json() == {"bandwidth_saver": False}
-        assert session.get("last_access", 0) > 0
-        assert session.get("playback_policy") is not policy
+    @pytest.mark.asyncio
+    async def test_feedback_is_passed_to_backend(
+        self,
+        auth_client: TestClient,
+        fast_live: _FastLive,
+    ):
+        session_id = await fast_live.start()
+        session = ffmpeg_session._transcode_sessions[session_id]
+        assert ffmpeg_session._is_fast_live(session)
+        policy = session["playback_policy"]
+        fast_live.clock.advance(10)
+        health = f"/transcode/{session_id}/health"
+        response = auth_client.post(health, json={"buffer_seconds": 0, "waiting": True})
+        assert response.json() == {
+            "bandwidth_saver": False,
+            "playlist": f"/transcode/{session_id}/low.m3u8",
+        }
+        assert session.get("last_access") == fast_live.clock.now
+        assert session["playback_policy"] is not policy
 
         auth.create_user("other", "otherpass1")
         auth_client.cookies.set("token", auth.create_token({"sub": "other"}))
-        response = auth_client.post(
-            "/transcode/live/health",
-            json={"buffer_seconds": 0, "waiting": True},
-        )
+        response = auth_client.post(health, json={"buffer_seconds": 0, "waiting": True})
         assert response.status_code == 404
+        await ffmpeg_session.stop_session(session_id, force=True)
 
     @pytest.mark.parametrize("owner,status", [("testuser", 200), ("other", 404)])
     def test_force_stop_requires_owner(
@@ -2618,7 +2699,6 @@ def _add_session(
     origin_time: float = 0.0,
     playback_buffer_seconds: float = 12.0,
     caption_timestamp_origin: float | None = None,
-    playback_policy: PlaybackPolicy | None = None,
 ) -> ffmpeg_session.TranscodeSession:
     """Register a running live session, as a started transcode leaves it."""
     session: ffmpeg_session.TranscodeSession = {
@@ -2633,7 +2713,6 @@ def _add_session(
         "origin_pts": origin_pts,
         "origin_time": origin_time,
         "playback_buffer_seconds": playback_buffer_seconds,
-        "playback_policy": playback_policy or PlaybackPolicy(),
     }
     if caption_timestamp_origin is not None:
         session["caption_timestamp_origin"] = caption_timestamp_origin
@@ -2707,6 +2786,10 @@ def _watching(stream_id: str, now: float) -> None:
 
 async def _gone() -> Message:
     return {"type": "http.disconnect"}
+
+
+async def _connected() -> Message:
+    return {"type": "http.request", "body": b"", "more_body": False}
 
 
 class _JsonResponse(Protocol):

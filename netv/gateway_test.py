@@ -15,6 +15,7 @@ import sys
 import time
 
 from fastapi import Request
+from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 from treekle import MutablePlainTree, ReadError, json_loads
 
@@ -345,8 +346,10 @@ def test_upscale_live_stream_starts_session(
 ):
     client, _ = gateway_client
     _set_upscale(sr_model=MODEL)
-    _cache_live_sessions()
-    sessions["upscale-session"] = _session(tmp_path / "upscale", url=UPSTREAM)
+    # The player already watches this channel, so its running live session is reused.
+    running = _session(tmp_path / "upscale", url=UPSTREAM)
+    running.update(process=testing.FakeProcess(exit_code=None), fast_start=True)
+    sessions["upscale-session"] = running
     ffmpeg_session._url_to_session[UPSTREAM] = "upscale-session"
 
     response = client.get(
@@ -355,7 +358,7 @@ def test_upscale_live_stream_starts_session(
     )
 
     assert response.status_code == 302
-    assert response.headers["location"] == "/upscale/upscale-session/stream.m3u8"
+    assert response.headers["location"] == "/upscale/upscale-session/low.m3u8"
     assert cache.load_live_view_counts("player") == {"src_1:987": 1}
 
 
@@ -557,13 +560,6 @@ def _source() -> SourceConfig:
         "username": "remote-user",
         "password": "remote-pass",
     }
-
-
-def _cache_live_sessions() -> None:
-    """Keep finished live sessions reusable, so a fresh one is reused rather than started."""
-    settings = cache.load_server_settings()
-    settings["live_transcode_cache_secs"] = 3600
-    cache.save_server_settings(settings)
 
 
 def _session(
@@ -1109,13 +1105,17 @@ def _start_upscale(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     client: TestClient,
+    web: testing.FakeWeb,
 ) -> tuple[testing.ProcessLauncher, int]:
     """Request the upscaled stream with a scripted ffmpeg that exits at once."""
     _set_upscale(sr_model=MODEL)
     settings = cache.load_server_settings()
     settings["transcode_dir"] = str(tmp_path / "transcodes")
-    settings["probe_live"] = False
     cache.save_server_settings(settings)
+    web.routes[UPSTREAM] = testing.ended_upstream
+    probe = testing.FakeRun()
+    probe.program("ffprobe", testing.Program(stdout=testing.probed_video_json()))
+    testing.install_subprocess(monkeypatch, ffmpeg_command, run=probe)
     launcher = testing.ProcessLauncher([testing.FakeProcess(exited=True, exit_code=1)])
     testing.install_launcher(monkeypatch, launcher, ffmpeg_session)
     testing.install_clock(monkeypatch, testing.FakeClock(), ffmpeg_session)
@@ -1130,16 +1130,20 @@ def test_upscale_live_stream_transcodes_resolved_upstream(
     gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    web: testing.FakeWeb,
 ):
     client, _ = gateway_client
 
-    launcher, status = _start_upscale(monkeypatch, tmp_path, client)
+    launcher, status = _start_upscale(monkeypatch, tmp_path, client, web)
 
     # The scripted ffmpeg exited at once, so the start itself fails.
     assert status == 500
+    # The session's relay reads the resolved upstream; the worker reads the relay.
+    assert UPSTREAM in web.urls
     [command] = launcher.commands
-    assert UPSTREAM in command
-    # Without probe data a source deinterlaces by default.
+    assert UPSTREAM not in command
+    assert command[command.index("-i") + 1] == "pipe:0"
+    # Without interlacing facts a source deinterlaces by default.
     assert any("yadif" in arg for arg in command)
 
 
@@ -1147,11 +1151,12 @@ def test_upscale_live_stream_applies_source_settings(
     gateway_client: GatewayClient,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    web: testing.FakeWeb,
 ):
     client, _ = gateway_client
     _set_sources({**_source(), "max_streams": 3, "deinterlace_fallback": False})
 
-    launcher, status = _start_upscale(monkeypatch, tmp_path, client)
+    launcher, status = _start_upscale(monkeypatch, tmp_path, client, web)
 
     assert status == 500
     [command] = launcher.commands
@@ -1163,13 +1168,14 @@ def test_upscale_live_stream_applies_source_limit(
     monkeypatch: pytest.MonkeyPatch,
     sessions: dict[str, TranscodeSession],
     tmp_path: Path,
+    web: testing.FakeWeb,
 ):
     client, _ = gateway_client
     _set_sources({**_source(), "max_streams": 3})
     for name in ("a", "b", "c"):
         sessions[name] = _session(tmp_path / name, url=f"http://up/{name}", username="other")
 
-    launcher, status = _start_upscale(monkeypatch, tmp_path, client)
+    launcher, status = _start_upscale(monkeypatch, tmp_path, client, web)
 
     assert status == 429
     assert launcher.launches == []
@@ -1181,13 +1187,14 @@ def test_upscale_live_stream_applies_user_limit(
     monkeypatch: pytest.MonkeyPatch,
     sessions: dict[str, TranscodeSession],
     tmp_path: Path,
+    web: testing.FakeWeb,
 ):
     client, _ = gateway_client
     assert auth.set_user_limits("player", max_streams_per_source={"src_1": 2})
     sessions["old"] = _session(tmp_path / "old", url="http://up/old", started=1.0)
     sessions["new"] = _session(tmp_path / "new", url="http://up/new", started=2.0)
 
-    launcher, _ = _start_upscale(monkeypatch, tmp_path, client)
+    launcher, _ = _start_upscale(monkeypatch, tmp_path, client, web)
 
     # The user's limit of two stopped their oldest stream to make room.
     assert "old" not in sessions
@@ -1198,6 +1205,7 @@ def test_upscale_live_stream_applies_user_limit(
 def test_live_stream_upstream_failure_is_bad_gateway(
     gateway_client: GatewayClient,
     web: testing.FakeWeb,
+    caplog: pytest.LogCaptureFixture,
 ):
     client, _ = gateway_client
     web.routes[UPSTREAM] = error.URLError("refused")
@@ -1206,6 +1214,10 @@ def test_live_stream_upstream_failure_is_bad_gateway(
 
     assert response.status_code == 502
     assert response.json() == {"detail": "Unable to connect to upstream stream"}
+    # The log names the failure's type, never the URL with its credentials.
+    assert [(r.levelname, r.getMessage()) for r in caplog.records if r.name == "netv.gateway"] == [
+        ("WARNING", "Gateway upstream connection failed (URLError)"),
+    ]
 
 
 def test_proxy_url_forwards_length_and_encoding(web: testing.FakeWeb):
@@ -1219,7 +1231,11 @@ def test_proxy_url_forwards_length_and_encoding(web: testing.FakeWeb):
     )
     web.routes["http://up"] = upstream
 
-    response = asyncio.run(gateway._proxy_url("http://up"))
+    async def proxy() -> tuple[StreamingResponse, list[object]]:
+        response = await gateway._proxy_url("http://up")
+        return response, [chunk async for chunk in response.body_iterator]
+
+    response, body = asyncio.run(proxy())
 
     [fetch] = web.fetches
     assert (fetch.url, fetch.timeout, fetch.headers) == ("http://up", 30, {"User-agent": "agent/1"})
@@ -1227,7 +1243,7 @@ def test_proxy_url_forwards_length_and_encoding(web: testing.FakeWeb):
     assert response.headers["content-length"] == "5"
     assert response.headers["content-encoding"] == "gzip"
     assert response.headers["cache-control"] == "no-store"
-    assert list(gateway._iter_upstream(upstream)) == [b"abcde"]
+    assert body == [b"abcde"]
     assert upstream.closed
 
 

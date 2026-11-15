@@ -9,7 +9,12 @@ from netv.cache import Source
 from netv.chromecast import CastSession
 from netv.epg import Program
 from netv.ffmpeg_command import MediaInfo, SubtitleStream
-from netv.ffmpeg_session import _FastLiveStartup, _SeekSessionInfo, _SessionSnapshot, _StartupGuard
+from netv.ffmpeg_session import (
+    _FastLivePlan,
+    _SeekSessionInfo,
+    _SessionSnapshot,
+    _StartupGuard,
+)
 from netv.gateway_catalog import CatalogSnapshot, GatewayStream
 from netv.handoff import Channel, HandoffPolicy, _Watch
 from netv.main import PlayerInfo
@@ -59,14 +64,18 @@ from netv.xtream import XtreamClient
             "url",
         ),
         (
-            _FastLiveStartup(
-                session_id="s",
-                directory="d",
-                processes=[],
-                started=0,
-                is_disconnected=None,
+            _FastLivePlan(
+                source_url="url",
+                user_agent=None,
+                hw="software",
+                resolution="1080p",
+                quality="high",
+                deinterlace=False,
+                bandwidth_saver=False,
+                audio_passthrough=False,
+                dvr=False,
             ),
-            "started",
+            "source_url",
         ),
         (_StartupGuard(), "users"),
         (

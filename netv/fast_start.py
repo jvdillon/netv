@@ -1,4 +1,4 @@
-"""Single upstream ingest and one local encoder for live fast start."""
+"""Live fast start: one worker per session, fed by the relay over stdin."""
 
 from datetime import datetime, timezone
 from urllib import parse
@@ -39,7 +39,9 @@ def live_buffer_durations(
     """
     valid = [value for value in segment_durations if math.isfinite(value) and value > 0]
     upstream_duration = max(valid, default=4.0)
-    startup_buffer = max(8.0, 2 * upstream_duration)
+    # Live media arrives in real time, so each second of reserve is a second of
+    # startup delay. Two upstream segments bridge the gap until the next one.
+    startup_buffer = 2 * upstream_duration
     playback_buffer = min(
         max_playback_buffer_seconds,
         max(playback_buffer_seconds, startup_buffer),
@@ -76,23 +78,26 @@ def is_hls_url(url: str) -> bool:
     return path.endswith((".m3u8", ".m3u"))
 
 
-def ingest_command(
-    url: str,
-    directory: str,
-    user_agent: str | None,
-    *,
-    restarting: bool = False,
-) -> list[str]:
-    # Remux only. No probe subprocess and no encoder may open the upstream URL.
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
-    cmd += http_reconnect_args(url, max_delay=5)
+def source_command(url: str, user_agent: str | None) -> list[str]:
+    """Remux an HLS source into the single MPEG-TS byte stream the relay reads.
+
+    Args:
+        url: HLS media playlist URL.
+        user_agent: User-Agent for upstream requests, or None for ffmpeg's.
+
+    Returns:
+        cmd: FFmpeg arguments writing MPEG-TS to stdout.
+    """
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", *http_reconnect_args(url, max_delay=5)]
     if user_agent is not None:
         cmd += ["-user_agent", user_agent]
-    if is_hls_url(url):
-        # Providers often serve segments without media extensions. The option
-        # only exists on the HLS demuxer, so it cannot be passed for raw TS.
-        cmd += ["-f", "hls", "-extension_picky", "0"]
-    output = [
+    return [
+        *cmd,
+        # Providers often serve segments without media extensions.
+        "-f",
+        "hls",
+        "-extension_picky",
+        "0",
         "-probesize",
         "5000000",
         "-analyzeduration",
@@ -106,22 +111,9 @@ def ingest_command(
         "-c",
         "copy",
         "-f",
-        "hls",
-        "-hls_time",
-        "1",
-        "-hls_list_size",
-        "120",
-        "-hls_flags",
-        "delete_segments+temp_file" + ("+discont_start" if restarting else ""),
+        "mpegts",
+        "pipe:1",
     ]
-    if restarting:
-        output += ["-hls_start_number_source", "epoch_us"]
-    output += [
-        "-hls_segment_filename",
-        f"{directory}/input_%06d.ts",
-        f"{directory}/input.m3u8",
-    ]
-    return cmd + output
 
 
 def encoder_command(
@@ -138,7 +130,7 @@ def encoder_command(
     video_codec: str = "",
 ) -> list[str]:
     cmd = build_hls_ffmpeg_cmd(
-        f"{directory}/input.m3u8",
+        "pipe:0",
         hw,
         directory,
         False,
@@ -153,76 +145,70 @@ def encoder_command(
         audio_passthrough=audio_passthrough,
         video_codec=video_codec,
     )
-    index = cmd.index("-i")
-    cmd[index:index] = ["-live_start_index", "-3" if restarting else "0"]
-    # MPEG-2 (HDHomeRun) sequence headers can arrive ~1MB in; probing less
-    # leaves the size unknown and yields 90000fps garbage output.
+    cmd[cmd.index("-i") : cmd.index("-i")] = ["-f", "mpegts"]
     cmd[cmd.index("-probesize") + 1] = "5000000"
-    cmd[cmd.index("-analyzeduration") + 1] = "2000000"
+    # The relay starts workers at a keyframe (keyframe_replay); the window only
+    # needs to reach the first audio, muxed up to ~0.7 s behind its video.
+    cmd[cmd.index("-analyzeduration") + 1] = "800000"
     # Preserve the source timeline that program dates are derived from.
     cmd[1:1] = ["-copyts"]
-    # "low" is a legacy client contract (web and Apple players); it is the only rendition.
-    cmd[cmd.index("-hls_segment_filename") + 1] = f"{directory}/low_%06d.ts"
-    flags = "delete_segments+temp_file"
-    if restarting:
-        flags += "+append_list+discont_start"
-    cmd[cmd.index("-hls_flags") + 1] = flags
-    duration = "2"
-    cmd[cmd.index("-hls_time") + 1] = duration
-    cmd[cmd.index("-hls_list_size") + 1] = str(get_live_hls_list_size(float(duration)))
-    cmd[-1:-1] = [
+    # Every B-frame or lookahead frame holds output back from a starting viewer.
+    for option in ("-bf", "-rc-lookahead", "-look_ahead", "-look_ahead_depth"):
+        if option in cmd:
+            del cmd[cmd.index(option) : cmd.index(option) + 2]
+    del cmd[cmd.index("-f", cmd.index("-max_delay")) :]
+    cmd += [
+        "-bf",
+        "0",
+        # Four quarter-second keyframes cut the short first segments, then one a second.
         "-force_key_frames",
-        f"expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+{duration}))",
+        "expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+if(lt(n_forced,4),0.25,1)))",
     ]
-    cmd[-1] = f"{directory}/low.m3u8"
+    # These encoders mark forced non-IDR I-frames as non-key, so HLS cannot cut there.
+    if cmd[cmd.index("-c:v") + 1] in ("h264_nvenc", "libx264"):
+        cmd += ["-forced-idr", "1"]
+    cmd += _hls_output(directory, restarting=restarting)
     limit_live_video_bitrate(cmd, resolution)
     return cmd
 
 
 def remux_command(directory: str, *, restarting: bool = False) -> list[str]:
-    """Stream-copy the ingest output into the DVR-length rendition.
+    """Stream-copy the relay into the DVR-length rendition.
 
     Takes the encoder's place when the source already plays everywhere: same
     input, output names, segment length, and source timeline, without decoding.
 
     Args:
-        directory: Session directory holding input.m3u8.
-        restarting: Resume an existing rendition after a pipeline restart.
+        directory: Session directory receiving low.m3u8.
+        restarting: Resume an existing rendition after a worker restart.
 
     Returns:
         cmd: FFmpeg arguments.
     """
-    duration = "2"
-    flags = "delete_segments+temp_file" + ("+append_list+discont_start" if restarting else "")
     return [
         "ffmpeg",
         "-copyts",
         "-hide_banner",
         "-loglevel",
         "error",
-        "-live_start_index",
-        "-3" if restarting else "0",
+        # Input starts at a keyframe; reach the first audio (see encoder_command).
+        "-analyzeduration",
+        "800000",
+        "-f",
+        "mpegts",
         "-i",
-        f"{directory}/input.m3u8",
+        "pipe:0",
         "-map",
-        "0",
+        "0:v:0",
+        "-map",
+        "0:a:0",
         "-c",
         "copy",
         # The MPEG-TS muxer otherwise delays every timestamp by 2 x max_delay (1.4 s);
-        # program dates assume segments keep the ingest's timestamps.
+        # program dates assume segments keep the source's timestamps.
         "-max_delay",
         "0",
-        "-f",
-        "hls",
-        "-hls_time",
-        duration,
-        "-hls_list_size",
-        str(get_live_hls_list_size(float(duration))),
-        "-hls_segment_filename",
-        f"{directory}/low_%06d.ts",
-        "-hls_flags",
-        flags,
-        f"{directory}/low.m3u8",
+        *_hls_output(directory, restarting=restarting),
     ]
 
 
@@ -285,14 +271,6 @@ def surround_audio_bitrate(audio: MediaInfo | None, passthrough: bool) -> int:
     return 0
 
 
-def playlist_duration(directory: str, name: str) -> float:
-    try:
-        content = (pathlib.Path(directory) / name).read_text()
-        return sum(float(value) for value in re.findall(r"#EXTINF:([\d.]+)", content))
-    except (OSError, ValueError):
-        return 0
-
-
 def segment_pts(path: pathlib.Path) -> float | None:
     """Read the first video PES presentation timestamp in an MPEG-TS segment.
 
@@ -304,9 +282,72 @@ def segment_pts(path: pathlib.Path) -> float | None:
     """
     try:
         with path.open("rb") as source:
-            data = source.read(188 * 512)
+            return first_video_pts(source.read(188 * 512))
     except OSError:
         return None
+
+
+# A transport packet starting a table section or PES: sync byte, unit-start set, no error.
+_UNIT_START = re.compile(rb"\x47[\x40-\x5f]")
+
+
+def keyframe_replay(data: bytes) -> bytes | None:
+    """MPEG-TS from the last video keyframe, prefixed with the stream's PAT and PMT.
+
+    A worker fed this decodes from its first packet, so its stream analysis is
+    nearly instant; nothing before a keyframe is decodable anyway.
+
+    Args:
+        data: MPEG-TS packets; may start mid-packet.
+
+    Returns:
+        replay: PAT, PMT, and the packets from the keyframe on, or None before
+            a keyframe and both tables have arrived.
+    """
+    sync = next((o for o in range(188) if data[o : o + 377 : 188] == b"\x47\x47\x47"), None)
+    if sync is None:
+        return None
+    pat = pmt = b""
+    keyframe = pmt_pid = None
+    # Only packets starting a table section or PES matter; the regex finds them in C.
+    for match in _UNIT_START.finditer(data, sync):
+        offset = match.start()
+        if (offset - sync) % 188 or offset + 188 > len(data):
+            continue
+        packet = data[offset : offset + 188]
+        pid = (packet[1] & 0x1F) << 8 | packet[2]
+        adaptation = packet[3] & 0x20
+        payload = packet[5 + packet[4] :] if adaptation else packet[4:]
+        if pid == 0:
+            pat = packet
+            # Pointer field, 8-byte table header, then the first program's entry.
+            entry = payload[1 + payload[0] + 8 : 1 + payload[0] + 12]
+            pmt_pid = (entry[2] & 0x1F) << 8 | entry[3] if len(entry) == 4 else pmt_pid
+        elif pid == pmt_pid:
+            pmt = packet
+        elif (
+            adaptation
+            and packet[4]
+            and packet[5] & 0x40  # random_access_indicator.
+            and len(payload) > 3
+            and payload[:3] == b"\x00\x00\x01"
+            and 0xE0 <= payload[3] <= 0xEF  # A video stream id.
+        ):
+            keyframe = offset
+    if keyframe is None or not pat or not pmt:
+        return None
+    return pat + pmt + data[keyframe:]
+
+
+def first_video_pts(data: bytes) -> float | None:
+    """Read the first video PES presentation timestamp in MPEG-TS bytes.
+
+    Args:
+        data: MPEG-TS packets.
+
+    Returns:
+        timestamp: Presentation time in seconds, or None when absent.
+    """
     for offset in range(0, len(data) - 187, 188):
         packet = data[offset : offset + 188]
         if packet[0] != 0x47 or not packet[1] & 0x40:
@@ -335,7 +376,7 @@ def dated_playlist(
 ) -> tuple[str, dict[str, float]]:
     """Map the rendition to the source clock, independent of encoder warm-up.
 
-    A segment keeps the date it was first given: an ingest restart moves the
+    A segment keeps the date it was first given: a relay restart moves the
     clock origin, and redating older segments still in the window would move
     them in time.
 
@@ -408,3 +449,25 @@ def ready_bitrate(
         return max(rates)
     except (OSError, ValueError):
         return 0
+
+
+def _hls_output(directory: str, *, restarting: bool) -> list[str]:
+    """HLS muxer options shared by every worker: short segments over the DVR window."""
+    duration = 1.0
+    flags = "delete_segments+temp_file" + ("+append_list+discont_start" if restarting else "")
+    return [
+        "-f",
+        "hls",
+        "-hls_time",
+        "1",
+        # Playback starts after two segments; short first ones cut the wait.
+        "-hls_init_time",
+        "0.25",
+        "-hls_list_size",
+        str(get_live_hls_list_size(duration)),
+        "-hls_segment_filename",
+        f"{directory}/low_%06d.ts",
+        "-hls_flags",
+        flags,
+        f"{directory}/low.m3u8",
+    ]

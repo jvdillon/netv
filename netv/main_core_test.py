@@ -931,10 +931,15 @@ def test_transcode_start_rotates_users_oldest_stream(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     sessions: dict[str, TranscodeSession],
+    web: testing.FakeWeb,
 ) -> None:
     _limited_source(tmp_path)
     sessions["old"] = _session(tmp_path / "old", source_id="s1", started=1.0)
     sessions["new"] = _session(tmp_path / "new", source_id="s1", started=2.0)
+    web.routes["http://up/l"] = testing.ended_upstream
+    probe = testing.FakeRun()
+    probe.program("ffprobe", testing.Program(stdout=testing.probed_video_json()))
+    testing.install_subprocess(monkeypatch, ffmpeg_command, run=probe)
     launcher = testing.ProcessLauncher([testing.FakeProcess(exited=True, exit_code=1)])
     testing.install_launcher(monkeypatch, launcher, ffmpeg_session)
     testing.install_clock(monkeypatch, testing.FakeClock(), ffmpeg_session)
@@ -947,7 +952,10 @@ def test_transcode_start_rotates_users_oldest_stream(
     assert resp.status_code == 500
     assert set(sessions) == {"new"}
     assert not (tmp_path / "old").exists()
-    assert "http://up/l" in launcher.commands[0]
+    # The new session's relay read the upstream; its worker read the relay.
+    assert "http://up/l" in web.urls
+    [command] = launcher.commands
+    assert command[command.index("-i") + 1] == "pipe:0"
 
 
 def test_transcode_seek_and_progress(

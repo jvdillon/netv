@@ -16,7 +16,7 @@ Examples:
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -45,6 +45,7 @@ from netv.cache import ServerSettings
 from netv.gateway_catalog import CatalogSnapshot, GatewayCatalog, GatewayStream
 from netv.gateway_epg import EpgUnavailableError, build_filtered_xmltv
 from netv.m3u import get_xtream_client_by_source
+from netv.relay import Feed, Relay
 from netv.util import configure_logging, safe_urlopen
 from netv.xtream import credentials_path
 
@@ -394,7 +395,7 @@ async def live_stream(request: Request, stream_path: str) -> Response:
             source_max_streams=0 if source is None else source.get("max_streams", 0),
         )
         return RedirectResponse(
-            f"/upscale/{result['session_id']}/stream.m3u8",
+            f"/upscale/{result['session_id']}/low.m3u8",
             status_code=302,
         )
     return await _proxy_url(_resolve_upstream(stream, extension))
@@ -643,18 +644,13 @@ def _resolve_upstream(stream: GatewayStream, extension: str) -> str:
     return client.build_stream_url("live", int(stream.upstream_id), extension)
 
 
-class _ByteStream(Protocol):
-    """Readable, closable upstream HTTP body."""
-
-    def read(self, amt: int, /) -> bytes: ...
-
-    def close(self) -> None: ...
-
-
-def _iter_upstream(upstream: _ByteStream) -> Iterator[bytes]:
-    with contextlib.closing(upstream):
-        while chunk := upstream.read(64 * 1024):
+async def _relay_body(stream: Relay, feed: Feed) -> AsyncGenerator[bytes]:
+    """Yield the relay's bytes; a client that leaves closes the upstream."""
+    try:
+        async for chunk in feed:
             yield chunk
+    finally:
+        await stream.close()
 
 
 async def _proxy_url(url: str) -> StreamingResponse:
@@ -669,14 +665,21 @@ async def _proxy_url(url: str) -> StreamingResponse:
         log.warning("Gateway upstream connection failed (%s)", type(exc).__name__)
         raise HTTPException(502, "Unable to connect to upstream stream") from exc
     content_type = upstream.headers.get("Content-Type") or "video/mp2t"
-    headers = {"Cache-Control": "no-store"}
+    # Response header names are case-insensitive; Starlette sends them lowercase.
+    headers = {"cache-control": "no-store"}  # pragma: no mutate
     content_length = upstream.headers.get("Content-Length")
     if content_length is not None and content_length:
-        headers["Content-Length"] = content_length
+        headers["content-length"] = content_length  # pragma: no mutate
     content_encoding = upstream.headers.get("Content-Encoding")
     if content_encoding is not None and content_encoding:
-        headers["Content-Encoding"] = content_encoding
-    return StreamingResponse(_iter_upstream(upstream), media_type=content_type, headers=headers)
+        headers["content-encoding"] = content_encoding  # pragma: no mutate
+    # The client pulls at its own pace; one that falls far behind is dropped
+    # rather than stalling the upstream read. Its only subscriber joins before
+    # the first byte, so the relay keeps no history (memory, not behavior).
+    stream, feed = Relay(lambda: upstream, history_sec=0), Feed()  # pragma: no mutate
+    stream.subscribe(feed)
+    await stream.start()
+    return StreamingResponse(_relay_body(stream, feed), media_type=content_type, headers=headers)
 
 
 if __name__ == "__main__":

@@ -979,7 +979,6 @@
       if (cfg.seriesName) url += '&series_name=' + encodeURIComponent(cfg.seriesName);
       if (cfg.deinterlaceFallback !== undefined) url += '&deinterlace_fallback=' + (cfg.deinterlaceFallback ? '1' : '0');
       if (cfg.sourceId) url += '&source_id=' + encodeURIComponent(cfg.sourceId);
-      if (!cfg.isVod) url += '&fast_start=true';
       const data = await transcodeSession.start(url);
       if (!data) return;
       transcodeSessionId = data.session_id;
@@ -1192,7 +1191,6 @@
       hls,
       sessionId: transcodeSessionId,
       playlist: adaptiveSession.playlist,
-      onPlaylist: playlist => { transcodePlaylist = playlist; },
     });
   }
 

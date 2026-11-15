@@ -9,6 +9,7 @@ from urllib import error, request
 
 import asyncio
 import hashlib
+import json
 import os
 import pathlib
 import signal
@@ -21,7 +22,7 @@ from pychromecast.error import PyChromecastError
 import pytest
 import uvicorn
 
-from netv import testing, util
+from netv import fast_start, testing, util
 
 
 @pytest.mark.asyncio
@@ -217,6 +218,96 @@ def test_response_reads_in_chunks_and_closes():
         assert body.headers.get("content-type") == "image/png"
         assert body.getcode() == 201
     assert response.closed
+    assert testing.FakeResponse(b"abc").read1(2) == b"ab"
+
+
+def test_probed_video_json_reports_a_video_frame_size_without_audio():
+    (stream,) = json.loads(testing.probed_video_json())["streams"]
+    assert (stream["codec_type"], stream["height"]) == ("video", 1080)
+
+
+def test_ts_source_opens_with_tables_and_a_replayable_keyframe():
+    source = testing.ts_source(12, packets=3)
+    assert len(source) == 188 * 6
+    assert source[:188] == testing.pat_packet()
+    assert source[188:376] == testing.pmt_packet()
+    assert fast_start.keyframe_replay(source) == source
+    assert fast_start.first_video_pts(source) == 12
+
+
+def test_only_a_keyframe_packet_is_a_random_access_point():
+    keyframe = testing.video_packet(3, keyframe=True)
+    plain = testing.video_packet(3)
+    assert len(keyframe) == len(plain) == 188
+    assert fast_start.first_video_pts(keyframe) == fast_start.first_video_pts(plain) == 3
+    tables = testing.pat_packet() + testing.pmt_packet()
+    assert fast_start.keyframe_replay(tables + plain * 3) is None
+    assert fast_start.keyframe_replay(testing.pat_packet() + keyframe * 3) is None
+
+
+@pytest.mark.asyncio
+async def test_sink_records_writes_and_waits_for_them():
+    sink = testing.FakeSink()
+    waiter = asyncio.ensure_future(sink.wait_for(3))
+    await asyncio.sleep(0)
+    sink.write(b"ab")
+    await asyncio.sleep(0)
+    assert not waiter.done()
+    sink.write(b"c")
+    await waiter
+    await sink.drain()
+    sink.close()
+    assert (bytes(sink.written), sink.closed) == (b"abc", True)
+
+
+@pytest.mark.asyncio
+async def test_sink_can_fail_writes_or_block_drain():
+    failing = testing.FakeSink(error=BrokenPipeError())
+    with pytest.raises(BrokenPipeError):
+        failing.write(b"x")
+    assert failing.written == b""
+    drain = asyncio.ensure_future(testing.FakeSink(blocked=True).drain())
+    await asyncio.sleep(0)
+    assert not drain.done()
+    drain.cancel()
+
+
+def test_upstream_serves_fed_chunks_then_end_or_failure():
+    upstream = testing.FakeUpstream(headers={"Content-Type": "video/mp2t"})
+    upstream.feed(b"ab")
+    upstream.fail(ConnectionResetError())
+    upstream.end()
+    assert upstream.read1(1) == b"ab"
+    with pytest.raises(ConnectionResetError):
+        upstream.read1()
+    assert upstream.read1() == b""
+    assert upstream.headers.get("content-type") == "video/mp2t"
+
+
+def test_closing_an_upstream_unblocks_a_pending_read():
+    upstream = testing.FakeUpstream()
+    chunks: list[bytes] = []
+    reader = threading.Thread(target=lambda: chunks.append(upstream.read1()))
+    reader.start()
+    upstream.close()
+    reader.join(timeout=5)
+    assert (chunks, upstream.closed) == ([b""], True)
+
+
+def test_ended_upstream_sends_its_data_then_ends():
+    default = testing.ended_upstream()
+    assert (default.read1(), default.read1()) == (testing.ts_source(), b"")
+    assert testing.ended_upstream(b"x").read1() == b"x"
+
+
+def test_upstreams_open_one_per_request_and_close_them_all():
+    upstreams = testing.FakeUpstreams()
+    first, second = upstreams(), upstreams()
+    assert first is not second
+    assert upstreams.opened == [first, second]
+    upstreams.close()
+    assert all(upstream.closed for upstream in upstreams.opened)
+    assert (first.read1(), second.read1()) == (b"", b"")
 
 
 def test_web_routes_by_url_and_records_requests():
@@ -541,7 +632,7 @@ def test_cast_network_connects_and_discovers(monkeypatch: pytest.MonkeyPatch):
     with pytest.raises(PyChromecastError, match=r"no receiver at 192\.168\.1\.9"):
         module.get_chromecast_from_host(("192.168.1.9", 8009))
     assert network.connects == ["192.168.1.5", "192.168.1.9"]
-    assert not network.browsing
+    assert network.browsing is False
     with module.Zeroconf() as zconf:
         browser = module.CastBrowser(object(), zconf)
         browser.start_discovery()

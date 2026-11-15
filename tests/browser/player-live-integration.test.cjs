@@ -83,7 +83,6 @@ async function player({
   const beacons = [];
   const errors = [];
   let sessionNumber = 0;
-  let rendition = 'low';
   let windowStart = 0;
   let castStatus = initialCast || { active: false };
   const engines = [];
@@ -118,7 +117,8 @@ async function player({
     loadSource(url) {
       this.sources.push(url);
       if (url.endsWith('/master.m3u8')) {
-        this.levels = ['low', 'high'].map(name => ({
+        // The server's master lists its single rendition.
+        this.levels = ['low'].map(name => ({
           uri: 'http://netv.test' + url.replace('master.m3u8', `${name}.m3u8`),
           details: { get fragments() { return [{ start: windowStart }]; } },
         }));
@@ -212,7 +212,7 @@ async function player({
         data = { duration: transcodedDuration };
       } else if (url.endsWith('/health')) {
         data = {
-          playlist: `/transcode/session${sessionNumber}/${rendition}.m3u8${
+          playlist: `/transcode/session${sessionNumber}/low.m3u8${
             startGeneration ? `?generation=${startGeneration}` : ''
           }`,
         };
@@ -243,7 +243,6 @@ async function player({
   await flush();
   return {
     video, window, document, elements, engines, calls, beacons, errors, timers, pickerCalls, browserLoads,
-    setRendition: value => { rendition = value; },
     setWindowStart: value => { windowStart = value; },
     setTranscodedDuration: value => { transcodedDuration = value; },
     setLiveEdge: value => { for (const engine of engines) engine.liveSyncPosition = value; },
@@ -267,20 +266,19 @@ async function player({
   };
 }
 
-test('web live startup and upgrades use one shared adaptive session', async () => {
+test('web live startup and health polls use one shared adaptive session', async () => {
   const p = await player();
   const start = p.calls.find(call => call.url.startsWith('/transcode/start?'));
-  assert.equal(new URL(start.url, 'http://netv.test').searchParams.get('fast_start'), 'true');
+  assert.equal(new URL(start.url, 'http://netv.test').searchParams.get('content_type'), 'live');
   assert.equal(p.engines.length, 1);
   const hls = p.engines[0];
   assert.deepEqual(hls.sources, ['/transcode/session1/master.m3u8']);
   assert.equal(hls.config.startPosition, -1);
   assert.equal(hls.config.liveSyncDuration, 12);
   assert.equal(hls.config.maxBufferLength, 30);
-  assert.equal(hls.nextLevel, 0);
-  p.setRendition('high');
   await p.pollHealth();
-  assert.equal(hls.nextLevel, 1);
+  // Health feedback for the same generation leaves playback alone.
+  assert.equal(hls.nextLevel, undefined);
   assert.equal(p.engines.length, 1);
   assert.equal(p.calls.filter(call => call.url.startsWith('/transcode/start?')).length, 1);
   assert.equal(p.calls.some(call => call.url.includes('/progress/')), false);

@@ -1,6 +1,6 @@
 """Verify the fallback changes the actual encoder configuration."""
 
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import asyncio
@@ -8,22 +8,29 @@ import asyncio
 from fastapi import HTTPException
 
 import pytest
+import pytest_asyncio
 
-from netv import cache, ffmpeg_command, ffmpeg_session
-from netv.fast_start_test import ffprobe_source, serve_transcode
-from netv.ffmpeg_command import build_hls_ffmpeg_cmd
-from netv.playback_policy import PlaybackHealth, PlaybackPolicy
+from netv import cache, fast_start, ffmpeg_command, ffmpeg_session, util
+from netv.fast_start_test import ffprobe_source, output_dir, serve_fast_start, serve_transcode
+from netv.playback_policy import PlaybackHealth
 from netv.testing import (
     BackgroundTasks,
     FakeClock,
     FakeProcess,
     FakeRun,
+    FakeUpstreams,
+    FakeWeb,
     ProcessLauncher,
     Program,
     install_clock,
     install_launcher,
     install_subprocess,
+    install_web,
+    probed_video_json,
 )
+
+
+LIVE = "http://example.com/live.ts"
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +66,19 @@ def launcher(monkeypatch: pytest.MonkeyPatch) -> Iterator[ProcessLauncher]:
     install_launcher(monkeypatch, fake, ffmpeg_session)
     yield fake
     tasks.discard()
+
+
+@pytest_asyncio.fixture
+async def upstreams(
+    monkeypatch: pytest.MonkeyPatch,
+    programs: FakeRun,
+) -> AsyncIterator[FakeUpstreams]:
+    """The live provider, probed as 1080p video; closed before the loop ends to free readers."""
+    programs.program("ffprobe", Program(stdout=probed_video_json()))
+    opened = FakeUpstreams()
+    install_web(monkeypatch, FakeWeb({LIVE: opened}), util)
+    yield opened
+    opened.close()
 
 
 @pytest.fixture
@@ -97,7 +117,6 @@ def existing_session(
         "url": url,
         "username": username,
         "audio_passthrough": audio_passthrough,
-        "playback_policy": PlaybackPolicy(),
     }
     ffmpeg_session._url_to_session[url] = session_id
 
@@ -112,6 +131,7 @@ async def test_fallback_command_and_cleanup(
     monkeypatch: pytest.MonkeyPatch,
     transcode_dir: Path,
     launcher: ProcessLauncher,
+    upstreams: FakeUpstreams,
     configured_resolution: cache.MaxResolution,
     expected_resolution: str,
 ):
@@ -129,25 +149,33 @@ async def test_fallback_command_and_cleanup(
             "sr_model": "nomos",
         },
     )
-    url = "http://example.com/live.ts"
-    task = asyncio.create_task(ffmpeg_session.start_transcode(url, bandwidth_saver=True))
-    result = await serve_transcode(launcher, task)
+    task = asyncio.create_task(ffmpeg_session.start_transcode(LIVE, bandwidth_saver=True))
+    result = await serve_fast_start(launcher, upstreams, task)
     try:
-        command = launcher.commands[0]
-        directory = str(Path(command[-1]).parent)
-        args = (url, "nvenc+software", directory, False, [], None, expected_resolution, "low")
-        user_agent = cache.get_user_agent()
-        assert command == build_hls_ffmpeg_cmd(*args, user_agent, True, allow_upscale=False)
+        [command] = launcher.commands
+        session = ffmpeg_session.get_session(result["session_id"])
+        assert session is not None
+        encoder = (str(output_dir(launcher, 0)), "nvenc+software", expected_resolution, "low", True)
+        source = session.get("audio_info")
+        assert command == fast_start.encoder_command(
+            *encoder,
+            allow_upscale=False,
+            audio=source,
+            video_codec="mpeg2video",
+        )
         assert not any("dnn_processing=" in arg for arg in command)
-        upscaled = build_hls_ffmpeg_cmd(*args, user_agent, True, allow_upscale=True)
+        upscaled = fast_start.encoder_command(
+            *encoder,
+            allow_upscale=True,
+            audio=source,
+            video_codec="mpeg2video",
+        )
         assert any("dnn_processing=" in arg for arg in upscaled)
         settings = cache.load_server_settings()
         assert settings["transcode_hw"] == "nvenc+software"
         assert settings.get("max_resolution") == configured_resolution
         assert settings.get("quality") == "high"
         assert settings.get("sr_model") == "nomos"
-        session = ffmpeg_session.get_session(result["session_id"])
-        assert session is not None
         assert session.get("bandwidth_saver") is True
     finally:
         await ffmpeg_session.stop_session(result["session_id"], force=True)
@@ -160,18 +188,19 @@ async def test_fallback_does_not_reuse_high_quality_stream(
     clock: FakeClock,
     transcode_dir: Path,
     launcher: ProcessLauncher,
+    upstreams: FakeUpstreams,
 ):
     old = FakeProcess(exit_code=None)
-    existing_session(tmp_path / "old", old, now=clock.now)
+    existing_session(tmp_path / "old", old, url=LIVE, now=clock.now)
     task = asyncio.create_task(
-        ffmpeg_session.start_transcode("stream", username="viewer", bandwidth_saver=True),
+        ffmpeg_session.start_transcode(LIVE, username="viewer", bandwidth_saver=True),
     )
-    result = await serve_transcode(launcher, task)
+    result = await serve_fast_start(launcher, upstreams, task)
     assert result["session_id"] != "old"
     assert old.signals == ["TERM"]
     assert not (tmp_path / "old").exists()
     assert "old" not in ffmpeg_session._transcode_sessions
-    assert ffmpeg_session._url_to_session["stream"] == result["session_id"]
+    assert ffmpeg_session._url_to_session[LIVE] == result["session_id"]
     assert len(launcher.launches) == 1
     session = ffmpeg_session.get_session(result["session_id"])
     assert session is not None
@@ -181,15 +210,14 @@ async def test_fallback_does_not_reuse_high_quality_stream(
 
 
 @pytest.mark.asyncio
-async def test_legacy_saver_session_can_request_recovery(
+async def test_saver_session_can_request_recovery(
     clock: FakeClock,
     transcode_dir: Path,
     launcher: ProcessLauncher,
+    upstreams: FakeUpstreams,
 ):
-    task = asyncio.create_task(
-        ffmpeg_session.start_transcode("http://example.com/live.ts", bandwidth_saver=True),
-    )
-    result = await serve_transcode(launcher, task)
+    task = asyncio.create_task(ffmpeg_session.start_transcode(LIVE, bandwidth_saver=True))
+    result = await serve_fast_start(launcher, upstreams, task)
     session_id = result["session_id"]
     try:
         good = PlaybackHealth(buffer_seconds=12, waiting=False, observed_bitrate=20_000_000)
@@ -198,8 +226,10 @@ async def test_legacy_saver_session_can_request_recovery(
             clock.now = start + offset
             assert ffmpeg_session.report_playback_health(session_id, "", good) == {
                 "bandwidth_saver": True,
+                "playlist": result["playlist"],
             }
         clock.now = start + 60
+        # The saver encoder cannot serve full quality: the client retunes to a new session.
         assert ffmpeg_session.report_playback_health(session_id, "", good) == {
             "bandwidth_saver": False,
         }
@@ -265,13 +295,14 @@ async def test_passthrough_client_reuses_dolby_session(
 ):
     old = FakeProcess(exit_code=None)
     existing_session(tmp_path / "old", old, audio_passthrough=True, now=clock.now)
+    ffmpeg_session._transcode_sessions["old"]["fast_start"] = True
     result = await ffmpeg_session.start_transcode(
         "stream",
         username="viewer",
         audio_passthrough=True,
     )
     assert result["session_id"] == "old"
-    assert result["playlist"] == "/transcode/old/stream.m3u8"
+    assert result["playlist"] == "/transcode/old/low.m3u8"
     assert old.signals == []
     assert launcher.launches == []
 
@@ -279,19 +310,30 @@ async def test_passthrough_client_reuses_dolby_session(
 @pytest.mark.asyncio
 async def test_starting_passthrough_session_is_not_reused_by_aac_client(
     tmp_path: Path,
+    clock: FakeClock,
     transcode_dir: Path,
     launcher: ProcessLauncher,
+    upstreams: FakeUpstreams,
 ):
     """While the audio probe is pending, a passthrough request's session counts as Dolby."""
     pending = tmp_path / "pending"
-    existing_session(pending, None, audio_passthrough=True, session_id="pending", now=0)
+    worker = FakeProcess(exit_code=None)
+    existing_session(
+        pending,
+        worker,
+        audio_passthrough=True,
+        session_id="pending",
+        url=LIVE,
+        now=clock.now,
+    )
     ffmpeg_session._transcode_sessions["pending"]["fast_start"] = True
-    task = asyncio.create_task(ffmpeg_session.start_transcode("stream", username="viewer"))
-    result = await serve_transcode(launcher, task)
+    task = asyncio.create_task(ffmpeg_session.start_transcode(LIVE, username="viewer"))
+    result = await serve_fast_start(launcher, upstreams, task)
     assert result["session_id"] != "pending"
+    assert worker.signals == ["TERM"]
     assert "pending" not in ffmpeg_session._transcode_sessions
     assert not pending.exists()
-    assert ffmpeg_session._url_to_session["stream"] == result["session_id"]
+    assert ffmpeg_session._url_to_session[LIVE] == result["session_id"]
     await ffmpeg_session.stop_session(result["session_id"], force=True)
     assert not list(transcode_dir.iterdir())
 

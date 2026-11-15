@@ -1677,6 +1677,27 @@ segment1.ts
 
         assert resolve_hls_master_playlist(url) == "http://example.com/streams/1080p/index.m3u8"
 
+    def test_redirected_playlists_resolve_to_where_they_were_served(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Providers redirect each playlist request (~1 s); ffmpeg should not repeat the hop."""
+        media = "http://example.com/live/1.m3u8"
+        master = "http://example.com/live/2.m3u8"
+        web = FakeWeb(
+            {
+                media: FakeResponse(b"#EXTM3U\n#EXTINF:10,\ns.ts\n", url="http://edge/a/1.m3u8"),
+                master: FakeResponse(
+                    b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhd/index.m3u8\n",
+                    url="http://edge/b/2.m3u8",
+                ),
+            },
+        )
+        install_web(monkeypatch, web, ffmpeg_command)
+
+        assert resolve_hls_master_playlist(media) == "http://edge/a/1.m3u8"
+        assert resolve_hls_master_playlist(master) == "http://edge/b/hd/index.m3u8"
+
     def test_default_user_agent_sends_no_header(self, monkeypatch: pytest.MonkeyPatch):
         _save_user_agent("default")
         url = "http://example.com/stream.m3u8"
@@ -1685,6 +1706,87 @@ segment1.ts
 
         assert resolve_hls_master_playlist(url) == url
         assert web.fetches[0].headers == {}
+
+    @pytest.mark.parametrize(
+        ("playlist", "variant", "count", "bandwidth"),
+        [
+            # A missing BANDWIDTH ranks as 0; ties keep playlist order.
+            (b"BANDWIDTH=0\nzero.m3u8\n#EXT-X-STREAM-INF:RESOLUTION=1x1\nnone.m3u8", "zero", 2, 0),
+            (b"BANDWIDTH=7\na.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=7\nb.m3u8", "a", 2, 7),
+            (b"BANDWIDTH=abc\nonly.m3u8", "only", 1, 0),
+            (b"BANDWIDTH=900, RESOLUTION=1x1\nhd.m3u8", "hd", 1, 900),
+            (
+                b"BANDWIDTH=500\nlow.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=3000000\nhigh.m3u8",
+                "high",
+                2,
+                3_000_000,
+            ),
+        ],
+    )
+    def test_variant_selection_is_logged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        playlist: bytes,
+        variant: str,
+        count: int,
+        bandwidth: int,
+    ):
+        caplog.set_level("INFO", logger="netv.ffmpeg_command")
+        base = f"http://example.com/{'p' * 90}/"
+        url = base + "master.m3u8"
+        body = b"#EXTM3U\n#EXT-X-STREAM-INF:" + playlist + b"\n"
+        install_web(monkeypatch, FakeWeb({url: FakeResponse(body)}), ffmpeg_command)
+
+        best = f"{base}{variant}.m3u8"
+        assert resolve_hls_master_playlist(url) == best
+        assert _command_log(caplog) == [
+            (
+                "INFO",
+                f"HLS master playlist resolved: {count} variants, selected {bandwidth} bps: {best[:80]}",
+            ),
+        ]
+
+    def test_invalid_utf8_is_replaced(self, monkeypatch: pytest.MonkeyPatch):
+        url = "http://example.com/master.m3u8"
+        body = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nvid\xff.m3u8\n"
+        install_web(monkeypatch, FakeWeb({url: FakeResponse(body)}), ffmpeg_command)
+
+        assert resolve_hls_master_playlist(url) == "http://example.com/vid\ufffd.m3u8"
+
+    def test_master_without_variants_logs_served_url(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        url = "http://example.com/master.m3u8"
+        served = f"http://edge.example.com/{'p' * 90}/master.m3u8"
+        body = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n#comment\n"
+        install_web(monkeypatch, FakeWeb({url: FakeResponse(body, url=served)}), ffmpeg_command)
+
+        assert resolve_hls_master_playlist(url) == served
+        assert _command_log(caplog) == [
+            ("WARNING", f"HLS master playlist has no variants: {served[:80]}"),
+        ]
+
+    def test_fetch_error_is_logged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        url = f"http://example.com/{'p' * 90}/master.m3u8"
+        install_web(monkeypatch, FakeWeb({url: Exception("Network error")}), ffmpeg_command)
+
+        assert resolve_hls_master_playlist(url) == url
+        assert _command_log(caplog) == [
+            ("WARNING", f"Failed to resolve HLS master playlist {url[:80]}: Network error"),
+        ]
+
+
+def _command_log(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str]]:
+    return [
+        (r.levelname, r.getMessage()) for r in caplog.records if r.name == "netv.ffmpeg_command"
+    ]
 
 
 @pytest.mark.parametrize("hw", ["software", "nvenc+software", "amf+software", "qsv", "vaapi"])
@@ -1925,7 +2027,6 @@ def _server_settings() -> ServerSettings:
         "transcode_mode": "auto",
         "transcode_hw": "software",
         "vod_transcode_cache_mins": 60,
-        "live_transcode_cache_secs": 0,
         "live_dvr_mins": 120,
         "transcode_dir": "",
         "probe_live": True,

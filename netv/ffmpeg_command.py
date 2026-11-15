@@ -367,9 +367,11 @@ def resolve_hls_master_playlist(url: str) -> str:
         req = request.Request(url)
         user_agent = get_user_agent()
         if user_agent is not None:
-            req.add_header("User-Agent", user_agent)
+            req.add_header("User-Agent", user_agent)  # pragma: no mutate
         with request.urlopen(req, timeout=10) as response:
-            content = response.read().decode("utf-8", errors="replace")
+            content = response.read().decode(errors="replace")
+            # Where the playlist was served after redirects; reusing it saves a hop.
+            url = str(response.geturl())
 
         # Check if this is a master playlist (has #EXT-X-STREAM-INF)
         if "#EXT-X-STREAM-INF" not in content:

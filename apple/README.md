@@ -255,9 +255,9 @@ repeatedly runs out of buffer, then tune another channel and confirm it starts a
 720p without a second provider connection. Restore bandwidth and verify that a later
 channel returns to full quality after the cooldown and sustained-health requirements.
 Also check that a short stall or manual pause does not change the saver decision,
-and that both processes exit when playback stops. The backend fast-start path is
-selected by both clients through `/transcode/start?fast_start=true`; older clients
-and gateway players retain their existing playback contracts. The response includes
+and that both processes exit when playback stops. Every live `/transcode/start`
+takes the fast-start path; the server ignores the `fast_start` query parameter
+older clients still send. The response includes
 `playlist` for the rendition and `master_playlist` for clients that load the master.
 
 The cancellation/rapid-tuning regression check uses a fake transport with the real

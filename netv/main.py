@@ -1652,7 +1652,6 @@ async def transcode_start(
     deinterlace_fallback: str = "1",  # "1" or "0"
     source_id: str = "",
     bandwidth_saver: bool = False,
-    fast_start: bool = False,
     audio_passthrough: bool = False,  # `client` decodes AC-3/E-AC-3.
 ):
     """Start a transcode session and return its identifier.
@@ -1668,7 +1667,6 @@ async def transcode_start(
         deinterlace_fallback: Whether deinterlacing is enabled when probing is skipped.
         source_id: Source used for access checks and stream limits.
         bandwidth_saver: Request the lower-bandwidth rendition.
-        fast_start: Enable adaptive live startup.
         audio_passthrough: Whether the client decodes Dolby audio.
     """
     if chromecast.manager.owns_url(url):
@@ -1715,11 +1713,10 @@ async def transcode_start(
         user_max_streams,
         source_max_streams,
         bandwidth_saver=bandwidth_saver,
-        fast_start=fast_start,
         is_disconnected=request.is_disconnected,
         audio_passthrough=audio_passthrough,
     )
-    if fast_start and await request.is_disconnected():
+    if content_type == "live" and await request.is_disconnected():
         await ffmpeg_session.stop_session(result["session_id"], force=True)
         raise HTTPException(499, "Playback request disconnected")
     return result
@@ -1963,7 +1960,6 @@ async def settings_page(request: Request, user: Annotated[TokenClaims, Depends(r
             "max_resolution": server_settings.get("max_resolution", "1080p"),
             "quality": server_settings.get("quality", "high"),
             "vod_transcode_cache_mins": server_settings["vod_transcode_cache_mins"],
-            "live_transcode_cache_secs": server_settings["live_transcode_cache_secs"],
             "live_dvr_mins": server_settings["live_dvr_mins"],
             "transcode_dir": server_settings["transcode_dir"],
             "probe_live": server_settings["probe_live"],
@@ -2731,7 +2727,6 @@ async def settings_transcode(
     max_resolution: Annotated[cache.MaxResolution, Form()] = "1080p",
     quality: Annotated[str, Form()] = "high",
     vod_transcode_cache_mins: Annotated[int, Form()] = 60,
-    live_transcode_cache_secs: Annotated[int, Form()] = 0,
     live_dvr_mins: Annotated[int, Form()] = 120,
     transcode_dir: Annotated[str, Form()] = "",
     probe_live: Annotated[str | None, Form()] = None,
@@ -2749,7 +2744,6 @@ async def settings_transcode(
     settings["max_resolution"] = max_resolution
     settings["quality"] = quality if quality in ("high", "medium", "low") else "high"
     settings["vod_transcode_cache_mins"] = max(0, vod_transcode_cache_mins)
-    settings["live_transcode_cache_secs"] = max(0, live_transcode_cache_secs)
     settings["live_dvr_mins"] = clamp_live_dvr_mins(live_dvr_mins)
     settings["transcode_dir"] = transcode_dir  # Empty uses the system temp dir.
     settings["probe_live"] = probe_live == "on"
