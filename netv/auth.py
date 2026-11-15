@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import pathlib
+import re
 import secrets
 import time
 
@@ -322,6 +323,9 @@ def verify_token(token: str) -> TokenClaims | None:
     return payload
 
 
+_STREAM_URL_TOKEN = re.compile(r"[0-9a-f]{64}")
+
+
 def stream_url_token(username: str, url: str) -> str:
     """Token proving the server handed ``url`` to ``username`` on a player page.
 
@@ -342,7 +346,10 @@ def stream_url_token(username: str, url: str) -> str:
 
 def verify_stream_url_token(username: str, url: str, token: str) -> bool:
     """Whether ``token`` is the stream URL token for this user and URL."""
-    return bool(token) and hmac.compare_digest(token, stream_url_token(username, url))
+    # compare_digest raises on non-ASCII strings; anything but 64 hex digits is no token.
+    if not _STREAM_URL_TOKEN.fullmatch(token):
+        return False
+    return hmac.compare_digest(token, stream_url_token(username, url))
 
 
 def _get_settings_file() -> pathlib.Path:
