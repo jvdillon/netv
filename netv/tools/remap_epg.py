@@ -41,7 +41,7 @@ import unicodedata
 
 from treekle import json_loads
 
-from netv import cache
+from netv import cache, credentials
 
 
 def parse_name(name: object) -> tuple[str, list[str], bool]:
@@ -201,7 +201,11 @@ def source_countries(cache_dir: pathlib.Path) -> dict[str, str]:
     for s in settings.get("sources", []):
         if s.get("type") != "epg":
             continue
-        m = re.search(r"epg_([A-Za-z]{2})\.", s.get("url", ""))
+        try:
+            url = credentials.decrypt(s.get("url", ""), cache_dir)
+        except credentials.CredentialsKeyError:
+            continue
+        m = re.search(r"epg_([A-Za-z]{2})\.", url)
         source_id = s.get("id")
         if m and source_id is not None:
             result[source_id] = _country(m.group(1))

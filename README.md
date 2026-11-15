@@ -391,6 +391,16 @@ After installing with `uv tool`, run any included command directly.
 
 Open http://localhost:8000, create an admin account, and add your IPTV source.
 Settings and caches persist in `~/.local/share/netv`, or `$NETV_DATA_DIR` when set.
+
+Source logins and URLs in `server_settings.json` are stored encrypted. The key
+comes from `NETV_CREDENTIALS_KEY` (a Fernet key, for example from
+`python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`)
+or from the file `NETV_CREDENTIALS_KEY_FILE` names, such as a Docker secret.
+Without either, neTV creates `credentials.key` next to the settings; set one of
+the variables to keep the key out of copies of that directory. Keep the key safe:
+without it the sources cannot be read and have to be added again. Settings from
+older releases are read as before and encrypted the next time they are saved.
+
 For the native-player gateway, run `uvx --from 'pynetv[server]' netv-gateway` on port `8100`.
 
 ### Docker
