@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import json
+import shutil
 import subprocess
 import tempfile
 import time
@@ -1709,7 +1710,8 @@ def test_archive_policy_copies_compatible_source_without_ai_upscaling(height: in
     assert "-vf" not in cmd
 
 
-@pytest.mark.skipif(__import__("shutil").which("ffmpeg") is None, reason="ffmpeg not installed")
+@pytest.mark.cli_ffmpeg
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
 def test_probe_audio_reads_local_surround_segment(tmp_path: Path):
     """probe_audio reports the layout that decides 5.1 handling."""
 
@@ -1787,7 +1789,8 @@ def test_probe_video_codec_handles_invalid_json():
         assert probe_video_codec("input.ts") == ""
 
 
-@pytest.mark.skipif(__import__("shutil").which("ffmpeg") is None, reason="ffmpeg not installed")
+@pytest.mark.cli_ffmpeg
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
 def test_probe_video_codec_reads_local_segment(tmp_path: Path):
 
     path = tmp_path / "input.ts"

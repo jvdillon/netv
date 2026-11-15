@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import json
+import logging
 import time
 
 import pytest
@@ -21,8 +22,6 @@ def m3u_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None
     monkeypatch.setattr(cache, "SERVER_SETTINGS_FILE", tmp_path / "server_settings.json")
     monkeypatch.setattr(cache, "USERS_DIR", tmp_path / "users")
     monkeypatch.setattr(cache, "CACHE_DIR", tmp_path / "cache")
-    # Skip hardware encoder detection in cache.initialize().
-    monkeypatch.setattr(cache, "AVAILABLE_ENCODERS", {"software": True})
     cache.USERS_DIR.mkdir(exist_ok=True)
     cache.CACHE_DIR.mkdir(exist_ok=True)
     _reset_memory()
@@ -465,10 +464,33 @@ class TestLoadAllLiveData:
         fetch.assert_not_called()
         assert sync_thread == []
 
-    def test_stale_cache_refreshes_in_background(self, sync_thread: list[_SyncThread]):
+    def test_cache_exactly_ttl_old_is_still_fresh(
+        self,
+        sync_thread: list[_SyncThread],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        _write_cache("live_data", _LIVE, 900.0)
+
+        def now() -> float:
+            return 1000.0
+
+        monkeypatch.setattr(m3u.time, "time", now)
+        assert m3u.load_all_live_data(ttl_seconds=100) == (_LIVE["cats"], _LIVE["streams"], [])
+        assert sync_thread == []
+
+    @pytest.mark.parametrize("memory_has_live_lists", [True, False])
+    def test_stale_cache_refreshes_in_background(
+        self,
+        sync_thread: list[_SyncThread],
+        caplog: pytest.LogCaptureFixture,
+        memory_has_live_lists: bool,
+    ):
         _write_cache("live_data", _LIVE, time.time() - 100)
         mem = cache.get_cache()
-        mem.update({"live_categories": [], "live_streams": [], "epg_error": "kept"})
+        mem["epg_error"] = "kept"
+        if memory_has_live_lists:
+            mem.update({"live_categories": [], "live_streams": []})
+        caplog.set_level(logging.INFO, logger="netv.m3u")
         new: tuple[list[ProviderRecord], list[ProviderRecord], list[tuple[str, int, str]]] = (
             [{"category_id": "n"}],
             [{"stream_id": 2}],
@@ -485,6 +507,7 @@ class TestLoadAllLiveData:
         }
         assert mem == {"epg_error": "kept", "epg_urls": new[2]}
         assert m3u.get_refresh_in_progress() == set()
+        assert caplog.messages == ["Refreshing live data in background", "Live data refreshed"]
 
     def test_failed_refresh_clears_in_progress_flag(self, sync_thread: list[_SyncThread]):
         _write_cache("live_data", _LIVE, 0)
@@ -500,14 +523,16 @@ class TestLoadAllLiveData:
         m3u.load_all_live_data()
         assert sync_thread == []
 
-    def test_no_cache_fetches_and_saves(self):
+    def test_no_cache_fetches_and_saves(self, caplog: pytest.LogCaptureFixture):
         new: tuple[list[ProviderRecord], list[ProviderRecord], list[tuple[str, int, str]]] = (
             [{"category_id": "n"}],
             [],
             [("http://n", 9, "s")],
         )
+        caplog.set_level(logging.INFO, logger="netv.m3u")
         with patch.object(m3u, "_fetch_all_live_data", return_value=new):
             assert m3u.load_all_live_data() == new
+        assert caplog.messages == ["No live cache, fetching"]
         assert _read_cache("live_data") == {
             "cats": [{"category_id": "n"}],
             "streams": [],

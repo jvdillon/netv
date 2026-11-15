@@ -267,6 +267,14 @@ def _series(last_modified: int) -> Any:
     return {"last_modified": last_modified}
 
 
+class _UnlimitedRateLimiter:
+    def __init__(self, max_calls: int, per_seconds: float = 1) -> None:
+        self.max_calls = max_calls
+
+    def acquire(self) -> None:
+        pass
+
+
 def test_fetch_series_info_refreshes_cache(
     workdir: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -288,6 +296,8 @@ def test_fetch_series_info_refreshes_cache(
         return "not json"
 
     monkeypatch.setattr(xtream2m3u, "fetch_text", fetch)
+    # Five calls through the real 4/s limiter would sleep ~1s; it has its own tests.
+    monkeypatch.setattr(xtream2m3u, "SlidingRateLimiter", _UnlimitedRateLimiter)
     series = {1: _series(50), 2: _series(10), 4: _series(1), 5: _series(1)}
     result = xtream2m3u.fetch_series_info(series, "https://api", workdir)
     assert result == {1: fresh, 2: {"info": {"last_modified": "10"}}, 4: None, 5: {}}

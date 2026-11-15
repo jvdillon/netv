@@ -166,8 +166,9 @@ def test_successful_authentication_is_cached(
 def test_failed_authentication_is_rate_limited(gateway_client: GatewayClient):
     client, _ = gateway_client
     params = {"username": "player", "password": "wrong"}
+    gateway.authenticator.max_login_failures = 2
 
-    for _ in range(10):
+    for _ in range(2):
         assert client.get("/player_api.php", params=params).status_code == 200
 
     assert client.get("/player_api.php", params=params).status_code == 429

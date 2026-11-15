@@ -428,73 +428,138 @@ def test_live_program_api_unknown_stream_is_not_found(auth_client: TestClient):
     assert response.status_code == 404
 
 
-def test_catchup_player_info_builds_timeshift_url():
+class _FakeXtreamClient:
+    def __init__(self, timezone_name: str) -> None:
+        self.timezone_name = timezone_name
 
-    start = (datetime.now(timezone.utc) - timedelta(hours=3)).replace(second=0, microsecond=0)
+    def get_server_info(self) -> dict[str, MutablePlainTree]:
+        return {"server_info": {"timezone": self.timezone_name}}
+
+
+class _CatchupWorld:
+    """Live cache, EPG, and Xtream clients for ``_get_catchup_player_info``."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.streams: list[ProviderRecord] = [_archive_stream()]
+        self.programs: list[Program] = []
+        self.clients: dict[str, _FakeXtreamClient] = {}
+        self.tz_cache: dict[str, tuple[float, tzinfo]] = {}
+        monkeypatch.setattr(main, "_ensure_live_cache", self._ensure_live_cache)
+        monkeypatch.setattr(main, "get_cache", self.get_cache)
+        monkeypatch.setattr(main, "get_xtream_client_by_source", self.clients.get)
+        monkeypatch.setattr(main.epg, "get_programs_in_range", self.get_programs_in_range)
+        monkeypatch.setattr(main.catchup, "_tz_cache", self.tz_cache)
+
+    def _ensure_live_cache(self) -> None:
+        pass
+
+    def get_cache(self) -> dict[str, list[ProviderRecord]]:
+        return {"live_streams": self.streams}
+
+    def get_programs_in_range(
+        self,
+        channel_id: str,
+        start: datetime,
+        end: datetime,
+        preferred_source_id: str = "",
+    ) -> list[Program]:
+        return [
+            p
+            for p in self.programs
+            if p.channel_id == channel_id and p.start < end and start < p.stop
+        ]
+
+
+@pytest.fixture
+def catchup_world(monkeypatch: pytest.MonkeyPatch) -> _CatchupWorld:
+    return _CatchupWorld(monkeypatch)
+
+
+def _hours_ago(hours: int) -> datetime:
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).replace(second=0, microsecond=0)
+
+
+def test_catchup_player_info_builds_timeshift_url(catchup_world: _CatchupWorld):
+    start = _hours_ago(3)
     program = Program(
         channel_id="ch1",
         title="Earlier news",
         start=start,
         stop=start + timedelta(minutes=30),
+        desc="Headlines",
     )
-    client = MagicMock()
-    client.get_server_info.return_value = {"server_info": {"timezone": "Europe/Amsterdam"}}
-    tz_cache: dict[str, tuple[float, tzinfo]] = {}
-    with (
-        patch("netv.main._ensure_live_cache"),
-        patch("netv.main.get_cache", return_value={"live_streams": [_archive_stream()]}),
-        patch("netv.main.get_xtream_client_by_source", return_value=client),
-        patch("netv.epg.get_programs_in_range", return_value=[program]),
-        patch("netv.catchup._tz_cache", tz_cache),
-    ):
-        info = main._get_catchup_player_info("src1_42", start.timestamp())
+    catchup_world.programs.append(program)
+    # A direct playlist URL makes live info M3U; the archive is always Xtream timeshift.
+    catchup_world.streams[0]["direct_url"] = "http://m3u.test/42.ts"
+    catchup_world.clients["src1"] = _FakeXtreamClient("Europe/Amsterdam")
+
+    info = main._get_catchup_player_info("src1_42", start.timestamp())
+
     local = start.astimezone(ZoneInfo("Europe/Amsterdam")).strftime("%Y-%m-%d:%H-%M")
     assert info.url == f"http://upstream.test/timeshift/user/pass/30/{local}/42.ts"
+    assert info.is_m3u is False
     assert info.catchup_start == start.timestamp()
     assert info.catchup_days == 2
-    assert info.program_title == "Earlier news"
+    assert (info.program_title, info.program_desc) == ("Earlier news", "Headlines")
     assert info.program_end == program.stop.timestamp()
+    assert list(catchup_world.tz_cache) == ["src1"]
 
 
-def test_catchup_player_info_starts_mid_program():
-
-    program_start = (datetime.now(timezone.utc) - timedelta(hours=3)).replace(
-        second=0,
-        microsecond=0,
-    )
+def test_catchup_player_info_starts_mid_program(catchup_world: _CatchupWorld):
+    program_start = _hours_ago(3)
     program = Program(
         channel_id="ch1",
         title="Earlier news",
         start=program_start,
         stop=program_start + timedelta(minutes=30),
     )
-    target = program_start + timedelta(minutes=10, seconds=25)
-    with (
-        patch("netv.main._ensure_live_cache"),
-        patch("netv.main.get_cache", return_value={"live_streams": [_archive_stream()]}),
-        patch("netv.main.get_xtream_client_by_source", return_value=None),
-        patch("netv.epg.get_programs_in_range", return_value=[program]),
-    ):
-        info = main._get_catchup_player_info("src1_42", target.timestamp())
+    catchup_world.programs.append(program)
+    target = program_start + timedelta(minutes=10, seconds=25, microseconds=500_000)
+
+    info = main._get_catchup_player_info("src1_42", target.timestamp())
+
     begin = program_start + timedelta(minutes=10)
     assert f"/20/{begin:%Y-%m-%d:%H-%M}/42.ts" in info.url
     assert info.catchup_start == begin.timestamp()
-    assert info.catchup_seek == 25
+    assert info.catchup_seek == 25.5
     assert info.program_start == program_start.timestamp()
     assert info.program_end == program.stop.timestamp()
 
 
-def test_catchup_player_info_rejects_programs_outside_archive():
+def test_catchup_player_info_without_guide_plays_one_hour(catchup_world: _CatchupWorld):
+    start = _hours_ago(3) + timedelta(seconds=40)
+    # What airs now must not label an archive the guide does not cover.
+    now = datetime.now(timezone.utc)
+    catchup_world.programs.append(
+        Program(
+            channel_id="ch1",
+            title="Live now",
+            start=now - timedelta(minutes=5),
+            stop=now + timedelta(minutes=25),
+            desc="Current",
+        ),
+    )
 
+    info = main._get_catchup_player_info("src1_42", start.timestamp())
+
+    begin = start.replace(second=0)
+    assert f"/timeshift/user/pass/61/{begin:%Y-%m-%d:%H-%M}/42.ts" in info.url
+    assert (info.program_title, info.program_desc) == ("", "")
+    assert info.program_start == begin.timestamp()
+    assert info.program_end == (start + timedelta(hours=1)).timestamp()
+
+
+def test_catchup_player_info_needs_a_live_url(catchup_world: _CatchupWorld):
+    catchup_world.streams[0]["source_type"] = "m3u"
+    assert main._get_catchup_player_info("src1_42", _hours_ago(3).timestamp()) == PlayerInfo()
+
+
+def test_catchup_player_info_rejects_programs_outside_archive(catchup_world: _CatchupWorld):
     too_old = datetime.now(timezone.utc) - timedelta(days=3)
-    with (
-        patch("netv.main._ensure_live_cache"),
-        patch("netv.main.get_cache", return_value={"live_streams": [_archive_stream()]}),
-        patch("netv.epg.get_programs_in_range", return_value=[]),
-        pytest.raises(HTTPException) as excinfo,
-    ):
+    with pytest.raises(HTTPException) as excinfo:
         main._get_catchup_player_info("src1_42", too_old.timestamp())
     assert excinfo.value.status_code == 404
+    assert excinfo.value.detail == "This program is not available to watch from the start"
 
 
 def test_catchup_player_page_plays_archive_as_vod(auth_client: TestClient):

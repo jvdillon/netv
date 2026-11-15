@@ -26,6 +26,40 @@ def _close(coro: Coroutine[object, object, None]) -> None:
     coro.close()
 
 
+_real_sleep = asyncio.sleep
+
+
+async def _yield_only(seconds: float) -> None:
+    del seconds
+    await _real_sleep(0)
+
+
+def _silent_segment_audio(path: str) -> MediaInfo | None:
+    del path
+    return None
+
+
+def _segment_without_captions(path: str) -> bool:
+    del path
+    return False
+
+
+def _segment_unknown_codec(path: str) -> str:
+    del path
+    return ""
+
+
+# Fake segments carry no media for ffprobe, so real probes cost ~0.5s and find nothing.
+# Each readiness poll otherwise sleeps 0.2s of real time.
+@pytest.fixture(autouse=True)
+def _no_segment_probes_or_poll_waits(monkeypatch: pytest.MonkeyPatch):
+    """Keep startup polling and probing off the wall clock."""
+    monkeypatch.setattr(ffmpeg_session.asyncio, "sleep", _yield_only)
+    monkeypatch.setattr(ffmpeg_session, "probe_audio", _silent_segment_audio)
+    monkeypatch.setattr(ffmpeg_session, "probe_closed_captions", _segment_without_captions)
+    monkeypatch.setattr(ffmpeg_session, "probe_video_codec", _segment_unknown_codec)
+
+
 def video_packet(seconds: float) -> bytes:
     pts = int(seconds * 90_000)
     encoded = bytes(
@@ -451,7 +485,6 @@ async def test_shared_session_runs_one_encoder(
         patch("netv.ffmpeg_session.get_settings", return_value={"max_resolution": "4k"}),
         patch("netv.ffmpeg_session.get_transcode_dir", return_value=tmp_path),
         patch("netv.ffmpeg_session.asyncio.create_subprocess_exec", side_effect=launch),
-        patch("netv.ffmpeg_session.probe_audio", return_value=None),
         patch(
             "netv.fast_start.build_hls_ffmpeg_cmd",
             wraps=fast_start.build_hls_ffmpeg_cmd,
@@ -709,6 +742,7 @@ async def test_dvr_disabled_skips_probe_and_uses_fast_start():
     assert probe.call_count == 0
 
 
+@pytest.mark.cli_ffmpeg
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="requires FFmpeg")
 def test_real_local_encoders_share_timestamps(tmp_path: pathlib.Path):
     """Exercise the actual generated commands, demuxing, and timestamp extraction."""
@@ -785,6 +819,8 @@ def test_real_local_encoders_share_timestamps(tmp_path: pathlib.Path):
         process.wait()
 
 
+@pytest.mark.cli_ffmpeg
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="requires FFmpeg")
 def test_real_encoder_probes_past_late_mpeg2_sequence_header(tmp_path: pathlib.Path):
     """HDHomeRun MPEG-2 joined mid-GOP: the first sequence header is >500KB in."""
     source = tmp_path / "source.ts"

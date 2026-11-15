@@ -22,8 +22,6 @@ from netv import cache
 @pytest.fixture
 def cache_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Point cache at temp directories."""
-    # Skip real ffmpeg hardware probing on first settings load.
-    monkeypatch.setattr(cache, "AVAILABLE_ENCODERS", {"nvenc": False})
     monkeypatch.setattr(cache, "LOGOS_DIR", tmp_path / "logos")
     original_server_settings = cache.SERVER_SETTINGS_FILE
     original_users_dir = cache.USERS_DIR
