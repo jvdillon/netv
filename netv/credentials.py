@@ -17,9 +17,11 @@ next time the settings are saved.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import pathlib
+import tempfile
 import threading
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -61,18 +63,12 @@ def _key(settings_dir: pathlib.Path, *, create: bool) -> Fernet | None:
         return Fernet(_read_key(pathlib.Path(key_file).expanduser()))
     path = settings_dir / DEFAULT_KEY_FILE
     with _lock:
-        if not path.exists():
+        # An empty file is what an interrupted write by an older build could
+        # leave; it holds no key, so it counts as missing.
+        if not path.exists() or not _read_key(path):
             if not create:
                 return None
-            path.parent.mkdir(parents=True, exist_ok=True)
-            # O_EXCL: two processes starting at once cannot each write a key.
-            try:
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
-                pass
-            else:
-                with os.fdopen(fd, "wb") as file:
-                    file.write(Fernet.generate_key())
+            _create_key_file(path)
         if not _warned_default_key:
             _warned_default_key = True
             log.warning(
@@ -85,9 +81,39 @@ def _key(settings_dir: pathlib.Path, *, create: bool) -> Fernet | None:
         return Fernet(_read_key(path))
 
 
+def _create_key_file(path: pathlib.Path) -> None:
+    """Write a new key to ``path`` atomically, unless another process got there first.
+
+    The key is written and synced in a private temporary file, then linked into
+    place. ``os.link`` fails when the name already exists, so two processes
+    starting at once cannot each publish a key, and no reader ever sees a
+    partly written file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    temp = pathlib.Path(name)
+    try:
+        with os.fdopen(fd, "wb") as file:
+            file.write(Fernet.generate_key())
+            file.flush()
+            os.fsync(file.fileno())
+        if path.exists() and not _read_key(path):
+            path.unlink()
+        # Another process may have published its key first; then use that one.
+        with contextlib.suppress(FileExistsError):
+            os.link(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def encrypt(value: str, settings_dir: pathlib.Path) -> str:
-    """Encrypt one value; empty and already-encrypted values are returned as they are."""
-    if not value or is_encrypted(value):
+    """Encrypt one in-memory value; an empty value is returned as it is.
+
+    Values reach this function decrypted, so a password that happens to start
+    with ``enc:v1:`` is encrypted like any other; the prefix is only meaningful
+    when reading the settings file.
+    """
+    if not value:
         return value
     fernet = _key(settings_dir, create=True)
     assert fernet is not None

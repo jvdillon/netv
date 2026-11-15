@@ -57,10 +57,24 @@ class TestValues:
         assert credentials.decrypt(token, tmp_path) == "hunter2"
         assert credentials.decrypt("plain", tmp_path) == "plain"
 
-    def test_empty_and_encrypted_values_are_not_encrypted_again(self, tmp_path: Path):
+    def test_empty_values_stay_empty(self, tmp_path: Path):
         assert credentials.encrypt("", tmp_path) == ""
+        assert not (tmp_path / "credentials.key").exists()
+
+    def test_a_value_that_looks_encrypted_is_still_encrypted(self, tmp_path: Path):
+        lookalike = "enc:v1:my-password"
+        token = credentials.encrypt(lookalike, tmp_path)
+        assert token != lookalike
+        assert credentials.decrypt(token, tmp_path) == lookalike
+
+    def test_an_empty_key_file_left_by_an_interrupted_write_is_replaced(self, tmp_path: Path):
+        (tmp_path / "credentials.key").write_bytes(b"")
+        with pytest.raises(credentials.CredentialsKeyError, match="no key is configured"):
+            credentials.decrypt("enc:v1:token", tmp_path)
         token = credentials.encrypt("x", tmp_path)
-        assert credentials.encrypt(token, tmp_path) == token
+        assert (tmp_path / "credentials.key").read_bytes().strip()
+        assert credentials.decrypt(token, tmp_path) == "x"
+        assert not list(tmp_path.glob(".credentials.key.*"))
 
     def test_default_key_file_is_private(self, tmp_path: Path):
         credentials.encrypt("x", tmp_path)
@@ -133,6 +147,10 @@ class TestSettingsFile:
         loaded = cache.load_server_settings()["sources"][0]
         assert loaded["password"] == "hunter2"
         assert loaded["epg_url"] == SOURCE["epg_url"]
+
+    def test_a_password_that_looks_encrypted_survives_save_and_load(self, settings_file: Path):
+        _save({**SOURCE, "password": "enc:v1:not-a-token"})
+        assert cache.load_server_settings()["sources"][0]["password"] == "enc:v1:not-a-token"
 
     def test_lost_key_stops_loading_instead_of_blanking_credentials(self, settings_file: Path):
         _save(dict(SOURCE))
