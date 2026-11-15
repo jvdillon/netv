@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import call, patch
 
 import gc
 import gzip
@@ -17,7 +16,7 @@ import warnings
 import defusedxml.ElementTree as ET
 import pytest
 
-from netv import epg
+from netv import epg, testing, util
 from netv.epg import Program
 
 
@@ -574,32 +573,17 @@ def _append_connection(conns: list[sqlite3.Connection]) -> None:
     conns.append(epg._get_conn())
 
 
-class _Resp:
-    def __init__(self, body: bytes) -> None:
-        self.body = body
-
-    def __enter__(self) -> _Resp:
-        return self
-
-    def __exit__(self, *exc: object) -> bool:
-        return False
-
-    def read(self) -> bytes:
-        return self.body
+def _serve(monkeypatch: pytest.MonkeyPatch, url: str, body: bytes) -> testing.FakeWeb:
+    web = testing.FakeWeb({url: testing.FakeResponse(body)})
+    testing.install_web(monkeypatch, web, util)
+    return web
 
 
-def _fake_urlopen(
-    monkeypatch: pytest.MonkeyPatch,
-    body: bytes,
-) -> list[tuple[str, int, str | None]]:
-    calls: list[tuple[str, int, str | None]] = []
+def _requests(web: testing.FakeWeb) -> list[tuple[str, float | None, dict[str, str]]]:
+    return [(f.url, f.timeout, f.headers) for f in web.fetches]
 
-    def fake(url: str, timeout: int, user_agent: str | None) -> _Resp:
-        calls.append((url, timeout, user_agent))
-        return _Resp(body)
 
-    monkeypatch.setattr(epg, "safe_urlopen", fake)
-    return calls
+VLC = {"User-agent": "VLC/3.0.20 LibVLC/3.0.20"}
 
 
 XMLTV = """<?xml version="1.0"?>
@@ -621,7 +605,7 @@ XMLTV = """<?xml version="1.0"?>
 
 
 class TestFetchEpg:
-    """Tests for fetch_epg with mocked HTTP."""
+    """Tests for fetch_epg against a fake EPG server."""
 
     def test_parses_channels_icons_and_programs(
         self,
@@ -630,7 +614,7 @@ class TestFetchEpg:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ):
-        calls = _fake_urlopen(monkeypatch, XMLTV.encode())
+        web = _serve(monkeypatch, "http://epg.example/guide.xml", XMLTV.encode())
         caplog.set_level(logging.DEBUG, logger="netv.epg")
 
         count = epg.fetch_epg(
@@ -645,7 +629,7 @@ class TestFetchEpg:
         assert caplog.messages == [
             "EPG parsed: 3 channels, 2 unique program channel IDs, 2 programs",
         ]
-        assert calls == [("http://epg.example/guide.xml", 7, "UA/1")]
+        assert _requests(web) == [("http://epg.example/guide.xml", 7, {"User-agent": "UA/1"})]
         conn = epg._get_conn()
         names = dict(conn.execute("SELECT id, name FROM channels").fetchall())
         assert names == {"ch1": "Channel One", "ch2": "ch2", "ch3": "ch3"}
@@ -656,11 +640,17 @@ class TestFetchEpg:
             ("News", "Daily news", "src1"),
             ("Unknown", "", "src1"),
         ]
+        hour = timedelta(hours=1)
+        assert [(p.start, p.stop) for p in progs] == [
+            (start, start + hour),
+            (start + hour, start + 2 * hour),
+        ]
 
     def test_decompresses_gzip(self, db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        calls = _fake_urlopen(monkeypatch, gzip.compress(XMLTV.encode()))
-        assert epg.fetch_epg("http://epg.example/guide.xml.gz", tmp_path) == 2
-        assert calls == [("http://epg.example/guide.xml.gz", 120, None)]
+        url = "http://epg.example/guide.xml.gz"
+        web = _serve(monkeypatch, url, gzip.compress(XMLTV.encode()))
+        assert epg.fetch_epg(url, tmp_path) == 2
+        assert _requests(web) == [(url, 120, VLC)]
         conn = epg._get_conn()
         assert {row[0] for row in conn.execute("SELECT source_id FROM channels")} == {""}
         assert {row[0] for row in conn.execute("SELECT source_id FROM programs")} == {""}
@@ -671,50 +661,47 @@ class TestFetchEpg:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
+        start, stop = "20241130120000 +0000", "20241130130000 +0000"
         body = (
             "<tv><channel><icon/></channel>"
-            "<programme><title>Untimed</title></programme>"
-            '<programme start="start" stop="stop" channel="named"/>'
+            '<programme channel="untimed"><title>Untimed</title></programme>'
+            f'<programme start="{start}" channel="no-stop"><title>No stop</title></programme>'
+            f'<programme stop="{stop}" channel="no-start"><title>No start</title></programme>'
+            f'<programme start="{start}" stop="{stop}"/>'
             "</tv>"
         )
-        _fake_urlopen(monkeypatch, body.encode())
-        instant = datetime(2024, 11, 30, 12, tzinfo=timezone.utc)
-        with patch.object(epg, "_parse_epg_time", return_value=instant) as parse_time:
-            assert epg.fetch_epg("http://epg.example/defaults.xml", tmp_path) == 2
-        assert parse_time.call_args_list == [call(""), call(""), call("start"), call("stop")]
+        _serve(monkeypatch, "http://epg.example/defaults.xml", body.encode())
+        # A programme without both times is skipped rather than placed at "now".
+        assert epg.fetch_epg("http://epg.example/defaults.xml", tmp_path) == 1
         conn = epg._get_conn()
         assert [tuple(row) for row in conn.execute("SELECT * FROM channels")] == [("", "", "")]
         assert [tuple(row) for row in conn.execute("SELECT * FROM icons")] == [("", "")]
+        noon = datetime(2024, 11, 30, 12, tzinfo=timezone.utc).timestamp()
         assert [
             tuple(row)
             for row in conn.execute(
-                "SELECT channel_id, title, start_ts, stop_ts, desc, source_id FROM programs ORDER BY id",
+                "SELECT channel_id, title, desc, source_id, start_ts, stop_ts FROM programs",
             )
-        ] == [
-            ("", "Untimed", instant.timestamp(), instant.timestamp(), "", ""),
-            ("named", "Unknown", instant.timestamp(), instant.timestamp(), "", ""),
-        ]
+        ] == [("", "Unknown", "", "", noon, noon + 3600)]
 
-    def test_inserts_in_batches(self, db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        n = 10_001
+    def test_counts_rows_streamed_from_a_generator(
+        self,
+        db: None,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        n = 3
         prog = (
             '<programme start="20241130120000 +0000" stop="20241130130000 +0000" channel="c">'
             "<title>T</title></programme>"
         )
-        body = "<tv>" + prog * n + "</tv>"
-        _fake_urlopen(monkeypatch, body.encode())
-        inserted: list[int] = []
-        real_insert = epg.insert_programs
-
-        def counting_insert(batch: list[tuple[str, str, float, float, str, str]]) -> None:
-            inserted.append(len(batch))
-            real_insert(batch)
-
-        monkeypatch.setattr(epg, "insert_programs", counting_insert)
+        _serve(monkeypatch, "http://epg.example/big.xml", f"<tv>{prog * n}</tv>".encode())
 
         assert epg.fetch_epg("http://epg.example/big.xml", tmp_path) == n
-        assert inserted == [10_000, 1]
         assert epg.get_program_count() == n
+        rows = (("c", f"T{i}", 0.0, 1.0, "", "") for i in range(2))
+        assert epg.insert_programs(rows) == 2
+        assert epg.get_program_count() == n + 2
 
     def test_sanitizes_corrupt_xml(
         self,
@@ -732,7 +719,7 @@ class TestFetchEpg:
             "<title>Kept</title></programme>"
             "</tv>"
         )
-        _fake_urlopen(monkeypatch, body.encode())
+        _serve(monkeypatch, "http://epg.example/bad.xml", body.encode())
 
         assert epg.fetch_epg("http://epg.example/bad.xml", tmp_path) == 1
         debug_files = list(tmp_path.glob("epg_debug_*.xml"))
@@ -755,7 +742,7 @@ class TestFetchEpg:
         caplog: pytest.LogCaptureFixture,
     ):
         body = '<tv><channel id="ch1"><bad></channel>'
-        _fake_urlopen(monkeypatch, body.encode())
+        _serve(monkeypatch, "http://epg.example/worse.xml", body.encode())
         with pytest.raises(ET.ParseError) as error:
             epg.fetch_epg("http://epg.example/worse.xml", tmp_path)
         assert len(list(tmp_path.glob("epg_debug_*.xml"))) == 1

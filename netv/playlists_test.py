@@ -2,22 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
-from unittest.mock import patch
 
 import json
 
 import pytest
 
-from netv import playlists
+from netv import cache, playlists
 from netv.xtream import ProviderRecord
 
 
 @pytest.fixture(autouse=True)
-def cache_dir(tmp_path: Path) -> Iterator[Path]:
-    with patch("netv.cache.CACHE_DIR", tmp_path):
-        yield tmp_path
+def cache_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setattr(cache, "CACHE_DIR", tmp_path)
+    return tmp_path
 
 
 STREAMS: list[ProviderRecord] = [

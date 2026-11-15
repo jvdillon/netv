@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Coroutine, Iterator, Sequence
-from datetime import datetime, timedelta, timezone, tzinfo
+from collections.abc import Iterator, Sequence
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Protocol, TypedDict, TypeVar, cast, override
-from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import asyncio
@@ -17,6 +16,8 @@ import time
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.requests import Request
+from starlette.types import Message
 from treekle import MutablePlainTree, json_loads
 
 import pytest
@@ -24,98 +25,74 @@ import pytest
 from netv import (
     auth,
     cache as cache_module,
-    fast_start,
+    catchup,
+    chromecast,
+    epg,
+    ffmpeg_command,
     ffmpeg_session,
     handoff,
     m3u as m3u_module,
     main,
+    testing,
+    util,
 )
 from netv.epg import Program
 from netv.fast_start_test import video_packet
-from netv.ffmpeg_session_lifecycle_test import LoopProcess
-from netv.ffmpeg_session_test import FakeProcess
+from netv.ffmpeg_command import MediaInfo
 from netv.main import CatchupListing, GuideRowsResponse, PlayerInfo, PlaylistPayload
-from netv.playback_policy import LiveRecoveryPolicy
+from netv.playback_policy import LiveRecoveryPolicy, PlaybackPolicy
 from netv.playlists import NameMatch, StreamSummary
 from netv.xtream import ProviderRecord
 
 
 T = TypeVar("T")
 
-
-@pytest.fixture
-def mock_deps() -> Iterator[None]:
-    """Mock all external dependencies before importing main."""
-    with (
-        patch.dict(
-            "sys.modules",
-            {"defusedxml": MagicMock(), "defusedxml.ElementTree": MagicMock()},
-        ),
-        patch("netv.cache.CACHE_DIR", Path("/tmp/test_cache")),
-        patch("netv.cache.SERVER_SETTINGS_FILE", Path("/tmp/test_cache/server_settings.json")),
-        patch("netv.cache.USERS_DIR", Path("/tmp/test_cache/users")),
-    ):
-        yield
+SERVER_INFO_URL = "http://upstream.test/player_api.php?username=user&password=pass"
 
 
 @pytest.fixture
-def client(tmp_path: Path, mock_deps: None) -> Iterator[TestClient]:
-    """Create test client with mocked dependencies."""
-
-    # Patch paths before importing main.
-    with (
-        patch("netv.cache.CACHE_DIR", tmp_path),
-        patch("netv.cache.SERVER_SETTINGS_FILE", tmp_path / "server_settings.json"),
-        patch("netv.cache.USERS_DIR", tmp_path / "users"),
-        patch("netv.auth.CACHE_DIR", tmp_path),
-        patch("netv.auth.SERVER_SETTINGS_FILE", tmp_path / "server_settings.json"),
-        patch("netv.auth.USERS_DIR", tmp_path / "users"),
-        patch("netv.epg.init"),
-        patch("netv.ffmpeg_command.init"),
-        patch("netv.ffmpeg_session.cleanup_and_recover_sessions"),
-    ):
-        (tmp_path / "users").mkdir(exist_ok=True)
-
-        # Disable background loading.
-        cache_module.clear_all_caches()
-        cache_module.get_cache().pop("epg", None)
-        yield TestClient(main.app)
+def mock_deps(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Give each test an empty guide database and fresh session, cast and login state."""
+    epg.init(cache_module.CACHE_DIR)
+    settings = cache_module.load_server_settings()
+    settings["transcode_dir"] = str(cache_module.CACHE_DIR / "transcode")
+    cache_module.save_server_settings(settings)
+    monkeypatch.setattr(ffmpeg_session, "_transcode_sessions", {})
+    monkeypatch.setattr(ffmpeg_session, "_url_to_session", {})
+    monkeypatch.setattr(chromecast, "manager", chromecast.CastManager())
+    monkeypatch.setattr(m3u_module, "_refresh_in_progress", set())
+    monkeypatch.setattr(main, "_login_attempts", {})
+    monkeypatch.setattr(catchup, "_tz_cache", {})
+    yield
+    epg.close()
 
 
 @pytest.fixture
-def auth_client(tmp_path: Path, mock_deps: None) -> Iterator[TestClient]:
+def client(mock_deps: None) -> TestClient:
+    """Create a test client with no users signed in."""
+    return TestClient(main.app)
+
+
+@pytest.fixture
+def auth_client(mock_deps: None) -> TestClient:
     """Create test client with a logged-in user."""
+    client = TestClient(main.app)
+    auth.create_user("testuser", "testpass123")
+    client.cookies.set("token", auth.create_token({"sub": "testuser"}))
+    return client
 
-    with (
-        patch("netv.cache.CACHE_DIR", tmp_path),
-        patch("netv.cache.SERVER_SETTINGS_FILE", tmp_path / "server_settings.json"),
-        patch("netv.cache.USERS_DIR", tmp_path / "users"),
-        patch("netv.auth.CACHE_DIR", tmp_path),
-        patch("netv.auth.SERVER_SETTINGS_FILE", tmp_path / "server_settings.json"),
-        patch("netv.auth.USERS_DIR", tmp_path / "users"),
-        patch("netv.epg.init"),
-        patch("netv.ffmpeg_command.init"),
-        patch("netv.ffmpeg_session.cleanup_and_recover_sessions"),
-    ):
-        (tmp_path / "users").mkdir(exist_ok=True)
 
-        cache_module.clear_all_caches()
-        cache_module.get_cache().pop("epg", None)
-        client = TestClient(main.app)
-
-        # Create user and get token.
-        auth.create_user("testuser", "testpass123")
-        token = auth.create_token({"sub": "testuser"})
-        client.cookies.set("token", token)
-
-        yield client
+@pytest.fixture
+def threads(monkeypatch: pytest.MonkeyPatch) -> testing.ThreadRecorder:
+    """Hold main's background loaders instead of running them."""
+    recorder = testing.ThreadRecorder(run_inline=False)
+    testing.install_threads(monkeypatch, recorder, main)
+    return recorder
 
 
 def test_web_player_includes_resolution_badge(auth_client: TestClient):
-
-    info = PlayerInfo(url="https://example.test/live.m3u8", channel_name="Test channel")
-    with patch("netv.main._get_live_player_info", return_value=info):
-        response = auth_client.get("/play/live/test")
+    _set_live({"stream_id": "test", "name": "Test channel", "direct_url": "https://e.test/l.m3u8"})
+    response = auth_client.get("/play/live/test")
     assert response.status_code == 200
     assert 'id="quality-badge"' in response.text
     assert response.text.index('id="player-container"') < response.text.index('id="quality-badge"')
@@ -161,17 +138,13 @@ def test_web_player_includes_resolution_badge(auth_client: TestClient):
 
 
 def test_live_player_records_view(auth_client: TestClient):
-
-    info = PlayerInfo(
-        url="https://example.test/live.m3u8",
-        channel_name="Test",
-        source_id="source-a",
+    _set_live(
+        {"stream_id": "7", "name": "Test", "direct_url": "https://e.test/l.m3u8", "source_id": "a"},
     )
-    with patch("netv.main._get_live_player_info", return_value=info):
-        response = auth_client.get("/play/live/7")
+    response = auth_client.get("/play/live/7")
 
     assert response.status_code == 200
-    assert cache_module.load_live_view_counts("testuser") == {"source-a:7": 1}
+    assert cache_module.load_live_view_counts("testuser") == {"a:7": 1}
 
 
 @pytest.mark.parametrize("path", ["devices", "status"])
@@ -184,123 +157,150 @@ def test_cast_commands_require_authentication(client: TestClient, path: str):
     assert client.post(f"/api/cast/{path}", json={}).status_code == 401
 
 
-def test_cast_api_uses_http_and_remembers_lan_address(auth_client: TestClient):
-    with patch("netv.chromecast.manager.start", return_value={"active": True}) as start:
-        response = auth_client.post(
-            "/api/cast/start",
-            json={
-                "host": "192.168.1.50",
-                "session_id": "abc",
-                "server_url": "http://192.168.1.10:9000/",
-                "title": "News",
-                "current_time": 15,
-            },
-        )
-        assert response.status_code == 200
-        start.assert_called_once_with(
-            "testuser",
-            "192.168.1.50",
-            "abc",
-            "http://192.168.1.10:9000",
-            "News",
-            15,
-        )
-        assert (
-            cache_module.load_user_settings("testuser")["cast_host"] == "http://192.168.1.10:9000"
-        )
+def test_cast_api_uses_http_and_remembers_lan_address(
+    auth_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    receiver = _cast_lan(monkeypatch, tmp_path)
+    response = auth_client.post(
+        "/api/cast/start",
+        json={
+            "host": "192.168.1.50",
+            "session_id": "abc",
+            "server_url": "http://192.168.1.10:9000/",
+            "title": "News",
+            "current_time": 15,
+        },
+    )
+    assert response.status_code == 200
+    assert _fields(response)["host"] == "192.168.1.50"
+    load = receiver.media_controller.loaded[0]
+    assert load.url == "http://192.168.1.10:9000/transcode/abc/stream.m3u8"
+    assert load.options["title"] == "News"
+    assert cache_module.load_user_settings("testuser")["cast_host"] == "http://192.168.1.10:9000"
 
 
-def test_cast_api_uses_request_origin_and_supports_legacy_host_preference(auth_client: TestClient):
-    with patch("netv.chromecast.manager.start", return_value={"active": True}) as start:
-        response = auth_client.post(
-            "/api/cast/start",
-            json={"host": "192.168.1.50", "session_id": "abc"},
-        )
-        assert response.status_code == 200
-        assert start.call_args.args[3] == "http://testserver"
-        settings = cache_module.load_user_settings("testuser")
-        settings["cast_host"] = "192.168.1.10:8000"
-        cache_module.save_user_settings("testuser", settings)
-        response = auth_client.post(
-            "/api/cast/start",
-            json={"host": "192.168.1.50", "session_id": "abc"},
-        )
-        assert response.status_code == 200
-        assert start.call_args.args[3] == "http://192.168.1.10:8000"
+def test_cast_api_uses_request_origin_and_supports_legacy_host_preference(
+    auth_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    receiver = _cast_lan(monkeypatch, tmp_path)
+    response = auth_client.post(
+        "/api/cast/start",
+        json={"host": "192.168.1.50", "session_id": "abc"},
+    )
+    assert response.status_code == 200
+    assert receiver.media_controller.loaded[0].url == "http://testserver/transcode/abc/stream.m3u8"
+    assert cache_module.load_user_settings("testuser").get("cast_host", "") == ""
+
+    monkeypatch.setattr(chromecast, "manager", chromecast.CastManager())
+    settings = cache_module.load_user_settings("testuser")
+    settings["cast_host"] = "192.168.1.10:8000"
+    cache_module.save_user_settings("testuser", settings)
+    response = auth_client.post(
+        "/api/cast/start",
+        json={"host": "192.168.1.50", "session_id": "abc"},
+    )
+    assert response.status_code == 200
+    assert receiver.media_controller.loaded[1].url == (
+        "http://192.168.1.10:8000/transcode/abc/stream.m3u8"
+    )
 
 
-def test_cast_rejects_localhost_media_address(auth_client: TestClient):
-    with patch("netv.chromecast.manager.start") as start:
-        response = auth_client.post(
-            "/api/cast/start",
-            json={
-                "host": "192.168.1.50",
-                "session_id": "abc",
-                "server_url": "http://localhost:8000",
-            },
-        )
-        assert response.status_code == 400
-        start.assert_not_called()
+def test_cast_rejects_localhost_media_address(
+    auth_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    _cast_lan(monkeypatch, tmp_path)
+    network = testing.CastNetwork({"192.168.1.50": testing.FakeChromecast()})
+    testing.install_chromecast(monkeypatch, network, chromecast)
+    response = auth_client.post(
+        "/api/cast/start",
+        json={
+            "host": "192.168.1.50",
+            "session_id": "abc",
+            "server_url": "http://localhost:8000",
+        },
+    )
+    assert response.status_code == 400
+    assert "localhost" in _body(response, _Detail)["detail"]
+    assert network.connects == []
+    assert cache_module.load_user_settings("testuser").get("cast_host", "") == ""
 
 
-def _release_and_report(
-    username: str,
-    action: str,
-    volume: float | None,
-    *,
-    release: Callable[[str], None],
-) -> dict[str, bool]:
-    del username, action, volume
-    release("cast-session")
-    return {"active": True}
+def test_cast_command_validation_and_user_scope(
+    auth_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    receiver = _cast_lan(monkeypatch, tmp_path)
+    assert (
+        auth_client.post("/api/cast/start", json={"host": "192.168.1.50", "session_id": "abc"})
+    ).status_code == 200
+    process = ffmpeg_session._transcode_sessions["abc"]["process"]
+    assert (
+        auth_client.post("/api/cast/control", json={"action": "volume", "volume": 2}).status_code
+        == 422
+    )
+    assert auth_client.post("/api/cast/control", json={"action": "reboot"}).status_code == 422
+    assert receiver.media_controller.commands == ["load"]
+
+    assert auth_client.post("/api/cast/control", json={"action": "pause"}).status_code == 200
+    assert receiver.media_controller.commands == ["load", "pause"]
+    assert "abc" in ffmpeg_session._transcode_sessions
+
+    auth.create_user("other", "otherpass1")
+    other = TestClient(main.app)
+    other.cookies.set("token", auth.create_token({"sub": "other"}))
+    assert other.post("/api/cast/control", json={"action": "stop"}).status_code == 404
+
+    assert auth_client.post("/api/cast/control", json={"action": "stop"}).status_code == 200
+    assert receiver.media_controller.commands == ["load", "pause", "stop"]
+    assert "abc" not in ffmpeg_session._transcode_sessions
+    assert isinstance(process, testing.FakeProcess)
+    assert process.signals == ["TERM"]
 
 
-def test_cast_command_validation_and_user_scope(auth_client: TestClient):
-    with (
-        patch("netv.chromecast.manager.command", side_effect=_release_and_report) as command,
-        patch("netv.main.ffmpeg_session.stop_session", new_callable=AsyncMock) as stop,
-    ):
-        assert (
-            auth_client.post(
-                "/api/cast/control",
-                json={"action": "volume", "volume": 2},
-            ).status_code
-            == 422
-        )
-        assert auth_client.post("/api/cast/control", json={"action": "reboot"}).status_code == 422
-        command.assert_not_called()
-        assert auth_client.post("/api/cast/control", json={"action": "pause"}).status_code == 200
-        assert command.call_args.args == ("testuser", "pause", None)
-        stop.assert_awaited_once_with("cast-session", force=True)
-
-
-def test_cast_discovery_reports_network_errors(auth_client: TestClient):
-    with patch("netv.chromecast.manager.discover", side_effect=OSError("no network")):
-        response = auth_client.get("/api/cast/devices")
+def test_cast_discovery_reports_network_errors(
+    auth_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    network = testing.CastNetwork(discovery_error=OSError("no network"))
+    testing.install_chromecast(monkeypatch, network, chromecast)
+    response = auth_client.get("/api/cast/devices")
     assert response.status_code == 503
     assert "manually" in _body(response, _Detail)["detail"]
 
 
-def test_browser_cannot_stop_or_seek_cast_owned_session(auth_client: TestClient):
-    with (
-        patch("netv.chromecast.manager.owns_session", return_value=True),
-        patch("netv.ffmpeg_session.stop_session") as stop,
-    ):
-        response = auth_client.post("/transcode/abc/stop?force=true")
-        assert response.json() == {"status": "casting"}
-        assert auth_client.delete("/transcode/abc?force=true").json() == {"status": "casting"}
-        assert auth_client.get("/transcode/seek/abc?time=10").status_code == 409
-        stop.assert_not_called()
+def test_browser_cannot_stop_or_seek_cast_owned_session(
+    auth_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    session = _add_session("abc", tmp_path)
+    _cast_owns(monkeypatch, session_id="abc", url=session["url"])
+    response = auth_client.post("/transcode/abc/stop?force=true")
+    assert response.json() == {"status": "casting"}
+    assert auth_client.delete("/transcode/abc?force=true").json() == {"status": "casting"}
+    assert auth_client.get("/transcode/seek/abc?time=10").status_code == 409
+    assert ffmpeg_session._transcode_sessions["abc"] is session
+    assert _signals(session) == []
 
 
-def test_cast_source_cannot_be_restarted_while_receiver_owns_it(auth_client: TestClient):
-    with (
-        patch("netv.chromecast.manager.owns_url", return_value=True),
-        patch("netv.ffmpeg_session.clear_url_session") as clear,
-    ):
-        assert auth_client.delete("/transcode-clear?url=http://provider/live").status_code == 409
-        assert auth_client.get("/transcode/start?url=http://provider/live").status_code == 409
-        clear.assert_not_called()
+def test_cast_source_cannot_be_restarted_while_receiver_owns_it(
+    auth_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    session = _add_session("abc", tmp_path, url="http://provider/live")
+    _cast_owns(monkeypatch, session_id="abc", url="http://provider/live")
+    assert auth_client.delete("/transcode-clear?url=http://provider/live").status_code == 409
+    assert auth_client.get("/transcode/start?url=http://provider/live").status_code == 409
+    assert ffmpeg_session._url_to_session == {"http://provider/live": "abc"}
+    assert _signals(session) == []
 
 
 def test_receiver_hls_request_keeps_session_alive_without_cookie(
@@ -308,97 +308,86 @@ def test_receiver_hls_request_keeps_session_alive_without_cookie(
     tmp_path: Path,
 ):
     (tmp_path / "stream.m3u8").write_text("#EXTM3U\n#EXTINF:6,\nseg001.ts\n")
-    with (
-        patch("netv.ffmpeg_session.get_session", return_value={"dir": str(tmp_path)}),
-        patch("netv.ffmpeg_session.touch_session") as touch,
-    ):
-        response = client.get("/transcode/abc/stream.m3u8")
+    session = _add_session("abc", tmp_path, last_access=0.0)
+    before = time.time()
+    response = client.get("/transcode/abc/stream.m3u8")
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "*"
-    touch.assert_called_once_with("abc")
+    assert session.get("last_access", 0) >= before
 
 
 def test_live_dvr_routes_auto_mode_through_server(auth_client: TestClient):
-
-    info = PlayerInfo(url="https://example.test/live.ts", channel_name="Test channel")
-    with patch("netv.main._get_live_player_info", return_value=info):
-        response = auth_client.get("/play/live/test")
+    _set_live(_archive_stream(stream_id="test", tv_archive=0))
+    response = auth_client.get("/play/live/test")
     assert response.status_code == 200
     assert 'transcodeMode: "always"' in response.text
     assert "liveDvrMins: 120" in response.text
 
 
 def test_live_dvr_disabled_keeps_direct_auto_mode(auth_client: TestClient):
-
     settings = cache_module.load_server_settings()
     settings["live_dvr_mins"] = 0
     cache_module.save_server_settings(settings)
-    info = PlayerInfo(url="https://example.test/live.ts", channel_name="Test channel")
-    with patch("netv.main._get_live_player_info", return_value=info):
-        response = auth_client.get("/play/live/test")
+    _set_live(_archive_stream(stream_id="test", tv_archive=0))
+    response = auth_client.get("/play/live/test")
     assert response.status_code == 200
     assert 'transcodeMode: "auto"' in response.text
     assert "liveDvrMins: 0" in response.text
 
 
 def test_live_player_passes_program_window_from_epg(auth_client: TestClient):
-
-    info = PlayerInfo(
-        url="https://example.test/live.ts",
-        channel_name="Test channel",
-        program_title="News",
-        program_start=1749998200.0,
-        program_end=1750000000.0,
+    start = _now() - timedelta(minutes=30)
+    stop = start + timedelta(hours=1)
+    _set_live(
+        {
+            "stream_id": "test",
+            "name": "Test channel",
+            "direct_url": "https://e.test/l.ts",
+            "epg_channel_id": "ch1",
+        },
     )
-    with patch("netv.main._get_live_player_info", return_value=info):
-        response = auth_client.get("/play/live/test")
+    _air("ch1", "News", start, stop)
+    response = auth_client.get("/play/live/test")
     assert response.status_code == 200
-    assert "programStart: 1749998200.0" in response.text
-    assert "programEnd: 1750000000.0" in response.text
+    assert f"programStart: {start.timestamp()}" in response.text
+    assert f"programEnd: {stop.timestamp()}" in response.text
     assert 'streamId: "test"' in response.text
     assert 'id="program-remaining"' not in response.text
 
 
-def test_live_player_info_reads_program_window_from_epg():
-
-    start = datetime.now(timezone.utc) - timedelta(minutes=30)
-    stop = datetime.now(timezone.utc) + timedelta(minutes=30)
-    program = Program(channel_id="ch1", title="News", start=start, stop=stop)
-    stream = {
-        "stream_id": "1",
-        "name": "Channel",
-        "direct_url": "https://example.test/live.ts",
-        "epg_channel_id": "ch1",
-    }
-    with (
-        patch("netv.main._ensure_live_cache"),
-        patch("netv.main.get_cache", return_value={"live_streams": [stream]}),
-        patch("netv.epg.get_programs_in_range", return_value=[program]),
-    ):
-        info = main._get_live_player_info("1")
-    assert info.program_title == "News"
+def test_live_player_info_reads_program_window_from_epg(mock_deps: None):
+    start = _now() - timedelta(minutes=30)
+    stop = _now() + timedelta(minutes=30)
+    _air("ch1", "News", start, stop, desc="Headlines")
+    settings = cache_module.load_server_settings()
+    settings["sources"] = [{"id": "src1", "name": "P", "type": "m3u", "url": "http://p"}]
+    cache_module.save_server_settings(settings)
+    _set_live(
+        {
+            "stream_id": "1",
+            "name": "Channel",
+            "direct_url": "https://example.test/live.ts",
+            "epg_channel_id": "ch1",
+            "source_id": "src1",
+            "category_ids": "not-a-list",
+        },
+    )
+    info = main._get_live_player_info("1")
+    assert (info.url, info.is_m3u) == ("https://example.test/live.ts", True)
+    assert (info.program_title, info.program_desc) == ("News", "Headlines")
     assert info.program_start == start.timestamp()
     assert info.program_end == stop.timestamp()
+    # A source saved without the setting keeps deinterlacing on.
+    assert info.deinterlace_fallback is True
+    assert info.category_ids is None
 
 
 def test_live_program_api_returns_current_program(auth_client: TestClient):
-
-    start = datetime.now(timezone.utc) - timedelta(minutes=10)
+    start = _now() - timedelta(minutes=10)
     stop = start + timedelta(minutes=45)
-    program = Program(
-        channel_id="ch1",
-        title="News",
-        start=start,
-        stop=stop,
-        desc="Tonight's headlines",
-    )
-    stream = {"stream_id": "1", "name": "Channel", "epg_channel_id": "ch1"}
-    with (
-        patch("netv.main._ensure_live_cache"),
-        patch("netv.main.get_cache", return_value={"live_streams": [stream]}),
-        patch("netv.epg.get_programs_in_range", return_value=[program]),
-    ):
-        response = auth_client.get("/api/live/program/1")
+    _air("ch1", "News", start, stop, desc="Tonight's headlines")
+    _set_live({"stream_id": "1", "name": "Channel", "epg_channel_id": "ch1"})
+    response = auth_client.get("/api/live/program/1")
     assert response.status_code == 200
     assert response.json() == {
         "title": "News",
@@ -409,69 +398,47 @@ def test_live_program_api_returns_current_program(auth_client: TestClient):
 
 
 def test_live_program_api_without_guide_data_returns_empty_program(auth_client: TestClient):
-    stream = {"stream_id": "1", "name": "Channel"}
-    with (
-        patch("netv.main._ensure_live_cache"),
-        patch("netv.main.get_cache", return_value={"live_streams": [stream]}),
-    ):
-        response = auth_client.get("/api/live/program/1")
+    _set_live({"stream_id": "1", "name": "Channel"})
+    response = auth_client.get("/api/live/program/1")
     assert response.status_code == 200
     assert response.json() == {"title": "", "desc": "", "start": 0.0, "end": 0.0}
 
 
 def test_live_program_api_unknown_stream_is_not_found(auth_client: TestClient):
-    with (
-        patch("netv.main._ensure_live_cache"),
-        patch("netv.main.get_cache", return_value={"live_streams": []}),
-    ):
-        response = auth_client.get("/api/live/program/missing")
+    _set_live()
+    response = auth_client.get("/api/live/program/missing")
     assert response.status_code == 404
 
 
-class _FakeXtreamClient:
-    def __init__(self, timezone_name: str) -> None:
-        self.timezone_name = timezone_name
-
-    def get_server_info(self) -> dict[str, MutablePlainTree]:
-        return {"server_info": {"timezone": self.timezone_name}}
-
-
 class _CatchupWorld:
-    """Live cache, EPG, and Xtream clients for ``_get_catchup_player_info``."""
+    """Live cache, guide and upstream server info for ``_get_catchup_player_info``."""
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.streams: list[ProviderRecord] = [_archive_stream()]
-        self.programs: list[Program] = []
-        self.clients: dict[str, _FakeXtreamClient] = {}
-        self.tz_cache: dict[str, tuple[float, tzinfo]] = {}
-        monkeypatch.setattr(main, "_ensure_live_cache", self._ensure_live_cache)
-        monkeypatch.setattr(main, "get_cache", self.get_cache)
-        monkeypatch.setattr(main, "get_xtream_client_by_source", self.clients.get)
-        monkeypatch.setattr(main.epg, "get_programs_in_range", self.get_programs_in_range)
-        monkeypatch.setattr(main.catchup, "_tz_cache", self.tz_cache)
+        self.stream = _archive_stream()
+        _set_live(self.stream)
+        self.web = testing.FakeWeb()
+        testing.install_web(monkeypatch, self.web, util)
 
-    def _ensure_live_cache(self) -> None:
-        pass
-
-    def get_cache(self) -> dict[str, list[ProviderRecord]]:
-        return {"live_streams": self.streams}
-
-    def get_programs_in_range(
-        self,
-        channel_id: str,
-        start: datetime,
-        end: datetime,
-        preferred_source_id: str = "",
-    ) -> list[Program]:
-        return [
-            p
-            for p in self.programs
-            if p.channel_id == channel_id and p.start < end and start < p.stop
+    def serve_timezone(self, name: str) -> None:
+        """Configure the archive's Xtream source and the time zone its server reports."""
+        settings = cache_module.load_server_settings()
+        settings["sources"] = [
+            {
+                "id": "src1",
+                "name": "Upstream",
+                "type": "xtream",
+                "url": "http://upstream.test",
+                "username": "user",
+                "password": "pass",
+            },
         ]
+        cache_module.save_server_settings(settings)
+        body = json.dumps({"server_info": {"timezone": name}}).encode()
+        self.web.routes[SERVER_INFO_URL] = testing.FakeResponse(body)
 
 
 @pytest.fixture
-def catchup_world(monkeypatch: pytest.MonkeyPatch) -> _CatchupWorld:
+def catchup_world(mock_deps: None, monkeypatch: pytest.MonkeyPatch) -> _CatchupWorld:
     return _CatchupWorld(monkeypatch)
 
 
@@ -481,17 +448,10 @@ def _hours_ago(hours: int) -> datetime:
 
 def test_catchup_player_info_builds_timeshift_url(catchup_world: _CatchupWorld):
     start = _hours_ago(3)
-    program = Program(
-        channel_id="ch1",
-        title="Earlier news",
-        start=start,
-        stop=start + timedelta(minutes=30),
-        desc="Headlines",
-    )
-    catchup_world.programs.append(program)
+    program = _air("ch1", "Earlier news", start, start + timedelta(minutes=30), desc="Headlines")
     # A direct playlist URL makes live info M3U; the archive is always Xtream timeshift.
-    catchup_world.streams[0]["direct_url"] = "http://m3u.test/42.ts"
-    catchup_world.clients["src1"] = _FakeXtreamClient("Europe/Amsterdam")
+    catchup_world.stream["direct_url"] = "http://m3u.test/42.ts"
+    catchup_world.serve_timezone("Europe/Amsterdam")
 
     info = main._get_catchup_player_info("src1_42", start.timestamp())
 
@@ -502,18 +462,13 @@ def test_catchup_player_info_builds_timeshift_url(catchup_world: _CatchupWorld):
     assert info.catchup_days == 2
     assert (info.program_title, info.program_desc) == ("Earlier news", "Headlines")
     assert info.program_end == program.stop.timestamp()
-    assert list(catchup_world.tz_cache) == ["src1"]
+    assert list(catchup._tz_cache) == ["src1"]
+    assert catchup_world.web.urls == [SERVER_INFO_URL]
 
 
 def test_catchup_player_info_starts_mid_program(catchup_world: _CatchupWorld):
     program_start = _hours_ago(3)
-    program = Program(
-        channel_id="ch1",
-        title="Earlier news",
-        start=program_start,
-        stop=program_start + timedelta(minutes=30),
-    )
-    catchup_world.programs.append(program)
+    program = _air("ch1", "Earlier news", program_start, program_start + timedelta(minutes=30))
     target = program_start + timedelta(minutes=10, seconds=25, microseconds=500_000)
 
     info = main._get_catchup_player_info("src1_42", target.timestamp())
@@ -524,21 +479,15 @@ def test_catchup_player_info_starts_mid_program(catchup_world: _CatchupWorld):
     assert info.catchup_seek == 25.5
     assert info.program_start == program_start.timestamp()
     assert info.program_end == program.stop.timestamp()
+    assert catchup_world.web.urls == []
 
 
 def test_catchup_player_info_without_guide_plays_one_hour(catchup_world: _CatchupWorld):
+    del catchup_world
     start = _hours_ago(3) + timedelta(seconds=40)
     # What airs now must not label an archive the guide does not cover.
-    now = datetime.now(timezone.utc)
-    catchup_world.programs.append(
-        Program(
-            channel_id="ch1",
-            title="Live now",
-            start=now - timedelta(minutes=5),
-            stop=now + timedelta(minutes=25),
-            desc="Current",
-        ),
-    )
+    now = _now()
+    _air("ch1", "Live now", now - timedelta(minutes=5), now + timedelta(minutes=25), desc="Current")
 
     info = main._get_catchup_player_info("src1_42", start.timestamp())
 
@@ -550,11 +499,12 @@ def test_catchup_player_info_without_guide_plays_one_hour(catchup_world: _Catchu
 
 
 def test_catchup_player_info_needs_a_live_url(catchup_world: _CatchupWorld):
-    catchup_world.streams[0]["source_type"] = "m3u"
+    catchup_world.stream["source_type"] = "m3u"
     assert main._get_catchup_player_info("src1_42", _hours_ago(3).timestamp()) == PlayerInfo()
 
 
 def test_catchup_player_info_rejects_programs_outside_archive(catchup_world: _CatchupWorld):
+    del catchup_world
     too_old = datetime.now(timezone.utc) - timedelta(days=3)
     with pytest.raises(HTTPException) as excinfo:
         main._get_catchup_player_info("src1_42", too_old.timestamp())
@@ -563,221 +513,185 @@ def test_catchup_player_info_rejects_programs_outside_archive(catchup_world: _Ca
 
 
 def test_catchup_player_page_plays_archive_as_vod(auth_client: TestClient):
-
-    info = PlayerInfo(
-        url="http://upstream.test/timeshift/user/pass/30/2026-01-01:10-00/42.ts",
-        channel_name="Channel",
-        catchup_days=2,
-        catchup_start=1767261600.0,
-        catchup_seek=25.0,
-    )
-    with patch("netv.main._get_catchup_player_info", return_value=info) as get_info:
-        response = auth_client.get("/play/live/src1_42?start=1767261600")
-    get_info.assert_called_once_with("src1_42", 1767261600.0)
+    _set_live(_archive_stream())
+    begin = _hours_ago(3)
+    start = int(begin.timestamp()) + 25
+    response = auth_client.get(f"/play/live/src1_42?start={start}")
     assert response.status_code == 200
     assert "catchup: true" in response.text
-    assert "catchupStart: 1767261600.0" in response.text
+    assert f"catchupStart: {begin.timestamp()}" in response.text
     assert "catchupSeek: 25.0" in response.text
+    assert "/timeshift/user/pass/" in response.text
     assert 'id="go-live-btn"' in response.text
     assert 'id="jump-btn"' in response.text
     assert 'id="start-over-btn"' not in response.text
 
 
 def test_live_player_offers_start_over_with_archive(auth_client: TestClient):
-
-    info = PlayerInfo(url="https://example.test/live.ts", channel_name="Channel", catchup_days=1)
-    with patch("netv.main._get_live_player_info", return_value=info):
-        response = auth_client.get("/play/live/test")
+    _set_live(
+        _archive_stream(stream_id="test", direct_url="https://e.test/l.ts", tv_archive_duration=1),
+    )
+    response = auth_client.get("/play/live/test")
     assert "catchup: false" in response.text
     assert "catchupDays: 1" in response.text
     assert 'id="start-over-btn"' in response.text
 
 
 def test_catchup_api_lists_archived_programs_newest_first(auth_client: TestClient):
-
-    now = datetime.now(timezone.utc)
-    programs = [
-        Program(
-            channel_id="ch1",
-            title="Too old",
-            start=now - timedelta(days=2, hours=1),
-            stop=now - timedelta(days=2) + timedelta(minutes=1),
-        ),
-        Program(
-            channel_id="ch1",
-            title="Morning",
-            start=now - timedelta(hours=5),
-            stop=now - timedelta(hours=4),
-        ),
-        Program(
-            channel_id="ch1",
-            title="On now",
-            start=now - timedelta(minutes=10),
-            stop=now + timedelta(minutes=20),
-        ),
-    ]
-    with (
-        patch("netv.main._ensure_live_cache"),
-        patch("netv.main.get_cache", return_value={"live_streams": [_archive_stream()]}),
-        patch("netv.epg.get_programs_in_range", return_value=programs),
-    ):
-        response = auth_client.get("/api/live/catchup/src1_42")
+    now = _now()
+    _air("ch1", "Too old", now - timedelta(days=2, hours=1), now - timedelta(days=2, minutes=-1))
+    morning = _air("ch1", "Morning", now - timedelta(hours=5), now - timedelta(hours=4))
+    _air("ch1", "On now", now - timedelta(minutes=10), now + timedelta(minutes=20))
+    _set_live(_archive_stream())
+    response = auth_client.get("/api/live/catchup/src1_42")
     assert response.status_code == 200
     payload = _body(response, CatchupListing)
     assert payload["days"] == 2
     assert [p["title"] for p in payload["programs"]] == ["On now", "Morning"]
-    assert payload["programs"][1]["start_timestamp"] == programs[1].start.timestamp()
+    assert payload["programs"][1]["start_timestamp"] == morning.start.timestamp()
 
 
 def test_catchup_api_without_archive_is_empty(auth_client: TestClient):
-    with (
-        patch("netv.main._ensure_live_cache"),
-        patch(
-            "netv.main.get_cache",
-            return_value={"live_streams": [_archive_stream(tv_archive=0)]},
-        ),
-    ):
-        response = auth_client.get("/api/live/catchup/src1_42")
+    _set_live(_archive_stream(tv_archive=0))
+    response = auth_client.get("/api/live/catchup/src1_42")
     assert response.json() == {"days": 0, "programs": []}
 
 
 def test_catchup_api_uses_playlist_guide_assignment(auth_client: TestClient):
-
-    now = datetime.now(timezone.utc)
-    earlier = Program(
-        channel_id="assigned",
-        title="Morning",
-        start=now - timedelta(hours=5),
-        stop=now - timedelta(hours=4),
+    now = _now()
+    _air("assigned", "Morning", now - timedelta(hours=5), now - timedelta(hours=4))
+    _air("ch1", "Unassigned guide", now - timedelta(hours=3), now - timedelta(hours=2))
+    _set_live(_archive_stream(epg_channel_id=""))
+    auth_client.post(
+        "/api/playlists",
+        json={
+            "name": "pl1",
+            "channels": [
+                {
+                    "stream_id": "src1_42",
+                    "source_id": "src1",
+                    "name": "Channel",
+                    "epg_channel_id": "assigned",
+                },
+            ],
+        },
     )
-    stream = _archive_stream(epg_channel_id="")
-    playlist = {
-        "id": "pl1",
-        "channels": [
-            {
-                "stream_id": "src1_42",
-                "source_id": "src1",
-                "name": "Channel",
-                "epg_channel_id": "assigned",
-            },
-        ],
-    }
-    with (
-        patch("netv.main._ensure_live_cache"),
-        patch("netv.main.get_cache", return_value={"live_streams": [stream]}),
-        patch("netv.main.playlists.load", return_value=[playlist]),
-        patch("netv.epg.get_programs_in_range", return_value=[earlier]) as get_programs,
-    ):
-        response = auth_client.get("/api/live/catchup/src1_42")
+    response = auth_client.get("/api/live/catchup/src1_42")
     assert [p["title"] for p in _body(response, CatchupListing)["programs"]] == ["Morning"]
-    assert get_programs.call_args.args[0] == "assigned"
 
 
 def test_catchup_player_page_rejects_invalid_start(auth_client: TestClient):
-    with (
-        patch("netv.main._ensure_live_cache"),
-        patch("netv.main.get_cache", return_value={"live_streams": [_archive_stream()]}),
-        patch("netv.epg.get_programs_in_range", return_value=[]),
-    ):
-        assert auth_client.get("/play/live/src1_42?start=1e300").status_code == 404
+    _set_live(_archive_stream())
+    assert auth_client.get("/play/live/src1_42?start=1e300").status_code == 404
 
 
 def test_catchup_api_unknown_stream_is_not_found(auth_client: TestClient):
-    with (
-        patch("netv.main._ensure_live_cache"),
-        patch("netv.main.get_cache", return_value={"live_streams": []}),
-    ):
-        assert auth_client.get("/api/live/catchup/missing").status_code == 404
+    _set_live()
+    assert auth_client.get("/api/live/catchup/missing").status_code == 404
 
 
-def test_adaptive_start_uses_shared_backend(auth_client: TestClient):
-    result = {
+ADAPTIVE_URL = "https://provider.example/live.m3u8"
+
+
+def test_adaptive_start_uses_shared_backend(auth_client: TestClient, tmp_path: Path):
+    _add_fast_session("shared", tmp_path)
+    response = auth_client.get(
+        "/transcode/start",
+        params={"url": ADAPTIVE_URL, "fast_start": "true"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {
         "session_id": "shared",
         "playlist": "/transcode/shared/low.m3u8",
         "master_playlist": "/transcode/shared/master.m3u8",
+        "playback_buffer_seconds": 12.0,
+        "subtitles": [],
+        "duration": 0,
+        "seek_offset": 0,
     }
-    with patch("netv.ffmpeg_session.start_transcode", new=AsyncMock(return_value=result)) as start:
-        response = auth_client.get(
-            "/transcode/start",
-            params={"url": "https://provider.example/live.m3u8", "fast_start": "true"},
-        )
-    assert response.status_code == 200
-    assert response.json() == result
-    assert start.call_args.kwargs["fast_start"] is True
 
 
-def test_disconnected_adaptive_start_is_cleaned_up(auth_client: TestClient):
-    with (
-        patch(
-            "netv.ffmpeg_session.start_transcode",
-            new=AsyncMock(return_value={"session_id": "new"}),
-        ),
-        patch("starlette.requests.Request.is_disconnected", new=AsyncMock(return_value=True)),
-        patch("netv.ffmpeg_session.stop_session") as stop,
-    ):
-        response = auth_client.get(
-            "/transcode/start",
-            params={"url": "https://provider.example/live.m3u8", "fast_start": "true"},
-        )
-    assert response.status_code == 499
-    stop.assert_called_once_with("new", force=True)
+@pytest.mark.parametrize("fast_start", [True, False])
+def test_disconnected_adaptive_start_is_cleaned_up(
+    mock_deps: None,
+    tmp_path: Path,
+    fast_start: bool,
+):
+    session = _add_fast_session("shared", tmp_path)
+    request = Request({"type": "http", "method": "GET", "headers": [], "query_string": b""}, _gone)
+    start = main.transcode_start(request, {"sub": "testuser"}, ADAPTIVE_URL, fast_start=fast_start)
+    if fast_start:
+        with pytest.raises(HTTPException) as excinfo:
+            asyncio.run(start)
+        assert excinfo.value.status_code == 499
+        assert "shared" not in ffmpeg_session._transcode_sessions
+        assert _signals(session) == ["TERM"]
+    else:
+        assert asyncio.run(start)["session_id"] == "shared"
+        assert ffmpeg_session._transcode_sessions["shared"] is session
+        assert _signals(session) == []
 
 
 @pytest.mark.parametrize("owner,status", [("testuser", 200), ("other", 404)])
-def test_live_page_close_force_stop_checks_owner(auth_client: TestClient, owner: str, status: int):
-    with (
-        patch("netv.ffmpeg_session.get_session", return_value={"username": owner}),
-        patch("netv.ffmpeg_session.stop_session") as stop,
-    ):
-        response = auth_client.post("/transcode/live/stop?force=true")
+def test_live_page_close_force_stop_checks_owner(
+    auth_client: TestClient,
+    tmp_path: Path,
+    owner: str,
+    status: int,
+):
+    session = _add_session("live", tmp_path, username=owner)
+    response = auth_client.post("/transcode/live/stop?force=true")
     assert response.status_code == status
-    if status == 200:
-        stop.assert_called_once_with("live", force=True)
-    else:
-        stop.assert_not_called()
+    _assert_stopped("live", session, stopped=status == 200)
 
 
 @pytest.mark.parametrize("owner,status", [("testuser", 200), ("other", 404)])
 def test_archive_stop_without_force_still_releases_only_owner_session(
     auth_client: TestClient,
+    tmp_path: Path,
     owner: str,
     status: int,
 ):
-    with (
-        patch(
-            "netv.ffmpeg_session.get_session",
-            return_value={"username": owner, "is_archive": True},
-        ),
-        patch("netv.ffmpeg_session.stop_session") as stop,
-    ):
-        response = auth_client.post("/transcode/archive/stop")
+    session = _add_session("archive", tmp_path, username=owner, is_archive=True)
+    response = auth_client.post("/transcode/archive/stop")
     assert response.status_code == status
-    if status == 200:
-        stop.assert_called_once_with("archive", force=True)
-    else:
-        stop.assert_not_called()
+    _assert_stopped("archive", session, stopped=status == 200)
+
+
+XMLTV_URL = "http://epg.test/guide.xml"
 
 
 class TestLoadAllEpg:
-    def test_refetches_when_listings_ran_out(self, mock_deps: None):
+    def test_refetches_when_listings_ran_out(
+        self,
+        mock_deps: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        now = _now()
+        _air("news", "Ended", now - timedelta(hours=2), now - timedelta(hours=1))
+        web = testing.FakeWeb({XMLTV_URL: testing.FakeResponse(_xmltv("news", now, hours=12))})
+        testing.install_web(monkeypatch, web, util)
 
-        urls = [("http://epg", 30, "s")]
-        with (
-            patch("netv.main.epg.has_programs_after", return_value=False),
-            patch("netv.main._fetch_all_epg") as fetch,
-        ):
-            main.load_all_epg(urls)
-        fetch.assert_called_once_with(urls)
+        main.load_all_epg([(XMLTV_URL, 30, "s")])
 
-    def test_skips_fetch_when_listings_are_current(self, mock_deps: None):
+        assert web.urls == [XMLTV_URL]
+        assert web.fetches[0].timeout == 30
+        assert epg.has_programs_after(now + timedelta(hours=6))
 
-        with (
-            patch("netv.main.epg.has_programs_after", return_value=True),
-            patch("netv.main.epg.get_program_count", return_value=5),
-            patch("netv.main._fetch_all_epg") as fetch,
-        ):
-            main.load_all_epg([("http://epg", 30, "s")])
-        fetch.assert_not_called()
+    def test_skips_fetch_when_listings_are_current(
+        self,
+        mock_deps: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        now = _now()
+        _air("news", "Tonight", now, now + timedelta(hours=12))
+        web = testing.FakeWeb()
+        testing.install_web(monkeypatch, web, util)
+
+        main.load_all_epg([(XMLTV_URL, 30, "s")])
+
+        assert web.fetches == []
+        assert epg.get_program_count() == 1
 
 
 class TestSetup:
@@ -788,8 +702,7 @@ class TestSetup:
         assert resp.status_code == 200
         assert b"setup" in resp.content.lower() or b"Create" in resp.content
 
-    def test_setup_redirects_when_users_exist(self, client: TestClient, tmp_path: Path):
-
+    def test_setup_redirects_when_users_exist(self, client: TestClient):
         auth.create_user("admin", "password123")
 
         resp = client.get("/setup", follow_redirects=False)
@@ -840,15 +753,13 @@ class TestLogin:
         assert resp.status_code == 303
         assert resp.headers["location"] == "/setup"
 
-    def test_login_page_shown_when_users_exist(self, client: TestClient, tmp_path: Path):
-
+    def test_login_page_shown_when_users_exist(self, client: TestClient):
         auth.create_user("admin", "password123")
 
         resp = client.get("/login")
         assert resp.status_code == 200
 
-    def test_login_success_sets_cookie(self, client: TestClient, tmp_path: Path):
-
+    def test_login_success_sets_cookie(self, client: TestClient):
         auth.create_user("admin", "password123")
 
         resp = client.post(
@@ -859,8 +770,7 @@ class TestLogin:
         assert resp.status_code == 303
         assert "token" in resp.cookies
 
-    def test_login_failure_returns_401(self, client: TestClient, tmp_path: Path):
-
+    def test_login_failure_returns_401(self, client: TestClient):
         auth.create_user("admin", "password123")
 
         resp = client.post(
@@ -884,35 +794,11 @@ class TestLogout:
 class TestAuthRequired:
     """Tests for auth-protected routes."""
 
-    def test_index_redirects_to_login(self, client: TestClient, tmp_path: Path):
-
+    @pytest.mark.parametrize("path", ["/", "/guide", "/vod", "/series"])
+    def test_redirects_to_login(self, client: TestClient, path: str):
         auth.create_user("admin", "password123")
 
-        resp = client.get("/", follow_redirects=False)
-        assert resp.status_code == 303
-        assert resp.headers["location"] == "/login"
-
-    def test_guide_redirects_to_login(self, client: TestClient, tmp_path: Path):
-
-        auth.create_user("admin", "password123")
-
-        resp = client.get("/guide", follow_redirects=False)
-        assert resp.status_code == 303
-        assert resp.headers["location"] == "/login"
-
-    def test_vod_redirects_to_login(self, client: TestClient, tmp_path: Path):
-
-        auth.create_user("admin", "password123")
-
-        resp = client.get("/vod", follow_redirects=False)
-        assert resp.status_code == 303
-        assert resp.headers["location"] == "/login"
-
-    def test_series_redirects_to_login(self, client: TestClient, tmp_path: Path):
-
-        auth.create_user("admin", "password123")
-
-        resp = client.get("/series", follow_redirects=False)
+        resp = client.get(path, follow_redirects=False)
         assert resp.status_code == 303
         assert resp.headers["location"] == "/login"
 
@@ -937,12 +823,28 @@ class TestFavicon:
 class TestGuide:
     """Tests for guide page."""
 
-    def test_guide_shows_loading_when_no_cache(self, auth_client: TestClient):
-        with patch("netv.m3u.load_file_cache", return_value=None):
-            resp = auth_client.get("/guide")
-            assert resp.status_code == 200
-            # Should show loading state.
-            assert b"loading" in resp.content.lower() or b"Loading" in resp.content
+    @pytest.mark.parametrize("guide_db_open", [True, False])
+    def test_guide_shows_loading_when_no_cache(
+        self,
+        auth_client: TestClient,
+        threads: testing.ThreadRecorder,
+        guide_db_open: bool,
+    ):
+        resp = auth_client.get("/guide")
+        assert resp.status_code == 200
+        assert b"Loading channel data" in resp.content
+        assert [t.is_alive() for t in threads.threads] == [True]
+        assert "guide_load" in m3u_module.get_refresh_in_progress()
+        assert auth_client.get("/guide").status_code == 200
+        assert len(threads.threads) == 1, "A load in progress is not started twice"
+
+        if not guide_db_open:
+            epg.close()
+        threads.run_all()
+        assert threads.errors == []
+        assert cache_module.get_cache().get("live_streams") == []
+        assert ("epg_error" in cache_module.get_cache()) is not guide_db_open
+        assert "guide_load" not in m3u_module.get_refresh_in_progress()
 
     def test_guide_shows_channels_from_cache(self, auth_client: TestClient):
         cache_module.get_cache()["live_categories"] = [
@@ -952,9 +854,9 @@ class TestGuide:
             {"stream_id": 1, "name": "CNN", "category_ids": ["1"], "epg_channel_id": ""},
         ]
 
-        with patch("netv.main.epg.has_programs", return_value=True):
-            resp = auth_client.get("/guide?cats=1")
-            assert resp.status_code == 200
+        resp = auth_client.get("/guide?cats=1")
+        assert resp.status_code == 200
+        assert "CNN" in resp.text
 
     def test_guide_limits_initial_virtual_rows(self, auth_client: TestClient):
         cache_module.get_cache()["live_categories"] = [
@@ -971,8 +873,7 @@ class TestGuide:
             for stream_id in range(60)
         ]
 
-        with patch("netv.main.epg.has_programs", return_value=True):
-            resp = auth_client.get("/guide?cats=1")
+        resp = auth_client.get("/guide?cats=1")
 
         assert resp.status_code == 200
         assert resp.text.count('class="guide-row') == 50
@@ -1013,23 +914,20 @@ class TestGuide:
             }
             for index in range(501)
         ] + [{"stream_id": 999, "name": "Hidden", "category_ids": ["3"]}]
+        auth.set_user_limits("testuser", unavailable_groups=["cat:3"])
 
-        with patch(
-            "netv.main.auth.get_user_limits",
-            return_value={"unavailable_groups": ["cat:3"]},
-        ):
-            first = _body(
-                auth_client.get("/api/guide/rows?cats=1,2,3&count=500"),
-                GuideRowsResponse,
-            )
-            second = _body(
-                auth_client.get("/api/guide/rows?cats=1,2,3&start=500&count=500"),
-                GuideRowsResponse,
-            )
-            reordered = _body(
-                auth_client.get("/api/guide/rows?cats=2,1,3&count=1"),
-                GuideRowsResponse,
-            )
+        first = _body(
+            auth_client.get("/api/guide/rows?cats=1,2,3&count=500"),
+            GuideRowsResponse,
+        )
+        second = _body(
+            auth_client.get("/api/guide/rows?cats=1,2,3&start=500&count=500"),
+            GuideRowsResponse,
+        )
+        reordered = _body(
+            auth_client.get("/api/guide/rows?cats=2,1,3&count=1"),
+            GuideRowsResponse,
+        )
 
         assert first["total"] == second["total"] == 501
         assert len(first["rows"]) == 500
@@ -1038,9 +936,17 @@ class TestGuide:
         assert first["categories"] == second["categories"] == categories[:2]
         assert reordered["categories"] == categories[1::-1]
         assert reordered["rows"][0]["channel"]["stream_id"] == 500
+        past_end = _body(
+            auth_client.get("/api/guide/rows?cats=1,2,3&start=600&count=10"),
+            GuideRowsResponse,
+        )
+        assert (past_end["rows"], past_end["total"]) == ([], 501)
 
-    def test_guide_rows_timestamps_anchor_local_timeline(self, auth_client: TestClient):
-
+    def test_guide_rows_timestamps_anchor_local_timeline(
+        self,
+        auth_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
         now = datetime(2026, 9, 14, 0, 15, tzinfo=timezone.utc)
         window_start = now.replace(minute=0)
         program_start = window_start - timedelta(minutes=30)
@@ -1048,20 +954,10 @@ class TestGuide:
         cache_module.get_cache()["live_streams"] = [
             {"stream_id": 1, "name": "News", "category_ids": ["1"], "epg_channel_id": "news"},
         ]
-        program = Program(
-            channel_id="news",
-            title="Overnight news",
-            start=program_start,
-            stop=program_end,
-        )
+        _air("news", "Overnight news", program_start, program_end)
+        testing.install_clock(monkeypatch, testing.FakeClock(now.timestamp()), main)
 
-        with (
-            patch("netv.main.datetime") as clock,
-            patch("netv.main.epg.get_icons_batch", return_value={}),
-            patch("netv.main.epg.get_programs_batch", return_value={"news": [program]}),
-        ):
-            clock.now.return_value = now
-            response = auth_client.get("/api/guide/rows?cats=1")
+        response = auth_client.get("/api/guide/rows?cats=1")
 
         assert response.status_code == 200
         payload = _body(response, GuideRowsResponse)
@@ -1075,8 +971,7 @@ class TestGuide:
         assert listing["width_pct"] == pytest.approx(100 / 3)
 
     def test_guide_rows_flag_archived_programs(self, auth_client: TestClient):
-
-        now = datetime.now(timezone.utc)
+        now = _now()
         cache_module.get_cache()["live_streams"] = [
             {
                 "stream_id": 1,
@@ -1089,30 +984,11 @@ class TestGuide:
             },
             {"stream_id": 2, "name": "Other", "category_ids": ["1"], "epg_channel_id": "other"},
         ]
-        past = Program(
-            channel_id="news",
-            title="Earlier",
-            start=now - timedelta(hours=1),
-            stop=now - timedelta(minutes=5),
-        )
-        current = Program(
-            channel_id="news",
-            title="Now",
-            start=now - timedelta(minutes=5),
-            stop=now + timedelta(hours=1),
-        )
-        other = Program(channel_id="other", title="Earlier", start=past.start, stop=past.stop)
+        past = _air("news", "Earlier", now - timedelta(hours=1), now - timedelta(minutes=5))
+        _air("news", "Now", now - timedelta(minutes=5), now + timedelta(hours=1))
+        _air("other", "Earlier", past.start, past.stop)
 
-        with (
-            patch("netv.main.epg.get_icons_batch", return_value={}),
-            patch(
-                "netv.main.epg.get_programs_batch",
-                return_value={"news": [past, current], "other": [other]},
-            ),
-        ):
-            rows = _body(auth_client.get("/api/guide/rows?cats=1&offset=-1"), GuideRowsResponse)[
-                "rows"
-            ]
+        rows = _body(auth_client.get("/api/guide/rows?cats=1&offset=-1"), GuideRowsResponse)["rows"]
 
         assert rows[0]["channel"]["catchup_days"] == 1
         assert [p["catchup"] for p in rows[0]["programs"]] == [True, False]
@@ -1132,7 +1008,6 @@ class TestGuide:
         auth_client: TestClient,
         archive_days: int,
     ):
-
         class ProgramLinks(HTMLParser):
             def __init__(self) -> None:
                 super().__init__()
@@ -1144,8 +1019,7 @@ class TestGuide:
                 if tag == "a" and "data-start" in attributes:
                     self.links.append(attributes)
 
-        now = datetime.now(timezone.utc)
-        start = now - timedelta(days=2)
+        start = _now() - timedelta(days=2)
         cache_module.get_cache()["live_categories"] = [
             {"category_id": "1", "category_name": "Group"},
         ]
@@ -1160,21 +1034,11 @@ class TestGuide:
                 "tv_archive_duration": archive_days,
             },
         ]
-        program = Program(
-            channel_id="guide",
-            title="Earlier program",
-            start=start,
-            stop=start + timedelta(hours=1),
-        )
-        with (
-            patch("netv.main.epg.has_programs", return_value=True),
-            patch("netv.main.epg.get_icons_batch", return_value={}),
-            patch("netv.main.epg.get_programs_batch", return_value={"guide": [program]}),
-        ):
-            response = auth_client.get("/guide?cats=1&offset=-48")
-            rows = _body(auth_client.get("/api/guide/rows?cats=1&offset=-48"), GuideRowsResponse)[
-                "rows"
-            ]
+        _air("guide", "Earlier program", start, start + timedelta(hours=1))
+        response = auth_client.get("/guide?cats=1&offset=-48")
+        rows = _body(auth_client.get("/api/guide/rows?cats=1&offset=-48"), GuideRowsResponse)[
+            "rows"
+        ]
         assert response.status_code == 200
         parser = ProgramLinks()
         parser.feed(response.text)
@@ -1195,7 +1059,6 @@ class TestGuide:
             assert programs[0].get("unavailable") is (archive_days != 3)
 
     def test_guide_page_exposes_timestamps_for_local_times(self, auth_client: TestClient):
-
         now = datetime.now(timezone.utc)
         cache_module.get_cache()["live_categories"] = [
             {"category_id": "1", "category_name": "News"},
@@ -1203,45 +1066,54 @@ class TestGuide:
         cache_module.get_cache()["live_streams"] = [
             {"stream_id": 1, "name": "News", "category_ids": ["1"], "epg_channel_id": "news"},
         ]
-        program = Program(
-            channel_id="news",
-            title="Headlines",
-            start=now - timedelta(minutes=5),
-            stop=now + timedelta(minutes=55),
+        program = _air(
+            "news",
+            "Headlines",
+            _now() - timedelta(minutes=5),
+            _now() + timedelta(minutes=55),
         )
-        with (
-            patch("netv.main.epg.has_programs", return_value=True),
-            patch("netv.main.epg.get_icons_batch", return_value={}),
-            patch("netv.main.epg.get_programs_batch", return_value={"news": [program]}),
-        ):
-            html = auth_client.get("/guide?cats=1").text
+        html = auth_client.get("/guide?cats=1").text
         window_start = now.replace(minute=0, second=0, microsecond=0)
         assert f'data-clock="{window_start.timestamp()}"' in html
         assert f'data-start="{program.start.timestamp()}"' in html
         assert f'data-end="{program.stop.timestamp()}"' in html
         assert "localizeGuideTimes(document)" in html
 
-    def test_guide_uses_saved_filter(self, auth_client: TestClient, tmp_path: Path):
-        user_dir = tmp_path / "users" / "testuser"
-        user_dir.mkdir(parents=True, exist_ok=True)
-        (user_dir / "settings.json").write_text(json.dumps({"guide_filter": ["1", "2"]}))
-
-        cache_module.get_cache()["live_categories"] = []
-        cache_module.get_cache()["live_streams"] = []
+    def test_guide_uses_saved_filter(self, auth_client: TestClient):
+        _save_guide_filter(["2"])
+        cache_module.get_cache()["live_categories"] = [
+            {"category_id": "1", "category_name": "News"},
+            {"category_id": "2", "category_name": "Sports"},
+        ]
+        cache_module.get_cache()["live_streams"] = [
+            {"stream_id": 1, "name": "CNN", "category_ids": ["1"]},
+            {"stream_id": 2, "name": "ESPN", "category_ids": ["2"]},
+        ]
 
         # Guide now renders directly using saved filter (no redirect)
-        with patch("netv.main.epg.has_programs", return_value=True):
-            resp = auth_client.get("/guide")
-            assert resp.status_code == 200
+        resp = auth_client.get("/guide")
+        assert resp.status_code == 200
+        assert "ESPN" in resp.text
+        assert "CNN" not in resp.text
 
 
 class TestVod:
     """Tests for VOD page."""
 
-    def test_vod_shows_loading_when_no_cache(self, auth_client: TestClient):
-        with patch("netv.m3u.load_file_cache", return_value=None):
-            resp = auth_client.get("/vod")
-            assert resp.status_code == 200
+    def test_vod_shows_loading_when_no_cache(
+        self,
+        auth_client: TestClient,
+        threads: testing.ThreadRecorder,
+    ):
+        resp = auth_client.get("/vod")
+        assert resp.status_code == 200
+        assert len(threads.threads) == 1
+        assert "vod_load" in m3u_module.get_refresh_in_progress()
+        auth_client.get("/vod")
+        assert len(threads.threads) == 1
+        threads.run_all()
+        assert cache_module.get_cache().get("vod_streams") == []
+        assert "vod_load" not in m3u_module.get_refresh_in_progress()
 
     def test_vod_shows_movies_from_cache(self, auth_client: TestClient):
         cache_module.get_cache()["vod_categories"] = [
@@ -1251,8 +1123,9 @@ class TestVod:
             {"stream_id": 100, "name": "Movie 1", "category_id": "10", "source_id": "src1"},
         ]
 
-        resp = auth_client.get("/vod")
+        resp = auth_client.get("/vod?sort=alpha")
         assert resp.status_code == 200
+        assert "Movie 1" in resp.text
 
     def test_vod_filters_by_category(self, auth_client: TestClient):
         cache_module.get_cache()["vod_categories"] = [
@@ -1264,8 +1137,10 @@ class TestVod:
             {"stream_id": 101, "name": "Comedy Movie", "category_id": "20", "source_id": "src1"},
         ]
 
-        resp = auth_client.get("/vod?category=10")
+        resp = auth_client.get("/vod?category=10&sort=alpha")
         assert resp.status_code == 200
+        assert "Action Movie" in resp.text
+        assert "Comedy Movie" not in resp.text
 
     def test_vod_sorts_by_alpha(self, auth_client: TestClient):
         cache_module.get_cache()["vod_categories"] = []
@@ -1276,15 +1151,36 @@ class TestVod:
 
         resp = auth_client.get("/vod?sort=alpha")
         assert resp.status_code == 200
+        assert resp.text.index("Apple") < resp.text.index("Zebra")
+
+    def test_vod_sorts_unrated_movies_last(self, auth_client: TestClient):
+        cache_module.get_cache()["vod_categories"] = []
+        cache_module.get_cache()["vod_streams"] = [
+            {"stream_id": 1, "name": "Unrated", "rating": None},
+            {"stream_id": 2, "name": "Poor", "rating": "0.5"},
+        ]
+
+        resp = auth_client.get("/vod?sort=rating")
+        assert resp.text.index("Poor") < resp.text.index("Unrated")
 
 
 class TestSeries:
     """Tests for series page."""
 
-    def test_series_shows_loading_when_no_cache(self, auth_client: TestClient):
-        with patch("netv.m3u.load_file_cache", return_value=None):
-            resp = auth_client.get("/series")
-            assert resp.status_code == 200
+    def test_series_shows_loading_when_no_cache(
+        self,
+        auth_client: TestClient,
+        threads: testing.ThreadRecorder,
+    ):
+        resp = auth_client.get("/series")
+        assert resp.status_code == 200
+        assert len(threads.threads) == 1
+        assert "series_load" in m3u_module.get_refresh_in_progress()
+        auth_client.get("/series")
+        assert len(threads.threads) == 1
+        threads.run_all()
+        assert cache_module.get_cache().get("series") == []
+        assert "series_load" not in m3u_module.get_refresh_in_progress()
 
     def test_series_shows_list_from_cache(self, auth_client: TestClient):
         cache_module.get_cache()["series_categories"] = [
@@ -1294,8 +1190,9 @@ class TestSeries:
             {"series_id": 200, "name": "Show 1", "category_id": "30", "source_id": "src1"},
         ]
 
-        resp = auth_client.get("/series")
+        resp = auth_client.get("/series?sort=alpha")
         assert resp.status_code == 200
+        assert "Show 1" in resp.text
 
 
 class TestSearch:
@@ -1321,11 +1218,14 @@ class TestSearch:
 
         resp = auth_client.get("/search?q=CNN&live=true")
         assert resp.status_code == 200
+        assert "CNN News" in resp.text
+        assert "BBC World" not in resp.text
 
     def test_search_regex_mode(self, auth_client: TestClient):
         cache_module.get_cache()["live_streams"] = [
             {"stream_id": 1, "name": "CNN News"},
             {"stream_id": 2, "name": "CNBC Finance"},
+            {"stream_id": 3, "name": "BBC World"},
         ]
         cache_module.get_cache()["live_categories"] = []
         cache_module.get_cache()["epg_urls"] = []
@@ -1334,6 +1234,9 @@ class TestSearch:
 
         resp = auth_client.get("/search?q=CN.*&regex=true&live=true")
         assert resp.status_code == 200
+        assert "CNN News" in resp.text
+        assert "CNBC Finance" in resp.text
+        assert "BBC World" not in resp.text
 
     def test_search_rejects_long_regex(self, auth_client: TestClient):
         cache_module.get_cache()["live_streams"] = []
@@ -1345,38 +1248,43 @@ class TestSearch:
 class TestSettings:
     """Tests for settings page."""
 
-    def test_only_nomos_engine_is_discovered(self, auth_client: TestClient, tmp_path: Path):
-
+    def test_only_nomos_engine_is_discovered(
+        self,
+        auth_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
         (tmp_path / "retired-model_720p_fp16.engine").write_bytes(b"engine")
-        with patch.dict("os.environ", {"SR_ENGINE_DIR": str(tmp_path)}):
-            assert main.get_sr_models() == []
+        monkeypatch.setenv("SR_ENGINE_DIR", str(tmp_path))
+        assert main.get_sr_models() == []
 
-            (tmp_path / "2x-nomosuni-compact_720p_fp16.engine").write_bytes(b"engine")
-            assert main.get_sr_models() == ["2x-nomosuni-compact"]
+        (tmp_path / "2x-nomosuni-compact_720p_fp16.engine").write_bytes(b"engine")
+        assert main.get_sr_models() == ["2x-nomosuni-compact"]
 
-    def test_settings_page_renders(self, auth_client: TestClient):
+    def test_settings_page_renders(
+        self,
+        auth_client: TestClient,
+        threads: testing.ThreadRecorder,
+    ):
+        resp = auth_client.get("/settings")
+        assert resp.status_code == 200
+        assert 'id="sort-live-by-views" checked' in resp.text
+        assert len(threads.threads) == 1
+
+    def test_settings_page_maps_enabled_retired_model_to_nomos(
+        self,
+        auth_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
         cache_module.get_cache()["live_categories"] = []
+        settings = cache_module.load_server_settings()
+        settings["sr_model"] = "retired-model"
+        cache_module.save_server_settings(settings)
+        (tmp_path / "2x-nomosuni-compact_720p_fp16.engine").write_bytes(b"engine")
+        monkeypatch.setenv("SR_ENGINE_DIR", str(tmp_path))
 
-        with patch("netv.m3u.load_file_cache", return_value=None):
-            resp = auth_client.get("/settings")
-            assert resp.status_code == 200
-            assert 'id="sort-live-by-views" checked' in resp.text
-
-    def test_settings_page_maps_enabled_retired_model_to_nomos(self, auth_client: TestClient):
-        cache_module.get_cache()["live_categories"] = []
-
-        with (
-            patch("netv.m3u.load_file_cache", return_value=None),
-            patch(
-                "netv.main.load_server_settings",
-                return_value={"sr_model": "retired-model"},
-            ),
-            patch(
-                "netv.main.get_sr_models",
-                return_value=["2x-nomosuni-compact"],
-            ),
-        ):
-            resp = auth_client.get("/settings")
+        resp = auth_client.get("/settings")
 
         assert resp.status_code == 200
         assert resp.text.count('name="sr_model"') == 2
@@ -1390,6 +1298,7 @@ class TestSettings:
         )
         assert resp.status_code == 200
         assert _fields(resp)["status"] == "ok"
+        assert cache_module.load_user_settings("testuser")["guide_filter"] == ["1", "2", "3"]
 
     def test_settings_captions(self, auth_client: TestClient):
         resp = auth_client.post(
@@ -1398,6 +1307,7 @@ class TestSettings:
         )
         assert resp.status_code == 200
         assert _fields(resp)["ok"] is True
+        assert cache_module.load_user_settings("testuser")["captions_enabled"] is True
 
     def test_settings_transcode(self, auth_client: TestClient):
         resp = auth_client.post(
@@ -1428,92 +1338,72 @@ class TestAddSource:
     """Tests for adding sources."""
 
     def test_add_xtream_source(self, auth_client: TestClient):
-        with patch("netv.main.clear_all_caches"):
-            resp = auth_client.post(
-                "/settings/add",
-                data={
-                    "name": "Test Provider",
-                    "source_type": "xtream",
-                    "url": "http://example.com",
-                    "username": "user",
-                    "password": "pass",
-                    "epg_timeout": 120,
-                },
-                follow_redirects=False,
-            )
-            assert resp.status_code == 303
+        cache_module.get_cache()["live_streams"] = []
+        resp = auth_client.post(
+            "/settings/add",
+            data={
+                "name": "Test Provider",
+                "source_type": "xtream",
+                "url": "http://example.com/",
+                "username": "user",
+                "password": "pass",
+                "epg_timeout": 120,
+            },
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        [source] = cache_module.get_sources()
+        assert (source.name, source.type, source.url) == (
+            "Test Provider",
+            "xtream",
+            "http://example.com",
+        )
+        assert "live_streams" not in cache_module.get_cache()
 
     def test_add_m3u_source(self, auth_client: TestClient):
-        with patch("netv.main.clear_all_caches"):
-            resp = auth_client.post(
-                "/settings/add",
-                data={
-                    "name": "M3U Playlist",
-                    "source_type": "m3u",
-                    "url": "http://example.com/playlist.m3u",
-                    "epg_timeout": 120,
-                },
-                follow_redirects=False,
-            )
-            assert resp.status_code == 303
-
-    def test_add_source_validates_type(self, auth_client: TestClient):
         resp = auth_client.post(
             "/settings/add",
             data={
-                "name": "Bad Source",
-                "source_type": "invalid",
-                "url": "http://example.com",
+                "name": "M3U Playlist",
+                "source_type": "m3u",
+                "url": "http://example.com/playlist.m3u",
+                "epg_timeout": 120,
             },
+            follow_redirects=False,
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 303
+        assert [s.type for s in cache_module.get_sources()] == ["m3u"]
 
-    def test_add_source_validates_url_scheme(self, auth_client: TestClient):
-        resp = auth_client.post(
-            "/settings/add",
-            data={
-                "name": "Bad Source",
-                "source_type": "xtream",
-                "url": "ftp://example.com",
-            },
-        )
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"name": "Bad Source", "source_type": "invalid", "url": "http://example.com"},
+            {"name": "Bad Source", "source_type": "xtream", "url": "ftp://example.com"},
+            {"name": "x" * 201, "source_type": "xtream", "url": "http://example.com"},
+        ],
+    )
+    def test_add_source_validates(self, auth_client: TestClient, data: dict[str, str]):
+        resp = auth_client.post("/settings/add", data=data)
         assert resp.status_code == 400
-
-    def test_add_source_validates_name_length(self, auth_client: TestClient):
-        resp = auth_client.post(
-            "/settings/add",
-            data={
-                "name": "x" * 201,
-                "source_type": "xtream",
-                "url": "http://example.com",
-            },
-        )
-        assert resp.status_code == 400
+        assert cache_module.get_sources() == []
 
 
 class TestDeleteSource:
     """Tests for deleting sources."""
 
-    def test_delete_source(self, auth_client: TestClient, tmp_path: Path):
-        settings_file = tmp_path / "server_settings.json"
-        settings_file.write_text(
-            json.dumps(
-                {
-                    "sources": [
-                        {
-                            "id": "src_123",
-                            "name": "Test",
-                            "type": "xtream",
-                            "url": "http://example.com",
-                        },
-                    ],
-                },
-            ),
-        )
+    def test_delete_source(self, auth_client: TestClient):
+        settings = cache_module.load_server_settings()
+        settings["sources"] = [
+            {"id": "src_123", "name": "Test", "type": "xtream", "url": "http://example.com"},
+        ]
+        cache_module.save_server_settings(settings)
+        epg.insert_channel("ch", "Channel", "src_123")
+        _air("ch", "Show", _now(), _now() + timedelta(hours=1), source_id="src_123")
 
-        with patch("netv.main.clear_all_caches"):
-            resp = auth_client.post("/settings/delete/src_123", follow_redirects=False)
-            assert resp.status_code == 303
+        resp = auth_client.post("/settings/delete/src_123", follow_redirects=False)
+        assert resp.status_code == 303
+        assert cache_module.get_sources() == []
+        assert epg.get_program_count() == 0
 
 
 class TestUserPrefs:
@@ -1582,12 +1472,12 @@ class TestWatchPosition:
 class TestUserManagement:
     """Tests for user management endpoints."""
 
-    def test_delete_user(self, auth_client: TestClient, tmp_path: Path):
-
+    def test_delete_user(self, auth_client: TestClient):
         auth.create_user("otheruser", "password123")
 
         resp = auth_client.post("/settings/users/delete/otheruser", follow_redirects=False)
         assert resp.status_code == 303
+        assert "otheruser" not in auth.get_all_usernames()
 
     def test_cannot_delete_self(self, auth_client: TestClient):
         resp = auth_client.post("/settings/users/delete/testuser")
@@ -1599,6 +1489,7 @@ class TestUserManagement:
             data={"current_password": "testpass123", "new_password": "newpass456"},
         )
         assert resp.status_code == 200
+        assert auth.verify_password("testuser", "newpass456")
 
     def test_change_password_wrong_current(self, auth_client: TestClient):
         resp = auth_client.post(
@@ -1634,31 +1525,28 @@ class TestApiSettings:
             json={"transcode_mode": "always"},
         )
         assert resp.status_code == 200
+        assert cache_module.load_server_settings()["transcode_mode"] == "always"
 
 
 class TestTranscodeRoutes:
-    """Tests for transcode routes (with mocked transcoding module)."""
+    """Tests for transcode routes."""
 
     def test_transcode_file_not_found(self, auth_client: TestClient):
-        with patch("netv.main.ffmpeg_session.get_session", return_value=None):
-            resp = auth_client.get("/transcode/invalid-session/stream.m3u8")
-            assert resp.status_code == 404
+        resp = auth_client.get("/transcode/invalid-session/stream.m3u8")
+        assert resp.status_code == 404
 
-    def test_transcode_stop(self, auth_client: TestClient):
-        with patch("netv.main.ffmpeg_session.stop_session"):
-            resp = auth_client.delete("/transcode/test-session")
-            assert resp.status_code == 200
-            assert _fields(resp)["status"] == "stopped"
-
-    def test_transcode_stop_post(self, auth_client: TestClient):
-        with patch("netv.main.ffmpeg_session.stop_session"):
-            resp = auth_client.post("/transcode/test-session/stop")
-            assert resp.status_code == 200
+    @pytest.mark.parametrize("method", ["DELETE", "POST"])
+    def test_transcode_stop(self, auth_client: TestClient, tmp_path: Path, method: str):
+        session = _add_session("test-session", tmp_path, last_access=0.0)
+        path = "/transcode/test-session" + ("/stop" if method == "POST" else "")
+        resp = auth_client.request(method, path)
+        assert resp.status_code == 200
+        assert _fields(resp)["status"] == "stopped"
+        _assert_stopped("test-session", session, stopped=True)
 
     def test_transcode_progress_not_found(self, auth_client: TestClient):
-        with patch("netv.main.ffmpeg_session.get_session_progress", return_value=None):
-            resp = auth_client.get("/transcode/progress/invalid-session")
-            assert resp.status_code == 404
+        resp = auth_client.get("/transcode/progress/invalid-session")
+        assert resp.status_code == 404
 
     @pytest.mark.parametrize("filename", ["master.m3u8", "low.m3u8"])
     def test_adaptive_playlists_share_dates_but_master_is_not_rewritten(
@@ -1667,38 +1555,26 @@ class TestTranscodeRoutes:
         tmp_path: Path,
         filename: str,
     ):
-        content = "#EXTM3U\n"
-        (tmp_path / filename).write_text(content)
-        session = {
-            "dir": str(tmp_path),
-            "fast_start": True,
-            "origin_pts": 10,
-            "origin_time": 0,
-            "playback_buffer_seconds": 24,
-        }
-        with (
-            patch("netv.ffmpeg_session.get_session", return_value=session),
-            patch(
-                "netv.main.ffmpeg_session.dated_fast_playlist",
-                return_value=content + "#dated\n",
-            ) as dates,
-            patch(
-                "netv.main.add_live_start_offset",
-                side_effect=_mark_start,
-            ) as start,
-        ):
-            response = auth_client.get(f"/transcode/shared/{filename}")
+        content = _write_segments(tmp_path, [("low_0.ts", 10.0)])
+        (tmp_path / filename).write_text("#EXTM3U\n" + content)
+        _add_session(
+            "shared",
+            tmp_path,
+            fast_start=True,
+            origin_pts=10,
+            origin_time=0,
+            playback_buffer_seconds=24,
+        )
+        response = auth_client.get(f"/transcode/shared/{filename}")
         assert response.status_code == 200
         assert response.headers["access-control-allow-origin"] == "*"
         if filename == "master.m3u8":
-            dates.assert_not_called()
-            start.assert_not_called()
-            assert response.text == content
+            assert response.text == "#EXTM3U\n" + content
         else:
-            dates.assert_called_once_with("shared", content)
-            start.assert_called_once_with(content + "#dated\n", 24)
-            assert "#dated" in response.text
-            assert "#start" in response.text
+            assert response.text == (
+                "#EXTM3U\n#EXT-X-START:TIME-OFFSET=-24,PRECISE=NO\n#EXTINF:2.000000,\n"
+                "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.000+00:00\nlow_0.ts\n"
+            )
 
     def test_segmented_webvtt_is_mapped_to_the_video_clock(
         self,
@@ -1707,15 +1583,9 @@ class TestTranscodeRoutes:
     ):
         filename = "sub0_000001.vtt"
         (tmp_path / filename).write_text("WEBVTT\n\n00:01.000 --> 00:03.000\nCaption\n")
-        session = {"dir": str(tmp_path)}
-        with (
-            patch("netv.main.ffmpeg_session.get_session", return_value=session),
-            patch(
-                "netv.main.ffmpeg_session.get_caption_timestamp_origin",
-                return_value=10.08,
-            ),
-        ):
-            response = auth_client.get(f"/transcode/session/{filename}")
+        _add_session("session", tmp_path, caption_timestamp_origin=10.08)
+
+        response = auth_client.get(f"/transcode/session/{filename}")
 
         assert response.status_code == 200
         assert "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:907200" in response.text
@@ -1732,7 +1602,7 @@ def _fast_session(
 ) -> ffmpeg_session.FastLiveSession:
     return {
         "dir": str(directory),
-        "process": process if process is not None else FakeProcess(),
+        "process": process if process is not None else testing.FakeProcess(exit_code=None),
         "extra_processes": list(extra_processes),
         "ingest_process": ingest_process,
         "origin_pts": origin_pts,
@@ -1768,8 +1638,22 @@ def _program_dates(text: str) -> dict[str, float]:
     return dates
 
 
-def _close_background(coro: Coroutine[object, object, None]) -> None:
-    coro.close()
+class _RestartedPipeline:
+    """Fake ffmpeg that writes what a restarted ingest and encoder would publish."""
+
+    def __init__(self, directory: Path, restarted: list[tuple[str, float]]) -> None:
+        self.directory = directory
+        self.restarted = restarted
+
+    def __call__(self, command: list[str]) -> None:
+        if command[0] == "ingest":
+            (self.directory / "input_000001.ts").write_bytes(video_packet(1.48) * 10)
+            (self.directory / "input.m3u8").write_text("#EXTINF:2,\ninput_000001.ts\n")
+        else:
+            text = (self.directory / "low.m3u8").read_text()
+            (self.directory / "low.m3u8").write_text(
+                text + "#EXT-X-DISCONTINUITY\n" + _write_segments(self.directory, self.restarted),
+            )
 
 
 class TestFastStartRoutes:
@@ -1777,6 +1661,7 @@ class TestFastStartRoutes:
         self,
         auth_client: TestClient,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ):
         directory = tmp_path / "fast"
         directory.mkdir()
@@ -1784,42 +1669,30 @@ class TestFastStartRoutes:
         old = _write_segments(directory, [(f"low_{i}.ts", 5000 + 2 * i) for i in range(3)])
         (directory / "low.m3u8").write_text(header + old)
         session = _fast_session(directory, origin_pts=5000.0, origin_time=time.time() - 100)
+        ffmpeg_session._transcode_sessions["fast"] = session
         restarted = [(f"low_{i}.ts", 1.48 + 2 * (i - 100)) for i in range(100, 103)]
+        launcher = testing.ProcessLauncher(on_launch=_RestartedPipeline(directory, restarted))
+        testing.install_launcher(monkeypatch, launcher, ffmpeg_session)
+        tasks = testing.BackgroundTasks()
+        monkeypatch.setattr(ffmpeg_session, "_spawn_background_task", tasks)
 
-        async def launch(command: list[str]) -> FakeProcess:
-            if command[0] == "ingest":
-                (directory / "input_000001.ts").write_bytes(video_packet(1.48) * 10)
-                (directory / "input.m3u8").write_text("#EXTINF:2,\ninput_000001.ts\n")
-            else:
-                text = (directory / "low.m3u8").read_text()
-                (directory / "low.m3u8").write_text(
-                    text + "#EXT-X-DISCONTINUITY\n" + _write_segments(directory, restarted),
-                )
-            return FakeProcess()
+        before = _program_dates(auth_client.get("/transcode/fast/low.m3u8").text)
+        session["live_recovery"], permitted = session["live_recovery"].permit_restart(
+            "pipeline",
+            time.monotonic(),
+        )
+        assert permitted
+        asyncio.run(ffmpeg_session._restart_fast_pipeline("fast", session, "input"))
+        tasks.discard()
+        restart_time = time.time()
+        during = _program_dates(auth_client.get("/transcode/fast/low.m3u8").text)
+        (directory / "low.m3u8").write_text(
+            header + "".join(f"#EXTINF:2.000000,\n{name}\n" for name, _ in restarted),
+        )
+        after = _program_dates(auth_client.get("/transcode/fast/low.m3u8").text)
 
-        with patch.dict(ffmpeg_session._transcode_sessions, {"fast": session}, clear=True):
-            before = _program_dates(auth_client.get("/transcode/fast/low.m3u8").text)
-            session["live_recovery"], permitted = session["live_recovery"].permit_restart(
-                "pipeline",
-                time.monotonic(),
-            )
-            assert permitted
-            with (
-                patch("netv.ffmpeg_session._launch_ffmpeg", side_effect=launch),
-                patch(
-                    "netv.ffmpeg_session._wait_for_fresh_fast_playlist",
-                    new=AsyncMock(return_value=True),
-                ),
-                patch("netv.ffmpeg_session._spawn_background_task", side_effect=_close_background),
-            ):
-                asyncio.run(ffmpeg_session._restart_fast_pipeline("fast", session, "input"))
-            restart_time = time.time()
-            during = _program_dates(auth_client.get("/transcode/fast/low.m3u8").text)
-            (directory / "low.m3u8").write_text(
-                header + "".join(f"#EXTINF:2.000000,\n{name}\n" for name, _ in restarted),
-            )
-            after = _program_dates(auth_client.get("/transcode/fast/low.m3u8").text)
-
+        assert [c[0] for c in launcher.commands] == ["ingest", "encoder"]
+        assert session.get("playlist_generation") == 1
         assert during["low_0.ts"] == pytest.approx(before["low_0.ts"])
         assert before["low_2.ts"] < during["low_100.ts"] <= restart_time + 1
         assert after == {name: during[name] for name, _ in restarted}
@@ -1833,15 +1706,17 @@ class TestFastStartRoutes:
         directory.mkdir()
         segments = _write_segments(directory, [(f"low_{i}.ts", 10 + 2 * i) for i in range(4)])
         (directory / "low.m3u8").write_text("#EXTM3U\n" + segments)
-        session = _fast_session(directory, origin_pts=10.0, origin_time=0.0)
-        with (
-            patch.dict(ffmpeg_session._transcode_sessions, {"fast": session}, clear=True),
-            patch("netv.fast_start.segment_pts", wraps=fast_start.segment_pts) as reads,
-        ):
-            first = auth_client.get("/transcode/fast/low.m3u8")
-            second = auth_client.get("/transcode/fast/low.m3u8")
+        ffmpeg_session._transcode_sessions["fast"] = _fast_session(
+            directory,
+            origin_pts=10.0,
+            origin_time=0.0,
+        )
+        first = auth_client.get("/transcode/fast/low.m3u8")
+        # A second listing that re-read the segments would now date them differently.
+        _write_segments(directory, [(f"low_{i}.ts", 500 + 2 * i) for i in range(4)])
+        second = auth_client.get("/transcode/fast/low.m3u8")
+        assert len(_program_dates(first.text)) == 4
         assert first.text == second.text
-        assert reads.call_count == 4
 
     @pytest.mark.parametrize("force", [False, True])
     def test_stop_removes_fast_session_and_lets_encoders_exit(
@@ -1850,22 +1725,21 @@ class TestFastStartRoutes:
         tmp_path: Path,
         force: bool,
     ):
+        settings = cache_module.load_server_settings()
+        settings["live_transcode_cache_secs"] = 30
+        cache_module.save_server_settings(settings)
         directory = tmp_path / "fast"
         directory.mkdir()
-        processes = [LoopProcess(), LoopProcess(), LoopProcess()]
-        session = _fast_session(
+        processes = [testing.FakeProcess(exit_code=None) for _ in range(3)]
+        ffmpeg_session._transcode_sessions["fast"] = _fast_session(
             directory,
             process=processes[0],
             ingest_process=processes[1],
             extra_processes=processes[1:],
         )
-        with (
-            patch.dict(ffmpeg_session._transcode_sessions, {"fast": session}, clear=True),
-            patch("netv.ffmpeg_session.get_live_cache_timeout", return_value=30),
-        ):
-            response = auth_client.delete(f"/transcode/fast?force={str(force).lower()}")
-            assert response.status_code == 200
-            assert "fast" not in ffmpeg_session._transcode_sessions
+        response = auth_client.delete(f"/transcode/fast?force={str(force).lower()}")
+        assert response.status_code == 200
+        assert "fast" not in ffmpeg_session._transcode_sessions
         assert [process.signals for process in processes] == [["TERM"]] * 3
         assert [process.returncode for process in processes] == [-15] * 3
         assert not directory.exists()
@@ -1879,38 +1753,44 @@ class TestSubtitleRoutes:
         assert resp.status_code == 400
 
     def test_subtitle_session_not_found(self, auth_client: TestClient):
-        with patch("netv.main.ffmpeg_session.get_session", return_value=None):
-            resp = auth_client.get("/subs/invalid-session/sub0.vtt")
-            assert resp.status_code == 404
+        resp = auth_client.get("/subs/invalid-session/sub0.vtt")
+        assert resp.status_code == 404
+
+
+@pytest.fixture
+def probe_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One cached episode probe, for series 123."""
+    monkeypatch.setattr(ffmpeg_command, "_probe_cache", {})
+    monkeypatch.setattr(ffmpeg_command, "_series_probe_cache", {})
+    media = MediaInfo(video_codec="h264", audio_codec="aac", pix_fmt="yuv420p", height=720)
+    ffmpeg_command.restore_probe_cache_entry("http://x/7.mkv", media, [], 123, 7)
 
 
 class TestProbeCache:
     """Tests for probe cache endpoints."""
 
-    def test_get_probe_cache(self, auth_client: TestClient):
-        with patch("netv.main.ffmpeg_command.get_series_probe_cache_stats", return_value=[]):
-            resp = auth_client.get("/settings/probe-cache")
-            assert resp.status_code == 200
-            assert "series" in _fields(resp)
+    def test_get_probe_cache(self, auth_client: TestClient, probe_cache: None):
+        resp = auth_client.get("/settings/probe-cache")
+        assert resp.status_code == 200
+        series = _body(resp, _ProbeCache)["series"]
+        assert [s["series_id"] for s in series] == [123]
 
-    def test_clear_probe_cache(self, auth_client: TestClient):
-        with patch("netv.main.ffmpeg_command.clear_all_probe_cache", return_value=5):
-            resp = auth_client.post("/settings/probe-cache/clear")
-            assert resp.status_code == 200
-            assert _fields(resp)["cleared"] == 5
+    def test_clear_probe_cache(self, auth_client: TestClient, probe_cache: None):
+        resp = auth_client.post("/settings/probe-cache/clear")
+        assert resp.status_code == 200
+        assert _fields(resp)["cleared"] == 2
+        assert _body(auth_client.get("/settings/probe-cache"), _ProbeCache)["series"] == []
 
-    def test_clear_series_probe_cache(self, auth_client: TestClient):
-        with patch("netv.main.ffmpeg_command.invalidate_series_probe_cache"):
-            resp = auth_client.post("/settings/probe-cache/clear/123")
-            assert resp.status_code == 200
+    def test_clear_series_probe_cache(self, auth_client: TestClient, probe_cache: None):
+        resp = auth_client.post("/settings/probe-cache/clear/123")
+        assert resp.status_code == 200
+        assert _body(auth_client.get("/settings/probe-cache"), _ProbeCache)["series"] == []
 
 
 class TestRefreshStatus:
     """Tests for refresh status endpoints."""
 
     def test_guide_refresh_status(self, auth_client: TestClient):
-        m3u_module.get_refresh_in_progress().clear()
-
         resp = auth_client.get("/guide/refresh-status")
         assert resp.status_code == 200
         data = _fields(resp)
@@ -1918,8 +1798,6 @@ class TestRefreshStatus:
         assert data["epg"] is False
 
     def test_settings_refresh_status(self, auth_client: TestClient):
-        m3u_module.get_refresh_in_progress().clear()
-
         resp = auth_client.get("/settings/refresh-status")
         assert resp.status_code == 200
 
@@ -1932,34 +1810,36 @@ class TestPlaybackHealth:
         )
         assert response.status_code == 422
 
-    def test_feedback_is_passed_to_backend(self, auth_client: TestClient):
-        with patch(
-            "netv.ffmpeg_session.report_playback_health",
-            return_value={"bandwidth_saver": True},
-        ) as report:
-            response = auth_client.post(
-                "/transcode/live/health",
-                json={"buffer_seconds": 0, "waiting": True},
-            )
-        assert response.json() == {"bandwidth_saver": True}
-        assert report.call_args.args[:2] == ("live", "testuser")
+    def test_feedback_is_passed_to_backend(self, auth_client: TestClient, tmp_path: Path):
+        policy = PlaybackPolicy()
+        session = _add_session("live", tmp_path, last_access=0.0, playback_policy=policy)
+        response = auth_client.post(
+            "/transcode/live/health",
+            json={"buffer_seconds": 0, "waiting": True},
+        )
+        assert response.json() == {"bandwidth_saver": False}
+        assert session.get("last_access", 0) > 0
+        assert session.get("playback_policy") is not policy
 
-    def test_force_stop_releases_current_stream(self, auth_client: TestClient):
-        with (
-            patch("netv.ffmpeg_session.get_session", return_value={"username": "testuser"}),
-            patch("netv.ffmpeg_session.stop_session") as stop,
-        ):
-            response = auth_client.delete("/transcode/live?force=true")
-        assert response.status_code == 200
-        stop.assert_called_once_with("live", force=True)
+        auth.create_user("other", "otherpass1")
+        auth_client.cookies.set("token", auth.create_token({"sub": "other"}))
+        response = auth_client.post(
+            "/transcode/live/health",
+            json={"buffer_seconds": 0, "waiting": True},
+        )
+        assert response.status_code == 404
 
-    def test_force_stop_requires_owner(self, auth_client: TestClient):
-        with (
-            patch("netv.ffmpeg_session.get_session", return_value={"username": "other"}),
-            patch("netv.ffmpeg_session.stop_session") as stop,
-        ):
-            assert auth_client.delete("/transcode/live?force=true").status_code == 404
-        stop.assert_not_called()
+    @pytest.mark.parametrize("owner,status", [("testuser", 200), ("other", 404)])
+    def test_force_stop_requires_owner(
+        self,
+        auth_client: TestClient,
+        tmp_path: Path,
+        owner: str,
+        status: int,
+    ):
+        session = _add_session("live", tmp_path, username=owner)
+        assert auth_client.delete("/transcode/live?force=true").status_code == status
+        _assert_stopped("live", session, stopped=status == 200)
 
 
 class TestPlaylists:
@@ -2071,8 +1951,7 @@ class TestPlaylists:
     def test_guide_page_defaults_to_playlists_then_filter(self, auth_client: TestClient):
         playlist = self._create(auth_client)
         auth_client.post("/settings/guide-filter", json={"cats": ["1"]})
-        with patch("netv.main.epg.has_programs", return_value=True):
-            resp = auth_client.get("/guide")
+        resp = auth_client.get("/guide")
         assert resp.status_code == 200
         assert "★ Favorites" in resp.text
         assert f'"{playlist["category_id"]},1"' in resp.text
@@ -2080,8 +1959,7 @@ class TestPlaylists:
     def test_guide_page_shows_section_headings(self, auth_client: TestClient):
         self._create(auth_client)
         auth_client.post("/settings/guide-filter", json={"cats": ["2"]})
-        with patch("netv.main.epg.has_programs", return_value=True):
-            resp = auth_client.get("/guide")
+        resp = auth_client.get("/guide")
 
         match = re.search(r"sections: (\[.*?\]),\n", resp.text)
         assert match
@@ -2100,8 +1978,7 @@ class TestPlaylists:
         client: TestClient,
         url: str = "/guide",
     ) -> tuple[list[tuple[str, str]], list[str], int]:
-        with patch("netv.main.epg.has_programs", return_value=True):
-            text = client.get(url).text
+        text = client.get(url).text
         aside = text[text.index("<aside") : text.index("</aside>")]
         links = cast(
             list[tuple[str, str]],
@@ -2116,7 +1993,6 @@ class TestPlaylists:
         return links, current, len(rows)
 
     def test_guide_sidebar_lists_playlists_and_categories(self, auth_client: TestClient):
-
         auth_client.post("/settings/guide-filter", json={"cats": ["1", "2"]})
         auth_client.post("/api/user-prefs", json={"guide_selected_cats": ["2"]})
         playlist = self._create(auth_client)
@@ -2219,21 +2095,24 @@ class TestPlaylists:
             "channels"
         ]
         assert channels[0].get("epg_channel_id") == "guide.one"
-        with (
-            patch("netv.main.epg.get_icons_batch", return_value={}),
-            patch("netv.main.epg.get_programs_batch", return_value={}),
-        ):
-            rows = _body(
-                auth_client.get(f"/api/guide/rows?cats={playlist['category_id']}"),
-                GuideRowsResponse,
-            )["rows"]
+        _air("guide.one", "Assigned show", _now(), _now() + timedelta(hours=1))
+        rows = _body(
+            auth_client.get(f"/api/guide/rows?cats={playlist['category_id']}"),
+            GuideRowsResponse,
+        )["rows"]
         assert rows[0]["channel"]["epg_id"] == "guide.one"
+        assert [p["title"] for p in rows[0]["programs"]] == ["Assigned show"]
 
     def test_epg_channel_search(self, auth_client: TestClient):
-        with patch("netv.main.epg.search_channels", return_value=[]) as search:
-            resp = auth_client.get("/api/playlists/epg-channels?q=XX| ALPHA ONE HD")
+        epg.insert_channel("alpha.one.hd", "ALPHA ONE HD", "s")
+        epg.insert_channel("alpha.one", "Alpha One", "s")
+        epg.insert_channel("alpha.two", "Alpha Two", "s")
+        epg.commit()
+        resp = auth_client.get("/api/playlists/epg-channels?q=XX| ALPHA ONE HD")
         assert resp.status_code == 200
-        search.assert_called_once_with(["ALPHA", "ONE"], 20)
+        results = _body(resp, _EpgChannels)["results"]
+        # Provider prefixes and quality tags are not search terms.
+        assert sorted(r["id"] for r in results) == ["alpha.one", "alpha.one.hd"]
 
     def test_match_and_search(self, auth_client: TestClient):
         matches = _body(
@@ -2247,14 +2126,15 @@ class TestPlaylists:
         assert [r["stream_id"] for r in results] == ["2", "3"]
 
     def test_non_admin_can_read_but_not_edit(self, auth_client: TestClient):
-
         playlist = self._create(auth_client)
         auth.create_user("viewer", "viewerpass1")
         auth_client.cookies.set("token", auth.create_token({"sub": "viewer"}))
 
         assert auth_client.get("/api/playlists").status_code == 200
         assert auth_client.get(f"/api/playlists/{playlist['id']}").status_code == 200
-        assert auth_client.post("/api/playlists", json={"name": "X"}).status_code == 403
+        denied = auth_client.post("/api/playlists", json={"name": "X"})
+        assert denied.status_code == 403
+        assert _body(denied, _Detail)["detail"] == "Admin access required"
         assert (
             auth_client.put(f"/api/playlists/{playlist['id']}", json={"name": "X"}).status_code
             == 403
@@ -2300,7 +2180,6 @@ class TestPlaylists:
         self,
         auth_client: TestClient,
     ):
-
         playlist = self._create(auth_client, ids=(3, 1))
         only_sports = self._create(auth_client, "Sports", ids=(3,))
         auth.create_user("viewer", "viewerpass1")
@@ -2332,14 +2211,12 @@ class TestPlaylists:
         assert _body(auth_client.get("/api/playlists"), _PlaylistList)["playlists"] == []
 
     def test_saved_view_drops_deleted_playlist(self, auth_client: TestClient):
-
         playlist = self._create(auth_client)
         auth_client.post("/settings/guide-filter", json={"cats": ["1"]})
         auth_client.post("/api/user-prefs", json={"guide_selected_cats": [playlist["category_id"]]})
         auth_client.delete(f"/api/playlists/{playlist['id']}")
 
-        with patch("netv.main.epg.has_programs", return_value=True):
-            resp = auth_client.get("/guide")
+        resp = auth_client.get("/guide")
 
         assert resp.status_code == 200
         assert "CNN" in resp.text
@@ -2390,7 +2267,6 @@ class TestSourceAssignment:
         auth.create_user("kid", "kidpass123")
 
     def _rows(self, auth_client: TestClient, user: str) -> list[MutablePlainTree]:
-
         auth_client.cookies.set("token", auth.create_token({"sub": user}))
         rows = _body(
             auth_client.get("/api/guide/rows?cats=fam_1,pub_1&exact=1"),
@@ -2409,7 +2285,6 @@ class TestSourceAssignment:
         assert self._rows(auth_client, "friend") == ["A", "B"]
 
     def test_hidden_source_blocks_transcode(self, auth_client: TestClient):
-
         self._setup(auth_client, [])
         auth_client.cookies.set("token", auth.create_token({"sub": "kid"}))
         resp = auth_client.get("/transcode/start?url=http://a/x.ts&source_id=fam")
@@ -2460,13 +2335,12 @@ class TestSourceAssignment:
 
 
 @pytest.fixture
-def clean_handoff() -> Iterator[None]:
-
-    handoff._records.clear()
-    handoff._watches.clear()
-    yield
-    handoff._records.clear()
-    handoff._watches.clear()
+def clean_handoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(handoff, "_users_dir", None)
+    monkeypatch.setattr(handoff, "_records", {})
+    monkeypatch.setattr(handoff, "_watches", {})
+    monkeypatch.setattr(handoff, "_recorders", {})
+    monkeypatch.setattr(handoff, "_generations", {})
 
 
 def test_handoff_api_offers_the_users_handoff(auth_client: TestClient, clean_handoff: None):
@@ -2484,11 +2358,9 @@ def test_handoff_recording_resumes_from_where_it_was_left(
     auth_client: TestClient,
     clean_handoff: None,
 ):
-
     handoff._records["testuser"] = _handoff_record()
-    info = PlayerInfo(url="http://upstream.test/live/u/p/42.m3u8", channel_name="Channel")
-    with patch("netv.main._get_live_player_info", return_value=info):
-        response = auth_client.get("/play/live/src1_42?handoff=h1")
+    _set_live(_archive_stream())
+    response = auth_client.get("/play/live/src1_42?handoff=h1")
     assert response.status_code == 200
     assert '"/handoff/rec1/stream.m3u8"' in response.text
     assert 'transcodeMode: "never"' in response.text
@@ -2498,21 +2370,25 @@ def test_handoff_recording_resumes_from_where_it_was_left(
 
 
 def test_handoff_catchup_resumes_through_the_archive(auth_client: TestClient, clean_handoff: None):
-
-    handoff._records["testuser"] = _handoff_record(mode="catchup", recording_id="")
-    info = PlayerInfo(url="http://upstream.test/timeshift/x.ts", catchup_start=1767264000.0)
-    with patch("netv.main._get_catchup_player_info", return_value=info) as get_info:
-        response = auth_client.get("/play/live/src1_42?handoff=h1")
+    position = _hours_ago(3).timestamp()
+    handoff._records["testuser"] = _handoff_record(
+        mode="catchup",
+        recording_id="",
+        position=position,
+    )
+    _set_live(_archive_stream())
+    response = auth_client.get("/play/live/src1_42?handoff=h1")
     assert response.status_code == 200
-    get_info.assert_called_once_with("src1_42", 1767264000.0)
+    assert "/timeshift/user/pass/" in response.text
+    assert f"catchupStart: {position}" in response.text
+    assert "catchupSeek: 0.0" in response.text
+    assert handoff._records["testuser"]["resumed"] is True
 
 
 def test_playing_something_else_cancels_the_handoff(auth_client: TestClient, clean_handoff: None):
-
     handoff._records["testuser"] = _handoff_record(mode="catchup", recording_id="")
-    info = PlayerInfo(url="https://example.test/live.m3u8", channel_name="Other")
-    with patch("netv.main._get_live_player_info", return_value=info):
-        auth_client.get("/play/live/other")
+    _set_live({"stream_id": "other", "name": "Other", "direct_url": "https://e.test/l.m3u8"})
+    assert auth_client.get("/play/live/other").status_code == 200
     assert "testuser" not in handoff._records
 
 
@@ -2524,57 +2400,64 @@ def test_stale_handoff_cannot_be_resumed(auth_client: TestClient, clean_handoff:
 
 
 def test_handoff_stop_hands_off_the_watched_channel(auth_client: TestClient, clean_handoff: None):
-
-    now = datetime.now(timezone.utc).timestamp()
-    handoff._watches["testuser"] = handoff._Watch(
-        stream_id="src1_42",
-        position=now - 10,
-        first_seen=now - 600,
-        last_seen=now - 15,
+    now = time.time()
+    _watching("src1_42", now)
+    _set_live(_archive_stream())
+    response = auth_client.post(
+        "/api/handoff/stop",
+        json={"stream_id": "src1_42", "position": now - 5},
     )
-    channel = handoff.Channel(
-        stream_id="src1_42",
-        name="Channel",
-        url="http://x/42.m3u8",
-        catchup_days=2,
-    )
-    with (
-        patch("netv.main._handoff_stream_allowed", return_value=True),
-        patch("netv.main._handoff_channel", return_value=channel),
-    ):
-        response = auth_client.post(
-            "/api/handoff/stop",
-            json={"stream_id": "src1_42", "position": now - 5},
-        )
     assert response.status_code == 200
     assert handoff._records["testuser"]["mode"] == "catchup"
     assert handoff._records["testuser"]["position"] == pytest.approx(now - 5)
 
 
-def test_handoff_recording_first_releases_the_live_transcode(
+def test_handoff_stop_rejects_streams_the_user_cannot_see(
     auth_client: TestClient,
     clean_handoff: None,
 ):
-    now = datetime.now(timezone.utc).timestamp()
-    handoff._watches["testuser"] = handoff._Watch(
-        stream_id="src1_42",
-        position=now - 10,
-        first_seen=now - 600,
-        last_seen=now - 15,
+    now = time.time()
+    _watching("src1_42", now)
+    _set_live(_archive_stream(category_ids=["9"]))
+    auth.set_user_limits("testuser", unavailable_groups=["cat:9"])
+    response = auth_client.post(
+        "/api/handoff/stop",
+        json={"stream_id": "src1_42", "position": now - 5},
     )
-    channel = handoff.Channel(stream_id="src1_42", name="Channel", url="http://x/42.m3u8")
-    with (
-        patch("netv.main._handoff_stream_allowed", return_value=True),
-        patch("netv.main._handoff_channel", return_value=channel),
-        patch("netv.main.ffmpeg_session.stop_user_stream", new_callable=AsyncMock) as release,
-        patch("netv.handoff._start_recorder", side_effect=OSError("no ffmpeg")),
-    ):
-        response = auth_client.post(
-            "/api/handoff/stop",
-            json={"stream_id": "src1_42", "position": now - 5},
-        )
+    assert response.status_code == 404
+    assert handoff._records == {}
+
+
+def test_handoff_recording_first_releases_the_live_transcode(
+    auth_client: TestClient,
+    clean_handoff: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    url = "http://x/42.m3u8"
+    settings = cache_module.load_server_settings()
+    settings["probe_live"] = False
+    cache_module.save_server_settings(settings)
+    web = testing.FakeWeb({url: testing.FakeResponse(b"#EXTM3U\n#EXTINF:6,\nseg.ts\n")})
+    testing.install_web(monkeypatch, web, ffmpeg_command)
+    popen = testing.PopenRecorder()
+    testing.install_subprocess(monkeypatch, handoff, popen=popen)
+    live = _add_session("live", tmp_path, url=url)
+    now = time.time()
+    _watching("src1_42", now)
+    _set_live({"stream_id": "src1_42", "name": "Channel", "direct_url": url})
+
+    response = auth_client.post(
+        "/api/handoff/stop",
+        json={"stream_id": "src1_42", "position": now - 5},
+    )
+
     assert response.status_code == 200
-    release.assert_awaited_once_with("testuser", "http://x/42.m3u8")
+    _assert_stopped("live", live, stopped=True)
+    assert handoff._records["testuser"]["mode"] == "recording"
+    [recorder] = popen.started
+    assert recorder.args[0] == "ffmpeg"
+    assert url in recorder.args
 
 
 class TestManagedDirectGuide:
@@ -2606,12 +2489,9 @@ class TestManagedDirectGuide:
                 "direct_url": "https://media.test/hidden.m3u8",
             },
         ]
-        with (
-            patch("netv.main.load_user_settings", return_value={"guide_filter": ["1"]}),
-            patch("netv.main._playlist_categories", return_value=[]),
-        ):
-            normal = _body(auth_client.get("/api/guide/rows"), GuideRowsResponse)
-            response = auth_client.get("/api/guide/rows?direct=true")
+        _save_guide_filter(["1"])
+        normal = _body(auth_client.get("/api/guide/rows"), GuideRowsResponse)
+        response = auth_client.get("/api/guide/rows?direct=true")
         assert all("direct_url" not in row["channel"] for row in normal["rows"])
         payload = _body(response, GuideRowsResponse)
         assert payload["direct_playback"] is True
@@ -2637,16 +2517,16 @@ class TestManagedDirectGuide:
                 "direct_url": "https://provider.test/private.m3u8",
             },
         ]
-        with patch("netv.main._unavailable_groups", return_value={"cat:1"}):
-            payload = _body(
-                auth_client.get("/api/guide/rows?cats=1&direct=true"),
-                GuideRowsResponse,
-            )
+        auth.set_user_limits("testuser", unavailable_groups=["cat:1"])
+        payload = _body(
+            auth_client.get("/api/guide/rows?cats=1&direct=true"),
+            GuideRowsResponse,
+        )
         assert payload["rows"] == []
         assert payload["direct_playback"] is True
 
 
-def _archive_stream(**overrides: str | int) -> ProviderRecord:
+def _archive_stream(**overrides: str | int | list[MutablePlainTree]) -> ProviderRecord:
     stream: ProviderRecord = {
         "stream_id": "src1_42",
         "name": "Channel",
@@ -2682,9 +2562,150 @@ def _handoff_record(**overrides: str | float | bool) -> dict[str, str | float | 
     return record
 
 
-def _mark_start(content: str, seconds: float) -> str:
-    del seconds
-    return content + "#start\n"
+def _now() -> datetime:
+    """The current UTC time in whole seconds, which the guide stores exactly."""
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def _save_guide_filter(cats: list[str]) -> None:
+    settings = cache_module.load_user_settings("testuser")
+    settings["guide_filter"] = cats
+    cache_module.save_user_settings("testuser", settings)
+
+
+def _set_live(*streams: ProviderRecord) -> None:
+    store = cache_module.get_cache()
+    store["live_streams"] = list(streams)
+    store["live_categories"] = []
+    store["epg_urls"] = []
+
+
+def _air(
+    channel_id: str,
+    title: str,
+    start: datetime,
+    stop: datetime,
+    *,
+    desc: str = "",
+    source_id: str = "",
+) -> Program:
+    epg.insert_programs([(channel_id, title, start.timestamp(), stop.timestamp(), desc, source_id)])
+    epg.commit()
+    return Program(channel_id=channel_id, title=title, start=start, stop=stop, desc=desc)
+
+
+def _xmltv(channel_id: str, start: datetime, *, hours: int) -> bytes:
+    stop = start + timedelta(hours=hours)
+    stamp = "%Y%m%d%H%M%S +0000"
+    return (
+        f'<tv><channel id="{channel_id}"><display-name>News</display-name></channel>'
+        f'<programme channel="{channel_id}" start="{start:{stamp}}" stop="{stop:{stamp}}">'
+        "<title>Tonight</title></programme></tv>"
+    ).encode()
+
+
+def _add_session(
+    session_id: str,
+    directory: Path,
+    *,
+    username: str = "testuser",
+    url: str = "http://provider/live.ts",
+    last_access: float | None = None,
+    is_archive: bool = False,
+    fast_start: bool = False,
+    origin_pts: float | None = None,
+    origin_time: float = 0.0,
+    playback_buffer_seconds: float = 12.0,
+    caption_timestamp_origin: float | None = None,
+    playback_policy: PlaybackPolicy | None = None,
+) -> ffmpeg_session.TranscodeSession:
+    """Register a running live session, as a started transcode leaves it."""
+    session: ffmpeg_session.TranscodeSession = {
+        "dir": str(directory),
+        "process": testing.FakeProcess(exit_code=None),
+        "started": time.time(),
+        "url": url,
+        "username": username,
+        "last_access": time.time() if last_access is None else last_access,
+        "is_archive": is_archive,
+        "fast_start": fast_start,
+        "origin_pts": origin_pts,
+        "origin_time": origin_time,
+        "playback_buffer_seconds": playback_buffer_seconds,
+        "playback_policy": playback_policy or PlaybackPolicy(),
+    }
+    if caption_timestamp_origin is not None:
+        session["caption_timestamp_origin"] = caption_timestamp_origin
+    ffmpeg_session._transcode_sessions[session_id] = session
+    ffmpeg_session._url_to_session[url] = session_id
+    return session
+
+
+def _add_fast_session(session_id: str, directory: Path) -> ffmpeg_session.TranscodeSession:
+    session = _fast_session(directory)
+    session.update(url=ADAPTIVE_URL, last_access=time.time())
+    ffmpeg_session._transcode_sessions[session_id] = session
+    ffmpeg_session._url_to_session[ADAPTIVE_URL] = session_id
+    return session
+
+
+def _signals(session: ffmpeg_session.TranscodeSession) -> list[str]:
+    process = session["process"]
+    assert isinstance(process, testing.FakeProcess)
+    return process.signals
+
+
+def _assert_stopped(
+    session_id: str,
+    session: ffmpeg_session.TranscodeSession,
+    *,
+    stopped: bool,
+) -> None:
+    if stopped:
+        assert session_id not in ffmpeg_session._transcode_sessions
+        assert _signals(session) == ["TERM"]
+    else:
+        assert ffmpeg_session._transcode_sessions[session_id] is session
+        assert _signals(session) == []
+
+
+def _cast_lan(monkeypatch: pytest.MonkeyPatch, directory: Path) -> testing.FakeChromecast:
+    """A TV at 192.168.1.50 and a playback session ``abc`` of testuser to cast."""
+    receiver = testing.FakeChromecast()
+    testing.install_chromecast(
+        monkeypatch,
+        testing.CastNetwork({"192.168.1.50": receiver}),
+        chromecast,
+    )
+    testing.install_threads(monkeypatch, testing.ThreadRecorder(run_inline=False), chromecast)
+    _add_session("abc", directory)
+    return receiver
+
+
+def _cast_owns(monkeypatch: pytest.MonkeyPatch, *, session_id: str, url: str) -> None:
+    record = chromecast.CastSession(
+        username="testuser",
+        host="192.168.1.50",
+        session_id=session_id,
+        url=f"http://192.168.1.10:8000/transcode/{session_id}/stream.m3u8",
+        source_url=url,
+        name="TV",
+        starting=False,
+    )
+    monkeypatch.setattr(chromecast.manager, "_sessions", {record.host: record})
+
+
+def _watching(stream_id: str, now: float) -> None:
+    handoff._watches["testuser"] = handoff._Watch(
+        stream_id=stream_id,
+        position=now - 10,
+        first_seen=now - 600,
+        last_seen=now - 15,
+    )
+
+
+async def _gone() -> Message:
+    return {"type": "http.disconnect"}
 
 
 class _JsonResponse(Protocol):
@@ -2721,6 +2742,18 @@ class _Matches(TypedDict):
 
 class _SearchResults(TypedDict):
     results: list[StreamSummary]
+
+
+class _EpgChannels(TypedDict):
+    results: list[epg.ChannelMatch]
+
+
+class _ProbeSeries(TypedDict):
+    series_id: int
+
+
+class _ProbeCache(TypedDict):
+    series: list[_ProbeSeries]
 
 
 class _HandoffBody(TypedDict):

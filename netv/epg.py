@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -147,13 +148,20 @@ def insert_icon(channel_id: str, url: str) -> None:
     )
 
 
-def insert_programs(programs: list[tuple[str, str, float, float, str, str]]) -> None:
-    """Bulk insert programs. Each tuple: (channel_id, title, start_ts, stop_ts, desc, source_id)."""
+def insert_programs(programs: Iterable[tuple[str, str, float, float, str, str]]) -> int:
+    """Bulk insert programs, streaming ``programs`` without materializing them.
+
+    Args:
+        programs: ``(channel_id, title, start_ts, stop_ts, desc, source_id)`` rows.
+
+    Returns:
+        count: Rows inserted.
+    """
     conn = _get_conn()
-    conn.executemany(
-        "INSERT INTO programs (channel_id, title, start_ts, stop_ts, desc, source_id) VALUES (?, ?, ?, ?, ?, ?)",
+    return conn.executemany(
+        "INSERT INTO programs (channel_id, title, start_ts, stop_ts, desc, source_id) VALUES (?, ?, ?, ?, ?, ?)",  # pragma: no mutate[case-insensitive]
         programs,
-    )
+    ).rowcount
 
 
 def commit() -> None:
@@ -464,37 +472,8 @@ def fetch_epg(
         if icon_el is not None:
             insert_icon(ch_id, icon_el.get("src", ""))
 
-    # Parse programs in batches.
-    batch: list[tuple[str, str, float, float, str, str]] = []
-    batch_size = 10_000
-    program_count = 0
     program_channel_ids: set[str] = set()
-
-    for prog in root.findall("programme"):
-        ch_id = prog.get("channel", "")
-        program_channel_ids.add(ch_id)
-        start_str = prog.get("start", "")
-        stop_str = prog.get("stop", "")
-
-        title = _element_text(prog.find("title"), default="Unknown")
-        desc = _element_text(prog.find("desc"), default="")
-
-        try:
-            start = _parse_epg_time(start_str)
-            stop = _parse_epg_time(stop_str)
-        except Exception:
-            continue
-
-        batch.append((ch_id, title, start.timestamp(), stop.timestamp(), desc, source_id))
-        program_count += 1
-
-        if len(batch) >= batch_size:
-            insert_programs(batch)
-            batch.clear()
-
-    if batch:
-        insert_programs(batch)
-
+    program_count = insert_programs(_program_rows(root, source_id, program_channel_ids))
     commit()
     log.debug(
         "EPG parsed: %d channels, %d unique program channel IDs, %d programs",
@@ -541,6 +520,31 @@ def _dedupe_programs(programs: list[Program], preferred_source_id: str) -> list[
         if not dominated:
             result.append(p)
     return sorted(result, key=lambda p: p.start)
+
+
+# A programme without both times is skipped: placing it at "now" would show it as airing
+# on every refresh.
+def _program_rows(
+    root: Element,
+    source_id: str,
+    channel_ids: set[str],
+) -> Iterator[tuple[str, str, float, float, str, str]]:
+    """Yield an insert row per well-formed ``programme``, adding its channel to ``channel_ids``."""
+    for prog in root.findall("programme"):
+        ch_id = prog.get("channel", "")
+        channel_ids.add(ch_id)
+        start_str = prog.get("start")
+        stop_str = prog.get("stop")
+        if start_str is None or stop_str is None:
+            continue
+        try:
+            start = _parse_epg_time(start_str)
+            stop = _parse_epg_time(stop_str)
+        except ValueError:
+            continue
+        title = _element_text(prog.find("title"), default="Unknown")
+        desc = _element_text(prog.find("desc"), default="")
+        yield ch_id, title, start.timestamp(), stop.timestamp(), desc, source_id
 
 
 def _parse_epg_time(s: str) -> datetime:

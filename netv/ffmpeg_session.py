@@ -4,7 +4,16 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, Required, TypedDict, TypeGuard
+from typing import (
+    TYPE_CHECKING,
+    Literal,
+    NotRequired,
+    Protocol,
+    Required,
+    TypeAlias,
+    TypedDict,
+    TypeGuard,
+)
 from urllib import parse
 
 import asyncio
@@ -15,6 +24,7 @@ import logging
 import pathlib
 import re
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -22,7 +32,7 @@ import uuid
 
 from treekle import json_loads
 
-from netv.cache import HwAccel, get_user_agent
+from netv.cache import HwAccel, ServerSettings, get_user_agent
 from netv.fast_start import (
     closed_caption_master_playlist,
     dated_playlist,
@@ -83,8 +93,10 @@ class ManagedProcess(Protocol):
     async def wait(self) -> int | None: ...
 
 
+ContentType: TypeAlias = Literal["movie", "series", "live"]
+
+
 class SubtitleInfo(TypedDict):
-    index: int
     lang: str
     name: str
 
@@ -445,16 +457,15 @@ def cleanup_and_recover_sessions() -> None:
     removed = recovered = 0
 
     for d in get_transcode_dir().glob("netv_transcode_*"):
-        if not d.is_dir():
+        try:
+            entry = d.stat()
+        except OSError:  # Dangling symlink, or removed since the glob.
             continue
+        if not stat.S_ISDIR(entry.st_mode):
+            continue
+        mtime = entry.st_mtime
 
         info_file = d / "session.json"
-        try:
-            mtime = d.stat().st_mtime
-        except OSError:
-            shutil.rmtree(d, ignore_errors=True)
-            removed += 1
-            continue
 
         # No session.json = orphaned (live session or failed VOD)
         if not info_file.exists():
@@ -663,7 +674,7 @@ class _SessionSnapshot:
 
 async def start_transcode(
     url: str,
-    content_type: str = "live",
+    content_type: ContentType = "live",
     series_id: int | None = None,
     episode_id: int | None = None,
     series_name: str = "",
@@ -824,7 +835,7 @@ async def seek_transcode(
         raise fastapi.HTTPException(400, "Seek an archive by opening it at the desired start time")
 
     settings = get_settings()
-    hw = settings.get("transcode_hw", "software")
+    hw = settings["transcode_hw"]
     max_resolution = settings.get("max_resolution", "1080p")
     quality = settings.get("quality", "high")
     seg_duration = get_hls_segment_duration()
@@ -868,9 +879,9 @@ async def seek_transcode(
 
     # Use probe_series if series_id, else probe_movies.
     if info.series_id is not None and info.series_id != 0:
-        do_probe = settings.get("probe_series", False)
+        do_probe = settings["probe_series"]
     else:
-        do_probe = settings.get("probe_movies", False)
+        do_probe = settings["probe_movies"]
     if do_probe:
         media_info = (
             await asyncio.to_thread(
@@ -1189,7 +1200,7 @@ async def _start_fast_live(
             session["closed_captions"] = closed_captions
         if closed_captions:
             log.info("Fast-start session %s detected embedded captions", session_id)
-        hw = settings.get("transcode_hw", "software")
+        hw = settings["transcode_hw"]
         encoder = functools.partial(
             encoder_command,
             directory,
@@ -1698,19 +1709,28 @@ def _adaptive_session_response(
     return response
 
 
-def _get_existing_session(url: str) -> tuple[str | None, bool, float]:
-    """Get existing session info atomically. Returns (session_id, is_valid, seek_offset)."""
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _ExistingSession:
+    """A URL's current session, read atomically."""
+
+    session_id: str
+    session: TranscodeSession  # Shallow copy.
+    is_valid: bool
+
+
+def _get_existing_session(url: str) -> _ExistingSession | None:
+    """The session ``url`` maps to, or None when there is none."""
     with _transcode_lock:
-        existing_id = _url_to_session.get(url)
-        if existing_id is None:
-            return None, False, 0.0
-        session = _transcode_sessions.get(existing_id)
+        session_id = _url_to_session.get(url)
+        if session_id is None:
+            return None
+        session = _transcode_sessions.get(session_id)
         if session is None:
-            return None, False, 0.0
-        return (
-            existing_id,
-            is_session_valid(session),
-            session.get("seek_offset", 0),
+            return None
+        return _ExistingSession(
+            session_id=session_id,
+            session=session.copy(),
+            is_valid=is_session_valid(session),
         )
 
 
@@ -1790,11 +1810,7 @@ async def _handle_existing_vod_session(
     i_idx = cmd.index("-i")
     cmd.insert(i_idx, str(hls_duration))
     cmd.insert(i_idx, "-ss")
-    try:
-        hls_flags_idx = cmd.index("-hls_flags")
-        cmd[hls_flags_idx + 1] += "+append_list"
-    except ValueError:
-        cmd.extend(["-hls_flags", "append_list"])
+    cmd[cmd.index("-hls_flags") + 1] += "+append_list"
     cmd.extend(["-start_number", str(len(segments))])
 
     process = await _launch_ffmpeg(cmd)
@@ -1828,21 +1844,16 @@ async def _try_reuse_session(
     existing_id: str,
     url: str,
     is_vod: bool,
-    content_type: str,
+    content_type: ContentType,
 ) -> TranscodeResponse | None:
     """Try to reuse an existing valid session. Returns response or None if can't reuse."""
     if is_vod:
         settings = get_settings()
-        probe_flags = {
-            "movie": settings.get("probe_movies", False),
-            "series": settings.get("probe_series", False),
-        }
-        do_probe = probe_flags.get(content_type, False)
         return await _handle_existing_vod_session(
             existing_id,
             url,
-            settings.get("transcode_hw", "software"),
-            do_probe,
+            settings["transcode_hw"],
+            _probe_enabled(settings, content_type),
             settings.get("max_resolution", "1080p"),
             settings.get("quality", "high"),
         )
@@ -1855,17 +1866,34 @@ async def _try_reuse_session(
     return _build_session_response(existing_id, snap, playlist_path)
 
 
-async def _cleanup_invalid_session(url: str, session_id: str) -> None:
-    """Clean up an invalid/expired session."""
-    with _transcode_lock:
-        _url_to_session.pop(url, None)
-    await stop_session(session_id, force=True)
+async def _remuxable_source(
+    url: str,
+    settings: ServerSettings,
+    audio_passthrough: bool,
+) -> str | None:
+    """The resolved variant URL when a live source can be stream-copied, else None."""
+    resolved = await asyncio.to_thread(resolve_hls_master_playlist, url)
+    media_info = (await asyncio.to_thread(probe_media, resolved))[0]
+    max_resolution = settings.get("max_resolution", "1080p")
+    remux = can_remux_live(media_info, max_resolution, audio_passthrough=audio_passthrough)
+    return resolved if remux else None
+
+
+def _probe_enabled(settings: ServerSettings, content_type: ContentType) -> bool:
+    """Whether settings ask for probing ``content_type``."""
+    match content_type:
+        case "movie":
+            return settings["probe_movies"]
+        case "series":
+            return settings["probe_series"]
+        case "live":
+            return settings["probe_live"]
 
 
 # resolved_url: the variant ``url`` already resolved to, saving a second fetch.
 async def _do_start_transcode(
     url: str,
-    content_type: str,
+    content_type: ContentType,
     series_id: int | None,
     episode_id: int | None,
     old_seek_offset: float,
@@ -1891,19 +1919,14 @@ async def _do_start_transcode(
         url = resolved_url
 
     settings = get_settings()
-    hw = settings.get("transcode_hw", "software")
+    hw = settings["transcode_hw"]
     max_resolution = settings.get("max_resolution", "1080p")
     quality = settings.get("quality", "high")
     if bandwidth_saver:
         max_resolution = "480p" if max_resolution == "480p" else "720p"
         quality = "low"
     is_vod = content_type in ("movie", "series")
-    probe_flags = {
-        "movie": settings.get("probe_movies", False),
-        "series": settings.get("probe_series", False),
-        "live": settings.get("probe_live", False),
-    }
-    do_probe = probe_flags.get(content_type, False)
+    do_probe = _probe_enabled(settings, content_type)
 
     media_info: MediaInfo | None = None
     subtitles: list[SubtitleStream] = []
@@ -1917,7 +1940,8 @@ async def _do_start_transcode(
         )
         if media_info is not None:
             codecs = media_info.subtitle_codecs
-            subs_str = ",".join(codecs) if codecs is not None and codecs else "none"
+            # Probing stores None, never [], for a source without subtitles.
+            subs_str = ",".join(codecs) if codecs is not None else "none"
             if subtitles:
                 subs_str += f" [extract:{','.join(s.lang for s in subtitles)}]"
             bitrate_str = (
@@ -1970,28 +1994,28 @@ async def _do_start_transcode(
         log.info("Applying seek_offset=%.1f from previous session", old_seek_offset)
 
     sub_info: list[SubtitleInfo] = [
-        {"index": subtitle.index, "lang": subtitle.lang, "name": subtitle.name}
-        for subtitle in subtitles
+        {"lang": subtitle.lang, "name": subtitle.name} for subtitle in subtitles
     ]
     stored_subtitles: list[StoredSubtitle | int] = [
         {"index": subtitle.index, "lang": subtitle.lang, "name": subtitle.name}
         for subtitle in subtitles
     ]
     total_duration = 0.0 if media_info is None else media_info.duration
-    try:
-        caption_master = _write_caption_master(output_dir, sub_info, max_resolution)
-    except OSError as error:
-        shutil.rmtree(output_dir, ignore_errors=True)
-        raise fastapi.HTTPException(500, "Could not prepare captions") from error
-
     log.info(
         "Starting transcode session %s (vod=%s): %s",
         session_id,
         is_vod,
         " ".join(cmd),
     )
-
-    process = await _launch_ffmpeg(cmd)
+    try:
+        caption_master = _write_caption_master(output_dir, sub_info, max_resolution)
+        process = await _launch_ffmpeg(cmd)
+    except OSError as error:
+        shutil.rmtree(output_dir)
+        raise fastapi.HTTPException(500, "Could not start the transcoder") from error
+    except asyncio.CancelledError:
+        shutil.rmtree(output_dir)
+        raise
 
     stderr_lines: list[str] = []
     _spawn_background_task(_monitor_ffmpeg_stderr(process, session_id, stderr_lines))
@@ -2113,8 +2137,8 @@ def _get_seek_session_info(session_id: str) -> _SeekSessionInfo | None:
 
 def _playlist_marker(path: pathlib.Path) -> tuple[int, int, int] | None:
     try:
-        stat = path.stat()
-        return stat.st_ino, stat.st_mtime_ns, stat.st_size
+        info = path.stat()
+        return info.st_ino, info.st_mtime_ns, info.st_size
     except OSError:
         return None
 
@@ -2452,7 +2476,7 @@ def _session_processes(session: TranscodeSession) -> list[ManagedProcess]:
 
 async def _start_or_reuse(
     url: str,
-    content_type: str,
+    content_type: ContentType,
     series_id: int | None,
     episode_id: int | None,
     series_name: str,
@@ -2468,46 +2492,44 @@ async def _start_or_reuse(
 ) -> TranscodeResponse:
     """Reuse the URL's session or start one; callers hold the URL's startup guard."""
     # A quality change replaces the current stream; release its slot first.
-    existing_id, is_valid, old_seek_offset = _get_existing_session(url)
-    if _is_archive_url(url):
-        old_seek_offset = 0.0
-        existing = get_session(existing_id) if existing_id is not None else None
-        if existing is not None and existing.get("username") != username:
-            raise fastapi.HTTPException(409, "This archive is playing on another device.")
-    if bandwidth_saver and existing_id is not None:
-        session = get_session(existing_id)
-        if session and session.get("username") != username:
-            raise fastapi.HTTPException(404, "Session not found")
-        await stop_session(existing_id, force=True)
-        existing_id, is_valid, old_seek_offset = None, False, 0.0
-    if existing_id is not None and not audio_passthrough:
-        session = get_session(existing_id)
-        if session is not None and session.get("audio_passthrough", False):
-            # This client cannot decode the session's Dolby audio.
-            if session.get("username") != username:
-                raise fastapi.HTTPException(409, "This stream is playing on another device.")
-            await stop_session(existing_id, force=True)
-            existing_id, is_valid = None, False
-
+    existing = _get_existing_session(url)
+    # An archive request names its own start, so it never resumes another position.
+    old_seek_offset = (
+        existing.session.get("seek_offset", 0)
+        if existing is not None and not _is_archive_url(url)
+        else 0.0
+    )
     is_vod = content_type in ("movie", "series")
-
-    # Try to reuse existing valid session.
-    if existing_id is not None and is_valid:
-        existing = get_session(existing_id)
-        if existing is not None and existing.get("fast_start", False):
-            if existing.get("username") != username:
+    if existing is not None:
+        owner = existing.session.get("username")
+        if _is_archive_url(url) and owner != username:
+            raise fastapi.HTTPException(409, "This archive is playing on another device.")
+        if bandwidth_saver:
+            if owner != username:
                 raise fastapi.HTTPException(404, "Session not found")
-            touch_session(existing_id)
-            return _adaptive_session_response(existing_id)
-        log.info("Found valid existing session %s (vod=%s)", existing_id, is_vod)
-        result = await _try_reuse_session(existing_id, url, is_vod, content_type)
+            await stop_session(existing.session_id, force=True)
+            existing, old_seek_offset = None, 0.0
+        elif not audio_passthrough and existing.session.get("audio_passthrough") is True:
+            # This client cannot decode the session's Dolby audio.
+            if owner != username:
+                raise fastapi.HTTPException(409, "This stream is playing on another device.")
+            await stop_session(existing.session_id, force=True)
+            existing = None
+
+    if existing is not None and existing.is_valid:
+        if existing.session.get("fast_start") is True:
+            if existing.session.get("username") != username:
+                raise fastapi.HTTPException(404, "Session not found")
+            touch_session(existing.session_id)
+            return _adaptive_session_response(existing.session_id)
+        log.info("Found valid existing session %s (vod=%s)", existing.session_id, is_vod)
+        result = await _try_reuse_session(existing.session_id, url, is_vod, content_type)
         if result:
             return result
 
-    # Clean up any existing invalid session.
-    if existing_id is not None:
-        log.info("Cleaning up invalid session %s", existing_id)
-        await _cleanup_invalid_session(url, existing_id)
+    if existing is not None:
+        log.info("Cleaning up invalid session %s", existing.session_id)
+        await stop_session(existing.session_id, force=True)
 
     # Limits count upstream connections, so only a new session is checked; a
     # reused one already holds its slot.
@@ -2525,31 +2547,15 @@ async def _start_or_reuse(
     if (
         fast_start
         and content_type == "live"
-        and get_settings().get("max_resolution", "1080p") in ("1080p", "1440p", "4k")
+        and get_settings().get("max_resolution", "1080p") in ("1080p", "4k")
     ):
         # A DVR request only needs server-side retention. When the source can
         # be stream-copied, serve one remux session instead of a fast-start
         # encoder; otherwise keep the adaptive transcode pipeline.
         settings = get_settings()
-        remux = False
-        if (
-            not bandwidth_saver
-            and settings.get("live_dvr_mins", 0) > 0
-            and settings.get("probe_live", True)
-        ):
-            resolved = await asyncio.to_thread(resolve_hls_master_playlist, url)
-            media_info = (await asyncio.to_thread(probe_media, resolved))[0]
-            remux = can_remux_live(
-                media_info,
-                settings.get("max_resolution", "1080p"),
-                audio_passthrough=audio_passthrough,
-            )
-        if remux:
-            log.info(
-                "DVR live session uses a stream-copy remux instead of fast-start: %s",
-                url,
-            )
-        else:
+        dvr = not bandwidth_saver and settings["live_dvr_mins"] > 0 and settings["probe_live"]
+        resolved = await _remuxable_source(url, settings, audio_passthrough) if dvr else None
+        if resolved is None:
             return await _start_fast_live(
                 url,
                 username,
@@ -2559,6 +2565,7 @@ async def _start_or_reuse(
                 is_disconnected=is_disconnected,
                 audio_passthrough=audio_passthrough,
             )
+        log.info("DVR live session uses a stream-copy remux instead of fast-start: %s", url)
 
     # Start fresh transcode (with retry for series probe cache staleness)
     try:

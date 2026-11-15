@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone, tzinfo
-from urllib import parse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import logging
@@ -18,6 +17,8 @@ import threading
 import time
 
 from treekle import MutablePlainTree
+
+from netv.xtream import credentials_path
 
 
 log = logging.getLogger(__name__)
@@ -141,9 +142,7 @@ def timeshift_url(
         url: Credential-encoded upstream timeshift URL.
     """
     base = str(stream["source_url"]).rstrip("/")
-    user = parse.quote(str(stream["source_username"]), safe="")
-    pwd = parse.quote(str(stream["source_password"]), safe="")
-    stream_id = str(stream["stream_id"])
-    stream_id = stream_id.split("_")[-1] if "_" in stream_id else stream_id
+    credentials = credentials_path(str(stream["source_username"]), str(stream["source_password"]))
+    stream_id = str(stream["stream_id"]).rpartition("_")[2]
     local_start = start.astimezone(tz).strftime("%Y-%m-%d:%H-%M")
-    return f"{base}/timeshift/{user}/{pwd}/{minutes}/{local_start}/{stream_id}.{ext}"
+    return f"{base}/timeshift/{credentials}/{minutes}/{local_start}/{stream_id}.{ext}"

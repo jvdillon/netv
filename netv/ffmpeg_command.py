@@ -20,7 +20,7 @@ import time
 from treekle import json_loads
 
 from netv import cache
-from netv.cache import HwAccel, ServerSettings, clamp_live_dvr_mins, get_user_agent
+from netv.cache import HwAccel, ServerSettings, get_user_agent
 
 
 log = logging.getLogger(__name__)
@@ -704,7 +704,6 @@ def live_video_bitrates(resolution: str) -> tuple[int, int]:
         "480p": (2_000_000, 3_000_000),
         "720p": (4_000_000, 6_000_000),
         "1080p": (6_000_000, 8_000_000),
-        "1440p": (10_000_000, 14_000_000),
         "4k": (16_000_000, 20_000_000),
     }.get(resolution, (4_000_000, 6_000_000))
 
@@ -762,7 +761,7 @@ def get_live_hls_list_size(
     Returns:
         list_size: Number of segments retained in the live playlist.
     """
-    dvr_mins = clamp_live_dvr_mins(_load_settings().get("live_dvr_mins", 0))
+    dvr_mins = _load_settings()["live_dvr_mins"]
     if dvr_mins <= 0:
         return int(live_buffer_secs / segment_duration)
     # DVR enabled: calculate segments from minutes.
@@ -990,11 +989,7 @@ def build_hls_ffmpeg_cmd(
         source_height=media_info.height if media_info else 0,
         allow_upscale=allow_upscale,
     )
-    audio_args = _build_audio_args(
-        copy_audio=copy_audio,
-        audio_sample_rate=audio.audio_sample_rate if audio else 0,
-        audio_channels=audio.audio_channels if audio else 0,
-    )
+    audio_args = _build_audio_args(copy_audio=copy_audio, audio=audio)
     sr_applied = any("dnn_processing=" in arg for arg in video_post)
     segment_duration = sr_segment_duration if sr_applied else get_hls_segment_duration()
 
@@ -1676,15 +1671,12 @@ def _build_video_args(
     return pre, post
 
 
-def _build_audio_args(
-    *,
-    copy_audio: bool,
-    audio_sample_rate: int,
-    audio_channels: int = 0,
-) -> list[str]:
+def _build_audio_args(*, copy_audio: bool, audio: MediaInfo | None) -> list[str]:
     """Build audio args."""
     if copy_audio:
         return ["-c:a", "copy"]
+    audio_sample_rate = audio.audio_sample_rate if audio else None
+    audio_channels = audio.audio_channels if audio else 0
     rate = str(audio_sample_rate) if audio_sample_rate in (44_100, 48_000) else "48000"
     if audio_channels > 2:
         # Every client decodes 5.1 AAC; wider layouts fold down to 5.1.
@@ -1759,7 +1751,9 @@ def _can_copy_audio(media_info: MediaInfo | None, *, passthrough: bool = False) 
 
 def _max_resolution_height(max_resolution: str) -> int | None:
     """Return the scale-down height for a resolution setting, or None for no limit."""
-    return {"4k": 2160, "1080p": 1080, "720p": 720, "480p": 480}.get(max_resolution)
+    return {"4k": 2160, "1080p": 1080, "720p": 720, "480p": 480}.get(
+        max_resolution,
+    )
 
 
 class _SeriesProbe(TypedDict):

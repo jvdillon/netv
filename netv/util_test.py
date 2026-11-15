@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from http.client import HTTPMessage
 from typing import TypedDict
-from unittest.mock import MagicMock
 from urllib import error, request
 
 import io
@@ -16,7 +15,7 @@ from treekle import MutablePlainTree
 
 import pytest
 
-from netv import util
+from netv import testing, util
 
 
 class TestDataDir:
@@ -335,18 +334,18 @@ def test_safe_urlopen_uses_safe_opener(
     user_agent: str | None,
     expected: str,
 ):
-    opener = MagicMock()
-    opener.open.return_value = "response"
-    build_opener = MagicMock(return_value=opener)
-    monkeypatch.setattr(util.request, "build_opener", build_opener)
-    assert util.safe_urlopen("https://example.com/x", 7, user_agent) == "response"
-    [handler] = build_opener.call_args.args
+    response = testing.FakeResponse(b"ok")
+    web = testing.FakeWeb({"https://example.com/x": response})
+    testing.install_web(monkeypatch, web, util)
+    assert util.safe_urlopen("https://example.com/x", 7, user_agent) is response
+    [fetch] = web.fetches
+    [handler] = fetch.handlers
     assert isinstance(handler, util._SafeRedirectHandler)
-    req = opener.open.call_args.args[0]
-    assert isinstance(req, request.Request)
-    assert opener.open.call_args.kwargs == {"timeout": 7}
-    assert req.full_url == "https://example.com/x"
-    assert req.get_header("User-agent") == expected
+    assert (fetch.url, fetch.timeout, fetch.headers) == (
+        "https://example.com/x",
+        7,
+        {"User-agent": expected},
+    )
 
 
 if __name__ == "__main__":

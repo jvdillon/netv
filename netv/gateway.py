@@ -46,6 +46,7 @@ from netv.gateway_catalog import CatalogSnapshot, GatewayCatalog, GatewayStream
 from netv.gateway_epg import EpgUnavailableError, build_filtered_xmltv
 from netv.m3u import get_xtream_client_by_source
 from netv.util import configure_logging, safe_urlopen
+from netv.xtream import credentials_path
 
 
 if TYPE_CHECKING:
@@ -75,22 +76,16 @@ def _available_upscale_models(model_name: str = "2x-nomosuni-compact") -> list[s
 
 def _upscale_settings(model_name: str = "2x-nomosuni-compact") -> ServerSettings:
     settings = cache.load_server_settings()
-    available_models = _available_upscale_models(model_name)
     configured_model = model_name if settings.get("sr_model", "").strip() else ""
-    if configured_model and configured_model not in available_models:
-        raise RuntimeError(
-            f"Configured AI Upscale model {configured_model!r} is not installed; "
-            f"available models: {', '.join(available_models) or 'none'}",
-        )
-    max_resolution = settings.get("max_resolution", "") or "1080p"
-    quality = settings.get("quality", "") or "high"
-    if max_resolution not in ("4k", "1080p", "720p", "480p"):
-        raise RuntimeError("Configured max_resolution must be one of: 4k, 1080p, 720p, 480p")
+    if configured_model and not _available_upscale_models(model_name):
+        raise RuntimeError(f"Configured AI Upscale model {configured_model!r} is not installed")
+    max_resolution = settings.get("max_resolution", "1080p")
+    quality = settings.get("quality") or "high"
     if quality not in ("high", "medium", "low"):
         raise RuntimeError("Configured quality must be one of: high, medium, low")
     return {
         **settings,
-        "transcode_hw": settings.get("transcode_hw", "nvenc+software"),
+        "transcode_hw": settings["transcode_hw"],
         "max_resolution": max_resolution,
         "quality": quality,
         "sr_model": configured_model,
@@ -118,7 +113,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "Native upscaling enabled: model=%s target=%s hw=%s",
             settings.get("sr_model", ""),
             settings.get("max_resolution", ""),
-            settings.get("transcode_hw", ""),
+            settings["transcode_hw"],
         )
     else:
         log.info("Native upscaling disabled; gateway will use passthrough")
@@ -330,8 +325,7 @@ async def playlist(
     if output not in allowed_outputs:
         raise HTTPException(400, "Unsupported playlist output")
     base_url = _public_base_url(request)
-    encoded_user = parse.quote(username, safe="")
-    encoded_password = parse.quote(password, safe="")
+    credentials = credentials_path(username, password)
     epg_query = parse.urlencode({"username": username, "password": password})
     lines = [f'#EXTM3U url-tvg="{base_url}/xmltv.php?{epg_query}"']
     snapshot = await _get_catalog()
@@ -353,7 +347,7 @@ async def playlist(
             ),
         )
         lines.append(
-            f"{base_url}/live/{encoded_user}/{encoded_password}/{stream.local_id}.{extension}",
+            f"{base_url}/live/{credentials}/{stream.local_id}.{extension}",
         )
     return Response("\n".join(lines) + "\n", media_type="audio/x-mpegurl")
 
@@ -384,11 +378,7 @@ async def live_stream(request: Request, stream_path: str) -> Response:
     if _upscale_enabled():
         settings = cache.load_server_settings()
         source = next(
-            (
-                source
-                for source in settings.get("sources", [])
-                if source.get("id") == stream.source_id
-            ),
+            (source for source in settings["sources"] if source.get("id") == stream.source_id),
             None,
         )
         user_limits = auth.get_user_limits(username)

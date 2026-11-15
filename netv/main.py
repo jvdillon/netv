@@ -108,6 +108,7 @@ from netv.xtream import (
     XtreamClient,
     category_ids,
     list_field,
+    live_stream_url,
     record_field,
     text_field,
 )
@@ -850,11 +851,7 @@ async def guide_rows_api(
         for row, stream in zip(rows, streams[start : start + count], strict=False):
             url = text_field(stream, "direct_url")
             if not url and stream.get("source_type") == "xtream":
-                base = text_field(stream, "source_url").rstrip("/")
-                user_name = parse.quote(text_field(stream, "source_username"), safe="")
-                password = parse.quote(text_field(stream, "source_password"), safe="")
-                upstream_id = str(stream["stream_id"]).rsplit("_", 1)[-1]
-                url = f"{base}/live/{user_name}/{password}/{upstream_id}.m3u8"
+                url = live_stream_url(stream)
             row["channel"]["direct_url"] = url
             # This contract exports live URLs only, not archive playback URLs.
             row["channel"]["catchup_days"] = 0
@@ -1347,7 +1344,7 @@ async def player_page(
     is_catchup = bool(info.catchup_start)
     server_settings = load_server_settings()
     user_settings = load_user_settings(username)
-    transcode_mode = server_settings.get("transcode_mode", "auto")
+    transcode_mode = server_settings["transcode_mode"]
     is_https = (
         request.url.scheme == "https"
         or "https" in request.headers.get("x-forwarded-proto", "").lower()
@@ -1361,7 +1358,7 @@ async def player_page(
         mixed_content = is_https and info.url.startswith("http://")
         # Pause/rewind requires a server-side buffer; route live through a
         # local HLS session (stream copy when codecs allow) when DVR is on.
-        needs_dvr = stream_type == "live" and server_settings.get("live_dvr_mins", 0) > 0
+        needs_dvr = stream_type == "live" and server_settings["live_dvr_mins"] > 0
         if needs_transcode or mixed_content or needs_dvr:
             transcode_mode = "always"
 
@@ -1387,7 +1384,7 @@ async def player_page(
             "raw_url": info.url,
             "stream_id": stream_id,
             "transcode_mode": transcode_mode,
-            "live_dvr_mins": server_settings.get("live_dvr_mins", 0),
+            "live_dvr_mins": server_settings["live_dvr_mins"],
             "stream_type": stream_type,
             "channel_name": info.channel_name,
             "program_title": info.program_title,
@@ -1648,7 +1645,7 @@ async def transcode_start(
     request: Request,
     user: Annotated[TokenClaims, Depends(require_auth)],
     url: str,
-    content_type: str = "live",  # "movie", "series", or "live"
+    content_type: ffmpeg_session.ContentType = "live",
     series_id: int | None = None,
     episode_id: int | None = None,
     series_name: str = "",
@@ -1701,7 +1698,7 @@ async def transcode_start(
     source_max_streams = 0
     if source_id:
         settings = load_server_settings()
-        sources = settings.get("sources", [])
+        sources = settings["sources"]
         source = next((s for s in sources if s.get("id") == source_id), None)
         if source is not None:
             source_max_streams = source.get("max_streams", 0)
@@ -1938,7 +1935,7 @@ async def settings_page(request: Request, user: Annotated[TokenClaims, Depends(r
         await asyncio.to_thread(_store_cached_series_data)
 
     # Build source_id -> source_name mapping.
-    source_names = {s["id"]: s["name"] for s in server_settings.get("sources", [])}
+    source_names = {s["id"]: s["name"] for s in server_settings["sources"]}
 
     # Filter categories based on user's unavailable groups.
     unavailable_groups = _unavailable_groups(username)
@@ -1960,20 +1957,20 @@ async def settings_page(request: Request, user: Annotated[TokenClaims, Depends(r
         "settings.html",
         {
             # Server settings.
-            "sources": server_settings.get("sources", []),
-            "transcode_mode": server_settings.get("transcode_mode", "auto"),
-            "transcode_hw": server_settings.get("transcode_hw", "nvidia"),
+            "sources": server_settings["sources"],
+            "transcode_mode": server_settings["transcode_mode"],
+            "transcode_hw": server_settings["transcode_hw"],
             "max_resolution": server_settings.get("max_resolution", "1080p"),
             "quality": server_settings.get("quality", "high"),
-            "vod_transcode_cache_mins": server_settings.get("vod_transcode_cache_mins", 60),
-            "live_transcode_cache_secs": server_settings.get("live_transcode_cache_secs", 60),
-            "live_dvr_mins": server_settings.get("live_dvr_mins", 120),
-            "transcode_dir": server_settings.get("transcode_dir", ""),
-            "probe_live": server_settings.get("probe_live", True),
-            "probe_movies": server_settings.get("probe_movies", True),
-            "probe_series": server_settings.get("probe_series", False),
-            "user_agent_preset": server_settings.get("user_agent_preset", "default"),
-            "user_agent_custom": server_settings.get("user_agent_custom", ""),
+            "vod_transcode_cache_mins": server_settings["vod_transcode_cache_mins"],
+            "live_transcode_cache_secs": server_settings["live_transcode_cache_secs"],
+            "live_dvr_mins": server_settings["live_dvr_mins"],
+            "transcode_dir": server_settings["transcode_dir"],
+            "probe_live": server_settings["probe_live"],
+            "probe_movies": server_settings["probe_movies"],
+            "probe_series": server_settings["probe_series"],
+            "user_agent_preset": server_settings["user_agent_preset"],
+            "user_agent_custom": server_settings["user_agent_custom"],
             "available_encoders": AVAILABLE_ENCODERS,
             "sr_available": is_sr_available(),
             "sr_models": sr_models,
@@ -2063,7 +2060,7 @@ async def settings_add_source(
 
     source_users = _source_users(access, users)
     settings = load_server_settings()
-    sources = settings.get("sources", [])
+    sources = settings["sources"]
     source_id = f"src_{int(time.time())}_{len(sources)}"
     sources.append(
         {
@@ -2126,7 +2123,7 @@ async def settings_edit_source(
 
     source_users = _source_users(access, users)
     settings = load_server_settings()
-    for s in settings.get("sources", []):
+    for s in settings["sources"]:
         if s["id"] == source_id:
             s["name"] = name
             s["type"] = source_type
@@ -2153,7 +2150,7 @@ async def settings_delete_source(
 ):
     del user
     settings = load_server_settings()
-    settings["sources"] = [s for s in settings.get("sources", []) if s["id"] != source_id]
+    settings["sources"] = [s for s in settings["sources"] if s["id"] != source_id]
     save_server_settings(settings)
     # Clear all caches including EPG data for this source.
     epg.clear_source(source_id)
@@ -2731,7 +2728,7 @@ async def settings_transcode(
     user: Annotated[TokenClaims, Depends(require_admin)],
     transcode_mode: Annotated[str, Form()],
     transcode_hw: Annotated[str, Form()],
-    max_resolution: Annotated[str, Form()] = "1080p",
+    max_resolution: Annotated[cache.MaxResolution, Form()] = "1080p",
     quality: Annotated[str, Form()] = "high",
     vod_transcode_cache_mins: Annotated[int, Form()] = 60,
     live_transcode_cache_secs: Annotated[int, Form()] = 0,
@@ -3119,13 +3116,14 @@ async def settings_change_own_password(
         current_password: Current account password.
         new_password: Replacement password.
     """
-    username = user.get("sub", "")
-    if not auth.verify_password(username, current_password):
-        raise HTTPException(400, "Current password is incorrect")
     if len(new_password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters")
-    if not auth.change_password(username, new_password):
-        raise HTTPException(404, "User not found")
+    if not auth.change_password(
+        user.get("sub", ""),
+        new_password,
+        current_password=current_password,
+    ):
+        raise HTTPException(400, "Current password is incorrect")
     return {"status": "ok"}
 
 
@@ -4046,12 +4044,7 @@ def _get_live_player_info(stream_id: str) -> PlayerInfo:
     if direct_url:
         info = replace(info, url=direct_url, is_m3u=True)
     elif stream.get("source_type") == "xtream":
-        base = text_field(stream, "source_url")
-        orig_id = stream_id.split("_")[-1] if "_" in stream_id else stream_id
-        # URL-encode username/password to handle special chars like # in passwords.
-        user = parse.quote(text_field(stream, "source_username"), safe="")
-        pwd = parse.quote(text_field(stream, "source_password"), safe="")
-        info = replace(info, url=f"{base}/live/{user}/{pwd}/{orig_id}.m3u8")
+        info = replace(info, url=live_stream_url(stream))
 
     # Look up source settings.
     source_id = text_field(stream, "source_id")
@@ -4062,7 +4055,7 @@ def _get_live_player_info(stream_id: str) -> PlayerInfo:
         category_ids=stream_category_ids if isinstance(stream_category_ids, list) else None,
     )
     if source_id:
-        sources = load_server_settings().get("sources", [])
+        sources = load_server_settings()["sources"]
         source = next((s for s in sources if s.get("id") == source_id), None)
         if source is not None:
             info = replace(info, deinterlace_fallback=source.get("deinterlace_fallback", True))

@@ -36,6 +36,10 @@ HwAccel: TypeAlias = Literal[
 ]
 
 
+# The settings page's choices; a stored value outside them fails to load.
+MaxResolution: TypeAlias = Literal["4k", "1080p", "720p", "480p"]
+
+
 class SourceConfig(TypedDict):
     """A configured provider as stored in the server settings file."""
 
@@ -69,7 +73,7 @@ class ServerSettings(TypedDict):
     sources: list[SourceConfig]
     user_agent_preset: str
     user_agent_custom: str
-    max_resolution: NotRequired[str]
+    max_resolution: NotRequired[MaxResolution]
     quality: NotRequired[str]
     sr_model: NotRequired[str]
     vod_order: NotRequired[list[str]]

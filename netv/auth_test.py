@@ -140,6 +140,12 @@ class TestChangePassword:
         assert auth.verify_password("alice", "new")
         assert not auth.verify_password("alice", "pw")
 
+    def test_current_password_must_match(self):
+        auth.create_user("alice", "pw")
+        assert not auth.change_password("alice", "new", current_password="wrong")
+        # Still "pw": the rejected change wrote nothing.
+        assert auth.change_password("alice", "new", current_password="pw")
+
 
 @pytest.mark.usefixtures("auth_module")
 class TestSetAdmin:

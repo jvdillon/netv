@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
-from unittest.mock import MagicMock
 from urllib import error
 
 import hashlib
@@ -13,28 +10,72 @@ import json
 
 import pytest
 
-from netv import cache, gateway_catalog
+from netv import cache, testing, util
+from netv.cache import SourceConfig
 from netv.gateway_catalog import CatalogSnapshot, GatewayCatalog, StreamIdRegistry, _safe_int
+from netv.xtream import ProviderRecord
 
 
-def _source(source_type: str = "xtream", source_id: str = "source-a") -> SimpleNamespace:
-    return SimpleNamespace(id=source_id, name="Provider", type=source_type, epg_enabled=False)
+PROVIDER = "https://provider.example"
+API = f"{PROVIDER}/player_api.php?username=remote-user&password=remote-password"
+CATEGORIES_URL = f"{API}&action=get_live_categories"
+STREAMS_URL = f"{API}&action=get_live_streams"
+PLAYLIST_URL = "https://provider.example/list.m3u"
 
 
-def _catalog(tmp_path: Path, **kwargs: Any) -> GatewayCatalog:
-    return GatewayCatalog(registry=StreamIdRegistry(tmp_path / "ids.json"), **kwargs)
+def _xtream(source_id: str = "source-a") -> SourceConfig:
+    return {
+        "id": source_id,
+        "name": "Provider",
+        "type": "xtream",
+        "url": PROVIDER,
+        "username": "remote-user",
+        "password": "remote-password",
+        "epg_enabled": False,
+    }
+
+
+def _other(source_type: str, source_id: str) -> SourceConfig:
+    return {"id": source_id, "name": "Provider", "type": source_type, "url": PLAYLIST_URL}
+
+
+def _configure(*sources: SourceConfig) -> None:
+    cache.save_server_settings({**cache.load_server_settings(), "sources": list(sources)})
+
+
+def _catalog(
+    tmp_path: Path,
+    *,
+    ttl_seconds: int = 2 * 3600,
+    failed_load_retry_seconds: int = 60,
+) -> GatewayCatalog:
+    return GatewayCatalog(
+        registry=StreamIdRegistry(tmp_path / "ids.json"),
+        ttl_seconds=ttl_seconds,
+        failed_load_retry_seconds=failed_load_retry_seconds,
+    )
 
 
 def _serve(
     monkeypatch: pytest.MonkeyPatch,
-    categories: list[dict[str, Any]],
-    streams: list[dict[str, Any]],
-    sources: list[SimpleNamespace] | None = None,
-) -> MagicMock:
-    monkeypatch.setattr(cache, "get_sources", lambda: sources or [_source()])
-    fetch = MagicMock(return_value=(categories, streams, None, 120))
-    monkeypatch.setattr(gateway_catalog, "fetch_source_live_data", fetch)
-    return fetch
+    categories: list[ProviderRecord],
+    streams: list[ProviderRecord],
+) -> testing.FakeWeb:
+    """Configure one Xtream source whose provider answers with these listings."""
+    _configure(_xtream())
+    web = testing.FakeWeb(
+        {
+            CATEGORIES_URL: lambda: testing.FakeResponse(json.dumps(categories).encode()),
+            STREAMS_URL: lambda: testing.FakeResponse(json.dumps(streams).encode()),
+        },
+    )
+    testing.install_web(monkeypatch, web, util)
+    return web
+
+
+def _loads(web: testing.FakeWeb) -> int:
+    """Number of times the catalog asked the provider for its categories."""
+    return web.urls.count(CATEGORIES_URL)
 
 
 def test_stream_id_registry_is_stable(tmp_path: Path):
@@ -67,17 +108,14 @@ def test_stream_id_registry_defaults_to_cache_dir(tmp_path: Path, monkeypatch: p
     assert json.loads((tmp_path / "gateway_stream_ids.json").read_text()) == {"ids": {"k": 1}}
 
 
-def test_stream_id_registry_skips_save_when_unchanged(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    registry = StreamIdRegistry(tmp_path / "ids.json")
+def test_stream_id_registry_skips_save_when_unchanged(tmp_path: Path):
+    path = tmp_path / "ids.json"
+    registry = StreamIdRegistry(path)
     registry.get_or_create_many(["k"])
-    write = MagicMock()
-    monkeypatch.setattr(gateway_catalog, "atomic_write_json", write)
+    path.write_text('{"ids":{"k":1}}')  # A save would rewrite it indented.
 
     assert registry.get_or_create_many(["k"]) == {"k": 1}
-    write.assert_not_called()
+    assert path.read_text() == '{"ids":{"k":1}}'
 
 
 def test_stream_id_registry_loads_file_only_once(tmp_path: Path):
@@ -128,17 +166,8 @@ def test_catalog_uses_default_registry():
 def test_catalog_removes_upstream_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _serve(
         monkeypatch,
-        [{"category_id": "source-a_9", "category_name": "News", "parent_id": 0}],
-        [
-            {
-                "stream_id": 7,
-                "name": "News",
-                "category_ids": ["source-a_9"],
-                "source_username": "remote-user",
-                "source_password": "remote-password",
-                "source_url": "https://provider.example",
-            },
-        ],
+        [{"category_id": "9", "category_name": "News", "parent_id": 0}],
+        [{"stream_id": 7, "name": "News", "category_ids": ["9"]}],
     )
     snapshot = _catalog(tmp_path, ttl_seconds=60).get()
 
@@ -154,14 +183,9 @@ def test_catalog_maps_full_public_stream_and_access_ids(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    fetch = _serve(
+    web = _serve(
         monkeypatch,
-        [
-            {"category_id": "news", "category_name": "News"},
-            {"category_id": "kids"},
-            {"category_id": None, "category_name": "Ignored"},
-            {"category_id": "", "category_name": "Ignored too"},
-        ],
+        [{"category_id": "news", "category_name": "News"}, {"category_id": "kids"}],
         [
             {
                 "stream_id": 7,
@@ -182,23 +206,29 @@ def test_catalog_maps_full_public_stream_and_access_ids(
 
     snapshot = _catalog(tmp_path).get()
 
-    fetch.assert_called_once_with(_source(), persist_epg_url=False)
+    assert web.urls == [CATEGORIES_URL, STREAMS_URL]
+    # The guide URL the provider advertises is not saved into the settings.
+    assert "epg_url" not in cache.load_server_settings()["sources"][0]
     by_name = {category["category_name"]: category for category in snapshot.categories}
     assert set(by_name) == {"News", "Uncategorized"}
     assert by_name["News"]["parent_id"] == 0
     news_id = by_name["News"]["category_id"]
     kids_id = by_name["Uncategorized"]["category_id"]
-    assert snapshot.category_access_ids[news_id] == "news"
-    assert snapshot.category_access_ids[kids_id] == "kids"
-    assert set(snapshot.category_access_ids.values()) == {"news", "kids", "extra"}
+    assert snapshot.category_access_ids[news_id] == "source-a_news"
+    assert snapshot.category_access_ids[kids_id] == "source-a_kids"
+    assert set(snapshot.category_access_ids.values()) == {
+        "source-a_news",
+        "source-a_kids",
+        "source-a_extra",
+    }
     assert len(snapshot.streams) == 1
     stream = snapshot.streams[0]
-    extra_id = next(k for k, v in snapshot.category_access_ids.items() if v == "extra")
+    extra_id = next(k for k, v in snapshot.category_access_ids.items() if v == "source-a_extra")
     assert stream.source_id == "source-a"
     assert stream.source_type == "xtream"
     assert stream.upstream_id == "7"
     assert stream.direct_url == ""
-    assert stream.access_group_ids == ("news", "None", "extra")
+    assert stream.access_group_ids == ("source-a_news", "source-a_extra")
     assert stream.public == {
         "num": 3,
         "name": "News HD",
@@ -220,12 +250,13 @@ def test_catalog_falls_back_to_primary_category_id(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
+    # The provider lists no usable category_ids, so only category_id is left.
     _serve(
         monkeypatch,
         [{"category_id": "news", "category_name": "News"}],
         [
-            {"stream_id": 1, "category_id": "news", "category_ids": []},
-            {"stream_id": 2, "category_id": "missing"},
+            {"stream_id": 1, "category_id": "source-a_news", "category_ids": [0]},
+            {"stream_id": 2, "category_id": "missing", "category_ids": [0]},
         ],
     )
 
@@ -235,7 +266,7 @@ def test_catalog_falls_back_to_primary_category_id(
     first, second = snapshot.streams
     assert names[first.public["category_id"]] == "News"
     assert first.public["category_ids"] == [first.public["category_id"]]
-    assert first.access_group_ids == ("news",)
+    assert first.access_group_ids == ("source-a_news",)
     assert first.public["name"] == "Unknown"
     assert first.public["num"] == first.local_id
     assert names[second.public["category_id"]] == "Uncategorized"
@@ -257,11 +288,13 @@ def test_catalog_assigns_uncategorized_streams_numeric_category(
 
 
 def test_catalog_skips_unsupported_source_types(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    fetch = _serve(monkeypatch, [], [], sources=[_source("vod"), _source("m3u", "m")])
+    _configure(_other("vod", "v"), _other("epg", "e"), _other("m3u", "m"))
+    web = testing.FakeWeb({PLAYLIST_URL: testing.FakeResponse(b"#EXTM3U\n")})
+    testing.install_web(monkeypatch, web, util)
 
     snapshot = _catalog(tmp_path).get()
 
-    fetch.assert_called_once_with(_source("m3u", "m"), persist_epg_url=False)
+    assert web.urls == [PLAYLIST_URL]
     assert snapshot == CatalogSnapshot(
         categories=[],
         category_access_ids={},
@@ -319,24 +352,16 @@ def test_catalog_assigns_distinct_ids_to_colliding_m3u_entries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    _serve(
+    _configure(_other("m3u", "source-a"))
+    playlist = (
+        "#EXTM3U\n"
+        "#EXTINF:-1,News\nhttps://streams.example/play?id=1\n"
+        "#EXTINF:-1,News\nhttps://streams.example/play?id=2\n"
+    )
+    testing.install_web(
         monkeypatch,
-        [],
-        [
-            {
-                "stream_id": "source-a_1",
-                "name": "News",
-                "direct_url": "https://streams.example/play?id=1",
-                "category_ids": [],
-            },
-            {
-                "stream_id": "source-a_2",
-                "name": "News",
-                "direct_url": "https://streams.example/play?id=2",
-                "category_ids": [],
-            },
-        ],
-        sources=[_source("m3u")],
+        testing.FakeWeb({PLAYLIST_URL: testing.FakeResponse(playlist.encode())}),
+        util,
     )
 
     snapshot = _catalog(tmp_path, ttl_seconds=60).get()
@@ -366,52 +391,39 @@ def test_catalog_get_returns_cached_snapshot_within_ttl(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    fetch = _serve(monkeypatch, [], [{"stream_id": 1}])
+    web = _serve(monkeypatch, [], [{"stream_id": 1}])
     catalog = _catalog(tmp_path, ttl_seconds=60)
 
     first = catalog.get()
 
     assert catalog.get() is first
-    assert fetch.call_count == 1
+    assert _loads(web) == 1
     assert catalog.get(force=True) is not first
-    assert fetch.call_count == 2
+    assert _loads(web) == 2
 
 
 def test_catalog_get_reloads_after_ttl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    fetch = _serve(monkeypatch, [], [{"stream_id": 1}])
+    web = _serve(monkeypatch, [], [{"stream_id": 1}])
     catalog = _catalog(tmp_path, ttl_seconds=0)
 
     catalog.get()
     catalog.get()
 
-    assert fetch.call_count == 2
+    assert _loads(web) == 2
 
 
 def test_catalog_get_rechecks_cache_after_acquiring_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    fetch = _serve(monkeypatch, [], [])
+    web = _serve(monkeypatch, [], [])
     catalog = _catalog(tmp_path, ttl_seconds=60)
-    loaded_by_other_thread = CatalogSnapshot(
-        categories=[],
-        category_access_ids={},
-        streams=[],
-        streams_by_id={},
-    )
+    loaded_by_other_thread: list[CatalogSnapshot] = []
+    lock = testing.ContendedLock(lambda: loaded_by_other_thread.append(catalog.get(force=True)))
+    monkeypatch.setattr(catalog, "_lock", lock)
 
-    class RacingLock:
-        def __enter__(self) -> None:
-            catalog._snapshot = loaded_by_other_thread
-            catalog._loaded_at = gateway_catalog.time.monotonic()
-
-        def __exit__(self, *_args: object) -> None:
-            return None
-
-    monkeypatch.setattr(catalog, "_lock", RacingLock())
-
-    assert catalog.get() is loaded_by_other_thread
-    fetch.assert_not_called()
+    assert [catalog.get()] == loaded_by_other_thread
+    assert _loads(web) == 1
 
 
 def test_catalog_retains_previous_snapshot_when_refresh_fails(
@@ -419,14 +431,14 @@ def test_catalog_retains_previous_snapshot_when_refresh_fails(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ):
-    fetch = _serve(
+    web = _serve(
         monkeypatch,
-        [{"category_id": "source-a_9", "category_name": "News", "parent_id": 0}],
-        [{"stream_id": 7, "name": "News", "category_ids": ["source-a_9"]}],
+        [{"category_id": "9", "category_name": "News", "parent_id": 0}],
+        [{"stream_id": 7, "name": "News", "category_ids": ["9"]}],
     )
     catalog = _catalog(tmp_path, ttl_seconds=60)
     original = catalog.get()
-    fetch.side_effect = error.URLError("temporary failure")
+    web.routes[CATEGORIES_URL] = error.URLError("temporary failure")
 
     refreshed = catalog.get(force=True)
 
@@ -435,27 +447,28 @@ def test_catalog_retains_previous_snapshot_when_refresh_fails(
     assert "Gateway failed to load source Provider (URLError)" in caplog.text
     assert "retaining the previous snapshot" in caplog.text
     assert catalog.get() is original
-    assert fetch.call_count == 2
+    assert _loads(web) == 2
 
 
 def test_catalog_failed_initial_load_retries_after_short_delay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ):
-    fetch = _serve(monkeypatch, [], [])
-    fetch.side_effect = KeyError("bad")
+    web = _serve(monkeypatch, [{"category_name": "No id"}], [])
     catalog = _catalog(tmp_path, ttl_seconds=60, failed_load_retry_seconds=30)
 
     empty = catalog.get()
 
+    assert "Gateway failed to load source Provider (KeyError)" in caplog.text
     assert empty.streams == []
     assert catalog.get() is empty
-    assert fetch.call_count == 1
+    assert _loads(web) == 1
 
     catalog = _catalog(tmp_path, ttl_seconds=60, failed_load_retry_seconds=0)
     catalog.get()
     catalog.get()
-    assert fetch.call_count == 3
+    assert _loads(web) == 3
 
 
 @pytest.mark.parametrize(("value", "expected"), [("5", 5), (3.9, 3), (None, 0), ("x", 0)])

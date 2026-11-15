@@ -153,15 +153,23 @@ def verify_password(username: str, password: str) -> bool:
     return valid and username in users
 
 
-def change_password(username: str, new_password: str) -> bool:
+def change_password(
+    username: str,
+    new_password: str,
+    *,
+    current_password: str | None = None,
+) -> bool:
     """Change an existing user's password.
 
     Args:
         username: Account to update.
         new_password: Plaintext replacement password.
+        current_password: When given, the change happens only if it matches,
+            checked against the same read that is rewritten.
 
     Returns:
-        changed: Whether the account existed and was updated.
+        changed: Whether the account existed (with a matching current
+            password, when one was given) and was updated.
     """
     settings_file = _get_settings_file()
     if not settings_file.exists():
@@ -169,6 +177,11 @@ def change_password(username: str, new_password: str) -> bool:
     settings = read_json_object(settings_file)
     users = from_plain(settings.get("users", {}), dict[str, UserRecord])
     if username not in users:
+        return False
+    if current_password is not None and not _verify_hashed_password(
+        current_password,
+        users[username]["password"],
+    ):
         return False
     users[username]["password"] = _hash_password(new_password)
     _save_users(settings, users)

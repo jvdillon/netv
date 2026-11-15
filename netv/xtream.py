@@ -40,6 +40,40 @@ def category_ids(record: Mapping[str, MutablePlainTree]) -> list[str]:
     return [str(c) for c in list_field(record, "category_ids")]
 
 
+def credentials_path(username: str, password: str) -> str:
+    """The ``user/password`` path segments of Xtream stream URLs.
+
+    Each is percent-encoded whole, so a ``/`` or ``#`` in a password cannot
+    split or end the path.
+
+    Args:
+        username: Provider account name.
+        password: Provider account password.
+
+    Returns:
+        path: ``<user>/<password>``, both encoded.
+    """
+    return f"{_path_segment(username)}/{_path_segment(password)}"
+
+
+def live_stream_url(stream: Mapping[str, MutablePlainTree]) -> str:
+    """The upstream HLS URL of a cached Xtream live stream.
+
+    Args:
+        stream: Cached live stream with its source's URL and credentials.
+
+    Returns:
+        url: ``<source>/live/<user>/<password>/<upstream id>.m3u8``.
+    """
+    base = text_field(stream, "source_url").rstrip("/")
+    credentials = credentials_path(
+        text_field(stream, "source_username"),
+        text_field(stream, "source_password"),
+    )
+    upstream_id = text_field(stream, "stream_id").rpartition("_")[2]
+    return f"{base}/live/{credentials}/{upstream_id}.m3u8"
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class XtreamClient:
     """Client for Xtream Codes API.
@@ -109,10 +143,8 @@ class XtreamClient:
         )
 
     def build_stream_url(self, stream_type: str, stream_id: int, ext: str = "") -> str:
-        # URL-encode username/password to handle special chars like # in passwords.
-        user = parse.quote(self.username, safe="")
-        pwd = parse.quote(self.password, safe="")
-        base = f"{self.base_url}/{stream_type}/{user}/{pwd}/{stream_id}"
+        credentials = credentials_path(self.username, self.password)
+        base = f"{self.base_url}/{stream_type}/{credentials}/{stream_id}"
         return f"{base}.{ext}" if ext else base
 
     def build_timeshift_url(
@@ -123,10 +155,8 @@ class XtreamClient:
         ext: str = "ts",
     ) -> str:
         """For streams with tv_archive=1. start format: YYYY-MM-DD:HH-MM."""
-        # URL-encode username/password to handle special chars like # in passwords.
-        user = parse.quote(self.username, safe="")
-        pwd = parse.quote(self.password, safe="")
-        return f"{self.base_url}/timeshift/{user}/{pwd}/{duration}/{start}/{stream_id}.{ext}"
+        credentials = credentials_path(self.username, self.password)
+        return f"{self.base_url}/timeshift/{credentials}/{duration}/{start}/{stream_id}.{ext}"
 
     @property
     def epg_url(self) -> str:
@@ -159,3 +189,8 @@ class XtreamClient:
 def _category_filter(category_id: int | None) -> int | None:
     """Return the id to send; ``None`` and ``0`` both mean every category."""
     return None if category_id is None or category_id == 0 else category_id
+
+
+def _path_segment(value: str) -> str:
+    # quote() keeps "/" by default; encode it too so the value stays one segment.
+    return parse.quote(value).replace("/", "%2F")

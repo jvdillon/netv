@@ -1,63 +1,178 @@
 """Fast start must keep one upstream reader and exactly one local encoder."""
 
-from collections.abc import Coroutine
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncio
 import os
 import pathlib
 import shutil
 import subprocess
-import time
 
 from fastapi import HTTPException
 
 import pytest
 
-from netv import fast_start, ffmpeg_session
+from netv import cache, fast_start, ffmpeg_command, ffmpeg_session
 from netv.cache import HwAccel
 from netv.ffmpeg_command import MediaInfo
-from netv.ffmpeg_session_test import FakeProcess
 from netv.playback_policy import PlaybackHealth, PlaybackPolicy
+from netv.testing import (
+    BackgroundTasks,
+    FakeClock,
+    FakeProcess,
+    FakeRun,
+    ProcessLauncher,
+    Program,
+    install_clock,
+    install_launcher,
+    install_subprocess,
+)
 
 
-def _close(coro: Coroutine[object, object, None]) -> None:
-    coro.close()
+CAPTIONED_FRAMES = '{"frames": [{"side_data_list": [{"side_data_type": "Closed Captions"}]}]}'
 
 
-_real_sleep = asyncio.sleep
-
-
-async def _yield_only(seconds: float) -> None:
-    del seconds
-    await _real_sleep(0)
-
-
-def _silent_segment_audio(path: str) -> MediaInfo | None:
-    del path
-    return None
-
-
-def _segment_without_captions(path: str) -> bool:
-    del path
-    return False
-
-
-def _segment_unknown_codec(path: str) -> str:
-    del path
-    return ""
-
-
-# Fake segments carry no media for ffprobe, so real probes cost ~0.5s and find nothing.
-# Each readiness poll otherwise sleeps 0.2s of real time.
 @pytest.fixture(autouse=True)
-def _no_segment_probes_or_poll_waits(monkeypatch: pytest.MonkeyPatch):
-    """Keep startup polling and probing off the wall clock."""
-    monkeypatch.setattr(ffmpeg_session.asyncio, "sleep", _yield_only)
-    monkeypatch.setattr(ffmpeg_session, "probe_audio", _silent_segment_audio)
-    monkeypatch.setattr(ffmpeg_session, "probe_closed_captions", _segment_without_captions)
-    monkeypatch.setattr(ffmpeg_session, "probe_video_codec", _segment_unknown_codec)
+def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    """Each readiness poll advances fake time instead of sleeping 0.2s."""
+    fake = FakeClock()
+    install_clock(monkeypatch, fake, ffmpeg_session)
+    return fake
+
+
+@pytest.fixture(autouse=True)
+def programs(monkeypatch: pytest.MonkeyPatch) -> FakeRun:
+    """Fake segments carry no media, so ffprobe reports no streams unless scripted."""
+    run = FakeRun()
+    run.program("ffprobe", Program(stdout="{}"))
+    install_subprocess(monkeypatch, ffmpeg_command, run=run)
+    return run
+
+
+@pytest.fixture(autouse=True)
+def fresh_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ffmpeg_session, "_transcode_sessions", {})
+    monkeypatch.setattr(ffmpeg_session, "_url_to_session", {})
+    monkeypatch.setattr(ffmpeg_session, "_startup_guards", {})
+    monkeypatch.setattr(ffmpeg_command, "_probe_cache", {})
+
+
+@pytest.fixture
+def tasks(monkeypatch: pytest.MonkeyPatch) -> Iterator[BackgroundTasks]:
+    background = BackgroundTasks()
+    monkeypatch.setattr(ffmpeg_session, "_spawn_background_task", background)
+    yield background
+    background.discard()
+
+
+@pytest.fixture
+def launcher(monkeypatch: pytest.MonkeyPatch, tasks: BackgroundTasks) -> ProcessLauncher:
+    """Record ffmpeg launches; monitors and watchdogs stay unscheduled in ``tasks``."""
+    del tasks
+    fake = ProcessLauncher()
+    install_launcher(monkeypatch, fake, ffmpeg_session)
+    return fake
+
+
+def configure(
+    transcode_dir: pathlib.Path,
+    *,
+    live_dvr_mins: int = 0,
+    max_resolution: cache.MaxResolution = "4k",
+) -> None:
+    cache.save_server_settings(
+        {
+            **cache.load_server_settings(),
+            "transcode_dir": str(transcode_dir),
+            "max_resolution": max_resolution,
+            "live_dvr_mins": live_dvr_mins,
+        },
+    )
+
+
+def ffprobe_source(video_codec: str, audio_codec: str = "aac", channels: int = 2) -> str:
+    """ffprobe JSON for a 1080p source with one audio stream."""
+    return (
+        '{"streams": ['
+        f'{{"codec_type": "video", "codec_name": "{video_codec}", '
+        '"pix_fmt": "yuv420p", "height": 1080}, '
+        f'{{"codec_type": "audio", "codec_name": "{audio_codec}", "channels": {channels}, '
+        '"sample_rate": "48000", "profile": "LC"}], '
+        '"format": {"format_name": "mpegts"}}'
+    )
+
+
+async def until(
+    condition: Callable[[], bool],
+    task: asyncio.Task[ffmpeg_session.TranscodeResponse],
+) -> None:
+    """Yield to ``task`` until ``condition`` holds, surfacing the task's failure."""
+    for _ in range(100_000):
+        if condition():
+            return
+        if task.done():
+            task.result()
+            raise AssertionError("startup finished before the condition held")
+        await asyncio.sleep(0)
+    raise AssertionError("condition never held")
+
+
+async def polled_again(
+    clock: FakeClock,
+    task: asyncio.Task[ffmpeg_session.TranscodeResponse],
+) -> None:
+    """Wait until ``task`` slept after re-reading its playlists at least once."""
+    polls = len(clock.sleeps)
+    await until(lambda: len(clock.sleeps) > polls + 1, task)
+
+
+def output_dir(launcher: ProcessLauncher, index: int) -> pathlib.Path:
+    return pathlib.Path(launcher.commands[index][-1]).parent
+
+
+async def serve_fast_start(
+    launcher: ProcessLauncher,
+    task: asyncio.Task[ffmpeg_session.TranscodeResponse],
+    *,
+    source_duration: float = 4,
+) -> ffmpeg_session.TranscodeResponse:
+    """Publish what the fast-start ingest and encoder would write, then finish startup."""
+    await until(lambda: len(launcher.launches) == 1, task)
+    media_playlist(output_dir(launcher, 0), "input", [source_duration])
+    await until(lambda: len(launcher.launches) == 2, task)
+    media_playlist(output_dir(launcher, 0), "low", [source_duration, source_duration])
+    return await task
+
+
+async def serve_transcode(
+    launcher: ProcessLauncher,
+    task: asyncio.Task[ffmpeg_session.TranscodeResponse],
+) -> ffmpeg_session.TranscodeResponse:
+    """Publish what a single HLS transcode would write, then finish startup."""
+    await until(lambda: len(launcher.launches) == 1, task)
+    directory = output_dir(launcher, 0)
+    lines = ["#EXTM3U"]
+    for i in range(2):
+        (directory / f"seg{i:03d}.ts").write_bytes(video_packet(10 + 3 * i) * 10)
+        lines += ["#EXTINF:3,", f"seg{i:03d}.ts"]
+    (directory / "stream.m3u8").write_text("\n".join(lines) + "\n")
+    return await task
+
+
+def media_playlist(
+    directory: pathlib.Path,
+    name: str,
+    durations: Sequence[float],
+    start: float = 10,
+) -> None:
+    """Write complete segments of the given durations and their playlist."""
+    lines = ["#EXTM3U"]
+    for i, duration in enumerate(durations):
+        filename = f"{name}_{i}.ts"
+        (directory / filename).write_bytes(video_packet(start + sum(durations[:i])) * 10)
+        lines += [f"#EXTINF:{duration},", filename]
+    (directory / f"{name}.m3u8").write_text("\n".join(lines) + "\n")
 
 
 def video_packet(seconds: float) -> bytes:
@@ -84,7 +199,7 @@ def playlist(directory: pathlib.Path, name: str, start: float = 10) -> None:
     (directory / f"{name}.m3u8").write_text("\n".join(lines) + "\n")
 
 
-def test_timeline_and_readiness(tmp_path: pathlib.Path):
+def test_timeline_and_readiness(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
     playlist(tmp_path, "low")
     assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8") == 7520
     assert fast_start.segment_pts(tmp_path / "low_0.ts") == 10
@@ -93,9 +208,9 @@ def test_timeline_and_readiness(tmp_path: pathlib.Path):
     assert "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.000+00:00" in dated
     assert dates == {"low_0.ts": 0, "low_1.ts": 2, "low_2.ts": 4}
     os.utime(tmp_path / "low.m3u8", (80, 80))
-    with patch("netv.fast_start.time.time", return_value=100):
-        assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8") == 0
-        assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8", max_age=30) == 7520
+    install_clock(monkeypatch, FakeClock(now=100), fast_start)
+    assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8") == 0
+    assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8", max_age=30) == 7520
     (tmp_path / "low_2.ts").unlink()
     assert fast_start.ready_bitrate(str(tmp_path), "low.m3u8") == 0
 
@@ -134,12 +249,26 @@ def test_dated_playlist_keeps_earlier_dates_across_a_clock_change(tmp_path: path
     assert dated.endswith("#EXTINF:2,\ngone.ts\n")
 
 
-def test_dated_playlist_keeps_clock_when_discontinuous_segment_vanishes(tmp_path: pathlib.Path):
-    content = "#EXTM3U\n#EXT-X-DISCONTINUITY\n#EXTINF:2,\ngone.ts\n"
-    with patch("netv.fast_start.segment_pts", return_value=12):
-        dated, dates = fast_start.dated_playlist(str(tmp_path), content, 10, 0, {})
+def test_dated_playlist_keeps_clock_after_discontinuity(tmp_path: pathlib.Path):
+    (tmp_path / "next.ts").write_bytes(video_packet(12))
+    content = "#EXTM3U\n#EXT-X-DISCONTINUITY\n#EXTINF:2,\nnext.ts\n"
+    dated, dates = fast_start.dated_playlist(str(tmp_path), content, 10, 0, {})
     assert "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:02.000+00:00" in dated
-    assert dates == {"gone.ts": 2.0}
+    assert dates == {"next.ts": 2.0}
+
+
+def test_dated_playlist_unwraps_33_bit_pts_rollover(tmp_path: pathlib.Path):
+    rollover = (1 << 33) / 90_000
+    (tmp_path / "wrapped.ts").write_bytes(video_packet(1))
+    content = "#EXTM3U\n#EXTINF:2,\nwrapped.ts\n"
+    _, dates = fast_start.dated_playlist(str(tmp_path), content, rollover - 1, 100, {})
+    assert dates == {"wrapped.ts": pytest.approx(102)}
+
+
+def test_dated_playlist_never_dates_tags(tmp_path: pathlib.Path):
+    content = "#EXTM3U\n#EXT-X-VERSION:3\n"
+    stale = {"#EXTM3U": 5.0, "#EXT-X-VERSION:3": 5.0}
+    assert fast_start.dated_playlist(str(tmp_path), content, 10, 0, stale) == (content, {})
 
 
 def test_ready_bitrate_rejects_unsafe_or_empty_entries(tmp_path: pathlib.Path):
@@ -321,7 +450,6 @@ def test_ingest_can_warm_encoders_before_playback_is_ready(tmp_path: pathlib.Pat
     "resolution,target,maximum",
     [
         ("1080p", "6000000", "8000000"),
-        ("1440p", "10000000", "14000000"),
         ("4k", "16000000", "20000000"),
     ],
 )
@@ -359,19 +487,25 @@ def test_encoder_uses_bounded_bitrate(
     assert not set(low) & {"-qp", "-qp_i", "-qp_p", "-global_quality", "-crf", "constqp"}
 
 
-def test_encoders_decode_on_gpu_when_source_codec_is_known(tmp_path: pathlib.Path):
-    with patch("netv.ffmpeg_command._get_gpu_nvdec_codecs", return_value={"h264"}):
-        for upscale in (False, True):
-            args = (str(tmp_path), "nvenc+software", "1080p", "high", False)
-            cmd = fast_start.encoder_command(*args, allow_upscale=upscale, video_codec="h264")
-            assert cmd[cmd.index("-hwaccel") + 1] == "cuda"
-            assert "hwupload_cuda" not in cmd[cmd.index("-vf") + 1]
-            assert "-hwaccel" not in fast_start.encoder_command(*args, allow_upscale=upscale)
-            assert "-hwaccel" not in fast_start.encoder_command(
-                *args,
-                allow_upscale=upscale,
-                video_codec="hevc",
-            )
+def test_encoders_decode_on_gpu_when_source_codec_is_known(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    programs: FakeRun,
+):
+    # Maxwell decodes H.264 but not HEVC.
+    programs.program("nvidia-smi", Program(stdout="NVIDIA GeForce GTX TITAN X, 5.2\n"))
+    monkeypatch.setattr(ffmpeg_command, "_gpu_nvdec_codecs", None)
+    for upscale in (False, True):
+        args = (str(tmp_path), "nvenc+software", "1080p", "high", False)
+        cmd = fast_start.encoder_command(*args, allow_upscale=upscale, video_codec="h264")
+        assert cmd[cmd.index("-hwaccel") + 1] == "cuda"
+        assert "hwupload_cuda" not in cmd[cmd.index("-vf") + 1]
+        assert "-hwaccel" not in fast_start.encoder_command(*args, allow_upscale=upscale)
+        assert "-hwaccel" not in fast_start.encoder_command(
+            *args,
+            allow_upscale=upscale,
+            video_codec="hevc",
+        )
 
 
 def test_master_playlist_reserves_surround_audio_bandwidth():
@@ -408,338 +542,274 @@ def test_closed_caption_master_declares_instream_cc1():
     )
 
 
-def test_health_learns_full_quality_bitrate_then_saver_recovers(tmp_path: pathlib.Path):
+def test_health_learns_full_quality_bitrate_then_saver_recovers(
+    tmp_path: pathlib.Path,
+    clock: FakeClock,
+):
     playlist(tmp_path, "low")
     policy = PlaybackPolicy()
     session = ffmpeg_session.TranscodeSession(
         dir=str(tmp_path),
         username="u",
         fast_start=True,
-        process=FakeProcess(),
+        process=FakeProcess(exit_code=None),
         playback_policy=policy,
         bandwidth_saver=False,
-        started=time.time(),
+        started=clock.time(),
         url="http://stream.test/live",
     )
+    ffmpeg_session._transcode_sessions["fast"] = session
+    start = clock.now
     good = PlaybackHealth(buffer_seconds=10, waiting=False, observed_bitrate=20_000)
-    with (
-        patch.dict(ffmpeg_session._transcode_sessions, {"fast": session}),
-        patch("netv.ffmpeg_session.time.monotonic") as clock,
-    ):
-        clock.return_value = 0
+    result = ffmpeg_session.report_playback_health("fast", "u", good)
+    assert result == {"bandwidth_saver": False, "playlist": "/transcode/fast/low.m3u8"}
+    assert "recovery_bitrate" in session
+    assert session["recovery_bitrate"] == 7520
+    assert "playback_policy" in session
+    session["playback_policy"] = replace(session["playback_policy"], bandwidth_saver=True)
+    for offset in range(2, 62, 2):
+        clock.now = start + offset
         result = ffmpeg_session.report_playback_health("fast", "u", good)
-        assert result == {"bandwidth_saver": False, "playlist": "/transcode/fast/low.m3u8"}
-        assert "recovery_bitrate" in session
-        assert session["recovery_bitrate"] == 7520
-        assert "playback_policy" in session
-        session["playback_policy"] = replace(session["playback_policy"], bandwidth_saver=True)
-        for now in range(2, 62, 2):
-            clock.return_value = now
-            result = ffmpeg_session.report_playback_health("fast", "u", good)
-            # The full-quality session cannot serve saver: clients must retune.
-            assert result == {"bandwidth_saver": True}
-        clock.return_value = 62
-        result = ffmpeg_session.report_playback_health("fast", "u", good)
-        assert result == {"bandwidth_saver": False, "playlist": "/transcode/fast/low.m3u8"}
+        # The full-quality session cannot serve saver: clients must retune.
+        assert result == {"bandwidth_saver": True}
+    clock.now = start + 62
+    result = ffmpeg_session.report_playback_health("fast", "u", good)
+    assert result == {"bandwidth_saver": False, "playlist": "/transcode/fast/low.m3u8"}
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("bandwidth_saver", "resolution", "bitrate", "upscale"),
-    [(False, "4k", "16000000", True), (True, "720p", "4000000", False)],
+    ("bandwidth_saver", "resolution", "quality", "bitrate", "upscale"),
+    [(False, "4k", "high", "16000000", True), (True, "720p", "low", "4000000", False)],
 )
 @pytest.mark.parametrize("source_duration", [4, 6, 30])
 async def test_shared_session_runs_one_encoder(
     tmp_path: pathlib.Path,
+    clock: FakeClock,
+    programs: FakeRun,
+    launcher: ProcessLauncher,
     source_duration: int,
     bandwidth_saver: bool,
     resolution: str,
+    quality: str,
     bitrate: str,
     upscale: bool,
 ):
-    launched: list[tuple[tuple[str, ...], FakeProcess]] = []
-    durations = iter([source_duration, 2, 2 * source_duration - 2, 2 * source_duration])
+    configure(tmp_path)
+    programs.program("ffprobe", Program(stdout=CAPTIONED_FRAMES), when="frame=side_data_list")
+    url = "https://provider/live"
+    task = asyncio.create_task(
+        ffmpeg_session.start_transcode(url, fast_start=True, bandwidth_saver=bandwidth_saver),
+    )
+    await until(lambda: len(launcher.launches) == 1, task)
+    directory = output_dir(launcher, 0)
+    # The encoder warms on one complete source segment.
+    media_playlist(directory, "input", [source_duration])
+    await until(lambda: len(launcher.launches) == 2, task)
+    # Encoder warm-up must not reduce the playback reserve, including for
+    # sources whose long keyframe intervals require more than eight seconds:
+    # playback needs two output segments covering it.
+    reserve = 2 * source_duration
+    for durations in ([reserve], [1, 1], [source_duration - 1, source_duration - 1]):
+        media_playlist(directory, "low", durations)
+        await polled_again(clock, task)
+        assert not task.done()
+    media_playlist(directory, "low", [source_duration, source_duration])
+    result = await task
 
-    async def launch(*cmd: str, **kwargs: object) -> FakeProcess:
-        process = FakeProcess()
-        launched.append((cmd, process))
-        return process
+    assert len(launcher.launches) == 2
+    ingest_cmd, encoder_cmd = launcher.commands
+    assert url in ingest_cmd
+    assert url not in encoder_cmd
+    assert encoder_cmd[encoder_cmd.index("-b:v") + 1] == bitrate
+    encoder = (str(directory), "software", resolution, quality, True)
+    assert encoder_cmd == fast_start.encoder_command(*encoder, allow_upscale=upscale)
+    assert result["playlist"].endswith("/low.m3u8")
+    assert "master_playlist" in result
+    assert result["master_playlist"].endswith("/master.m3u8")
+    assert "caption_playlist" in result
+    assert result["caption_playlist"].endswith("/low-captions.m3u8")
+    expected_playback_buffer = min(60, max(12, 2 * source_duration))
+    assert "playback_buffer_seconds" in result
+    assert result["playback_buffer_seconds"] == expected_playback_buffer
+    session = ffmpeg_session.get_session(result["session_id"])
+    assert session is not None
+    assert "playback_policy" in session
+    assert session["playback_policy"].bandwidth_saver is bandwidth_saver
+    assert "watchdog_stale_after" in session
+    assert session["watchdog_stale_after"] == max(45, 2 * source_duration + 2)
+    assert "playback_buffer_seconds" in session
+    assert session["playback_buffer_seconds"] == expected_playback_buffer
+    assert ffmpeg_session._is_fast_live(session)
+    assert session.get("low_restart_command") == fast_start.encoder_command(
+        *encoder,
+        allow_upscale=upscale,
+        restarting=True,
+    )
+    master = (directory / "master.m3u8").read_text()
+    assert master == fast_start.master_playlist(resolution, audio_bitrate=384_000)
+    assert 'INSTREAM-ID="CC1"' in (directory / "low-captions.m3u8").read_text()
+    assert sorted(path.name for path in directory.iterdir()) == [
+        "input.m3u8",
+        "input_0.ts",
+        "low-captions.m3u8",
+        "low.m3u8",
+        "low_0.ts",
+        "low_1.ts",
+        "master.m3u8",
+    ]
+    reused = await ffmpeg_session.start_transcode(url, fast_start=True)
+    assert reused == result
+    assert sum(url in cmd for cmd in launcher.commands) == 1
+    await ffmpeg_session.stop_session(result["session_id"], force=True)
+    assert all(proc.returncode is not None for proc in launcher.processes)
+    assert not list(tmp_path.iterdir())
 
-    def ready(directory: str, name: str, *, minimum_segments: int = 2) -> int:
-        if name == "input.m3u8":
-            assert minimum_segments == 1
-            (pathlib.Path(directory) / "input_0.ts").write_bytes(video_packet(10))
-            (pathlib.Path(directory) / name).write_text(
-                f"#EXTM3U\n#EXTINF:{source_duration},\ninput_0.ts\n",
-            )
-        else:
-            assert minimum_segments == 2
-        return 10_000
 
-    def measure_duration(directory: str, name: str) -> int:
-        if name == "low.m3u8":
-            assert len(launched) == 2
-        return next(durations)
+@pytest.mark.asyncio
+async def test_startup_cancellation_cleans_ingest(
+    tmp_path: pathlib.Path,
+    clock: FakeClock,
+    launcher: ProcessLauncher,
+):
+    configure(tmp_path)
+    task = asyncio.create_task(
+        ffmpeg_session.start_transcode("https://provider/cancel", fast_start=True),
+    )
+    await until(lambda: bool(clock.sleeps), task)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(launcher.launches) == 1
+    assert launcher.processes[0].returncode is not None
+    assert not list(tmp_path.iterdir())
 
-    with (
-        patch("netv.ffmpeg_session.get_settings", return_value={"max_resolution": "4k"}),
-        patch("netv.ffmpeg_session.get_transcode_dir", return_value=tmp_path),
-        patch("netv.ffmpeg_session.asyncio.create_subprocess_exec", side_effect=launch),
-        patch(
-            "netv.fast_start.build_hls_ffmpeg_cmd",
-            wraps=fast_start.build_hls_ffmpeg_cmd,
-        ) as build,
-        patch("netv.ffmpeg_session._spawn_background_task", side_effect=_close),
-        patch("netv.ffmpeg_session.probe_closed_captions", return_value=True),
-        patch("netv.ffmpeg_session.ready_bitrate", side_effect=ready),
-        # Encoder warm-up must not reduce the playback reserve, including for
-        # sources whose long keyframe intervals require more than eight seconds.
-        patch(
-            "netv.ffmpeg_session.playlist_duration",
-            side_effect=measure_duration,
-        ) as duration,
-    ):
-        result = await ffmpeg_session.start_transcode(
-            "https://provider/live",
+
+@pytest.mark.asyncio
+async def test_disconnected_startup_stops_waiting_and_cleans_ingest(
+    tmp_path: pathlib.Path,
+    launcher: ProcessLauncher,
+):
+    configure(tmp_path)
+
+    async def disconnected() -> bool:
+        return True
+
+    with pytest.raises(HTTPException) as error:
+        await ffmpeg_session.start_transcode(
+            "https://provider/disconnected",
             fast_start=True,
-            bandwidth_saver=bandwidth_saver,
+            is_disconnected=disconnected,
         )
-        assert duration.call_count == 4
-        assert len(launched) == 2
-        (ingest_cmd, _), (encoder_cmd, _) = launched
-        assert "https://provider/live" in ingest_cmd
-        assert encoder_cmd[encoder_cmd.index("-b:v") + 1] == bitrate
-        assert encoder_cmd[-1].endswith("/low.m3u8")
-        # Launched encoder plus its stored restart command.
-        assert {(call.args[6], call.kwargs["allow_upscale"]) for call in build.call_args_list} == {
-            (resolution, upscale),
-        }
-        assert result["playlist"].endswith("/low.m3u8")
-        assert "master_playlist" in result
-        assert result["master_playlist"].endswith("/master.m3u8")
-        assert "caption_playlist" in result
-        assert result["caption_playlist"].endswith("/low-captions.m3u8")
-        expected_playback_buffer = min(60, max(12, 2 * source_duration))
-        assert "playback_buffer_seconds" in result
-        assert result["playback_buffer_seconds"] == expected_playback_buffer
-        session = ffmpeg_session.get_session(result["session_id"])
-        assert session is not None
-        assert "playback_policy" in session
-        assert session["playback_policy"].bandwidth_saver is bandwidth_saver
-        assert "watchdog_stale_after" in session
-        assert session["watchdog_stale_after"] == max(45, 2 * source_duration + 2)
-        assert "playback_buffer_seconds" in session
-        assert session["playback_buffer_seconds"] == expected_playback_buffer
-        master = (pathlib.Path(session["dir"]) / "master.m3u8").read_text()
-        assert master == fast_start.master_playlist(resolution, audio_bitrate=384_000)
-        low_captions = pathlib.Path(session["dir"]) / "low-captions.m3u8"
-        assert 'INSTREAM-ID="CC1"' in low_captions.read_text()
-        assert sorted(path.name for path in pathlib.Path(session["dir"]).iterdir()) == [
-            "input.m3u8",
-            "input_0.ts",
-            "low-captions.m3u8",
-            "master.m3u8",
-        ]
-        reused = await ffmpeg_session.start_transcode("https://provider/live", fast_start=True)
-        assert reused == result
-        assert sum("https://provider/live" in cmd for cmd, _ in launched) == 1
-        await ffmpeg_session.stop_session(result["session_id"], force=True)
-        assert all(proc.returncode is not None for _, proc in launched)
-        assert not list(tmp_path.iterdir())
-
-
-@pytest.mark.asyncio
-async def test_startup_cancellation_cleans_ingest(tmp_path: pathlib.Path):
-    proc = FakeProcess()
-    with (
-        patch("netv.ffmpeg_session.get_settings", return_value={"max_resolution": "4k"}),
-        patch("netv.ffmpeg_session.get_transcode_dir", return_value=tmp_path),
-        patch(
-            "netv.ffmpeg_session.asyncio.create_subprocess_exec",
-            new=AsyncMock(return_value=proc),
-        ),
-        patch("netv.ffmpeg_session._spawn_background_task", side_effect=_close),
-        patch("netv.ffmpeg_session.ready_bitrate", side_effect=asyncio.CancelledError),
-    ):
-        with pytest.raises(asyncio.CancelledError):
-            await ffmpeg_session.start_transcode("https://provider/cancel", fast_start=True)
-        assert proc.returncode is not None
-        assert not list(tmp_path.iterdir())
-
-
-@pytest.mark.asyncio
-async def test_disconnected_startup_stops_waiting_and_cleans_ingest(tmp_path: pathlib.Path):
-    proc = FakeProcess()
-    disconnected = AsyncMock(return_value=True)
-    with (
-        patch("netv.ffmpeg_session.get_settings", return_value={"max_resolution": "4k"}),
-        patch("netv.ffmpeg_session.get_transcode_dir", return_value=tmp_path),
-        patch(
-            "netv.ffmpeg_session.asyncio.create_subprocess_exec",
-            new=AsyncMock(return_value=proc),
-        ) as launch,
-        patch("netv.ffmpeg_session._spawn_background_task", side_effect=_close),
-    ):
-        with pytest.raises(HTTPException) as error:
-            await ffmpeg_session.start_transcode(
-                "https://provider/disconnected",
-                fast_start=True,
-                is_disconnected=disconnected,
-            )
-        assert error.value.status_code == 499
-        assert launch.call_count == 1
-        assert proc.returncode is not None
-        assert not list(tmp_path.iterdir())
+    assert error.value.status_code == 499
+    assert len(launcher.launches) == 1
+    assert launcher.processes[0].returncode is not None
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancelled", [False, True])
-async def test_encoder_startup_failure_cleans_up(tmp_path: pathlib.Path, cancelled: bool):
-    processes = [FakeProcess(), FakeProcess()]
-
-    def ready(directory: str, name: str, **kwargs: object) -> int:
-        if name == "input.m3u8":
-            path = pathlib.Path(directory)
-            (path / "input_0.ts").write_bytes(video_packet(10) * 10)
-            (path / name).write_text("#EXTM3U\n#EXTINF:4,\ninput_0.ts\n")
-            return 10_000
-        if cancelled:
-            raise asyncio.CancelledError
-        processes[1].returncode = 1
-        return 0
-
-    with (
-        patch("netv.ffmpeg_session.get_settings", return_value={"max_resolution": "4k"}),
-        patch("netv.ffmpeg_session.get_transcode_dir", return_value=tmp_path),
-        patch(
-            "netv.ffmpeg_session.asyncio.create_subprocess_exec",
-            new=AsyncMock(side_effect=processes),
-        ) as launch,
-        patch("netv.ffmpeg_session._spawn_background_task", side_effect=_close),
-        patch("netv.ffmpeg_session.ready_bitrate", side_effect=ready),
-    ):
-        expected = asyncio.CancelledError if cancelled else HTTPException
-        with pytest.raises(expected):
-            await ffmpeg_session.start_transcode("https://provider/failed-low", fast_start=True)
-        assert launch.call_count == 2
-        assert all(proc.returncode is not None for proc in processes)
-        assert not list(tmp_path.iterdir())
-
-
-@pytest.mark.asyncio
-async def test_dvr_compatible_source_remuxes_without_fast_start():
-    """A DVR request for a copy-compatible source must not spawn encoders."""
-    media = MediaInfo(
-        video_codec="h264",
-        audio_codec="aac",
-        pix_fmt="yuv420p",
-        audio_channels=2,
-        audio_sample_rate=48_000,
-        audio_profile="LC",
-        height=1080,
+async def test_encoder_startup_failure_cleans_up(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: FakeClock,
+    tasks: BackgroundTasks,
+    cancelled: bool,
+):
+    del tasks
+    configure(tmp_path)
+    # A cancelled client leaves the encoder running; otherwise it dies at startup.
+    encoder = FakeProcess(exit_code=None) if cancelled else FakeProcess(exited=True, exit_code=1)
+    launcher = ProcessLauncher([FakeProcess(exit_code=None), encoder])
+    install_launcher(monkeypatch, launcher, ffmpeg_session)
+    task = asyncio.create_task(
+        ffmpeg_session.start_transcode("https://provider/failed-low", fast_start=True),
     )
-    remux = {"session_id": "remux", "playlist": "/transcode/remux/stream.m3u8"}
-    with (
-        patch(
-            "netv.ffmpeg_session.get_settings",
-            return_value={"max_resolution": "4k", "live_dvr_mins": 60, "probe_live": True},
-        ),
-        patch(
-            "netv.ffmpeg_session.resolve_hls_master_playlist",
-            return_value="https://provider/live",
-        ),
-        patch("netv.ffmpeg_session.probe_media", return_value=(media, [])),
-        patch(
-            "netv.ffmpeg_session._do_start_transcode",
-            new=AsyncMock(return_value=remux),
-        ) as do_start,
-        patch("netv.ffmpeg_session._start_fast_live", new=AsyncMock()) as fast_live,
-    ):
-        result = await ffmpeg_session.start_transcode("https://provider/live", fast_start=True)
-    assert result == remux
-    assert do_start.await_count == 1
-    assert fast_live.await_count == 0
+    await until(lambda: len(launcher.launches) == 1, task)
+    media_playlist(output_dir(launcher, 0), "input", [4])
+    await until(lambda: len(launcher.launches) == 2, task)
+    if cancelled:
+        await polled_again(clock, task)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        with pytest.raises(HTTPException) as error:
+            await task
+        assert error.value.status_code == 500
+    assert len(launcher.launches) == 2
+    assert all(proc.returncode is not None for proc in launcher.processes)
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("media", "bandwidth_saver"),
-    [
-        (
-            MediaInfo(
-                video_codec="hevc",
-                audio_codec="aac",
-                pix_fmt="yuv420p",
-                audio_channels=2,
-                audio_sample_rate=48_000,
-                audio_profile="LC",
-                height=1080,
-            ),
-            False,
-        ),
-        (
-            MediaInfo(
-                video_codec="h264",
-                audio_codec="aac",
-                pix_fmt="yuv420p",
-                audio_channels=2,
-                audio_sample_rate=48_000,
-                audio_profile="LC",
-                height=1080,
-            ),
-            True,
-        ),
-    ],
-)
+async def test_dvr_compatible_source_remuxes_without_fast_start(
+    tmp_path: pathlib.Path,
+    programs: FakeRun,
+    launcher: ProcessLauncher,
+):
+    """A DVR request for a copy-compatible source must not spawn encoders."""
+    url = "https://provider/live"
+    configure(tmp_path, live_dvr_mins=60)
+    programs.program("ffprobe", Program(stdout=ffprobe_source("h264")), when=url)
+    task = asyncio.create_task(ffmpeg_session.start_transcode(url, fast_start=True))
+    result = await serve_transcode(launcher, task)
+    assert result["playlist"] == f"/transcode/{result['session_id']}/stream.m3u8"
+    assert "master_playlist" not in result
+    assert len(launcher.launches) == 1
+    command = launcher.commands[0]
+    assert command[command.index("-i") + 1] == url
+    assert command[command.index("-c:v") + 1] == "copy"
+    assert command[command.index("-c:a") + 1] == "copy"
+    # The transcode reuses the routing probe instead of probing upstream again.
+    assert [call[-1] for call in programs.calls] == [url]
+    await ffmpeg_session.stop_session(result["session_id"], force=True)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("video_codec", "bandwidth_saver"), [("hevc", False), ("h264", True)])
 async def test_dvr_keeps_fast_start_when_remux_is_unavailable(
-    media: MediaInfo,
+    tmp_path: pathlib.Path,
+    programs: FakeRun,
+    launcher: ProcessLauncher,
+    video_codec: str,
     bandwidth_saver: bool,
 ):
     """Incompatible sources and bandwidth-saver requests keep fast start."""
-    fast = {"session_id": "fast", "playlist": "/transcode/fast/low.m3u8"}
-    with (
-        patch(
-            "netv.ffmpeg_session.get_settings",
-            return_value={"max_resolution": "4k", "live_dvr_mins": 60, "probe_live": True},
-        ),
-        patch(
-            "netv.ffmpeg_session.resolve_hls_master_playlist",
-            return_value="https://provider/live",
-        ),
-        patch("netv.ffmpeg_session.probe_media", return_value=(media, [])),
-        patch(
-            "netv.ffmpeg_session._start_fast_live",
-            new=AsyncMock(return_value=fast),
-        ) as fast_live,
-    ):
-        result = await ffmpeg_session.start_transcode(
-            "https://provider/live",
-            fast_start=True,
-            bandwidth_saver=bandwidth_saver,
-        )
-    assert result == fast
-    assert fast_live.await_count == 1
+    url = "https://provider/live"
+    configure(tmp_path, live_dvr_mins=60)
+    programs.program("ffprobe", Program(stdout=ffprobe_source(video_codec)), when=url)
+    task = asyncio.create_task(
+        ffmpeg_session.start_transcode(url, fast_start=True, bandwidth_saver=bandwidth_saver),
+    )
+    result = await serve_fast_start(launcher, task)
+    assert result["playlist"] == f"/transcode/{result['session_id']}/low.m3u8"
+    assert len(launcher.launches) == 2
+    assert launcher.commands[0][-1].endswith("/input.m3u8")
+    # Bandwidth saver never remuxes, so it skips the upstream probe.
+    upstream_probes = [call for call in programs.calls if call[-1] == url]
+    assert len(upstream_probes) == (0 if bandwidth_saver else 1)
+    await ffmpeg_session.stop_session(result["session_id"], force=True)
 
 
 @pytest.mark.asyncio
-async def test_dvr_disabled_skips_probe_and_uses_fast_start():
+async def test_dvr_disabled_skips_probe_and_uses_fast_start(
+    tmp_path: pathlib.Path,
+    programs: FakeRun,
+    launcher: ProcessLauncher,
+):
     """Without DVR the fast-start path must not pay a probe round trip."""
-    fast = {"session_id": "fast", "playlist": "/transcode/fast/low.m3u8"}
-    with (
-        patch(
-            "netv.ffmpeg_session.get_settings",
-            return_value={"max_resolution": "4k", "live_dvr_mins": 0, "probe_live": True},
-        ),
-        patch("netv.ffmpeg_session.probe_media", new=MagicMock()) as probe,
-        patch(
-            "netv.ffmpeg_session._start_fast_live",
-            new=AsyncMock(return_value=fast),
-        ) as fast_live,
-    ):
-        result = await ffmpeg_session.start_transcode("https://provider/live", fast_start=True)
-    assert result == fast
-    assert fast_live.await_count == 1
-    assert probe.call_count == 0
+    configure(tmp_path, live_dvr_mins=0)
+    task = asyncio.create_task(
+        ffmpeg_session.start_transcode("https://provider/live", fast_start=True),
+    )
+    result = await serve_fast_start(launcher, task)
+    assert result["playlist"] == f"/transcode/{result['session_id']}/low.m3u8"
+    # Only the local segment is probed (audio, captions, video codec).
+    assert len(programs.calls) == 3
+    assert all(call[-1].endswith("/input_0.ts") for call in programs.calls)
+    await ffmpeg_session.stop_session(result["session_id"], force=True)
 
 
 @pytest.mark.cli_ffmpeg
@@ -878,31 +948,32 @@ def test_real_encoder_probes_past_late_mpeg2_sequence_header(tmp_path: pathlib.P
     assert fast_start.playlist_duration(str(tmp_path), "low.m3u8") > 2
 
 
-def test_saver_session_keeps_full_quality_recovery_target(tmp_path: pathlib.Path):
+def test_saver_session_keeps_full_quality_recovery_target(
+    tmp_path: pathlib.Path,
+    clock: FakeClock,
+):
     playlist(tmp_path, "low")
     session = ffmpeg_session.TranscodeSession(
         dir=str(tmp_path),
         username="u",
         fast_start=True,
-        process=FakeProcess(),
+        process=FakeProcess(exit_code=None),
         bandwidth_saver=True,
         playback_policy=PlaybackPolicy(bandwidth_saver=True),
         recovery_bitrate=50_000,
-        started=time.time(),
+        started=clock.time(),
         url="http://stream.test/live",
     )
+    ffmpeg_session._transcode_sessions["saver"] = session
+    start = clock.now
     # Enough for the 720p saver output (7520 bps), not the full-quality target.
     good = PlaybackHealth(buffer_seconds=12, waiting=False, observed_bitrate=60_000)
-    with (
-        patch.dict(ffmpeg_session._transcode_sessions, {"saver": session}),
-        patch("netv.ffmpeg_session.time.monotonic") as clock,
-    ):
-        for now in range(0, 120, 2):
-            clock.return_value = now
-            result = ffmpeg_session.report_playback_health("saver", "u", good)
-            assert result["bandwidth_saver"]
-            assert "playlist" in result
-            assert result["playlist"].endswith("/low.m3u8")
+    for offset in range(0, 120, 2):
+        clock.now = start + offset
+        result = ffmpeg_session.report_playback_health("saver", "u", good)
+        assert result["bandwidth_saver"]
+        assert "playlist" in result
+        assert result["playlist"].endswith("/low.m3u8")
     assert "recovery_bitrate" in session
     assert session["recovery_bitrate"] == 50_000
 

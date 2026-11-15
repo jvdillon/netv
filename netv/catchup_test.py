@@ -4,15 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from urllib import error
 from zoneinfo import ZoneInfo
 
 from treekle import MutablePlainTree
 
 import pytest
 
-from netv import catchup
-from netv.xtream import ProviderRecord
+from netv import catchup, testing, util
+from netv.xtream import ProviderRecord, XtreamClient
+
+
+SERVER_INFO_URL = "http://upstream.test/player_api.php?username=u&password=p"
 
 
 class TestArchiveDays:
@@ -92,28 +95,67 @@ class TestTimeshiftUrl:
         )
         assert url.endswith("/45/2026-01-16:00-15/7.m3u8")
 
+    def test_keeps_base_path_and_takes_last_id_part(self):
+        start = datetime(2026, 1, 15, 23, 15, tzinfo=timezone.utc)
+        stream = _stream(source_url="http://upstream.test/X/", stream_id="src_1_42")
+        url = catchup.timeshift_url(stream, start, 45, timezone.utc)
+        assert url == "http://upstream.test/X/timeshift/user/p%23ss/45/2026-01-15:23-15/42.ts"
+
 
 class TestServerTimezone:
-    def test_reads_and_caches(self):
-        fetch = MagicMock(return_value={"server_info": {"timezone": "Europe/Amsterdam"}})
+    def test_reads_and_caches(self, monkeypatch: pytest.MonkeyPatch):
+        web = _upstream(monkeypatch, b'{"server_info": {"timezone": "Europe/Amsterdam"}}')
+        fetch = _client().get_server_info
         assert catchup.server_timezone("src1", fetch) == ZoneInfo("Europe/Amsterdam")
         assert catchup.server_timezone("src1", fetch) == ZoneInfo("Europe/Amsterdam")
-        fetch.assert_called_once()
+        assert web.urls == [SERVER_INFO_URL]
 
-    def test_unknown_zone_falls_back_to_utc(self):
-        fetch = MagicMock(return_value={"server_info": {"timezone": "Nowhere/Special"}})
+    def test_cache_expires_after_ttl(self, monkeypatch: pytest.MonkeyPatch):
+        web = _upstream(monkeypatch, b'{"server_info": {"timezone": "UTC"}}')
+        clock = testing.FakeClock()
+        testing.install_clock(monkeypatch, clock, catchup)
+        fetch = _client().get_server_info
+        catchup.server_timezone("src1", fetch, ttl_seconds=60)
+        clock.advance(59)
+        catchup.server_timezone("src1", fetch, ttl_seconds=60)
+        assert len(web.urls) == 1
+        clock.advance(1)
+        catchup.server_timezone("src1", fetch, ttl_seconds=60)
+        assert len(web.urls) == 2
+
+    def test_unknown_zone_falls_back_to_utc(self, monkeypatch: pytest.MonkeyPatch):
+        web = _upstream(monkeypatch, b'{"server_info": {"timezone": "Nowhere/Special"}}')
+        fetch = _client().get_server_info
         assert catchup.server_timezone("src1", fetch) == timezone.utc
         catchup.server_timezone("src1", fetch)
-        fetch.assert_called_once()
+        assert web.urls == [SERVER_INFO_URL]
 
-    def test_missing_zone_is_utc(self):
-        assert catchup.server_timezone("src1", MagicMock(return_value={})) == timezone.utc
+    @pytest.mark.parametrize(
+        "body",
+        [b"{}", b'{"server_info": []}', b'{"server_info": {"timezone": ""}}'],
+    )
+    def test_missing_zone_is_utc(self, monkeypatch: pytest.MonkeyPatch, body: bytes):
+        _upstream(monkeypatch, body)
+        assert catchup.server_timezone("src1", _client().get_server_info) == timezone.utc
 
-    def test_transient_failure_is_retried(self):
-        fetch = MagicMock(side_effect=[OSError("down"), {"server_info": {"timezone": "UTC"}}])
+    def test_transient_failure_is_retried(self, monkeypatch: pytest.MonkeyPatch):
+        web = testing.FakeWeb({SERVER_INFO_URL: error.URLError("down")})
+        testing.install_web(monkeypatch, web, util)
+        fetch = _client().get_server_info
         assert catchup.server_timezone("src1", fetch) == timezone.utc
+        web.routes[SERVER_INFO_URL] = testing.FakeResponse(b'{"server_info": {"timezone": "UTC"}}')
         assert catchup.server_timezone("src1", fetch) == ZoneInfo("UTC")
-        assert fetch.call_count == 2
+        assert web.urls == [SERVER_INFO_URL, SERVER_INFO_URL]
+
+
+def _client() -> XtreamClient:
+    return XtreamClient(base_url="http://upstream.test", username="u", password="p")
+
+
+def _upstream(monkeypatch: pytest.MonkeyPatch, body: bytes) -> testing.FakeWeb:
+    web = testing.FakeWeb({SERVER_INFO_URL: lambda: testing.FakeResponse(body)})
+    testing.install_web(monkeypatch, web, util)
+    return web
 
 
 def _stream(**overrides: MutablePlainTree) -> ProviderRecord:

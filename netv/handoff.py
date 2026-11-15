@@ -351,12 +351,12 @@ def _save(username: str) -> None:
 def _recorder_command(url: str, directory: pathlib.Path, seconds: float) -> list[str]:
     settings = ffmpeg_command.get_settings()
     url = ffmpeg_command.resolve_hls_master_playlist(url)
-    media_info = ffmpeg_command.probe_media(url)[0] if settings.get("probe_live", True) else None
+    media_info = ffmpeg_command.probe_media(url)[0] if settings["probe_live"] else None
     # The recording is kept like a VOD transcode: every segment stays and
     # the playlist grows as an event, so any client can play it directly.
     cmd = ffmpeg_command.build_hls_ffmpeg_cmd(
         url,
-        settings.get("transcode_hw", "software"),
+        settings["transcode_hw"],
         str(directory),
         is_vod=True,
         media_info=media_info,

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from urllib import parse
 
 import json
 import logging
@@ -12,55 +10,45 @@ import time
 
 import pytest
 
-from netv import cache, m3u
+from netv import cache, m3u, testing, util
 from netv.xtream import ProviderRecord, category_ids, text_field
 
 
-@pytest.fixture
-def m3u_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Point m3u's cache at temp directories."""
-    monkeypatch.setattr(cache, "SERVER_SETTINGS_FILE", tmp_path / "server_settings.json")
-    monkeypatch.setattr(cache, "USERS_DIR", tmp_path / "users")
-    monkeypatch.setattr(cache, "CACHE_DIR", tmp_path / "cache")
-    cache.USERS_DIR.mkdir(exist_ok=True)
-    cache.CACHE_DIR.mkdir(exist_ok=True)
-    _reset_memory()
-    m3u.get_refresh_in_progress().clear()
-
-    yield
-
-    _reset_memory()
-    m3u.get_refresh_in_progress().clear()
-
-
-def _reset_memory() -> None:
-    cache.clear_all_caches()
-    cache.get_cache().pop("epg", None)
-
-
-class _SyncThread:
-    """Thread stand-in that runs its target inline on start()."""
-
-    started: list[_SyncThread] = []
-
-    def __init__(self, target: Callable[[], object], daemon: bool = False) -> None:
-        self.target = target
-        self.daemon = daemon
-        self.error: Exception | None = None
-
-    def start(self) -> None:
-        _SyncThread.started.append(self)
-        try:
-            self.target()
-        except Exception as e:  # A real thread would swallow it too.
-            self.error = e
+@pytest.fixture(autouse=True)
+def no_refresh_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(m3u, "_refresh_in_progress", set())
 
 
 @pytest.fixture
-def sync_thread() -> Iterator[list[_SyncThread]]:
-    _SyncThread.started = []
-    with patch.object(m3u.threading, "Thread", _SyncThread):
-        yield _SyncThread.started
+def web(monkeypatch: pytest.MonkeyPatch) -> testing.FakeWeb:
+    web = testing.FakeWeb()
+    testing.install_web(monkeypatch, web, util)
+    return web
+
+
+@pytest.fixture
+def threads(monkeypatch: pytest.MonkeyPatch) -> testing.ThreadRecorder:
+    recorder = testing.ThreadRecorder()
+    testing.install_threads(monkeypatch, recorder, m3u)
+    return recorder
+
+
+def _configure(*sources: cache.SourceConfig) -> None:
+    cache.save_server_settings({**cache.load_server_settings(), "sources": list(sources)})
+
+
+def _stored_sources() -> list[cache.SourceConfig]:
+    return cache.load_server_settings()["sources"]
+
+
+def _api(base_url: str, action: str, *, username: str = "", password: str = "") -> str:
+    query = parse.urlencode({"username": username, "password": password, "action": action})
+    return f"{base_url}/player_api.php?{query}"
+
+
+def _serve(web: testing.FakeWeb, url: str, body: object) -> None:
+    payload = body.encode() if isinstance(body, str) else json.dumps(body).encode()
+    web.routes[url] = lambda: testing.FakeResponse(payload)
 
 
 def _write_cache(name: str, data: object, timestamp: float) -> None:
@@ -73,20 +61,43 @@ def _read_cache(name: str) -> object:
     return json.loads((cache.CACHE_DIR / f"{name}.json").read_text())["data"]
 
 
-def _xtream(source_id: str, *, epg_enabled: bool = True, epg_timeout: int = 120) -> cache.Source:
-    return cache.Source(
-        id=source_id,
-        name=source_id,
-        type="xtream",
-        url=f"https://{source_id}.example",
-        username="u",
-        password="p",
-        epg_enabled=epg_enabled,
-        epg_timeout=epg_timeout,
-    )
+_PLAYLIST = '#EXTM3U url-tvg="http://n"\n#EXTINF:-1 group-title="N",New\nhttp://n/1\n'
+_PLAYLIST_URL = "https://s.example/list.m3u"
 
 
-@pytest.mark.usefixtures("m3u_module")
+def _serve_playlist(
+    web: testing.FakeWeb,
+) -> tuple[
+    list[ProviderRecord],
+    list[ProviderRecord],
+    list[tuple[str, int, str]],
+]:
+    """Configure one M3U source ``s`` and return the live data it yields."""
+    _configure({"id": "s", "name": "s", "type": "m3u", "url": _PLAYLIST_URL, "epg_timeout": 9})
+    _serve(web, _PLAYLIST_URL, _PLAYLIST)
+    cats, streams, epg_url = m3u.parse_m3u(_PLAYLIST, "s")
+    return cats, streams, [(epg_url, 9, "s")]
+
+
+def _serve_xtream(
+    web: testing.FakeWeb,
+    source_id: str,
+    **actions: object,
+) -> cache.SourceConfig:
+    """Return an Xtream source config whose provider answers ``actions``."""
+    url = f"https://{source_id}.example"
+    for action, body in actions.items():
+        _serve(web, _api(url, action, username="u", password="p"), body)
+    return {
+        "id": source_id,
+        "name": source_id,
+        "type": "xtream",
+        "url": url,
+        "username": "u",
+        "password": "p",
+    }
+
+
 class TestParseM3u:
     def test_parse_basic_m3u(self):
         content = """#EXTM3U
@@ -173,13 +184,11 @@ class TestParseEpgUrls:
         assert result[0] == ("http://valid.com", 60, "src")
 
 
-@pytest.mark.usefixtures("m3u_module")
 class TestRefreshState:
     def test_get_refresh_in_progress(self):
-        m3u.get_refresh_in_progress()
+        assert m3u.get_refresh_in_progress() is m3u._refresh_in_progress
 
 
-@pytest.mark.usefixtures("m3u_module")
 class TestMakeClientUserAgent:
     """m3u fetches must use the configured User-Agent (issue #57)."""
 
@@ -192,162 +201,133 @@ class TestMakeClientUserAgent:
             username="u",
             password="p",
         )
-        cache.SERVER_SETTINGS_FILE.write_text(
-            json.dumps({"user_agent_preset": "custom", "user_agent_custom": "MyAgent/9.9"}),
+        cache.save_server_settings(
+            {
+                **cache.load_server_settings(),
+                "user_agent_preset": "custom",
+                "user_agent_custom": "MyAgent/9.9",
+            },
         )
         assert m3u._make_client(source).user_agent == "MyAgent/9.9"
 
-    def test_fetch_m3u_sends_user_agent(self):
-        cache.SERVER_SETTINGS_FILE.write_text(json.dumps({"user_agent_preset": "vlc"}))
-        resp = MagicMock()
-        resp.read.return_value = b"#EXTM3U\n"
-        resp.__enter__ = MagicMock(return_value=resp)
-        resp.__exit__ = MagicMock(return_value=False)
-        with patch.object(m3u, "safe_urlopen", return_value=resp) as mock_open:
-            m3u.fetch_m3u("http://example.com/list.m3u", "src1")
-        assert mock_open.call_args.kwargs["user_agent"] == "VLC/3.0.20 LibVLC/3.0.20"
+    def test_fetch_m3u_sends_user_agent(self, web: testing.FakeWeb):
+        cache.save_server_settings({**cache.load_server_settings(), "user_agent_preset": "vlc"})
+        _serve(web, "http://example.com/list.m3u", "#EXTM3U\n")
+        assert m3u.fetch_m3u("http://example.com/list.m3u", "src1") == ([], [], "")
+        assert [(f.url, f.timeout, f.headers) for f in web.fetches] == [
+            ("http://example.com/list.m3u", 30, {"User-agent": "VLC/3.0.20 LibVLC/3.0.20"}),
+        ]
 
 
-@pytest.mark.usefixtures("m3u_module")
 class TestFetchSourceLiveData:
-    def test_can_skip_epg_url_persistence(self):
-        source = cache.Source(
-            id="source-a",
-            name="Provider",
-            type="xtream",
-            url="https://provider.example",
-            username="remote-user",
-            password="remote-password",
-        )
-        client = MagicMock()
-        no_records: list[ProviderRecord] = []
-        client.get_live_categories.return_value = no_records
-        client.get_live_streams.return_value = no_records
-        client.epg_url = "https://provider.example/xmltv.php?credentials=private"
+    def test_can_skip_epg_url_persistence(self, web: testing.FakeWeb):
+        config = _serve_xtream(web, "a", get_live_categories=[], get_live_streams=[])
+        _configure(config)
 
-        with (
-            patch.object(m3u, "_make_client", return_value=client),
-            patch.object(m3u, "update_source_epg_url") as update_epg_url,
-        ):
-            m3u.fetch_source_live_data(source, persist_epg_url=False)
+        result = m3u.fetch_source_live_data(m3u.get_sources()[0], persist_epg_url=False)
 
-        update_epg_url.assert_not_called()
+        assert result == ([], [], "https://a.example/xmltv.php?username=u&password=p", 120)
+        assert "epg_url" not in _stored_sources()[0]
 
 
-@pytest.mark.usefixtures("m3u_module")
 class TestAggregateSourceData:
     @pytest.mark.parametrize("epg_enabled", [True, False])
-    def test_live_sources_share_normalization_without_persisting_epg(self, epg_enabled: bool):
-        sources = [
-            cache.Source(
-                id=kind,
-                name=kind,
-                type=kind,
-                url=f"https://{kind}.example",
-                epg_enabled=epg_enabled,
-                epg_timeout=90 + index,
-            )
+    def test_live_sources_share_normalization_without_persisting_epg(
+        self,
+        web: testing.FakeWeb,
+        epg_enabled: bool,
+    ):
+        sources: list[cache.SourceConfig] = [
+            {
+                "id": kind,
+                "name": kind,
+                "type": kind,
+                "url": f"https://{kind}.example",
+                "epg_enabled": epg_enabled,
+                "epg_timeout": 90 + index,
+            }
             for index, kind in enumerate(("xtream", "m3u", "epg"))
         ]
-        client = MagicMock()
-        client.get_live_categories.return_value = [{"category_id": "news"}]
-        client.get_live_streams.return_value = [
-            {"stream_id": 1, "category_id": "news"},
-            {"stream_id": 2, "category_ids": ["news", "sport"]},
-        ]
-        client.epg_url = "https://xtream.example/guide.xml"
-        m3u_cats: list[ProviderRecord] = [{"category_id": "m3u_news", "source_id": "m3u"}]
-        m3u_streams: list[ProviderRecord] = [
-            {"stream_id": "m3u_1", "direct_url": "https://m3u.example/live"},
-        ]
-        with (
-            patch.object(m3u, "get_sources", return_value=sources),
-            patch.object(m3u, "_make_client", return_value=client),
-            patch.object(
-                m3u,
-                "fetch_m3u",
-                return_value=(m3u_cats, m3u_streams, "https://m3u.example/guide.xml"),
-            ),
-            patch.object(m3u, "update_source_epg_url") as persist,
-        ):
-            cats, streams, epg_urls = m3u._fetch_all_live_data()
+        _configure(*sources)
+        _serve(
+            web,
+            _api("https://xtream.example", "get_live_categories"),
+            [{"category_id": "news"}],
+        )
+        _serve(
+            web,
+            _api("https://xtream.example", "get_live_streams"),
+            [
+                {"stream_id": 1, "category_id": "news"},
+                {"stream_id": 2, "category_ids": ["news", "sport"]},
+            ],
+        )
+        playlist = '#EXTM3U url-tvg="https://m3u.example/guide.xml"\n#EXTINF:-1,One\nhttps://m3u.example/live\n'
+        _serve(web, "https://m3u.example", playlist)
+        m3u_cats, m3u_streams, _ = m3u.parse_m3u(playlist, "m3u")
+
+        cats, streams, epg_urls = m3u._fetch_all_live_data()
 
         assert cats == [{"category_id": "xtream_news", "source_id": "xtream"}, *m3u_cats]
         assert [s["stream_id"] for s in streams] == [1, 2, "m3u_1"]
         assert streams[0]["category_ids"] == ["xtream_news"]
         assert streams[1]["category_ids"] == ["xtream_news", "xtream_sport"]
         assert all(s["source_id"] == "xtream" for s in streams[:2])
-        assert all(s["source_url"] == sources[0].url for s in streams[:2])
+        assert all(s["source_url"] == "https://xtream.example" for s in streams[:2])
         assert streams[-1] == m3u_streams[0]
         assert epg_urls == (
             [
-                ("https://xtream.example/guide.xml", 90, "xtream"),
+                ("https://xtream.example/xmltv.php?username=&password=", 90, "xtream"),
                 ("https://m3u.example/guide.xml", 91, "m3u"),
                 ("https://epg.example", 92, "epg"),
             ]
             if epg_enabled
             else []
         )
-        persist.assert_not_called()
+        assert all("epg_url" not in s for s in _stored_sources())
 
     def test_live_source_failure_does_not_drop_other_sources(
         self,
+        web: testing.FakeWeb,
         caplog: pytest.LogCaptureFixture,
     ):
-        broken = cache.Source(
-            id="broken",
-            name="Offline source",
-            type="xtream",
-            url="https://offline.example",
+        _configure(
+            {
+                "id": "broken",
+                "name": "Offline source",
+                "type": "xtream",
+                "url": "https://offline.example",
+            },
+            {"id": "working", "name": "EPG source", "type": "epg", "url": "https://epg.example"},
         )
-        working = cache.Source(
-            id="working",
-            name="EPG source",
-            type="epg",
-            url="https://epg.example",
-        )
-        with (
-            patch.object(m3u, "get_sources", return_value=[broken, working]),
-            patch.object(m3u, "_make_client", side_effect=OSError("offline")),
-        ):
-            assert m3u._fetch_all_live_data() == (
-                [],
-                [],
-                [(working.url, working.epg_timeout, working.id)],
-            )
+        assert m3u._fetch_all_live_data() == ([], [], [("https://epg.example", 120, "working")])
+        assert web.urls == [_api("https://offline.example", "get_live_categories")]
         assert "Error loading source Offline source" in caplog.text
 
-    def test_vod_sources_use_shared_loader_and_keep_order(self):
-        sources = [
-            cache.Source(id="a", name="First", type="xtream", url="https://a.example"),
-            cache.Source(
-                id="playlist",
-                name="Playlist",
-                type="m3u",
-                url="https://playlist.example",
-            ),
-            cache.Source(id="b", name="Second", type="xtream", url="https://b.example"),
+    def test_vod_sources_use_shared_loader_and_keep_order(self, web: testing.FakeWeb):
+        vod = {
+            "get_vod_categories": [{"category_id": "films"}],
+            "get_vod_streams": [{"stream_id": 1}],
+        }
+        _configure(
+            _serve_xtream(web, "a", **vod),
+            {
+                "id": "playlist",
+                "name": "Playlist",
+                "type": "m3u",
+                "url": "https://playlist.example",
+            },
+            _serve_xtream(web, "b", **vod),
+        )
+
+        cats, streams = m3u._fetch_vod_data()
+
+        assert web.urls == [
+            _api("https://a.example", "get_vod_categories", username="u", password="p"),
+            _api("https://a.example", "get_vod_streams", username="u", password="p"),
+            _api("https://b.example", "get_vod_categories", username="u", password="p"),
+            _api("https://b.example", "get_vod_streams", username="u", password="p"),
         ]
-        clients = {source.id: MagicMock() for source in sources if source.type == "xtream"}
-        for client in clients.values():
-            client.get_vod_categories.return_value = [{"category_id": "films"}]
-            client.get_vod_streams.return_value = [{"stream_id": 1}]
-
-        def source_client(source: cache.Source) -> MagicMock:
-            return clients[source.id]
-
-        with (
-            patch.object(m3u, "get_sources", return_value=sources),
-            patch.object(m3u, "_make_client", side_effect=source_client),
-            patch.object(
-                m3u,
-                "fetch_source_vod_data",
-                wraps=m3u.fetch_source_vod_data,
-            ) as fetch,
-        ):
-            cats, streams = m3u._fetch_vod_data()
-
-        assert [call.args[0] for call in fetch.call_args_list] == [sources[0], sources[2]]
         assert cats == [
             {"category_id": "films", "source_id": "a"},
             {"category_id": "films", "source_id": "b"},
@@ -356,26 +336,24 @@ class TestAggregateSourceData:
 
     def test_vod_source_failure_does_not_drop_other_sources(
         self,
+        web: testing.FakeWeb,
         caplog: pytest.LogCaptureFixture,
     ):
-        sources = [
-            cache.Source(id="broken", name="Offline", type="xtream", url="https://offline.example"),
-            cache.Source(id="working", name="Online", type="xtream", url="https://online.example"),
-        ]
-        client = MagicMock()
-        client.get_vod_categories.return_value = [{"category_id": "films"}]
-        client.get_vod_streams.return_value = [{"stream_id": 1}]
-        with (
-            patch.object(m3u, "get_sources", return_value=sources),
-            patch.object(m3u, "_make_client", side_effect=[OSError("offline"), client]),
-        ):
-            cats, streams = m3u._fetch_vod_data()
+        _configure(
+            _serve_xtream(web, "broken"),
+            _serve_xtream(
+                web,
+                "working",
+                get_vod_categories=[{"category_id": "films"}],
+                get_vod_streams=[{"stream_id": 1}],
+            ),
+        )
+        cats, streams = m3u._fetch_vod_data()
         assert cats == [{"category_id": "films", "source_id": "working"}]
         assert streams == [{"stream_id": 1, "source_id": "working"}]
         assert "Failed to fetch VOD from source broken" in caplog.text
 
 
-@pytest.mark.usefixtures("m3u_module")
 class TestParseM3uEdgeCases:
     def test_skips_blank_and_directive_lines_before_url(self):
         content = "#EXTM3U\n#EXTINF:-1,Alpha\n\n#EXTVLCOPT:http-user-agent=x\nhttp://a\n"
@@ -406,20 +384,20 @@ class TestParseM3uEdgeCases:
         assert [s["stream_id"] for s in streams] == ["s_1", "s_2"]
 
 
-@pytest.mark.usefixtures("m3u_module")
 class TestFetchSourceLiveDataPersistence:
-    def test_xtream_persists_epg_url_and_respects_disabled_epg(self):
-        source = _xtream("x", epg_enabled=False, epg_timeout=33)
-        client = MagicMock()
-        client.get_live_categories.return_value = [{"category_id": "1"}]
-        client.get_live_streams.return_value = [{"stream_id": 9, "category_id": None}]
-        client.epg_url = "https://x.example/xmltv.php"
-        with (
-            patch.object(m3u, "_make_client", return_value=client),
-            patch.object(m3u, "update_source_epg_url") as persist,
-        ):
-            cats, streams, epg_url, timeout = m3u.fetch_source_live_data(source)
-        persist.assert_called_once_with("x", "https://x.example/xmltv.php")
+    def test_xtream_persists_epg_url_and_respects_disabled_epg(self, web: testing.FakeWeb):
+        config = _serve_xtream(
+            web,
+            "x",
+            get_live_categories=[{"category_id": "1"}],
+            get_live_streams=[{"stream_id": 9, "category_id": None}],
+        )
+        _configure({**config, "epg_enabled": False, "epg_timeout": 33})
+        cats, streams, epg_url, timeout = m3u.fetch_source_live_data(m3u.get_sources()[0])
+        assert (
+            _stored_sources()[0].get("epg_url")
+            == "https://x.example/xmltv.php?username=u&password=p"
+        )
         assert cats == [{"category_id": "x_1", "source_id": "x"}]
         assert streams[0]["category_ids"] == []
         assert streams[0]["source_username"] == "u"
@@ -427,15 +405,12 @@ class TestFetchSourceLiveDataPersistence:
         assert streams[0]["source_type"] == "xtream"
         assert (epg_url, timeout) == (None, 33)
 
-    def test_m3u_persists_detected_epg_url(self):
-        source = cache.Source(id="m", name="m", type="m3u", url="https://m.example/list.m3u")
-        with (
-            patch.object(m3u, "fetch_m3u", return_value=([], [], "https://m/epg")) as fm,
-            patch.object(m3u, "update_source_epg_url") as persist,
-        ):
-            result = m3u.fetch_source_live_data(source)
-        fm.assert_called_once_with("https://m.example/list.m3u", "m")
-        persist.assert_called_once_with("m", "https://m/epg")
+    def test_m3u_persists_detected_epg_url(self, web: testing.FakeWeb):
+        _configure({"id": "m", "name": "m", "type": "m3u", "url": "https://m.example/list.m3u"})
+        _serve(web, "https://m.example/list.m3u", '#EXTM3U url-tvg="https://m/epg"\n')
+        result = m3u.fetch_source_live_data(m3u.get_sources()[0])
+        assert web.urls == ["https://m.example/list.m3u"]
+        assert _stored_sources()[0].get("epg_url") == "https://m/epg"
         assert result == ([], [], "https://m/epg", 120)
 
     def test_unknown_type_yields_nothing(self):
@@ -454,52 +429,48 @@ _LIVE: m3u.LiveData = {
 }
 
 
-@pytest.mark.usefixtures("m3u_module")
 class TestLoadAllLiveData:
-    def test_fresh_cache_returns_without_refresh(self, sync_thread: list[_SyncThread]):
+    def test_fresh_cache_returns_without_refresh(
+        self,
+        web: testing.FakeWeb,
+        threads: testing.ThreadRecorder,
+    ):
+        _serve_playlist(web)
         _write_cache("live_data", {**_LIVE, "epg_urls": [["http://e", 5, "s"]]}, time.time())
-        with patch.object(m3u, "_fetch_all_live_data") as fetch:
-            result = m3u.load_all_live_data()
+        result = m3u.load_all_live_data()
         assert result == (_LIVE["cats"], _LIVE["streams"], [("http://e", 5, "s")])
-        fetch.assert_not_called()
-        assert sync_thread == []
+        assert web.fetches == []
+        assert threads.threads == []
 
     def test_cache_exactly_ttl_old_is_still_fresh(
         self,
-        sync_thread: list[_SyncThread],
+        threads: testing.ThreadRecorder,
         monkeypatch: pytest.MonkeyPatch,
     ):
         _write_cache("live_data", _LIVE, 900.0)
-
-        def now() -> float:
-            return 1000.0
-
-        monkeypatch.setattr(m3u.time, "time", now)
+        testing.install_clock(monkeypatch, testing.FakeClock(now=1000.0), m3u)
         assert m3u.load_all_live_data(ttl_seconds=100) == (_LIVE["cats"], _LIVE["streams"], [])
-        assert sync_thread == []
+        assert threads.threads == []
 
     @pytest.mark.parametrize("memory_has_live_lists", [True, False])
     def test_stale_cache_refreshes_in_background(
         self,
-        sync_thread: list[_SyncThread],
+        web: testing.FakeWeb,
+        threads: testing.ThreadRecorder,
         caplog: pytest.LogCaptureFixture,
         memory_has_live_lists: bool,
     ):
+        new = _serve_playlist(web)
         _write_cache("live_data", _LIVE, time.time() - 100)
         mem = cache.get_cache()
         mem["epg_error"] = "kept"
         if memory_has_live_lists:
             mem.update({"live_categories": [], "live_streams": []})
         caplog.set_level(logging.INFO, logger="netv.m3u")
-        new: tuple[list[ProviderRecord], list[ProviderRecord], list[tuple[str, int, str]]] = (
-            [{"category_id": "n"}],
-            [{"stream_id": 2}],
-            [("http://n", 9, "s")],
-        )
-        with patch.object(m3u, "_fetch_all_live_data", return_value=new):
-            result = m3u.load_all_live_data(ttl_seconds=10)
+        result = m3u.load_all_live_data(ttl_seconds=10)
         assert result == (_LIVE["cats"], _LIVE["streams"], [])
-        assert len(sync_thread) == 1 and sync_thread[0].daemon
+        assert len(threads.threads) == 1 and threads.threads[0].daemon
+        assert threads.errors == []
         assert _read_cache("live_data") == {
             "cats": new[0],
             "streams": new[1],
@@ -509,48 +480,50 @@ class TestLoadAllLiveData:
         assert m3u.get_refresh_in_progress() == set()
         assert caplog.messages == ["Refreshing live data in background", "Live data refreshed"]
 
-    def test_failed_refresh_clears_in_progress_flag(self, sync_thread: list[_SyncThread]):
+    def test_failed_refresh_clears_in_progress_flag(self, threads: testing.ThreadRecorder):
         _write_cache("live_data", _LIVE, 0)
-        with patch.object(m3u, "_fetch_all_live_data", side_effect=RuntimeError("boom")):
-            m3u.load_all_live_data()
-        assert isinstance(sync_thread[0].error, RuntimeError)
+        cache.SERVER_SETTINGS_FILE.write_text(json.dumps({"live_dvr_mins": "corrupt"}))
+        m3u.load_all_live_data()
+        assert [type(e) for e in threads.errors] == [TypeError]
         assert m3u.get_refresh_in_progress() == set()
         assert _read_cache("live_data") == _LIVE
 
-    def test_stale_cache_skips_refresh_already_running(self, sync_thread: list[_SyncThread]):
+    def test_stale_cache_skips_refresh_already_running(self, threads: testing.ThreadRecorder):
         _write_cache("live_data", _LIVE, 0)
         m3u.get_refresh_in_progress().add("live")
         m3u.load_all_live_data()
-        assert sync_thread == []
+        assert threads.threads == []
 
-    def test_no_cache_fetches_and_saves(self, caplog: pytest.LogCaptureFixture):
-        new: tuple[list[ProviderRecord], list[ProviderRecord], list[tuple[str, int, str]]] = (
-            [{"category_id": "n"}],
-            [],
-            [("http://n", 9, "s")],
-        )
+    def test_no_cache_fetches_and_saves(
+        self,
+        web: testing.FakeWeb,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        new = _serve_playlist(web)
         caplog.set_level(logging.INFO, logger="netv.m3u")
-        with patch.object(m3u, "_fetch_all_live_data", return_value=new):
-            assert m3u.load_all_live_data() == new
+        assert m3u.load_all_live_data() == new
         assert caplog.messages == ["No live cache, fetching"]
         assert _read_cache("live_data") == {
-            "cats": [{"category_id": "n"}],
-            "streams": [],
+            "cats": new[0],
+            "streams": new[1],
             "epg_urls": [["http://n", 9, "s"]],
         }
 
-    def test_cache_filled_while_waiting_for_lock(self):
-        filled = ({**_LIVE, "epg_urls": [["http://e", 5, "s"]]}, time.time())
-        with (
-            patch.object(m3u, "load_file_cache", side_effect=[None, filled]),
-            patch.object(m3u, "_fetch_all_live_data") as fetch,
-        ):
-            result = m3u.load_all_live_data()
+    def test_cache_filled_while_waiting_for_lock(
+        self,
+        web: testing.FakeWeb,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        _serve_playlist(web)
+        filled = {**_LIVE, "epg_urls": [["http://e", 5, "s"]]}
+        lock = testing.ContendedLock(lambda: cache.save_file_cache("live_data", filled))
+        monkeypatch.setattr(m3u, "_fetch_locks", {**m3u._fetch_locks, "live": lock})
+        result = m3u.load_all_live_data()
         assert result == (_LIVE["cats"], _LIVE["streams"], [("http://e", 5, "s")])
-        fetch.assert_not_called()
+        assert lock.acquired == 1
+        assert web.fetches == []
 
 
-@pytest.mark.usefixtures("m3u_module")
 class TestCachedReaders:
     @pytest.mark.parametrize("name", ["live_data", "vod_data", "series_data"])
     def test_unreadable_cache_is_absent(self, name: str):
@@ -577,135 +550,153 @@ class TestCachedReaders:
 _VOD: m3u.VodData = {"cats": [{"category_id": "c"}], "streams": [{"stream_id": 1}]}
 
 
-@pytest.mark.usefixtures("m3u_module")
+def _serve_vod(web: testing.FakeWeb) -> None:
+    _configure(_serve_xtream(web, "a", get_vod_categories=[{"n": 1}], get_vod_streams=[]))
+
+
 class TestLoadVodData:
-    def test_fresh_cache(self, sync_thread: list[_SyncThread]):
+    def test_fresh_cache(self, threads: testing.ThreadRecorder):
         _write_cache("vod_data", _VOD, time.time())
         assert m3u.load_vod_data() == (_VOD["cats"], _VOD["streams"])
-        assert sync_thread == []
+        assert threads.threads == []
 
-    def test_stale_cache_refreshes(self, sync_thread: list[_SyncThread]):
+    def test_stale_cache_refreshes(self, web: testing.FakeWeb, threads: testing.ThreadRecorder):
+        _serve_vod(web)
         _write_cache("vod_data", _VOD, 0)
         mem = cache.get_cache()
         mem.update({"vod_categories": [], "vod_streams": [], "epg_error": "kept"})
-        with patch.object(m3u, "_fetch_vod_data", return_value=([{"n": 1}], [])):
-            assert m3u.load_vod_data() == (_VOD["cats"], _VOD["streams"])
-        assert _read_cache("vod_data") == {"cats": [{"n": 1}], "streams": []}
+        assert m3u.load_vod_data() == (_VOD["cats"], _VOD["streams"])
+        assert _read_cache("vod_data") == {"cats": [{"n": 1, "source_id": "a"}], "streams": []}
         assert mem == {"epg_error": "kept"}
         assert m3u.get_refresh_in_progress() == set()
-        assert len(sync_thread) == 1
+        assert len(threads.threads) == 1 and threads.errors == []
 
-    def test_stale_cache_skips_refresh_already_running(self, sync_thread: list[_SyncThread]):
+    def test_stale_cache_skips_refresh_already_running(self, threads: testing.ThreadRecorder):
         _write_cache("vod_data", _VOD, 0)
         m3u.get_refresh_in_progress().add("vod")
         m3u.load_vod_data()
-        assert sync_thread == []
+        assert threads.threads == []
 
-    def test_no_cache_fetches_and_saves(self):
-        with patch.object(m3u, "_fetch_vod_data", return_value=([{"n": 1}], [])):
-            assert m3u.load_vod_data() == ([{"n": 1}], [])
-        assert _read_cache("vod_data") == {"cats": [{"n": 1}], "streams": []}
+    def test_no_cache_fetches_and_saves(self, web: testing.FakeWeb):
+        _serve_vod(web)
+        assert m3u.load_vod_data() == ([{"n": 1, "source_id": "a"}], [])
+        assert _read_cache("vod_data") == {"cats": [{"n": 1, "source_id": "a"}], "streams": []}
 
     def test_empty_fetch_is_not_cached(self):
-        with patch.object(m3u, "_fetch_vod_data", return_value=([], [])):
-            assert m3u.load_vod_data() == ([], [])
+        assert m3u.load_vod_data() == ([], [])
         assert not (cache.CACHE_DIR / "vod_data.json").exists()
 
-    def test_cache_filled_while_waiting_for_lock(self):
-        with patch.object(m3u, "load_file_cache", side_effect=[None, (_VOD, 0)]):
-            assert m3u.load_vod_data() == (_VOD["cats"], _VOD["streams"])
+    def test_cache_filled_while_waiting_for_lock(
+        self,
+        web: testing.FakeWeb,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        _serve_vod(web)
+        lock = testing.ContendedLock(lambda: cache.save_file_cache("vod_data", _VOD))
+        monkeypatch.setattr(m3u, "_fetch_locks", {**m3u._fetch_locks, "vod": lock})
+        assert m3u.load_vod_data() == (_VOD["cats"], _VOD["streams"])
+        assert lock.acquired == 1
+        assert web.fetches == []
 
 
 _SERIES: m3u.SeriesData = {"cats": [{"category_id": "c"}], "series": [{"series_id": 1}]}
 
 
-@pytest.mark.usefixtures("m3u_module")
+def _serve_series(web: testing.FakeWeb) -> None:
+    _configure(_serve_xtream(web, "a", get_series_categories=[], get_series=[{"n": 1}]))
+
+
 class TestLoadSeriesData:
-    def test_fresh_cache(self, sync_thread: list[_SyncThread]):
+    def test_fresh_cache(self, threads: testing.ThreadRecorder):
         _write_cache("series_data", _SERIES, time.time())
         assert m3u.load_series_data() == (_SERIES["cats"], _SERIES["series"])
-        assert sync_thread == []
+        assert threads.threads == []
 
-    def test_stale_cache_refreshes(self, sync_thread: list[_SyncThread]):
+    def test_stale_cache_refreshes(self, web: testing.FakeWeb, threads: testing.ThreadRecorder):
+        _serve_series(web)
         _write_cache("series_data", _SERIES, 0)
         mem = cache.get_cache()
         mem.update({"series_categories": [], "series": [], "epg_error": "kept"})
-        with patch.object(m3u, "_fetch_series_data", return_value=([], [{"n": 1}])):
-            assert m3u.load_series_data() == (_SERIES["cats"], _SERIES["series"])
-        assert _read_cache("series_data") == {"cats": [], "series": [{"n": 1}]}
+        assert m3u.load_series_data() == (_SERIES["cats"], _SERIES["series"])
+        assert _read_cache("series_data") == {"cats": [], "series": [{"n": 1, "source_id": "a"}]}
         assert mem == {"epg_error": "kept"}
         assert m3u.get_refresh_in_progress() == set()
-        assert len(sync_thread) == 1
+        assert len(threads.threads) == 1 and threads.errors == []
 
-    def test_stale_cache_skips_refresh_already_running(self, sync_thread: list[_SyncThread]):
+    def test_stale_cache_skips_refresh_already_running(self, threads: testing.ThreadRecorder):
         _write_cache("series_data", _SERIES, 0)
         m3u.get_refresh_in_progress().add("series")
         m3u.load_series_data()
-        assert sync_thread == []
+        assert threads.threads == []
 
-    def test_no_cache_fetches_and_saves(self):
-        with patch.object(m3u, "_fetch_series_data", return_value=([], [{"n": 1}])):
-            assert m3u.load_series_data() == ([], [{"n": 1}])
-        assert _read_cache("series_data") == {"cats": [], "series": [{"n": 1}]}
+    def test_no_cache_fetches_and_saves(self, web: testing.FakeWeb):
+        _serve_series(web)
+        assert m3u.load_series_data() == ([], [{"n": 1, "source_id": "a"}])
+        assert _read_cache("series_data") == {"cats": [], "series": [{"n": 1, "source_id": "a"}]}
 
     def test_empty_fetch_is_not_cached(self):
-        with patch.object(m3u, "_fetch_series_data", return_value=([], [])):
-            assert m3u.load_series_data() == ([], [])
+        assert m3u.load_series_data() == ([], [])
         assert not (cache.CACHE_DIR / "series_data.json").exists()
 
-    def test_cache_filled_while_waiting_for_lock(self):
-        with patch.object(m3u, "load_file_cache", side_effect=[None, (_SERIES, 0)]):
-            assert m3u.load_series_data() == (_SERIES["cats"], _SERIES["series"])
+    def test_cache_filled_while_waiting_for_lock(
+        self,
+        web: testing.FakeWeb,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        _serve_series(web)
+        lock = testing.ContendedLock(lambda: cache.save_file_cache("series_data", _SERIES))
+        monkeypatch.setattr(m3u, "_fetch_locks", {**m3u._fetch_locks, "series": lock})
+        assert m3u.load_series_data() == (_SERIES["cats"], _SERIES["series"])
+        assert lock.acquired == 1
+        assert web.fetches == []
 
 
-_SOURCES = [
-    cache.Source(id="m", name="m", type="m3u", url="https://m"),
-    cache.Source(id="a", name="a", type="xtream", url="https://a.example/", username="ua"),
-    cache.Source(id="b", name="b", type="xtream", url="https://b.example", username="ub"),
+_SOURCES: list[cache.SourceConfig] = [
+    {"id": "m", "name": "m", "type": "m3u", "url": "https://m"},
+    {"id": "a", "name": "a", "type": "xtream", "url": "https://a.example/", "username": "ua"},
+    {"id": "b", "name": "b", "type": "xtream", "url": "https://b.example", "username": "ub"},
 ]
 
 
-@pytest.mark.usefixtures("m3u_module")
 class TestXtreamClientLookup:
     def test_first_xtream_client(self):
-        with patch.object(m3u, "get_sources", return_value=_SOURCES):
-            client = m3u.get_first_xtream_client()
+        _configure(*_SOURCES)
+        client = m3u.get_first_xtream_client()
         assert client is not None
         assert (client.base_url, client.username) == ("https://a.example", "ua")
 
     def test_first_xtream_client_none(self):
-        with patch.object(m3u, "get_sources", return_value=_SOURCES[:1]):
-            assert m3u.get_first_xtream_client() is None
+        _configure(*_SOURCES[:1])
+        assert m3u.get_first_xtream_client() is None
 
     def test_client_by_source(self):
-        with patch.object(m3u, "get_sources", return_value=_SOURCES):
-            client = m3u.get_xtream_client_by_source("b")
-            assert client is not None and client.username == "ub"
-            assert m3u.get_xtream_client_by_source("m") is None
-            assert m3u.get_xtream_client_by_source("missing") is None
+        _configure(*_SOURCES)
+        client = m3u.get_xtream_client_by_source("b")
+        assert client is not None and client.username == "ub"
+        assert m3u.get_xtream_client_by_source("m") is None
+        assert m3u.get_xtream_client_by_source("missing") is None
 
 
-@pytest.mark.usefixtures("m3u_module")
 class TestFetchSeriesData:
     def test_tags_sources_skips_non_xtream_and_survives_failures(
         self,
+        web: testing.FakeWeb,
         caplog: pytest.LogCaptureFixture,
     ):
-        sources = [
-            _xtream("broken"),
-            cache.Source(id="m", name="m", type="m3u", url="https://m"),
-            _xtream("ok"),
-        ]
-        client = MagicMock()
-        client.get_series_categories.return_value = [{"category_id": "1"}]
-        client.get_series.return_value = [{"series_id": 5}]
-        with (
-            patch.object(m3u, "get_sources", return_value=sources),
-            patch.object(m3u, "_make_client", side_effect=[OSError("down"), client]),
-        ):
-            cats, series = m3u._fetch_series_data()
+        _configure(
+            _serve_xtream(web, "broken"),
+            {"id": "m", "name": "m", "type": "m3u", "url": "https://m"},
+            _serve_xtream(
+                web,
+                "ok",
+                get_series_categories=[{"category_id": "1"}],
+                get_series=[{"series_id": 5}],
+            ),
+        )
+        cats, series = m3u._fetch_series_data()
         assert cats == [{"category_id": "1", "source_id": "ok"}]
         assert series == [{"series_id": 5, "source_id": "ok"}]
+        assert "https://m" not in web.urls
         assert "Failed to fetch series from source broken" in caplog.text
 
 

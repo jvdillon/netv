@@ -1,7 +1,6 @@
 """Tests for ffmpeg command generation and media probing."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import json
 import shutil
@@ -11,7 +10,7 @@ import time
 
 import pytest
 
-from netv import ffmpeg_command
+from netv import cache, ffmpeg_command
 from netv.cache import HwAccel, ServerSettings, get_user_agent
 from netv.ffmpeg_command import (
     MediaInfo,
@@ -38,13 +37,63 @@ from netv.ffmpeg_command import (
     resolve_hls_master_playlist,
     restore_probe_cache_entry,
 )
+from netv.testing import FakeResponse, FakeRun, FakeWeb, Program, install_subprocess, install_web
 
 
 @pytest.fixture(autouse=True)
-def mock_vaapi_device():
-    """Mock VAAPI_DEVICE for all tests to allow VAAPI tests on CI without hardware."""
-    with patch("netv.cache.VAAPI_DEVICE", "/dev/dri/renderD128"):
-        yield
+def command_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start each test with empty probe caches, the real settings loader, and a VAAPI device."""
+    monkeypatch.setattr(cache, "VAAPI_DEVICE", "/dev/dri/renderD128")
+    monkeypatch.setattr(ffmpeg_command, "_load_settings", cache.load_server_settings)
+    monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", None)
+    monkeypatch.setattr(ffmpeg_command, "_probe_cache", {})
+    monkeypatch.setattr(ffmpeg_command, "_series_probe_cache", {})
+    monkeypatch.setattr(ffmpeg_command, "_gpu_nvdec_codecs", None)
+    monkeypatch.setattr(ffmpeg_command, "_has_libplacebo", None)
+
+
+@pytest.fixture(autouse=True)
+def fake_run(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> FakeRun:
+    """Serve ffprobe, ffmpeg, and nvidia-smi from scripts, except in real-ffmpeg tests."""
+    run = FakeRun()
+    if request.node.get_closest_marker("cli_ffmpeg") is None:
+        install_subprocess(monkeypatch, ffmpeg_command, run=run)
+    return run
+
+
+def _save_dvr(minutes: int) -> None:
+    cache.save_server_settings({**cache.load_server_settings(), "live_dvr_mins": minutes})
+
+
+def _enable_sr(monkeypatch: pytest.MonkeyPatch, engine_dir: Path, *, model: str = "on") -> Path:
+    """Install one 720p AI Upscale engine and select a model; return the engine path."""
+    engine = engine_dir / "2x-nomosuni-compact_720p_fp16.engine"
+    engine.write_bytes(b"engine")
+    monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", str(engine_dir))
+    cache.save_server_settings({**cache.load_server_settings(), "sr_model": model})
+    return engine
+
+
+def _script_libplacebo(run: FakeRun, *, available: bool) -> None:
+    run.program(
+        "ffmpeg",
+        Program(stdout="... libplacebo ..." if available else ""),
+        when="-filters",
+    )
+
+
+def _ffprobe(
+    run: FakeRun,
+    payload: object,
+    *,
+    returncode: int = 0,
+    when: str | None = None,
+) -> None:
+    run.program("ffprobe", Program(stdout=json.dumps(payload), returncode=returncode), when=when)
+
+
+def _between(cmd: list[str], start: str, end: str) -> list[str]:
+    return cmd[cmd.index(start) + 1 : cmd.index(end)]
 
 
 # =============================================================================
@@ -137,28 +186,20 @@ class TestBuildVideoArgs:
         assert "yadif_cuda=0" in vf
         assert "scale_cuda" in vf
 
-    def test_nvenc_sr_uses_nomos(self, tmp_path: Path):
-        engine = tmp_path / "2x-nomosuni-compact_720p_fp16.engine"
-        engine.write_bytes(b"engine")
+    def test_nvenc_sr_uses_nomos(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        engine = _enable_sr(monkeypatch, tmp_path, model="retired-model")
         retired_engine = tmp_path / "retired-model_720p_fp16.engine"
         retired_engine.write_bytes(b"engine")
 
-        with (
-            patch("netv.ffmpeg_command._sr_engine_dir", str(tmp_path)),
-            patch(
-                "netv.ffmpeg_command._load_settings",
-                return_value={"sr_model": "retired-model"},
-            ),
-        ):
-            pre, post = _build_video_args(
-                copy_video=False,
-                hw="nvenc+software",
-                deinterlace=False,
-                use_hw_pipeline=False,
-                max_resolution="4k",
-                quality="high",
-                source_height=720,
-            )
+        pre, post = _build_video_args(
+            copy_video=False,
+            hw="nvenc+software",
+            deinterlace=False,
+            use_hw_pipeline=False,
+            max_resolution="4k",
+            quality="high",
+            source_height=720,
+        )
 
         assert pre[-2:] == ["-filter_threads", "4"]
         assert post[post.index("-preset") + 1] == "p5"
@@ -174,6 +215,7 @@ class TestBuildVideoArgs:
     )
     def test_sr_selects_fixed_nomos_engine(
         self,
+        monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
         source_height: int,
         expected_height: int,
@@ -181,9 +223,9 @@ class TestBuildVideoArgs:
         for height in (480, 720, 1080):
             (tmp_path / f"2x-nomosuni-compact_{height}p_fp16.engine").write_bytes(b"engine")
         (tmp_path / "retired-model_576p_fp16.engine").write_bytes(b"engine")
+        monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", str(tmp_path))
 
-        with patch("netv.ffmpeg_command._sr_engine_dir", str(tmp_path)):
-            result = _find_sr_engine(source_height)
+        result = _find_sr_engine(source_height)
 
         assert result is not None
         engine_path, engine_height, _, scale = result
@@ -191,18 +233,14 @@ class TestBuildVideoArgs:
         assert engine_height == expected_height
         assert scale == 2
 
-    def test_sr_maps_enabled_retired_setting_to_nomos(self, tmp_path: Path):
-        engine = tmp_path / "2x-nomosuni-compact_1080p_fp16.engine"
-        engine.write_bytes(b"engine")
+    def test_sr_maps_enabled_retired_setting_to_nomos(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        engine = _enable_sr(monkeypatch, tmp_path, model="retired-model")
 
-        with (
-            patch("netv.ffmpeg_command._sr_engine_dir", str(tmp_path)),
-            patch(
-                "netv.ffmpeg_command._load_settings",
-                return_value={"sr_model": "retired-model"},
-            ),
-        ):
-            video_filter = _build_sr_filter(1080, 2160)
+        video_filter = _build_sr_filter(1080, 2160)
 
         assert f"model={engine}" in video_filter
 
@@ -264,9 +302,13 @@ class TestBuildVideoArgs:
         )
         assert expected_qp in post
 
-    def test_sr_live_hls_uses_two_second_segments(self, tmp_path: Path):
-        engine = tmp_path / "2x-nomosuni-compact_720p_fp16.engine"
-        engine.write_bytes(b"engine")
+    def test_sr_live_hls_uses_two_second_segments(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        _enable_sr(monkeypatch, tmp_path, model="2x-nomosuni-compact")
+        _save_dvr(0)
         media_info = MediaInfo(
             video_codec="h264",
             audio_codec="aac",
@@ -277,25 +319,16 @@ class TestBuildVideoArgs:
             height=720,
         )
 
-        with (
-            patch("netv.ffmpeg_command._sr_engine_dir", str(tmp_path)),
-            patch(
-                "netv.ffmpeg_command._load_settings",
-                return_value={
-                    "sr_model": "2x-nomosuni-compact",
-                    "live_dvr_mins": 0,
-                },
-            ),
-        ):
-            command = build_hls_ffmpeg_cmd(
-                "https://example.test/live.m3u8",
-                "nvenc+software",
-                str(tmp_path / "output"),
-                media_info=media_info,
-                max_resolution="4k",
-                deinterlace_fallback=False,
-            )
+        command = build_hls_ffmpeg_cmd(
+            "https://example.test/live.m3u8",
+            "nvenc+software",
+            str(tmp_path / "output"),
+            media_info=media_info,
+            max_resolution="4k",
+            deinterlace_fallback=False,
+        )
 
+        assert "dnn_processing=" in command[command.index("-vf") + 1]
         assert command[command.index("-hls_time") + 1] == "2"
         assert command[command.index("-hls_list_size") + 1] == "15"
         assert command[command.index("-hls_init_time") + 1] == "1"
@@ -312,9 +345,9 @@ class TestBuildVideoArgs:
                 quality="high",
             )
 
-    @patch("netv.ffmpeg_command._has_libplacebo_filter", return_value=True)
-    def test_nvenc_hdr_with_libplacebo(self, mock_placebo: MagicMock):
+    def test_nvenc_hdr_with_libplacebo(self, fake_run: FakeRun):
         """Test NVENC HDR uses libplacebo when available."""
+        _script_libplacebo(fake_run, available=True)
         _, post = _build_video_args(
             copy_video=False,
             hw="nvenc+software",
@@ -331,9 +364,9 @@ class TestBuildVideoArgs:
         assert "hwdownload" in vf
         assert "hwupload_cuda" in vf
 
-    @patch("netv.ffmpeg_command._has_libplacebo_filter", return_value=False)
-    def test_nvenc_hdr_zscale_fallback(self, mock_placebo: MagicMock):
+    def test_nvenc_hdr_zscale_fallback(self, fake_run: FakeRun):
         """Test NVENC HDR falls back to zscale when libplacebo unavailable."""
+        _script_libplacebo(fake_run, available=False)
         _, post = _build_video_args(
             copy_video=False,
             hw="nvenc+software",
@@ -348,9 +381,9 @@ class TestBuildVideoArgs:
         assert "tonemap=hable" in vf
         assert "libplacebo" not in vf
 
-    @patch("netv.ffmpeg_command._has_libplacebo_filter", return_value=True)
-    def test_nvenc_hdr_deinterlace_order(self, mock_placebo: MagicMock):
+    def test_nvenc_hdr_deinterlace_order(self, fake_run: FakeRun):
         """Test NVENC HDR hw decode deinterlaces BEFORE tonemap."""
+        _script_libplacebo(fake_run, available=True)
         _, post = _build_video_args(
             copy_video=False,
             hw="nvenc+software",
@@ -366,9 +399,9 @@ class TestBuildVideoArgs:
         tonemap_pos = vf.find("libplacebo")
         assert deint_pos < tonemap_pos, f"deinterlace should come before tonemap: {vf}"
 
-    @patch("netv.ffmpeg_command._has_libplacebo_filter", return_value=True)
-    def test_nvenc_sw_hdr_deinterlace_order(self, mock_placebo: MagicMock):
+    def test_nvenc_sw_hdr_deinterlace_order(self, fake_run: FakeRun):
         """Test NVENC HDR sw decode uses CPU deinterlace before tonemap."""
+        _script_libplacebo(fake_run, available=True)
         _, post = _build_video_args(
             copy_video=False,
             hw="nvenc+software",
@@ -410,8 +443,8 @@ class TestBuildAudioArgs:
 
     def test_copy_audio(self):
         """Test copy_audio returns copy args."""
-        args = _build_audio_args(copy_audio=True, audio_sample_rate=48_000)
-        assert args == ["-c:a", "copy"]
+        assert _build_audio_args(copy_audio=True, audio=_media_info()) == ["-c:a", "copy"]
+        assert _build_audio_args(copy_audio=True, audio=None) == ["-c:a", "copy"]
 
     @pytest.mark.parametrize(
         "sample_rate,expected",
@@ -424,38 +457,35 @@ class TestBuildAudioArgs:
     )
     def test_sample_rates(self, sample_rate: int, expected: str):
         """Test sample rate handling."""
-        args = _build_audio_args(copy_audio=False, audio_sample_rate=sample_rate)
-        assert "-ar" in args
-        assert expected in args
+        args = _build_audio_args(copy_audio=False, audio=_media_info(audio_sample_rate=sample_rate))
+        assert args[args.index("-ar") + 1] == expected
 
     @pytest.mark.parametrize("channels", [3, 6, 8])
     def test_surround_encodes_5_1(self, channels: int):
         """Surround sources stay surround instead of being downmixed to stereo."""
-        args = _build_audio_args(
-            copy_audio=False,
-            audio_sample_rate=48_000,
-            audio_channels=channels,
-        )
+        args = _build_audio_args(copy_audio=False, audio=_media_info(audio_channels=channels))
         assert args[args.index("-af") + 1] == "aformat=channel_layouts=5.1"
         assert args[args.index("-b:a") + 1] == "384k"
         assert "-ac" not in args
 
     @pytest.mark.parametrize("channels", [1, 2])
     def test_stereo_stays_stereo(self, channels: int):
-        args = _build_audio_args(
-            copy_audio=False,
-            audio_sample_rate=48_000,
-            audio_channels=channels,
-        )
+        args = _build_audio_args(copy_audio=False, audio=_media_info(audio_channels=channels))
         assert args[args.index("-ac") + 1] == "2"
         assert args[args.index("-b:a") + 1] == "192k"
         assert "-af" not in args
 
     def test_unknown_layout_keeps_surround(self):
         """Unprobed audio lets ffmpeg keep 5.1 or fall back to stereo at runtime."""
-        args = _build_audio_args(copy_audio=False, audio_sample_rate=0)
-        assert args[args.index("-af") + 1] == "aformat=channel_layouts=stereo|5.1"
-        assert "-ac" not in args
+        assert _build_audio_args(copy_audio=False, audio=None) == _UNKNOWN_LAYOUT_AAC
+        unknown_channels = _build_audio_args(
+            copy_audio=False,
+            audio=_media_info(audio_channels=0, audio_sample_rate=44_100),
+        )
+        assert unknown_channels[unknown_channels.index("-af") + 1] == (
+            "aformat=channel_layouts=stereo|5.1"
+        )
+        assert unknown_channels[unknown_channels.index("-ar") + 1] == "44100"
 
 
 # =============================================================================
@@ -463,22 +493,48 @@ class TestBuildAudioArgs:
 # =============================================================================
 
 
-@pytest.fixture
-def hls_helpers(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
-    helpers = {
-        "_can_copy_video": MagicMock(return_value=False),
-        "_can_copy_audio": MagicMock(return_value=False),
-        "_build_video_args": MagicMock(return_value=(["video-pre"], ["video-post"])),
-        "_build_audio_args": MagicMock(return_value=["audio-args"]),
-        "_get_gpu_nvdec_codecs": MagicMock(return_value={"h264"}),
-        "get_hls_segment_duration": MagicMock(return_value=3.75),
-        "get_live_hls_list_size": MagicMock(return_value=17),
-        "http_reconnect_args": MagicMock(return_value=["reconnect-args"]),
-        "limit_live_video_bitrate": MagicMock(),
-    }
-    for name, helper in helpers.items():
-        monkeypatch.setattr(ffmpeg_command, name, helper)
-    return helpers
+_RECONNECT = [
+    "-reconnect",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_on_network_error",
+    "1",
+    "-reconnect_on_http_error",
+    "4xx,5xx",
+    "-reconnect_delay_max",
+    "30",
+]
+_UNKNOWN_LAYOUT_AAC = [
+    "-c:a",
+    "aac",
+    "-af",
+    "aformat=channel_layouts=stereo|5.1",
+    "-ar",
+    "48000",
+    "-b:a",
+    "192k",
+    "-profile:a",
+    "aac_low",
+]
+
+
+def _software_video(*, deinterlace: bool, height: int = 1080, crf: str = "20") -> list[str]:
+    vf = f"{'yadif=0,' if deinterlace else ''}scale=-2:min(ih\\,{height}),format=yuv420p"
+    return [
+        "-vf",
+        vf,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        crf,
+        "-bf",
+        "3",
+        "-g",
+        "60",
+    ]
 
 
 class TestHlsAssemblyContract:
@@ -488,18 +544,19 @@ class TestHlsAssemblyContract:
     @pytest.mark.parametrize("user_agent", [None, "", "custom-agent"])
     def test_exact_command(
         self,
-        hls_helpers: dict[str, MagicMock],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
         is_vod: bool,
         has_media: bool,
         sr: bool,
         user_agent: str | None,
     ):
-        post = ["video-post", "dnn_processing=model=test"] if sr else ["video-post"]
-        hls_helpers["_build_video_args"].return_value = (["video-pre"], post)
-        media = _media_info(is_hls=True) if has_media else None
+        _save_dvr(1)
+        engine = _enable_sr(monkeypatch, tmp_path) if sr else None
+        media = _media_info(height=720, is_hls=True) if has_media else None
         cmd = build_hls_ffmpeg_cmd(
             "https://source/stream",
-            "software",
+            "nvenc+software" if sr else "software",
             "/output",
             is_vod=is_vod,
             media_info=media,
@@ -510,7 +567,44 @@ class TestHlsAssemblyContract:
             ],
             sr_segment_duration=2.5,
         )
-        expected = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate", "video-pre"]
+        deinterlace = not has_media and not is_vod
+        video_pre: list[str] = []
+        if engine is not None:
+            video_pre = [
+                "-init_hw_device",
+                "cuda=cu",
+                "-filter_hw_device",
+                "cu",
+                "-filter_threads",
+                "4",
+            ]
+            sr_filter = (
+                "scale=1280:720:force_original_aspect_ratio=decrease,"
+                "pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=rgb24,hwupload,"
+                f"dnn_processing=dnn_backend=tensorrt:model={engine},scale_cuda=w=-2:h=1080"
+            )
+            video_post = [
+                "-vf",
+                f"{'yadif=0,' if deinterlace else ''}{sr_filter}",
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p5",
+                *(["-rc", "constqp", "-qp", "20"] if is_vod else []),
+                "-bf",
+                "0",
+                "-spatial-aq",
+                "1",
+                "-temporal-aq",
+                "1",
+                "-g",
+                "60",
+            ]
+        elif has_media:
+            video_post = ["-c:v", "copy"]
+        else:
+            video_post = _software_video(deinterlace=deinterlace)
+        expected = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate", *video_pre]
         if not has_media:
             expected += [
                 "-probesize",
@@ -518,18 +612,13 @@ class TestHlsAssemblyContract:
                 "-analyzeduration",
                 "500000" if is_vod else "5000000",
             ]
-        expected += [
-            "-fflags",
-            "+discardcorrupt+genpts",
-            "-err_detect",
-            "ignore_err",
-            "reconnect-args",
-        ]
+        expected += ["-fflags", "+discardcorrupt+genpts", "-err_detect", "ignore_err", *_RECONNECT]
         if user_agent is not None:
             expected += ["-user_agent", user_agent]
         if has_media:
             expected += ["-f", "hls", "-extension_picky", "0"]
         expected += ["-i", "https://source/stream"]
+        list_size = "0" if is_vod else ("24" if sr else "20")
         for number, index in [(0, 4), (1, 7)]:
             expected += [
                 "-map",
@@ -552,7 +641,7 @@ class TestHlsAssemblyContract:
                 "-segment_list_type",
                 "m3u8",
                 "-segment_list_size",
-                "0" if is_vod else "17",
+                list_size,
                 "-segment_format",
                 "webvtt",
             ]
@@ -564,8 +653,8 @@ class TestHlsAssemblyContract:
             "0:v:0",
             "-map",
             "0:a:0",
-            *post,
-            "audio-args",
+            *video_post,
+            *(["-c:a", "copy"] if has_media else _UNKNOWN_LAYOUT_AAC),
             "-max_delay",
             "5000000",
             "-f",
@@ -573,7 +662,7 @@ class TestHlsAssemblyContract:
             "-hls_time",
             "2" if sr else "3",
             "-hls_list_size",
-            "0" if is_vod else "17",
+            list_size,
             "-hls_segment_filename",
             "/output/seg%03d.ts",
         ]
@@ -589,119 +678,136 @@ class TestHlsAssemblyContract:
             if is_vod
             else ["-hls_init_time", "1", "-hls_flags", "delete_segments"]
         )
+        if sr and not is_vod:
+            expected += [
+                "-rc",
+                "vbr",
+                "-b:v",
+                "6000000",
+                "-maxrate",
+                "8000000",
+                "-bufsize",
+                "8000000",
+            ]
         expected += ["/output/stream.m3u8"]
         assert cmd == expected
-        hls_helpers["http_reconnect_args"].assert_called_once_with("https://source/stream")
-        if is_vod:
-            hls_helpers["get_live_hls_list_size"].assert_not_called()
-        else:
-            assert hls_helpers["get_live_hls_list_size"].call_count == 3
-            for args in hls_helpers["get_live_hls_list_size"].call_args_list:
-                assert args.args == (2.5 if sr else 3.75,)
-                assert args.kwargs == {}
-        if sr:
-            hls_helpers["get_hls_segment_duration"].assert_not_called()
-        else:
-            hls_helpers["get_hls_segment_duration"].assert_called_once_with()
-        if sr and not is_vod:
-            hls_helpers["limit_live_video_bitrate"].assert_called_once_with(cmd, "1080p")
-        else:
-            hls_helpers["limit_live_video_bitrate"].assert_not_called()
 
-    def test_default_forwarding(self, hls_helpers: dict[str, MagicMock]):
+    def test_default_forwarding(self):
         cmd = build_hls_ffmpeg_cmd("input", "software", "/output")
-        hls_helpers["_can_copy_video"].assert_called_once_with(None, "1080p", allow_upscale=True)
-        hls_helpers["_can_copy_audio"].assert_called_once_with(None, passthrough=False)
-        hls_helpers["_build_video_args"].assert_called_once_with(
-            copy_video=False,
-            hw="software",
-            deinterlace=True,
-            use_hw_pipeline=False,
-            max_resolution="1080p",
-            quality="high",
-            is_hdr=False,
-            source_height=0,
-            allow_upscale=True,
-        )
-        hls_helpers["_build_audio_args"].assert_called_once_with(
-            copy_audio=False,
-            audio_sample_rate=0,
-            audio_channels=0,
-        )
+        assert _between(cmd, "0:a:0", "-max_delay") == [
+            *_software_video(deinterlace=True),
+            *_UNKNOWN_LAYOUT_AAC,
+        ]
         assert "-user_agent" not in cmd
         assert "-c:s" not in cmd
 
-    @pytest.mark.parametrize("separate_audio", [False, True])
-    def test_explicit_forwarding(self, hls_helpers: dict[str, MagicMock], separate_audio: bool):
-        media = _media_info(height=720, is_hdr=True, audio_sample_rate=44_100, audio_channels=6)
-        audio = _media_info(audio_sample_rate=32_000, audio_channels=1) if separate_audio else None
-        hls_helpers["_can_copy_video"].return_value = True
-        hls_helpers["_can_copy_audio"].return_value = True
-        build_hls_ffmpeg_cmd(
+    def test_default_transcodes_dolby_audio(self):
+        dolby = _media_info(audio_codec="eac3", audio_channels=6)
+        default = build_hls_ffmpeg_cmd("input", "software", "/output", media_info=dolby)
+        passthrough = build_hls_ffmpeg_cmd(
             "input",
-            "qsv",
+            "software",
+            "/output",
+            media_info=dolby,
+            audio_passthrough=True,
+        )
+        assert default[default.index("-c:a") + 1] == "aac"
+        assert passthrough[passthrough.index("-c:a") + 1] == "copy"
+
+    @pytest.mark.parametrize("separate_audio", [False, True])
+    def test_explicit_forwarding(self, separate_audio: bool):
+        media = _media_info(
+            height=2160,
+            is_hdr=True,
+            audio_sample_rate=44_100,
+            audio_channels=6,
+            audio_profile="Main",
+        )
+        audio = (
+            _media_info(audio_codec="mp3", audio_sample_rate=32_000, audio_channels=1)
+            if separate_audio
+            else None
+        )
+        cmd = build_hls_ffmpeg_cmd(
+            "input",
+            "software",
             "/output",
             media_info=media,
             audio_info=audio,
             max_resolution="720p",
             quality="low",
-            allow_upscale=False,
-            audio_passthrough=True,
         )
-        hls_helpers["_can_copy_video"].assert_called_once_with(media, "720p", allow_upscale=False)
-        hls_helpers["_can_copy_audio"].assert_called_once_with(audio or media, passthrough=True)
-        hls_helpers["_build_video_args"].assert_called_once_with(
-            copy_video=True,
-            hw="qsv",
-            deinterlace=False,
-            use_hw_pipeline=False,
-            max_resolution="720p",
-            quality="low",
-            is_hdr=True,
-            source_height=720,
-            allow_upscale=False,
+        tonemap = (
+            "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,"
+            "zscale=t=bt709:m=bt709:r=tv,format=yuv420p,"
         )
-        hls_helpers["_build_audio_args"].assert_called_once_with(
-            copy_audio=True,
-            audio_sample_rate=32_000 if separate_audio else 44_100,
-            audio_channels=1 if separate_audio else 6,
-        )
+        video = _software_video(deinterlace=False, height=720, crf="32")
+        video[1] = tonemap + video[1]
+        if separate_audio:
+            audio_args = [
+                "-c:a",
+                "aac",
+                "-ac",
+                "2",
+                "-ar",
+                "48000",
+                "-b:a",
+                "192k",
+                "-profile:a",
+                "aac_low",
+            ]
+        else:
+            audio_args = [
+                "-c:a",
+                "aac",
+                "-af",
+                "aformat=channel_layouts=5.1",
+                "-ar",
+                "44100",
+                "-b:a",
+                "384k",
+                "-profile:a",
+                "aac_low",
+            ]
+        assert _between(cmd, "0:a:0", "-max_delay") == [*video, *audio_args]
 
     @pytest.mark.parametrize("hw", ["nvenc+software", "vaapi", "qsv", "amf+software", "software"])
     @pytest.mark.parametrize(
         "codec",
         ["h264", "hevc", "mpeg2video", "vp8", "vp9", "vc1", "av1", "unknown", ""],
     )
-    @pytest.mark.parametrize("copy_video", [False, True])
-    def test_hardware_pipeline(
-        self,
-        hls_helpers: dict[str, MagicMock],
-        hw: HwAccel,
-        codec: str,
-        copy_video: bool,
-    ):
-        hls_helpers["_can_copy_video"].return_value = copy_video
-        build_hls_ffmpeg_cmd("input", hw, "/output", video_codec=codec)
+    def test_hardware_pipeline(self, fake_run: FakeRun, hw: HwAccel, codec: str):
+        fake_run.program("nvidia-smi", Program(stdout="NVIDIA GeForce GTX 960, 5.2\n"))
+        cmd = build_hls_ffmpeg_cmd("input", hw, "/output", video_codec=codec)
         supported = {
             "nvenc+software": {"h264"},
             "vaapi": {"h264", "hevc", "mpeg2video", "vp8", "vp9", "vc1", "av1"},
             "qsv": {"h264", "hevc", "mpeg2video", "vp9", "vc1", "av1"},
-            "amf+software": set(),
-            "software": set(),
+            "amf+software": set[str](),
+            "software": set[str](),
         }
-        assert hls_helpers["_build_video_args"].call_args.kwargs["use_hw_pipeline"] is (
-            not copy_video and codec in supported[hw]
-        )
+        assert ("-hwaccel" in cmd) is (codec in supported[hw])
+        probed_gpu = [c[0] for c in fake_run.calls] == ["nvidia-smi"]
+        assert probed_gpu is (hw == "nvenc+software" and bool(codec))
 
-    def test_media_codec_overrides_hint(self, hls_helpers: dict[str, MagicMock]):
-        build_hls_ffmpeg_cmd(
+    @pytest.mark.parametrize("hw", ["nvenc+software", "vaapi", "qsv", "amf+software", "software"])
+    def test_copied_video_skips_hardware_pipeline(self, fake_run: FakeRun, hw: HwAccel):
+        fake_run.program("nvidia-smi", Program(stdout="NVIDIA GeForce RTX 3080, 8.6\n"))
+        cmd = build_hls_ffmpeg_cmd("input", hw, "/output", media_info=_media_info())
+        assert cmd[cmd.index("-c:v") + 1] == "copy"
+        assert "-hwaccel" not in cmd
+        assert fake_run.calls == []
+
+    def test_media_codec_overrides_hint(self):
+        cmd = build_hls_ffmpeg_cmd(
             "input",
             "qsv",
             "/output",
             media_info=_media_info(video_codec="vp8"),
             video_codec="h264",
         )
-        assert hls_helpers["_build_video_args"].call_args.kwargs["use_hw_pipeline"] is False
+        assert "-hwaccel" not in cmd
+        assert cmd[cmd.index("-c:v") + 1] == "h264_qsv"
 
     @pytest.mark.parametrize("is_vod", [False, True])
     @pytest.mark.parametrize("fallback", [None, False, True])
@@ -709,14 +815,17 @@ class TestHlsAssemblyContract:
     @pytest.mark.parametrize("interlaced", [False, True])
     def test_deinterlace_selection(
         self,
-        hls_helpers: dict[str, MagicMock],
         is_vod: bool,
         fallback: bool | None,
         height: int | None,
         interlaced: bool,
     ):
-        media = None if height is None else _media_info(height=height, interlaced=interlaced)
-        build_hls_ffmpeg_cmd(
+        media = (
+            None
+            if height is None
+            else _media_info(height=height, interlaced=interlaced, pix_fmt="yuv420p10le")
+        )
+        cmd = build_hls_ffmpeg_cmd(
             "input",
             "software",
             "/output",
@@ -725,18 +834,12 @@ class TestHlsAssemblyContract:
             deinterlace_fallback=fallback,
         )
         expected = interlaced if height == 1 else (not is_vod if fallback is None else fallback)
-        assert hls_helpers["_build_video_args"].call_args.kwargs["deinterlace"] is expected
+        assert cmd[cmd.index("-vf") + 1].startswith("yadif=0,") is expected
 
-    def test_default_sr_duration(self, hls_helpers: dict[str, MagicMock]):
-        video_args: list[str] = []
-        hls_helpers["_build_video_args"].return_value = (video_args, ["dnn_processing=model=test"])
-        build_hls_ffmpeg_cmd("input", "software", "/output")
-        hls_helpers["get_live_hls_list_size"].assert_called_once_with(2.0)
-
-    def test_missing_codec_does_not_probe_gpu(self, hls_helpers: dict[str, MagicMock]):
-        build_hls_ffmpeg_cmd("input", "nvenc+software", "/output")
-        hls_helpers["_get_gpu_nvdec_codecs"].assert_not_called()
-        assert hls_helpers["_build_video_args"].call_args.kwargs["use_hw_pipeline"] is False
+    def test_missing_codec_does_not_probe_gpu(self, fake_run: FakeRun):
+        cmd = build_hls_ffmpeg_cmd("input", "nvenc+software", "/output")
+        assert fake_run.calls == []
+        assert "-hwaccel" not in cmd
 
 
 class TestBuildHlsFfmpegCmd:
@@ -784,10 +887,8 @@ class TestBuildHlsFfmpegCmd:
     @pytest.mark.parametrize(("dvr_mins", "list_size"), [(0, "10"), (5, "100"), (120, "2400")])
     def test_live_hls_flags(self, dvr_mins: int, list_size: str):
         """Test live has correct HLS flags for the configured DVR window."""
-        settings = _server_settings()
-        settings["live_dvr_mins"] = dvr_mins
-        with patch("netv.ffmpeg_command._load_settings", return_value=settings):
-            cmd = build_hls_ffmpeg_cmd("http://test", "software", "/tmp", is_vod=False)
+        _save_dvr(dvr_mins)
+        cmd = build_hls_ffmpeg_cmd("http://test", "software", "/tmp", is_vod=False)
         assert "delete_segments" in cmd
         assert "-hls_list_size" in cmd
         assert cmd[cmd.index("-hls_list_size") + 1] == list_size
@@ -933,16 +1034,14 @@ class TestBuildHlsFfmpegCmd:
     @pytest.mark.parametrize(("dvr_mins", "list_size"), [(0, "10"), (5, "100"), (120, "2400")])
     def test_live_subtitle_renditions_use_bounded_playlists(self, dvr_mins: int, list_size: str):
         subs = [SubtitleStream(index=2, lang="eng", name="English")]
-        settings = _server_settings()
-        settings["live_dvr_mins"] = dvr_mins
-        with patch("netv.ffmpeg_command._load_settings", return_value=settings):
-            cmd = build_hls_ffmpeg_cmd(
-                "http://test",
-                "software",
-                "/tmp/out",
-                is_vod=False,
-                subtitles=subs,
-            )
+        _save_dvr(dvr_mins)
+        cmd = build_hls_ffmpeg_cmd(
+            "http://test",
+            "software",
+            "/tmp/out",
+            is_vod=False,
+            subtitles=subs,
+        )
         segment_output = cmd[
             cmd.index("/tmp/out/sub0.vtt") + 1 : cmd.index("/tmp/out/sub0_%06d.vtt")
         ]
@@ -985,19 +1084,20 @@ def test_non_http_inputs_do_not_need_command_repairs(url: str):
 
 
 @pytest.mark.parametrize("is_vod", [False, True])
-def test_live_ai_upscale_uses_shared_bitrate_policy(is_vod: bool):
-    with (
-        patch("netv.ffmpeg_command._load_settings", return_value={"sr_model": "nomos"}),
-        patch("netv.ffmpeg_command._sr_engine_dir", "/models"),
-        patch("netv.ffmpeg_command._build_sr_filter", return_value="dnn_processing=model=test"),
-    ):
-        cmd = build_hls_ffmpeg_cmd(
-            "https://provider.example/live.m3u8",
-            "nvenc+software",
-            "/tmp/output",
-            is_vod=is_vod,
-            max_resolution="4k",
-        )
+def test_live_ai_upscale_uses_shared_bitrate_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    is_vod: bool,
+):
+    _enable_sr(monkeypatch, tmp_path, model="nomos")
+    cmd = build_hls_ffmpeg_cmd(
+        "https://provider.example/live.m3u8",
+        "nvenc+software",
+        "/tmp/output",
+        is_vod=is_vod,
+        max_resolution="4k",
+    )
+    assert "dnn_processing=" in cmd[cmd.index("-vf") + 1]
     if is_vod:
         assert cmd[cmd.index("-rc") + 1] == "constqp"
         assert "-maxrate" not in cmd
@@ -1056,47 +1156,26 @@ class TestAspectRatioHandling:
 class TestGpuDetection:
     """Tests for GPU/NVDEC detection."""
 
-    def test_nvidia_gpu_detected(self):
+    def test_nvidia_gpu_detected(self, fake_run: FakeRun):
         """Test NVIDIA GPU detection parses compute capability."""
+        fake_run.program("nvidia-smi", Program(stdout="NVIDIA GeForce RTX 3080, 8.6\n"))
+        assert _get_gpu_nvdec_codecs() == {"h264", "hevc", "av1"}
+        assert fake_run.calls == [
+            ["nvidia-smi", "--query-gpu=name,compute_cap", "--format=csv,noheader"],
+        ]
 
-        ffmpeg_command._gpu_nvdec_codecs = None  # Reset cache.
-
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = "NVIDIA GeForce RTX 3080, 8.6\n"
-
-        with patch("subprocess.run", return_value=mock_result):
-            codecs = _get_gpu_nvdec_codecs()
-            assert "h264" in codecs
-            assert "hevc" in codecs
-            assert "av1" in codecs
-
-    def test_no_nvidia_gpu(self):
+    def test_no_nvidia_gpu(self, fake_run: FakeRun):
         """Test handling when no NVIDIA GPU present."""
+        fake_run.program(
+            "nvidia-smi",
+            Program(stdout="NVIDIA GeForce RTX 3080, 8.6\n", returncode=1),
+        )
+        assert _get_gpu_nvdec_codecs() == set()
 
-        ffmpeg_command._gpu_nvdec_codecs = None
-
-        mock_result = MagicMock()
-        mock_result.returncode = 1
-
-        with patch("subprocess.run", return_value=mock_result):
-            codecs = _get_gpu_nvdec_codecs()
-            assert codecs == set()
-
-    def test_older_nvidia_gpu(self):
+    def test_older_nvidia_gpu(self, fake_run: FakeRun):
         """Test older GPU with limited NVDEC support."""
-
-        ffmpeg_command._gpu_nvdec_codecs = None
-
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = "NVIDIA GeForce GTX 960, 5.2\n"
-
-        with patch("subprocess.run", return_value=mock_result):
-            codecs = _get_gpu_nvdec_codecs()
-            assert "h264" in codecs
-            assert "hevc" not in codecs
-            assert "av1" not in codecs
+        fake_run.program("nvidia-smi", Program(stdout="NVIDIA GeForce GTX 960, 5.2\n"))
+        assert _get_gpu_nvdec_codecs() == {"h264"}
 
 
 # =============================================================================
@@ -1104,46 +1183,43 @@ class TestGpuDetection:
 # =============================================================================
 
 
+def _save_user_agent(preset: str, custom: str = "") -> None:
+    cache.save_server_settings(
+        {**cache.load_server_settings(), "user_agent_preset": preset, "user_agent_custom": custom},
+    )
+
+
 class TestUserAgent:
     """Tests for user agent handling."""
 
     def test_default_user_agent(self):
         """Test default preset returns None."""
-        with patch(
-            "netv.cache.load_server_settings",
-            return_value={"user_agent_preset": "default"},
-        ):
-            assert get_user_agent() is None
+        _save_user_agent("default")
+        assert get_user_agent() is None
 
     def test_vlc_user_agent(self):
         """Test VLC preset."""
-        with patch("netv.cache.load_server_settings", return_value={"user_agent_preset": "vlc"}):
-            ua = get_user_agent()
-            assert ua is not None
-            assert "VLC" in ua
+        _save_user_agent("vlc")
+        ua = get_user_agent()
+        assert ua is not None
+        assert "VLC" in ua
 
     def test_chrome_user_agent(self):
         """Test Chrome preset."""
-        with patch("netv.cache.load_server_settings", return_value={"user_agent_preset": "chrome"}):
-            ua = get_user_agent()
-            assert ua is not None
-            assert "Chrome" in ua
+        _save_user_agent("chrome")
+        ua = get_user_agent()
+        assert ua is not None
+        assert "Chrome" in ua
 
     def test_custom_user_agent(self):
         """Test custom user agent."""
-        with patch(
-            "netv.cache.load_server_settings",
-            return_value={"user_agent_preset": "custom", "user_agent_custom": "MyAgent/1.0"},
-        ):
-            assert get_user_agent() == "MyAgent/1.0"
+        _save_user_agent("custom", "MyAgent/1.0")
+        assert get_user_agent() == "MyAgent/1.0"
 
     def test_custom_empty_returns_none(self):
         """Test empty custom user agent returns None."""
-        with patch(
-            "netv.cache.load_server_settings",
-            return_value={"user_agent_preset": "custom", "user_agent_custom": ""},
-        ):
-            assert get_user_agent() is None
+        _save_user_agent("custom")
+        assert get_user_agent() is None
 
 
 # =============================================================================
@@ -1151,25 +1227,23 @@ class TestUserAgent:
 # =============================================================================
 
 
+def _save_transcode_dir(path: str) -> None:
+    cache.save_server_settings({**cache.load_server_settings(), "transcode_dir": path})
+
+
 class TestTranscodeDir:
     """Tests for transcode directory handling."""
 
     def test_default_transcode_dir(self):
         """Test default uses system temp."""
-        with patch("netv.ffmpeg_command._load_settings", return_value={}):
-            path = get_transcode_dir()
-            assert path == Path(tempfile.gettempdir())
+        assert get_transcode_dir() == Path(tempfile.gettempdir())
 
     def test_custom_transcode_dir(self, tmp_path: Path):
         """Test custom directory is used and created."""
         custom_dir = tmp_path / "custom_transcode"
-        with patch(
-            "netv.ffmpeg_command._load_settings",
-            return_value={"transcode_dir": str(custom_dir)},
-        ):
-            path = get_transcode_dir()
-            assert path == custom_dir
-            assert custom_dir.exists()
+        _save_transcode_dir(str(custom_dir))
+        assert get_transcode_dir() == custom_dir
+        assert custom_dir.exists()
 
 
 # =============================================================================
@@ -1178,35 +1252,38 @@ class TestTranscodeDir:
 
 
 class TestHlsListSize:
+    """Tests for HLS list size calculation."""
+
     @pytest.mark.parametrize(
         ("dvr", "duration", "expected"),
         [(0, 1.0, 30), (0, 4.0, 7), (1, 4.0, 15), (2, 7.0, 17), (-1, 4.0, 7)],
     )
     def test_duration_arithmetic(self, dvr: int, duration: float, expected: int):
-        with patch("netv.ffmpeg_command._load_settings", return_value={"live_dvr_mins": dvr}):
-            assert get_live_hls_list_size(duration) == expected
+        _save_dvr(dvr)
+        assert get_live_hls_list_size(duration) == expected
 
     @pytest.mark.parametrize(("dvr", "expected"), [(0, 5), (1, 15)])
     def test_custom_live_buffer(self, dvr: int, expected: int):
-        with patch("netv.ffmpeg_command._load_settings", return_value={"live_dvr_mins": dvr}):
-            assert get_live_hls_list_size(4.0, live_buffer_secs=23.0) == expected
-
-    """Tests for HLS list size calculation."""
+        _save_dvr(dvr)
+        assert get_live_hls_list_size(4.0, live_buffer_secs=23.0) == expected
 
     def test_default_list_size(self):
-        """Test default (DVR disabled) uses 10 segments."""
-        with patch("netv.ffmpeg_command._load_settings", return_value={}):
-            assert get_live_hls_list_size() == 10
+        """Test DVR disabled uses 10 segments."""
+        _save_dvr(0)
+        assert get_live_hls_list_size() == 10
 
     def test_dvr_enabled_list_size(self):
         """Test DVR enabled calculates segments from minutes."""
-        with patch("netv.ffmpeg_command._load_settings", return_value={"live_dvr_mins": 5}):
-            # 5 min = 300 sec / 3 sec per segment = 100 segments.
-            assert get_live_hls_list_size() == 100
+        _save_dvr(5)
+        # 5 min = 300 sec / 3 sec per segment = 100 segments.
+        assert get_live_hls_list_size() == 100
 
     def test_dvr_list_size_follows_long_windows(self):
-        with patch("netv.ffmpeg_command._load_settings", return_value={"live_dvr_mins": 360}):
-            assert get_live_hls_list_size() == 7200
+        _save_dvr(360)
+        assert get_live_hls_list_size() == 7200
+
+    def test_server_default_dvr_window(self):
+        assert get_live_hls_list_size() == 2400
 
 
 # =============================================================================
@@ -1217,39 +1294,31 @@ class TestHlsListSize:
 class TestProbeMedia:
     """Tests for media probing."""
 
-    def test_probe_success(self):
+    def test_probe_success(self, fake_run: FakeRun):
         """Test successful probe parses media info."""
+        _ffprobe(
+            fake_run,
+            {
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "h264",
+                        "pix_fmt": "yuv420p",
+                        "height": 1080,
+                        "field_order": "progressive",
+                    },
+                    {
+                        "codec_type": "audio",
+                        "codec_name": "aac",
+                        "channels": 2,
+                        "sample_rate": "48000",
+                    },
+                ],
+                "format": {"duration": "3600.0"},
+            },
+        )
 
-        ffmpeg_command._probe_cache.clear()
-
-        probe_output: dict[str, object] = {
-            "streams": [
-                {
-                    "codec_type": "video",
-                    "codec_name": "h264",
-                    "pix_fmt": "yuv420p",
-                    "height": 1080,
-                    "field_order": "progressive",
-                },
-                {
-                    "codec_type": "audio",
-                    "codec_name": "aac",
-                    "channels": 2,
-                    "sample_rate": "48000",
-                },
-            ],
-            "format": {"duration": "3600.0"},
-        }
-
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = json.dumps(probe_output)
-
-        with (
-            patch("subprocess.run", return_value=mock_result),
-            patch("netv.ffmpeg_command._load_settings", return_value={}),
-        ):
-            media_info, subs = probe_media("http://test/video.mp4")
+        media_info, subs = probe_media("http://test/video.mp4")
 
         assert media_info is not None
         assert media_info.video_codec == "h264"
@@ -1257,34 +1326,32 @@ class TestProbeMedia:
         assert media_info.height == 1080
         assert media_info.duration == 3600.0
         assert not media_info.interlaced
+        assert subs == []
+        assert len(fake_run.calls) == 1
+        assert fake_run.calls[0][-1] == "http://test/video.mp4"
+        assert fake_run.options == [
+            {"check": False, "capture_output": True, "text": True, "timeout": 30},
+        ]
 
-    def test_probe_interlaced_detection(self):
+    def test_probe_interlaced_detection(self, fake_run: FakeRun):
         """Test interlaced content detection."""
+        _ffprobe(
+            fake_run,
+            {
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "mpeg2video",
+                        "pix_fmt": "yuv420p",
+                        "height": 1080,
+                        "field_order": "tt",  # Top field first = interlaced.
+                    },
+                ],
+                "format": {},
+            },
+        )
 
-        ffmpeg_command._probe_cache.clear()
-
-        probe_output: dict[str, object] = {
-            "streams": [
-                {
-                    "codec_type": "video",
-                    "codec_name": "mpeg2video",
-                    "pix_fmt": "yuv420p",
-                    "height": 1080,
-                    "field_order": "tt",  # Top field first = interlaced.
-                },
-            ],
-            "format": {},
-        }
-
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = json.dumps(probe_output)
-
-        with (
-            patch("subprocess.run", return_value=mock_result),
-            patch("netv.ffmpeg_command._load_settings", return_value={}),
-        ):
-            media_info, _ = probe_media("http://test/interlaced.ts")
+        media_info, _ = probe_media("http://test/interlaced.ts")
 
         assert media_info is not None
         assert media_info.interlaced is True
@@ -1301,32 +1368,24 @@ class TestProbeMedia:
             ("nv12", False),  # 8-bit NV12.
         ],
     )
-    def test_probe_10bit_detection(self, pix_fmt: str, expected: bool):
+    def test_probe_10bit_detection(self, fake_run: FakeRun, pix_fmt: str, expected: bool):
         """Test 10-bit content detection from pix_fmt."""
+        _ffprobe(
+            fake_run,
+            {
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "hevc",
+                        "pix_fmt": pix_fmt,
+                        "height": 2160,
+                    },
+                ],
+                "format": {},
+            },
+        )
 
-        ffmpeg_command._probe_cache.clear()
-
-        probe_output: dict[str, object] = {
-            "streams": [
-                {
-                    "codec_type": "video",
-                    "codec_name": "hevc",
-                    "pix_fmt": pix_fmt,
-                    "height": 2160,
-                },
-            ],
-            "format": {},
-        }
-
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = json.dumps(probe_output)
-
-        with (
-            patch("subprocess.run", return_value=mock_result),
-            patch("netv.ffmpeg_command._load_settings", return_value={}),
-        ):
-            media_info, _ = probe_media(f"http://test/{pix_fmt}.mkv")
+        media_info, _ = probe_media(f"http://test/{pix_fmt}.mkv")
 
         assert media_info is not None
         assert media_info.is_10bit is expected, f"pix_fmt={pix_fmt} should be is_10bit={expected}"
@@ -1341,61 +1400,44 @@ class TestProbeMedia:
             ("", False),  # Unknown/missing.
         ],
     )
-    def test_probe_hdr_detection(self, color_transfer: str, expected: bool):
+    def test_probe_hdr_detection(self, fake_run: FakeRun, color_transfer: str, expected: bool):
         """Test HDR content detection from color_transfer."""
+        _ffprobe(
+            fake_run,
+            {
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "hevc",
+                        "pix_fmt": "yuv420p10le",
+                        "height": 2160,
+                        "color_transfer": color_transfer,
+                    },
+                ],
+                "format": {},
+            },
+        )
 
-        ffmpeg_command._probe_cache.clear()
-
-        probe_output: dict[str, object] = {
-            "streams": [
-                {
-                    "codec_type": "video",
-                    "codec_name": "hevc",
-                    "pix_fmt": "yuv420p10le",
-                    "height": 2160,
-                    "color_transfer": color_transfer,
-                },
-            ],
-            "format": {},
-        }
-
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = json.dumps(probe_output)
-
-        with (
-            patch("subprocess.run", return_value=mock_result),
-            patch("netv.ffmpeg_command._load_settings", return_value={}),
-        ):
-            media_info, _ = probe_media(f"http://test/{color_transfer or 'unknown'}.mkv")
+        media_info, _ = probe_media(f"http://test/{color_transfer or 'unknown'}.mkv")
 
         assert media_info is not None
         assert media_info.is_hdr is expected, (
             f"color_transfer={color_transfer} should be is_hdr={expected}"
         )
 
-    def test_probe_failure(self):
+    def test_probe_failure(self, fake_run: FakeRun):
         """Test probe failure returns None."""
+        _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}}, returncode=1)
 
-        ffmpeg_command._probe_cache.clear()
-
-        mock_result = MagicMock()
-        mock_result.returncode = 1
-
-        with (
-            patch("subprocess.run", return_value=mock_result),
-            patch("netv.ffmpeg_command._load_settings", return_value={}),
-        ):
-            media_info, subs = probe_media("http://test/bad.mp4")
+        media_info, subs = probe_media("http://test/bad.mp4")
 
         assert media_info is None
         assert subs == []
+        assert len(fake_run.calls) == 2
+        assert ffmpeg_command._probe_cache == {}
 
-    def test_probe_cache_hit(self):
+    def test_probe_cache_hit(self, fake_run: FakeRun):
         """Test probe cache returns cached result."""
-
-        ffmpeg_command._probe_cache.clear()
-
         cached_info = MediaInfo(
             video_codec="h264",
             audio_codec="aac",
@@ -1407,55 +1449,41 @@ class TestProbeMedia:
             list[SubtitleStream](),
         )
 
-        with (
-            patch("subprocess.run") as mock_run,
-            patch("netv.ffmpeg_command._load_settings", return_value={}),
-        ):
-            media_info, _ = probe_media("http://cached")
+        media_info, _ = probe_media("http://cached")
 
-        mock_run.assert_not_called()
+        assert fake_run.calls == []
         assert media_info == cached_info
 
-    def test_probe_extracts_subtitles(self):
+    def test_probe_extracts_subtitles(self, fake_run: FakeRun):
         """Test subtitle stream extraction."""
+        _ffprobe(
+            fake_run,
+            {
+                "streams": [
+                    {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"},
+                    {
+                        "codec_type": "subtitle",
+                        "codec_name": "subrip",
+                        "index": 2,
+                        "tags": {"language": "eng", "title": "English"},
+                    },
+                    {
+                        "codec_type": "subtitle",
+                        "codec_name": "ass",
+                        "index": 3,
+                        "tags": {"language": "jpn"},
+                    },
+                ],
+                "format": {},
+            },
+        )
 
-        ffmpeg_command._probe_cache.clear()
+        _, subs = probe_media("http://test/subs.mkv")
 
-        probe_output: dict[str, object] = {
-            "streams": [
-                {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"},
-                {
-                    "codec_type": "subtitle",
-                    "codec_name": "subrip",
-                    "index": 2,
-                    "tags": {"language": "eng", "title": "English"},
-                },
-                {
-                    "codec_type": "subtitle",
-                    "codec_name": "ass",
-                    "index": 3,
-                    "tags": {"language": "jpn"},
-                },
-            ],
-            "format": {},
-        }
-
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = json.dumps(probe_output)
-
-        with (
-            patch("subprocess.run", return_value=mock_result),
-            patch("netv.ffmpeg_command._load_settings", return_value={}),
-        ):
-            _, subs = probe_media("http://test/subs.mkv")
-
-        assert len(subs) == 2
-        assert subs[0].index == 2
-        assert subs[0].lang == "eng"
-        assert subs[0].name == "English"
-        assert subs[1].index == 3
-        assert subs[1].lang == "jpn"
+        assert subs == [
+            SubtitleStream(index=2, lang="eng", name="English"),
+            SubtitleStream(index=3, lang="jpn", name="Japanese"),
+        ]
 
 
 # =============================================================================
@@ -1463,32 +1491,30 @@ class TestProbeMedia:
 # =============================================================================
 
 
+def _series_cache_text() -> str:
+    return (cache.CACHE_DIR / "series_probe_cache.json").read_text()
+
+
 class TestProbeCacheManagement:
     """Tests for probe cache management functions."""
 
     def test_clear_all_probe_cache(self):
         """Test clearing all probe caches."""
-
-        # Clear first to ensure known state.
-        ffmpeg_command._probe_cache.clear()
-        ffmpeg_command._series_probe_cache.clear()
-
         ffmpeg_command._probe_cache["url1"] = (time.time(), None, list[SubtitleStream]())
         ffmpeg_command._probe_cache["url2"] = (time.time(), None, list[SubtitleStream]())
         ffmpeg_command._series_probe_cache[123] = {
             "episodes": {1: (time.time(), None, list[SubtitleStream]())},
         }
 
-        with patch("netv.ffmpeg_command._save_series_probe_cache"):
-            count = clear_all_probe_cache()
+        count = clear_all_probe_cache()
 
         assert count == 3
         assert len(ffmpeg_command._probe_cache) == 0
         assert len(ffmpeg_command._series_probe_cache) == 0
+        assert json.loads(_series_cache_text()) == {}
 
     def test_invalidate_series_probe_cache_entire_series(self):
         """Test invalidating entire series cache."""
-
         ffmpeg_command._series_probe_cache[123] = {
             "name": "Test",
             "episodes": {
@@ -1497,50 +1523,68 @@ class TestProbeCacheManagement:
             },
         }
 
-        with patch("netv.ffmpeg_command._save_series_probe_cache"):
-            invalidate_series_probe_cache(123)
+        invalidate_series_probe_cache(123)
 
         assert 123 not in ffmpeg_command._series_probe_cache
+        assert json.loads(_series_cache_text()) == {}
 
     def test_invalidate_series_probe_cache_single_episode(self):
         """Test invalidating single episode cache."""
-
         ffmpeg_command._series_probe_cache[123] = {
             "name": "Test",
             "episodes": {
-                1: (0, None, list[SubtitleStream]()),
-                2: (0, None, list[SubtitleStream]()),
+                1: (0, _media_info(), list[SubtitleStream]()),
+                2: (0, _media_info(), list[SubtitleStream]()),
             },
         }
 
-        with patch("netv.ffmpeg_command._save_series_probe_cache"):
-            invalidate_series_probe_cache(123, episode_id=1)
+        invalidate_series_probe_cache(123, episode_id=1)
 
         assert 123 in ffmpeg_command._series_probe_cache
         assert 1 not in ffmpeg_command._series_probe_cache[123]["episodes"]
         assert 2 in ffmpeg_command._series_probe_cache[123]["episodes"]
+        assert list(json.loads(_series_cache_text())["123"]["episodes"]) == ["2"]
+
+    def test_invalidate_unknown_episode_keeps_series(self):
+        ffmpeg_command._series_probe_cache[123] = {
+            "name": "Test",
+            "episodes": {2: (0, _media_info(), list[SubtitleStream]())},
+        }
+
+        invalidate_series_probe_cache(123, episode_id=1)
+
+        assert list(ffmpeg_command._series_probe_cache[123]["episodes"]) == [2]
 
     def test_clear_series_mru(self):
         """Test clearing series MRU."""
-
         ffmpeg_command._series_probe_cache[123] = {
             "name": "Test",
             "mru": 5,
             "episodes": {1: (0, None, list[SubtitleStream]())},
         }
 
-        with patch("netv.ffmpeg_command._save_series_probe_cache"):
-            clear_series_mru(123)
+        clear_series_mru(123)
 
         assert "mru" not in ffmpeg_command._series_probe_cache[123]
         assert "episodes" in ffmpeg_command._series_probe_cache[123]
+        assert json.loads(_series_cache_text()) == {
+            "123": {"name": "Test", "mru": None, "episodes": {}},
+        }
+
+    def test_clear_series_mru_without_mru_still_saves(self):
+        ffmpeg_command._series_probe_cache[123] = {
+            "name": "Test",
+            "episodes": dict[int, ffmpeg_command._ProbeEntry](),
+        }
+
+        clear_series_mru(123)
+
+        assert json.loads(_series_cache_text()) == {
+            "123": {"name": "Test", "mru": None, "episodes": {}},
+        }
 
     def test_restore_probe_cache_entry(self):
         """Test restoring probe cache entry."""
-
-        ffmpeg_command._probe_cache.clear()
-        ffmpeg_command._series_probe_cache.clear()
-
         media_info = MediaInfo(video_codec="h264", audio_codec="aac", pix_fmt="yuv420p")
         subs = [SubtitleStream(index=2, lang="eng", name="English")]
 
@@ -1552,8 +1596,6 @@ class TestProbeCacheManagement:
 
     def test_get_series_probe_cache_stats(self):
         """Test getting cache stats for UI."""
-
-        ffmpeg_command._series_probe_cache.clear()
         ffmpeg_command._series_probe_cache[123] = {
             "name": "Test Series",
             "mru": 2,
@@ -1574,37 +1616,36 @@ class TestProbeCacheManagement:
 class TestResolveHlsMasterPlaylist:
     """Tests for resolve_hls_master_playlist function."""
 
-    def test_non_m3u8_url_returns_unchanged(self):
+    def test_non_m3u8_url_returns_unchanged(self, monkeypatch: pytest.MonkeyPatch):
         """Non-m3u8 URLs should be returned unchanged."""
-
+        web = FakeWeb()
+        install_web(monkeypatch, web, ffmpeg_command)
         url = "http://example.com/video.mp4"
         assert resolve_hls_master_playlist(url) == url
+        assert web.fetches == []
 
-    def test_master_playlist_selects_highest_bandwidth(self):
+    def test_master_playlist_selects_highest_bandwidth(self, monkeypatch: pytest.MonkeyPatch):
         """Master playlist should resolve to highest bandwidth variant."""
-
-        master_playlist = """#EXTM3U
+        master_playlist = b"""#EXTM3U
 #EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=640x360
 low.m3u8
-#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=1280x720
-mid.m3u8
 #EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080
 high.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=1280x720
+mid.m3u8
 """
-        mock_response = MagicMock()
-        mock_response.read.return_value = master_playlist.encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
+        url = "http://example.com/master.m3u8"
+        web = FakeWeb({url: FakeResponse(master_playlist)})
+        install_web(monkeypatch, web, ffmpeg_command)
 
-        with patch("urllib.request.urlopen", return_value=mock_response):
-            result = resolve_hls_master_playlist("http://example.com/master.m3u8")
+        assert resolve_hls_master_playlist(url) == "http://example.com/high.m3u8"
+        assert [(f.url, f.timeout, f.headers) for f in web.fetches] == [
+            (url, 10, {"User-agent": "TiviMate/4.7.0"}),
+        ]
 
-        assert result == "http://example.com/high.m3u8"
-
-    def test_media_playlist_returns_unchanged(self):
+    def test_media_playlist_returns_unchanged(self, monkeypatch: pytest.MonkeyPatch):
         """Media playlist (not master) should return original URL."""
-
-        media_playlist = """#EXTM3U
+        media_playlist = b"""#EXTM3U
 #EXT-X-VERSION:3
 #EXT-X-TARGETDURATION:10
 #EXTINF:10.0,
@@ -1612,44 +1653,48 @@ segment0.ts
 #EXTINF:10.0,
 segment1.ts
 """
-        mock_response = MagicMock()
-        mock_response.read.return_value = media_playlist.encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
+        url = "http://example.com/stream.m3u8"
+        install_web(monkeypatch, FakeWeb({url: FakeResponse(media_playlist)}), ffmpeg_command)
 
-        with patch("urllib.request.urlopen", return_value=mock_response):
-            result = resolve_hls_master_playlist("http://example.com/stream.m3u8")
+        assert resolve_hls_master_playlist(url) == url
 
-        assert result == "http://example.com/stream.m3u8"
-
-    def test_fetch_error_returns_original_url(self):
+    def test_fetch_error_returns_original_url(self, monkeypatch: pytest.MonkeyPatch):
         """On fetch error, should return original URL."""
+        url = "http://example.com/master.m3u8?token=1"
+        web = FakeWeb({url: Exception("Network error")})
+        install_web(monkeypatch, web, ffmpeg_command)
 
-        with patch("urllib.request.urlopen", side_effect=Exception("Network error")):
-            result = resolve_hls_master_playlist("http://example.com/master.m3u8")
+        assert resolve_hls_master_playlist(url) == url
+        assert web.urls == [url]
 
-        assert result == "http://example.com/master.m3u8"
-
-    def test_relative_url_resolved_correctly(self):
+    def test_relative_url_resolved_correctly(self, monkeypatch: pytest.MonkeyPatch):
         """Relative variant URLs should be resolved against base URL."""
-
-        master_playlist = """#EXTM3U
+        master_playlist = b"""#EXTM3U
 #EXT-X-STREAM-INF:BANDWIDTH=3000000
 ../streams/1080p/index.m3u8
 """
-        mock_response = MagicMock()
-        mock_response.read.return_value = master_playlist.encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
+        url = "http://example.com/hls/master.m3u8"
+        install_web(monkeypatch, FakeWeb({url: FakeResponse(master_playlist)}), ffmpeg_command)
 
-        with patch("urllib.request.urlopen", return_value=mock_response):
-            result = resolve_hls_master_playlist("http://example.com/hls/master.m3u8")
+        assert resolve_hls_master_playlist(url) == "http://example.com/streams/1080p/index.m3u8"
 
-        assert result == "http://example.com/streams/1080p/index.m3u8"
+    def test_default_user_agent_sends_no_header(self, monkeypatch: pytest.MonkeyPatch):
+        _save_user_agent("default")
+        url = "http://example.com/stream.m3u8"
+        web = FakeWeb({url: FakeResponse(b"#EXTM3U\n")})
+        install_web(monkeypatch, web, ffmpeg_command)
+
+        assert resolve_hls_master_playlist(url) == url
+        assert web.fetches[0].headers == {}
 
 
 @pytest.mark.parametrize("hw", ["software", "nvenc+software", "amf+software", "qsv", "vaapi"])
-def test_bandwidth_saver_bypasses_ai_and_scales_down(hw: HwAccel):
+def test_bandwidth_saver_bypasses_ai_and_scales_down(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    hw: HwAccel,
+):
+    _enable_sr(monkeypatch, tmp_path, model="nomos")
     media_info = MediaInfo(
         video_codec="h264",
         audio_codec="aac",
@@ -1659,28 +1704,67 @@ def test_bandwidth_saver_bypasses_ai_and_scales_down(hw: HwAccel):
         audio_profile="LC",
         height=2160,
     )
-    with (
-        patch("netv.ffmpeg_command._load_settings", return_value={"sr_model": "nomos"}),
-        patch("netv.ffmpeg_command._sr_engine_dir", "/models"),
-        patch("netv.ffmpeg_command._build_sr_filter") as sr_filter,
-    ):
-        cmd = build_hls_ffmpeg_cmd(
-            "http://example.com/live.ts",
-            hw,
-            "/tmp/hls",
-            media_info=media_info,
-            max_resolution="720p",
-            quality="low",
-            allow_upscale=False,
-        )
-    sr_filter.assert_not_called()
+    cmd = build_hls_ffmpeg_cmd(
+        "http://example.com/live.ts",
+        hw,
+        "/tmp/hls",
+        media_info=media_info,
+        max_resolution="720p",
+        quality="low",
+        allow_upscale=False,
+    )
     assert "720" in " ".join(cmd)
     assert "dnn_processing" not in " ".join(cmd)
     assert cmd[cmd.index("-c:v") + 1] != "copy"
 
 
+@pytest.mark.parametrize("allow_upscale", [False, True])
+def test_allow_upscale_gates_ai_for_low_resolution_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    allow_upscale: bool,
+):
+    _enable_sr(monkeypatch, tmp_path)
+    cmd = build_hls_ffmpeg_cmd(
+        "http://example.com/live.ts",
+        "nvenc+software",
+        "/tmp/hls",
+        media_info=_media_info(height=480, pix_fmt="yuv420p10le"),
+        max_resolution="720p",
+        allow_upscale=allow_upscale,
+    )
+    assert ("dnn_processing" in " ".join(cmd)) is allow_upscale
+
+
+@pytest.mark.parametrize(("height", "engine_height"), [(None, 1080), (480, 480)])
+def test_ai_upscale_engine_follows_source_height(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    height: int | None,
+    engine_height: int,
+):
+    """Probed height picks the nearest engine; an unprobed source gets the largest."""
+    _enable_sr(monkeypatch, tmp_path).unlink()
+    for h in (480, 1080):
+        (tmp_path / f"2x-nomosuni-compact_{h}p_fp16.engine").write_bytes(b"engine")
+    cmd = build_hls_ffmpeg_cmd(
+        "http://example.com/live.ts",
+        "nvenc+software",
+        "/tmp/hls",
+        media_info=None if height is None else _media_info(height=height),
+        max_resolution="4k",
+    )
+    engine = tmp_path / f"2x-nomosuni-compact_{engine_height}p_fp16.engine"
+    assert f"model={engine}," in cmd[cmd.index("-vf") + 1]
+
+
 @pytest.mark.parametrize("height", [720, 1080, 2160])
-def test_archive_policy_copies_compatible_source_without_ai_upscaling(height: int):
+def test_archive_policy_copies_compatible_source_without_ai_upscaling(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    height: int,
+):
+    _enable_sr(monkeypatch, tmp_path, model="upscale-model")
     media_info = MediaInfo(
         video_codec="h264",
         audio_codec="aac",
@@ -1690,21 +1774,15 @@ def test_archive_policy_copies_compatible_source_without_ai_upscaling(height: in
         audio_profile="LC",
         height=height,
     )
-    with (
-        patch("netv.ffmpeg_command._load_settings", return_value={"sr_model": "upscale-model"}),
-        patch("netv.ffmpeg_command._sr_engine_dir", "/models"),
-        patch("netv.ffmpeg_command._build_sr_filter") as sr_filter,
-    ):
-        cmd = build_hls_ffmpeg_cmd(
-            "https://upstream.test/timeshift/user/pass/60/2026-09-28:10-00/1.ts",
-            "nvenc+software",
-            "/tmp/hls",
-            is_vod=True,
-            media_info=media_info,
-            max_resolution="4k",
-            allow_upscale=False,
-        )
-    sr_filter.assert_not_called()
+    cmd = build_hls_ffmpeg_cmd(
+        "https://upstream.test/timeshift/user/pass/60/2026-09-28:10-00/1.ts",
+        "nvenc+software",
+        "/tmp/hls",
+        is_vod=True,
+        media_info=media_info,
+        max_resolution="4k",
+        allow_upscale=False,
+    )
     assert cmd[cmd.index("-c:v") + 1] == "copy"
     assert cmd[cmd.index("-c:a") + 1] == "copy"
     assert "-vf" not in cmd
@@ -1750,11 +1828,14 @@ def test_probe_audio_reads_local_surround_segment(tmp_path: Path):
         ({}, ""),
     ],
 )
-def test_probe_video_codec_parses_streams(payload: dict[str, object], expected: str):
-    result = subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(payload))
-    with patch("netv.ffmpeg_command.subprocess.run", return_value=result) as run:
-        assert probe_video_codec("input.ts") == expected
-    run.assert_called_once_with(
+def test_probe_video_codec_parses_streams(
+    fake_run: FakeRun,
+    payload: dict[str, object],
+    expected: str,
+):
+    _ffprobe(fake_run, payload)
+    assert probe_video_codec("input.ts") == expected
+    assert fake_run.calls == [
         [
             "ffprobe",
             "-v",
@@ -1767,26 +1848,69 @@ def test_probe_video_codec_parses_streams(payload: dict[str, object], expected: 
             "json",
             "input.ts",
         ],
-        capture_output=True,
-        text=True,
-        timeout=5,
-        check=False,
-    )
+    ]
+    assert fake_run.options == [
+        {"capture_output": True, "text": True, "timeout": 5, "check": False},
+    ]
 
 
 @pytest.mark.parametrize(
     "failure",
     [OSError("unavailable"), subprocess.TimeoutExpired("ffprobe", 5)],
 )
-def test_probe_video_codec_handles_process_errors(failure: Exception):
-    with patch("netv.ffmpeg_command.subprocess.run", side_effect=failure):
-        assert probe_video_codec("input.ts") == ""
+def test_probe_video_codec_handles_process_errors(fake_run: FakeRun, failure: Exception):
+    fake_run.program("ffprobe", Program(error=failure))
+    assert probe_video_codec("input.ts") == ""
 
 
-def test_probe_video_codec_handles_invalid_json():
-    result = subprocess.CompletedProcess(args=[], returncode=0, stdout="not json")
-    with patch("netv.ffmpeg_command.subprocess.run", return_value=result):
-        assert probe_video_codec("input.ts") == ""
+def test_probe_video_codec_handles_invalid_json(fake_run: FakeRun):
+    fake_run.program("ffprobe", Program(stdout="not json"))
+    assert probe_video_codec("input.ts") == ""
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {
+                "streams": [
+                    {"codec_name": "AAC", "channels": 6, "sample_rate": "48000", "profile": "LC"},
+                ],
+            },
+            ("aac", 6, 48_000, "LC"),
+        ),
+        ({"streams": [{}]}, ("", 0, 0, "")),
+    ],
+)
+def test_probe_audio_parses_first_stream(
+    fake_run: FakeRun,
+    payload: dict[str, object],
+    expected: tuple[str, int, int, str],
+):
+    _ffprobe(fake_run, payload)
+    info = probe_audio("input.ts")
+    assert info is not None
+    assert (info.audio_codec, info.audio_channels, info.audio_sample_rate, info.audio_profile) == (
+        expected
+    )
+    assert info.video_codec == ""
+    assert fake_run.calls[0][fake_run.calls[0].index("-select_streams") + 1] == "a:0"
+    assert fake_run.options == [
+        {"capture_output": True, "text": True, "timeout": 5, "check": False},
+    ]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        Program(error=OSError("unavailable")),
+        Program(stdout="not json"),
+        Program(stdout='{"streams": []}'),
+    ],
+)
+def test_probe_audio_unreadable_returns_none(fake_run: FakeRun, outcome: Program):
+    fake_run.program("ffprobe", outcome)
+    assert probe_audio("input.ts") is None
 
 
 @pytest.mark.cli_ffmpeg
@@ -1822,21 +1946,22 @@ def test_probe_video_codec_reads_local_segment(tmp_path: Path):
         ("H.264 User Data Unregistered SEI message", False),
     ],
 )
-def test_probe_closed_captions_reads_video_side_data(side_data_type: str, expected: bool):
-    result = MagicMock(
-        returncode=0,
-        stdout=json.dumps(
-            {
-                "frames": [{"side_data_list": [{"side_data_type": side_data_type}]}],
-            },
-        ),
-    )
-    with patch("netv.ffmpeg_command.subprocess.run", return_value=result) as run:
-        assert probe_closed_captions("/tmp/input.ts") is expected
+def test_probe_closed_captions_reads_video_side_data(
+    fake_run: FakeRun,
+    side_data_type: str,
+    expected: bool,
+):
+    _ffprobe(fake_run, {"frames": [{"side_data_list": [{"side_data_type": side_data_type}]}]})
+    assert probe_closed_captions("/tmp/input.ts") is expected
 
-    command = run.call_args.args[0]
+    command = fake_run.calls[0]
+    assert command[0] == "ffprobe"
+    assert command[-1] == "/tmp/input.ts"
     assert command[command.index("-read_intervals") + 1] == "%+2"
     assert command[command.index("-show_entries") + 1] == "frame=side_data_list"
+    assert fake_run.options == [
+        {"capture_output": True, "text": True, "timeout": 5, "check": False},
+    ]
 
 
 # =============================================================================
@@ -1845,14 +1970,10 @@ def test_probe_closed_captions_reads_video_side_data(side_data_type: str, expect
 
 
 @pytest.fixture
-def probe_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """Isolate probe caches, settings, and the on-disk cache directory."""
-    monkeypatch.setattr(ffmpeg_command, "_probe_cache", {})
-    monkeypatch.setattr(ffmpeg_command, "_series_probe_cache", {})
-    monkeypatch.setattr(ffmpeg_command, "_load_settings", dict)
-    monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", None)
-    monkeypatch.setattr(ffmpeg_command, "get_user_agent", lambda: None)
-    monkeypatch.setattr(ffmpeg_command.cache, "CACHE_DIR", tmp_path)
+def probe_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Keep the on-disk probe cache in tmp_path and send no User-Agent."""
+    _save_user_agent("default")
+    monkeypatch.setattr(cache, "CACHE_DIR", tmp_path)
     return tmp_path
 
 
@@ -1877,22 +1998,25 @@ def _server_settings() -> ServerSettings:
 
 
 def test_init_sets_settings_and_engine_dir(monkeypatch: pytest.MonkeyPatch, probe_state: Path):
-    initialized: list[int] = []
-    monkeypatch.setattr(ffmpeg_command.cache, "initialize", lambda: initialized.append(1))
+    # cache.initialize resolves a path still at its legacy default, so this proves it ran.
+    monkeypatch.setattr(cache, "LOGOS_DIR", cache.APP_DIR / ".cache" / "logos")
+    (probe_state / "series_probe_cache.json").write_text(
+        json.dumps({"4": {"name": "Show", "episodes": {"1": {"video_codec": "h264"}}}}),
+    )
     settings = _server_settings()
     settings["sr_model"] = "x"
 
     ffmpeg_command.init(lambda: settings, sr_engine_dir="/engines")
-    assert initialized == [1]
+    assert probe_state / "logos" == cache.LOGOS_DIR
     assert ffmpeg_command._sr_engine_dir == "/engines"
     assert ffmpeg_command.get_settings() is settings
+    assert list(ffmpeg_command._series_probe_cache[4]["episodes"]) == [1]
 
 
 def test_init_without_engine_dir_disables_upscale(
     monkeypatch: pytest.MonkeyPatch,
     probe_state: Path,
 ):
-    monkeypatch.setattr(ffmpeg_command.cache, "initialize", lambda: None)
     monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", "/stale")
     ffmpeg_command.init(_server_settings)
     assert ffmpeg_command._sr_engine_dir is None
@@ -1902,11 +2026,8 @@ def test_init_without_engine_dir_disables_upscale(
 def test_transcode_dir_falls_back_when_inaccessible(probe_state: Path):
     blocker = probe_state / "file"
     blocker.write_text("")
-    with patch(
-        "netv.ffmpeg_command._load_settings",
-        return_value={"transcode_dir": str(blocker / "x")},
-    ):
-        assert get_transcode_dir() == Path(tempfile.gettempdir())
+    _save_transcode_dir(str(blocker / "x"))
+    assert get_transcode_dir() == Path(tempfile.gettempdir())
 
 
 def test_series_stats_skip_empty_and_unprobed_series(probe_state: Path):
@@ -1930,69 +2051,67 @@ def test_series_stats_skip_empty_and_unprobed_series(probe_state: Path):
 
 
 def test_cache_mutators_ignore_unknown_series(probe_state: Path):
-    with patch("netv.ffmpeg_command._save_series_probe_cache") as save:
-        invalidate_series_probe_cache(999)
-        invalidate_series_probe_cache(999, episode_id=1)
-        clear_series_mru(999)
-    save.assert_not_called()
+    invalidate_series_probe_cache(999)
+    invalidate_series_probe_cache(999, episode_id=1)
+    clear_series_mru(999)
+    assert not (probe_state / "series_probe_cache.json").exists()
     assert ffmpeg_command._series_probe_cache == {}
 
 
-def test_master_playlist_without_variant_urls_returns_original(probe_state: Path):
-    response = MagicMock()
-    response.read.return_value = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=abc\n#comment\n"
-    response.__enter__.return_value = response
+def test_master_playlist_without_variant_urls_returns_original(
+    monkeypatch: pytest.MonkeyPatch,
+    probe_state: Path,
+):
+    _save_user_agent("custom", "UA/1")
     url = "http://example.com/master.m3u8"
-    with (
-        patch("netv.ffmpeg_command.get_user_agent", return_value="UA/1"),
-        patch("netv.ffmpeg_command.request.urlopen", return_value=response) as urlopen,
-    ):
-        assert resolve_hls_master_playlist(url) == url
-    assert urlopen.call_args.args[0].get_header("User-agent") == "UA/1"
+    body = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=abc\n#comment\n"
+    web = FakeWeb({url: FakeResponse(body)})
+    install_web(monkeypatch, web, ffmpeg_command)
+    assert resolve_hls_master_playlist(url) == url
+    assert web.fetches[0].headers == {"User-agent": "UA/1"}
 
 
 class TestProbeMediaSeriesCache:
     """Series/episode cache paths in probe_media."""
 
-    def test_exact_episode_hit_updates_mru_and_saves(self, probe_state: Path):
+    def test_exact_episode_hit_updates_mru_and_saves(self, fake_run: FakeRun, probe_state: Path):
         info = _media_info()
         ffmpeg_command._series_probe_cache[7] = {
             "name": "S",
             "mru": 1,
             "episodes": {2: (time.time(), info, list[SubtitleStream]())},
         }
-        with patch("subprocess.run") as run:
-            assert probe_media("http://x", series_id=7, episode_id=2) == (info, [])
-            # Same MRU now: hit without another save.
-            assert probe_media("http://x", series_id=7, episode_id=2) == (info, [])
-        run.assert_not_called()
-        saved = json.loads((probe_state / "series_probe_cache.json").read_text())
-        assert saved["7"]["mru"] == 2
+        assert probe_media("http://x", series_id=7, episode_id=2) == (info, [])
+        saved_file = probe_state / "series_probe_cache.json"
+        assert json.loads(saved_file.read_text())["7"]["mru"] == 2
+        saved_file.unlink()
+        # Same MRU now: hit without another save.
+        assert probe_media("http://x", series_id=7, episode_id=2) == (info, [])
+        assert not saved_file.exists()
+        assert fake_run.calls == []
 
-    def test_mru_fallback_hit(self, probe_state: Path):
+    def test_mru_fallback_hit(self, fake_run: FakeRun, probe_state: Path):
         info = _media_info()
         ffmpeg_command._series_probe_cache[7] = {
             "mru": 1,
             "episodes": {1: (time.time(), info, list[SubtitleStream]())},
         }
-        with patch("subprocess.run") as run:
-            assert probe_media("http://x", series_id=7, episode_id=99) == (info, [])
-        run.assert_not_called()
+        assert probe_media("http://x", series_id=7, episode_id=99) == (info, [])
+        assert fake_run.calls == []
 
     @pytest.mark.parametrize("episode_id", [1, 99])
-    def test_expired_series_entries_fall_through_to_probe(self, probe_state: Path, episode_id: int):
+    def test_expired_series_entries_fall_through_to_probe(
+        self,
+        fake_run: FakeRun,
+        probe_state: Path,
+        episode_id: int,
+    ):
         ffmpeg_command._series_probe_cache[7] = {
             "mru": 1,
             "episodes": {1: (0, _media_info(video_codec="old"), list[SubtitleStream]())},
         }
-        with patch(
-            "subprocess.run",
-            return_value=MagicMock(
-                returncode=0,
-                stdout=json.dumps({"streams": [_VIDEO], "format": {}}),
-            ),
-        ):
-            info, _ = probe_media("http://x", series_id=7, episode_id=episode_id, series_name="N")
+        _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}})
+        info, _ = probe_media("http://x", series_id=7, episode_id=episode_id, series_name="N")
         assert info is not None and info.video_codec == "h264"
         series = ffmpeg_command._series_probe_cache[7]
         assert "name" in series
@@ -2000,15 +2119,9 @@ class TestProbeMediaSeriesCache:
         assert series["mru"] == episode_id
         assert series["episodes"][episode_id][1] is info
 
-    def test_new_series_is_cached_and_persisted(self, probe_state: Path):
-        with patch(
-            "subprocess.run",
-            return_value=MagicMock(
-                returncode=0,
-                stdout=json.dumps({"streams": [_VIDEO], "format": {}}),
-            ),
-        ):
-            info, _ = probe_media("http://x", series_id=8, series_name="New")
+    def test_new_series_is_cached_and_persisted(self, fake_run: FakeRun, probe_state: Path):
+        _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}})
+        info, _ = probe_media("http://x", series_id=8, series_name="New")
         series = ffmpeg_command._series_probe_cache[8]
         assert "name" in series
         assert series["name"] == "New"
@@ -2018,80 +2131,51 @@ class TestProbeMediaSeriesCache:
         saved = json.loads((probe_state / "series_probe_cache.json").read_text())
         assert saved["8"]["episodes"]["0"]["video_codec"] == "h264"
 
-    def test_existing_named_series_keeps_name(self, probe_state: Path):
+    def test_existing_named_series_keeps_name(self, fake_run: FakeRun, probe_state: Path):
         ffmpeg_command._series_probe_cache[8] = {
             "name": "Kept",
             "episodes": dict[int, ffmpeg_command._ProbeEntry](),
         }
-        with patch(
-            "subprocess.run",
-            return_value=MagicMock(
-                returncode=0,
-                stdout=json.dumps({"streams": [_VIDEO], "format": {}}),
-            ),
-        ):
-            probe_media("http://x", series_id=8, episode_id=3, series_name="Other")
+        _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}})
+        probe_media("http://x", series_id=8, episode_id=3, series_name="Other")
         assert ffmpeg_command._series_probe_cache[8]["name"] == "Kept"
         assert 3 in ffmpeg_command._series_probe_cache[8]["episodes"]
 
 
 class TestProbeMediaEdgeCases:
-    def test_subprocess_exceptions_yield_none(self, probe_state: Path):
-        with patch("subprocess.run", side_effect=OSError("boom")) as run:
-            assert probe_media("http://x") == (None, [])
-        assert run.call_count == 2
-        assert run.call_args.args[0][-5:] == ["-f", "hls", "-extension_picky", "0", "http://x"]
+    def test_subprocess_exceptions_yield_none(self, fake_run: FakeRun, probe_state: Path):
+        fake_run.program("ffprobe", Program(error=OSError("boom")))
+        assert probe_media("http://x") == (None, [])
+        assert len(fake_run.calls) == 2
+        assert fake_run.calls[0][-1] == "http://x"
+        assert "hls" not in fake_run.calls[0]
+        assert fake_run.calls[1][-5:] == ["-f", "hls", "-extension_picky", "0", "http://x"]
 
-    def test_user_agent_and_format_bitrate_fallback(self, probe_state: Path):
+    def test_user_agent_and_format_bitrate_fallback(self, fake_run: FakeRun, probe_state: Path):
+        _save_user_agent("custom", "UA/1")
         fmt = {"bit_rate": "1234", "format_name": "hls"}
-        with (
-            patch("netv.ffmpeg_command.get_user_agent", return_value="UA/1"),
-            patch(
-                "subprocess.run",
-                return_value=MagicMock(
-                    returncode=0,
-                    stdout=json.dumps({"streams": [_VIDEO], "format": fmt}),
-                ),
-            ) as run,
-        ):
-            info, _ = probe_media("http://x")
+        _ffprobe(fake_run, {"streams": [_VIDEO], "format": fmt})
+        info, _ = probe_media("http://x")
         assert info is not None
         assert info.video_bitrate == 1234
         assert info.is_hls
-        cmd = run.call_args.args[0]
+        cmd = fake_run.calls[0]
         assert cmd[cmd.index("-user_agent") + 1] == "UA/1"
 
-    def test_invalid_format_bitrate_ignored(self, probe_state: Path):
-        with patch(
-            "subprocess.run",
-            return_value=MagicMock(
-                returncode=0,
-                stdout=json.dumps({"streams": [_VIDEO], "format": {"bit_rate": "n/a"}}),
-            ),
-        ):
-            info, _ = probe_media("http://x")
+    def test_invalid_format_bitrate_ignored(self, fake_run: FakeRun, probe_state: Path):
+        _ffprobe(fake_run, {"streams": [_VIDEO], "format": {"bit_rate": "n/a"}})
+        info, _ = probe_media("http://x")
         assert info is not None and info.video_bitrate == 0
+        assert "-user_agent" not in fake_run.calls[0]
 
-    def test_audio_only_returns_none(self, probe_state: Path):
+    def test_audio_only_returns_none(self, fake_run: FakeRun, probe_state: Path):
         audio = {"codec_type": "audio", "codec_name": "aac", "channels": 2}
-        with patch(
-            "subprocess.run",
-            return_value=MagicMock(
-                returncode=0,
-                stdout=json.dumps({"streams": [audio], "format": {}}),
-            ),
-        ):
-            assert probe_media("http://x") == (None, [])
+        _ffprobe(fake_run, {"streams": [audio], "format": {}})
+        assert probe_media("http://x") == (None, [])
 
-    def test_zero_height_not_cached(self, probe_state: Path):
-        with patch(
-            "subprocess.run",
-            return_value=MagicMock(
-                returncode=0,
-                stdout=json.dumps({"streams": [{**_VIDEO, "height": 0}], "format": {}}),
-            ),
-        ):
-            info, _ = probe_media("http://x", series_id=1)
+    def test_zero_height_not_cached(self, fake_run: FakeRun, probe_state: Path):
+        _ffprobe(fake_run, {"streams": [{**_VIDEO, "height": 0}], "format": {}})
+        info, _ = probe_media("http://x", series_id=1)
         assert info is not None and info.height == 0
         assert ffmpeg_command._probe_cache == {}
         assert ffmpeg_command._series_probe_cache == {}
@@ -2104,50 +2188,56 @@ def test_uses_audio_passthrough():
     assert not ffmpeg_command.uses_audio_passthrough(None, True)
 
 
-def test_probe_closed_captions_reports_ffprobe_failure(caplog: pytest.LogCaptureFixture):
-    result = MagicMock(returncode=1, stderr="  bad input \n", stdout="")
-    with patch("netv.ffmpeg_command.subprocess.run", return_value=result):
-        assert probe_closed_captions("/tmp/dir/a.ts") is False
+def test_probe_closed_captions_reports_ffprobe_failure(
+    fake_run: FakeRun,
+    caplog: pytest.LogCaptureFixture,
+):
+    fake_run.program("ffprobe", Program(returncode=1, stderr="  bad input \n"))
+    assert probe_closed_captions("/tmp/dir/a.ts") is False
     assert "a.ts: bad input" in caplog.text
 
-    result = MagicMock(returncode=2, stderr="", stdout="")
-    with patch("netv.ffmpeg_command.subprocess.run", return_value=result):
-        assert probe_closed_captions("/tmp/dir/a.ts") is False
+    fake_run.program("ffprobe", Program(returncode=2))
+    assert probe_closed_captions("/tmp/dir/a.ts") is False
     assert "ffprobe exited 2" in caplog.text
 
 
 @pytest.mark.parametrize(
-    "run",
+    "outcome",
     [
-        MagicMock(side_effect=subprocess.TimeoutExpired("ffprobe", 5)),
-        MagicMock(return_value=MagicMock(returncode=0, stdout="not json")),
+        Program(error=subprocess.TimeoutExpired("ffprobe", 5)),
+        Program(stdout="not json"),
     ],
 )
-def test_probe_closed_captions_handles_errors(run: MagicMock, caplog: pytest.LogCaptureFixture):
-    with patch("netv.ffmpeg_command.subprocess.run", new=run):
-        assert probe_closed_captions("/tmp/a.ts") is False
+def test_probe_closed_captions_handles_errors(
+    fake_run: FakeRun,
+    outcome: Program,
+    caplog: pytest.LogCaptureFixture,
+):
+    fake_run.program("ffprobe", outcome)
+    assert probe_closed_captions("/tmp/a.ts") is False
     assert "Could not inspect embedded captions in a.ts" in caplog.text
 
 
 @pytest.mark.parametrize("stdout", ['["not", "a", "dict"]', '{"frames": "not a list"}'])
-def test_probe_closed_captions_rejects_malformed_shapes(stdout: str):
+def test_probe_closed_captions_rejects_malformed_shapes(fake_run: FakeRun, stdout: str):
     """A probe of the wrong shape means no captions, not a crash."""
-    result = MagicMock(returncode=0, stdout=stdout)
-    with patch("netv.ffmpeg_command.subprocess.run", return_value=result):
-        assert probe_closed_captions("/tmp/a.ts") is False
+    fake_run.program("ffprobe", Program(stdout=stdout))
+    assert probe_closed_captions("/tmp/a.ts") is False
 
 
-def test_probe_media_retries_hls_when_a_field_has_the_wrong_type(probe_state: Path):
+def test_probe_media_retries_hls_when_a_field_has_the_wrong_type(
+    fake_run: FakeRun,
+    probe_state: Path,
+):
     """A mistyped field fails that probe attempt; the HLS retry still succeeds."""
-    bad = json.dumps({"streams": [{**_VIDEO, "codec_name": 7}], "format": {}})
-    good = json.dumps({"streams": [_VIDEO], "format": {}})
-    attempts = [MagicMock(returncode=0, stdout=bad), MagicMock(returncode=0, stdout=good)]
-    with patch("subprocess.run", side_effect=attempts) as run:
-        info, _ = probe_media("http://x/mistyped")
+    _ffprobe(fake_run, {"streams": [{**_VIDEO, "codec_name": 7}], "format": {}})
+    _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}}, when="hls")
+    info, _ = probe_media("http://x/mistyped")
     assert info is not None
     assert info.video_codec == "h264"
-    assert run.call_count == 2
-    assert run.call_args_list[1].args[0][-5:] == [
+    assert info.is_hls
+    assert len(fake_run.calls) == 2
+    assert fake_run.calls[1][-5:] == [
         "-f",
         "hls",
         "-extension_picky",
@@ -2172,83 +2262,87 @@ class TestSrEngineSelection:
         assert _find_sr_engine(720) is None
         assert _build_sr_filter(720, 1080) == ""
 
-    def test_missing_engine_dir(self, probe_state: Path):
-        with patch("netv.ffmpeg_command._sr_engine_dir", str(probe_state / "missing")):
-            assert _find_sr_engine(720) is None
+    def test_missing_engine_dir(self, monkeypatch: pytest.MonkeyPatch, probe_state: Path):
+        monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", str(probe_state / "missing"))
+        assert _find_sr_engine(720) is None
 
-    def test_no_valid_engines(self, probe_state: Path):
-        (probe_state / "2x-nomosuni-compact_bigp_fp16.engine").write_bytes(b"")
-        with (
-            patch("netv.ffmpeg_command._sr_engine_dir", str(probe_state)),
-            patch("netv.ffmpeg_command._load_settings", return_value={"sr_model": "on"}),
-        ):
-            assert _find_sr_engine(720) is None
-            assert _build_sr_filter(720, 1080) == ""
+    def test_no_valid_engines(self, monkeypatch: pytest.MonkeyPatch, probe_state: Path):
+        engine_dir = probe_state / "engines"
+        engine_dir.mkdir()
+        _enable_sr(monkeypatch, engine_dir).unlink()
+        (engine_dir / "2x-nomosuni-compact_bigp_fp16.engine").write_bytes(b"")
+        assert _find_sr_engine(720) is None
+        assert _build_sr_filter(720, 1080) == ""
 
-    def test_failed_probe_uses_largest_engine(self, probe_state: Path):
+    def test_failed_probe_uses_largest_engine(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        probe_state: Path,
+    ):
         for height in (480, 1080):
             (probe_state / f"2x-nomosuni-compact_{height}p_fp16.engine").write_bytes(b"")
-        with patch("netv.ffmpeg_command._sr_engine_dir", str(probe_state)):
-            result = _find_sr_engine(0)
+        monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", str(probe_state))
+        result = _find_sr_engine(0)
         assert result is not None
         assert result[1:] == (1080, 1920, 2)
 
-    def test_source_larger_than_engines_uses_largest(self, probe_state: Path):
+    def test_source_larger_than_engines_uses_largest(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        probe_state: Path,
+    ):
         (probe_state / "2x-nomosuni-compact_480p_fp16.engine").write_bytes(b"")
-        with patch("netv.ffmpeg_command._sr_engine_dir", str(probe_state)):
-            result = _find_sr_engine(1080)
+        monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", str(probe_state))
+        result = _find_sr_engine(1080)
         assert result is not None and result[1] == 480
 
-    def test_filter_disabled_without_model(self, probe_state: Path):
+    def test_filter_disabled_without_model(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        probe_state: Path,
+    ):
         (probe_state / "2x-nomosuni-compact_720p_fp16.engine").write_bytes(b"")
-        with patch("netv.ffmpeg_command._sr_engine_dir", str(probe_state)):
-            assert _build_sr_filter(480, 1080) == ""
+        monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", str(probe_state))
+        assert _build_sr_filter(480, 1080) == ""
 
-    def test_filter_skipped_when_source_meets_target(self, probe_state: Path):
-        (probe_state / "2x-nomosuni-compact_1080p_fp16.engine").write_bytes(b"")
-        with (
-            patch("netv.ffmpeg_command._sr_engine_dir", str(probe_state)),
-            patch("netv.ffmpeg_command._load_settings", return_value={"sr_model": "on"}),
-        ):
-            assert _build_sr_filter(1080, 1080) == ""
-            no_target = _build_sr_filter(720, 0)
-        assert no_target.endswith(
-            "dnn_processing=dnn_backend=tensorrt:model="
-            + str(
-                probe_state / "2x-nomosuni-compact_1080p_fp16.engine",
-            ),
-        )
+    def test_filter_skipped_when_source_meets_target(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        probe_state: Path,
+    ):
+        engine_dir = probe_state / "engines"
+        engine_dir.mkdir()
+        _enable_sr(monkeypatch, engine_dir).unlink()
+        engine = engine_dir / "2x-nomosuni-compact_1080p_fp16.engine"
+        engine.write_bytes(b"")
+        assert _build_sr_filter(1080, 1080) == ""
+        no_target = _build_sr_filter(720, 0)
+        assert no_target.endswith(f"dnn_processing=dnn_backend=tensorrt:model={engine}")
         assert "scale_cuda" not in no_target
 
 
 class TestHardwareProbes:
-    def test_nvidia_smi_unparseable_output(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(ffmpeg_command, "_gpu_nvdec_codecs", None)
-        with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="GPU only\n")):
-            assert _get_gpu_nvdec_codecs() == set()
+    def test_nvidia_smi_unparseable_output(self, fake_run: FakeRun):
+        fake_run.program("nvidia-smi", Program(stdout="GPU only\n"))
+        assert _get_gpu_nvdec_codecs() == set()
 
-    def test_nvidia_smi_missing(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(ffmpeg_command, "_gpu_nvdec_codecs", None)
-        with patch("subprocess.run", side_effect=FileNotFoundError("nvidia-smi")):
-            assert _get_gpu_nvdec_codecs() == set()
+    def test_nvidia_smi_missing(self, fake_run: FakeRun):
+        assert _get_gpu_nvdec_codecs() == set()
         # Cached: no second probe.
-        with patch("subprocess.run") as run:
-            assert _get_gpu_nvdec_codecs() == set()
-        run.assert_not_called()
+        fake_run.program("nvidia-smi", Program(stdout="NVIDIA GeForce RTX 3080, 8.6\n"))
+        assert _get_gpu_nvdec_codecs() == set()
+        assert len(fake_run.calls) == 1
 
-    @pytest.mark.parametrize(("stdout", "expected"), [("... libplacebo ...", True), ("", False)])
-    def test_libplacebo_probe(self, monkeypatch: pytest.MonkeyPatch, stdout: str, expected: bool):
-        monkeypatch.setattr(ffmpeg_command, "_has_libplacebo", None)
-        with patch("subprocess.run", return_value=MagicMock(stdout=stdout)) as run:
-            assert ffmpeg_command._has_libplacebo_filter() is expected
-            assert ffmpeg_command._has_libplacebo_filter() is expected
-        assert run.call_count == 1
-        assert run.call_args.args[0] == ["ffmpeg", "-filters"]
+    @pytest.mark.parametrize("available", [True, False])
+    def test_libplacebo_probe(self, fake_run: FakeRun, available: bool):
+        _script_libplacebo(fake_run, available=available)
+        assert ffmpeg_command._has_libplacebo_filter() is available
+        assert ffmpeg_command._has_libplacebo_filter() is available
+        assert fake_run.calls == [["ffmpeg", "-filters"]]
 
-    def test_libplacebo_probe_failure(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(ffmpeg_command, "_has_libplacebo", None)
-        with patch("subprocess.run", side_effect=OSError("no ffmpeg")):
-            assert ffmpeg_command._has_libplacebo_filter() is False
+    def test_libplacebo_probe_failure(self, fake_run: FakeRun):
+        fake_run.program("ffmpeg", Program(error=OSError("no ffmpeg")))
+        assert ffmpeg_command._has_libplacebo_filter() is False
 
 
 class TestSeriesProbeCachePersistence:
@@ -2359,22 +2453,21 @@ class TestVideoArgsRemainingBranches:
     def _vf(cls, post: list[str]) -> str:
         return post[post.index("-vf") + 1]
 
-    def test_missing_vaapi_device_falls_back_to_software(self):
-        with patch("netv.cache.VAAPI_DEVICE", None):
-            pre, post = self._args("vaapi", hw_pipeline=True)
-            assert pre == []
-            assert post[post.index("-c:v") + 1] == "libx264"
+    def test_missing_vaapi_device_falls_back_to_software(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(cache, "VAAPI_DEVICE", None)
+        pre, post = self._args("vaapi", hw_pipeline=True)
+        assert pre == []
+        assert post[post.index("-c:v") + 1] == "libx264"
 
-            pre, post = self._args("nvenc+vaapi")
-            assert pre == []
-            assert (
-                self._vf(post)
-                == "format=nv12,hwupload_cuda,scale_cuda=-2:min(ih\\,1080):format=nv12"
-            )
+        pre, post = self._args("nvenc+vaapi")
+        assert pre == []
+        assert (
+            self._vf(post) == "format=nv12,hwupload_cuda,scale_cuda=-2:min(ih\\,1080):format=nv12"
+        )
 
-    def test_nvenc_software_hdr_zscale_without_libplacebo(self):
-        with patch("netv.ffmpeg_command._has_libplacebo_filter", return_value=False):
-            _, post = self._args("nvenc+software", hdr=True)
+    def test_nvenc_software_hdr_zscale_without_libplacebo(self, fake_run: FakeRun):
+        _script_libplacebo(fake_run, available=False)
+        _, post = self._args("nvenc+software", hdr=True)
         assert self._vf(post).startswith("zscale=t=linear")
         assert self._vf(post).endswith("hwupload_cuda,scale_cuda=-2:min(ih\\,1080):format=nv12")
 
@@ -2384,9 +2477,9 @@ class TestVideoArgsRemainingBranches:
         assert vf.startswith("yadif=0,zscale=t=linear")
         assert vf.endswith("format=nv12,scale=-2:min(ih\\,1080),format=nv12")
 
-    def test_vaapi_baseline_only(self):
-        with patch.dict("netv.cache.AVAILABLE_ENCODERS", {"vaapi_baseline_only": True}):
-            _, post = self._args("vaapi", hw_pipeline=True)
+    def test_vaapi_baseline_only(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setitem(cache.AVAILABLE_ENCODERS, "vaapi_baseline_only", True)
+        _, post = self._args("vaapi", hw_pipeline=True)
         assert post[post.index("-profile:v") + 1] == "constrained_baseline"
         assert "-bf" not in post
 
