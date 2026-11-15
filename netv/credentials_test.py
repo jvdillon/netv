@@ -134,23 +134,23 @@ class TestSettingsFile:
     ):
         settings_file.write_text(json.dumps({"sources": [SOURCE], "secret_key": "s"}))
         settings = cache.load_server_settings()
-        assert settings["sources"][0]["password"] == "hunter2"
+        assert settings["sources"][0].get("password") == "hunter2"
         cache.save_server_settings(settings)
         stored = json.loads(settings_file.read_text())
         assert stored["secret_key"] == "s"
         assert credentials.is_encrypted(stored["sources"][0]["password"])
-        assert cache.load_server_settings()["sources"][0]["password"] == "hunter2"
+        assert cache.load_server_settings()["sources"][0].get("password") == "hunter2"
 
     def test_saving_twice_keeps_the_values(self, settings_file: Path):
         _save(dict(SOURCE))
         cache.save_server_settings(cache.load_server_settings())
         loaded = cache.load_server_settings()["sources"][0]
-        assert loaded["password"] == "hunter2"
-        assert loaded["epg_url"] == SOURCE["epg_url"]
+        assert loaded.get("password") == "hunter2"
+        assert loaded.get("epg_url") == SOURCE["epg_url"]
 
     def test_a_password_that_looks_encrypted_survives_save_and_load(self, settings_file: Path):
         _save({**SOURCE, "password": "enc:v1:not-a-token"})
-        assert cache.load_server_settings()["sources"][0]["password"] == "enc:v1:not-a-token"
+        assert cache.load_server_settings()["sources"][0].get("password") == "enc:v1:not-a-token"
 
     def test_lost_key_stops_loading_instead_of_blanking_credentials(self, settings_file: Path):
         _save(dict(SOURCE))

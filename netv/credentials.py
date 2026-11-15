@@ -25,6 +25,7 @@ import tempfile
 import threading
 
 from cryptography.fernet import Fernet, InvalidToken
+from treekle import MutablePlainTree
 
 
 log = logging.getLogger(__name__)
@@ -154,7 +155,9 @@ def encrypt_source(source: dict[str, object], settings_dir: pathlib.Path) -> dic
     return out
 
 
-def decrypt_source(source: dict[str, object], settings_dir: pathlib.Path) -> dict[str, object]:
+def decrypt_source(
+    source: dict[str, MutablePlainTree], settings_dir: pathlib.Path
+) -> dict[str, MutablePlainTree]:
     """A copy of a stored source with its secret fields decrypted."""
     out = dict(source)
     for field in SECRET_FIELDS:

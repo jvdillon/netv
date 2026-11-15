@@ -590,10 +590,11 @@ def load_server_settings() -> ServerSettings:
     sources = raw.get("sources")
     if isinstance(sources, list):
         settings_dir = SERVER_SETTINGS_FILE.parent
-        raw["sources"] = [
+        decrypted: list[MutablePlainTree] = [
             credentials.decrypt_source(s, settings_dir) if isinstance(s, dict) else s
             for s in sources
         ]
+        raw["sources"] = decrypted
     live_dvr_mins = raw.get("live_dvr_mins", 120)
     if not isinstance(live_dvr_mins, int):
         raise TypeError("live_dvr_mins must be an integer")
