@@ -940,6 +940,11 @@ def _limited_source(tmp_path: Path) -> None:
     auth.set_user_limits("testuser", {"s1": 2}, None)
 
 
+def _start(url: str, **params: str) -> dict[str, str]:
+    """Query for /transcode/start with the token a player page gives ``testuser``."""
+    return {"url": url, "url_token": auth.stream_url_token("testuser", url), **params}
+
+
 def test_transcode_start_enforces_source_limit(
     api: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -951,7 +956,7 @@ def test_transcode_start_enforces_source_limit(
         sessions[name] = _session(tmp_path / name, username="other", source_id="s1")
     launcher = testing.ProcessLauncher()
     testing.install_launcher(monkeypatch, launcher, ffmpeg_session)
-    resp = api.get("/transcode/start", params={"url": "http://up/l", "source_id": "s1"})
+    resp = api.get("/transcode/start", params=_start("http://up/l", source_id="s1"))
     assert resp.status_code == 429
     assert resp.json() == {"detail": "Source at capacity (3 streams)"}
     assert set(sessions) == {"a", "b", "c"}
@@ -977,7 +982,7 @@ def test_transcode_start_rotates_users_oldest_stream(
     testing.install_clock(monkeypatch, testing.FakeClock(), ffmpeg_session)
     tasks = testing.BackgroundTasks()
     monkeypatch.setattr(ffmpeg_session, "_spawn_background_task", tasks)
-    resp = api.get("/transcode/start", params={"url": "http://up/l", "source_id": "s1"})
+    resp = api.get("/transcode/start", params=_start("http://up/l", source_id="s1"))
     tasks.discard()
     # The user's limit of two stopped their oldest stream before the start, which
     # then failed because the scripted ffmpeg exited at once.

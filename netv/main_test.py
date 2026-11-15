@@ -297,7 +297,10 @@ def test_cast_source_cannot_be_restarted_while_receiver_owns_it(
     session = _add_session("abc", tmp_path, url="http://provider/live")
     _cast_owns(monkeypatch, session_id="abc", url="http://provider/live")
     assert auth_client.delete("/transcode-clear?url=http://provider/live").status_code == 409
-    assert auth_client.get("/transcode/start?url=http://provider/live").status_code == 409
+    assert (
+        auth_client.get("/transcode/start", params=_start("http://provider/live")).status_code
+        == 409
+    )
     assert ffmpeg_session._url_to_session == {"http://provider/live": "abc"}
     assert _signals(session) == []
 
@@ -589,10 +592,78 @@ def test_catchup_api_unknown_stream_is_not_found(auth_client: TestClient):
     assert auth_client.get("/api/live/catchup/missing").status_code == 404
 
 
+def _start(url: str, *, user: str = "testuser", **params: str) -> dict[str, str]:
+    """Query for /transcode/start with the token a player page gives ``user``."""
+    return {"url": url, "url_token": auth.stream_url_token(user, url), **params}
+
+
+class _StartRecorder:
+    """Stands in for ``ffmpeg_session.start_transcode`` and records the URLs it was asked to open."""
+
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    async def __call__(self, url: str, *args: object, **kwargs: object) -> dict[str, str]:
+        del args, kwargs
+        self.urls.append(url)
+        return {"session_id": "s"}
+
+
+@pytest.fixture
+def start_recorder(monkeypatch: pytest.MonkeyPatch) -> _StartRecorder:
+    recorder = _StartRecorder()
+    monkeypatch.setattr(ffmpeg_session, "start_transcode", recorder)
+    return recorder
+
+
+@pytest.mark.parametrize("case", ["missing", "other-user", "other-url", "forged", "not-hex"])
+def test_transcode_start_refuses_urls_the_server_did_not_issue(
+    auth_client: TestClient, start_recorder: _StartRecorder, case: str
+):
+    url = "http://169.254.169.254/x"
+    params = {"url": url}
+    # Tokens are made here, inside the fixture: the secret key lives in its settings.
+    tokens = {
+        "other-user": auth.stream_url_token("other", url),
+        "other-url": auth.stream_url_token("testuser", "http://provider/live"),
+        "forged": "0" * 64,
+        "not-hex": "\u00e9" * 64,
+    }
+    if case in tokens:
+        params["url_token"] = tokens[case]
+    response = auth_client.get("/transcode/start", params=params)
+    assert response.status_code == 403
+    assert start_recorder.urls == []
+
+
+def test_player_page_token_starts_that_stream_for_that_user(
+    auth_client: TestClient, start_recorder: _StartRecorder
+):
+    _set_live(
+        {
+            "stream_id": "test",
+            "name": "Test channel",
+            "direct_url": "https://provider.example/live.m3u8?user=a&pass=b",
+        }
+    )
+    page = auth_client.get("/play/live/test")
+    url_match = re.search(r"rawUrl: (\"[^\"]*\")", page.text)
+    token_match = re.search(r"rawUrlToken: (\"[0-9a-f]+\")", page.text)
+    assert url_match is not None and token_match is not None
+    url, token = json.loads(url_match.group(1)), json.loads(token_match.group(1))
+    assert url == "https://provider.example/live.m3u8?user=a&pass=b"
+    ok = auth_client.get("/transcode/start", params={"url": url, "url_token": token})
+    auth_client.cookies.set("token", auth.create_token({"sub": "other"}))
+    other = auth_client.get("/transcode/start", params={"url": url, "url_token": token})
+    assert ok.status_code == 200
+    assert other.status_code == 403
+    assert start_recorder.urls == [url]
+
+
 @pytest.mark.asyncio
 async def test_adaptive_start_uses_shared_backend(auth_client: TestClient, fast_live: _FastLive):
     session_id = await fast_live.start()
-    response = auth_client.get("/transcode/start", params={"url": PROVIDER})
+    response = auth_client.get("/transcode/start", params=_start(PROVIDER))
     assert response.status_code == 200
     assert response.json() == {
         "session_id": session_id,
@@ -616,7 +687,9 @@ async def test_disconnected_adaptive_start_is_cleaned_up(fast_live: _FastLive, d
     [worker] = fast_live.launcher.processes
     scope: Scope = {"type": "http", "method": "GET", "headers": [], "query_string": b""}
     request = Request(scope, _gone if disconnected else _connected)
-    start = main.transcode_start(request, {"sub": "testuser"}, PROVIDER)
+    start = main.transcode_start(
+        request, {"sub": "testuser"}, PROVIDER, auth.stream_url_token("testuser", PROVIDER)
+    )
     if disconnected:
         with pytest.raises(HTTPException) as excinfo:
             await start
@@ -2391,7 +2464,9 @@ class TestSourceAssignment:
     def test_hidden_source_blocks_transcode(self, auth_client: TestClient):
         self._setup(auth_client, [])
         auth_client.cookies.set("token", auth.create_token({"sub": "kid"}))
-        resp = auth_client.get("/transcode/start?url=http://a/x.ts&source_id=fam")
+        resp = auth_client.get(
+            "/transcode/start", params=_start("http://a/x.ts", user="kid", source_id="fam")
+        )
         assert resp.status_code == 403
 
     def test_edit_source_saves_selected_users(self, auth_client: TestClient):

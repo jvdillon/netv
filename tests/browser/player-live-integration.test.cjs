@@ -134,6 +134,7 @@ async function player({
   const window = Object.assign(element(), {
     PLAYER_CONFIG: {
       rawUrl: 'https://provider.example/live.m3u8',
+      rawUrlToken: 'token-1',
       streamType: isVod ? 'movie' : 'live', isVod,
       transcodeMode: auto ? 'auto' : direct ? 'never' : 'always',
       liveDvrMins: isVod ? 0 : 60,
@@ -269,7 +270,10 @@ async function player({
 test('web live startup and health polls use one shared adaptive session', async () => {
   const p = await player();
   const start = p.calls.find(call => call.url.startsWith('/transcode/start?'));
-  assert.equal(new URL(start.url, 'http://netv.test').searchParams.get('content_type'), 'live');
+  const params = new URL(start.url, 'http://netv.test').searchParams;
+  assert.equal(params.get('content_type'), 'live');
+  assert.equal(params.get('url'), 'https://provider.example/live.m3u8');
+  assert.equal(params.get('url_token'), 'token-1');
   assert.equal(p.engines.length, 1);
   const hls = p.engines[0];
   assert.deepEqual(hls.sources, ['/transcode/session1/master.m3u8']);

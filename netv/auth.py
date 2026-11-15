@@ -322,6 +322,29 @@ def verify_token(token: str) -> TokenClaims | None:
     return payload
 
 
+def stream_url_token(username: str, url: str) -> str:
+    """Token proving the server handed ``url`` to ``username`` on a player page.
+
+    ``/transcode/start`` makes the server open the URL it is given, so it only
+    accepts URLs that come with this token. The data starts with a fixed label,
+    so it can never equal the JSON a session token signs.
+
+    Args:
+        username: Viewer the URL was issued to.
+        url: Upstream media URL as the player page lists it.
+
+    Returns:
+        token: Hex HMAC-SHA256 of the label, user and URL under the secret key.
+    """
+    data = f"stream-url\n{username}\n{url}".encode()
+    return hmac.new(_get_secret_key().encode(), data, hashlib.sha256).hexdigest()
+
+
+def verify_stream_url_token(username: str, url: str, token: str) -> bool:
+    """Whether ``token`` is the stream URL token for this user and URL."""
+    return bool(token) and hmac.compare_digest(token, stream_url_token(username, url))
+
+
 def _get_settings_file() -> pathlib.Path:
     """Resolve legacy storage without replacing caller-supplied paths."""
     global CACHE_DIR, SERVER_SETTINGS_FILE, USERS_DIR
