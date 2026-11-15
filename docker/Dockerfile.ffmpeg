@@ -266,11 +266,13 @@ RUN --mount=type=bind,from=builder,source=/opt/ffmpeg_build/share,target=/tmp/ff
         cp -a /tmp/ffmpeg_share/libvmaf /usr/local/share/; \
     fi
 
-# Copy LibTorch shared libraries if torch enabled (needed for DNN filters)
+# Copy LibTorch shared libraries if torch enabled (needed for DNN filters), with the
+# torch backend plugin ffmpeg dlopens on first use
 RUN --mount=type=bind,from=builder,source=/src,target=/tmp/src \
+    --mount=type=bind,from=builder,source=/opt/lib,target=/tmp/ffmpeg_libs \
     if [ "$ENABLE_LIBTORCH" = "1" ] && [ -d /tmp/src/libtorch/lib ]; then \
         mkdir -p /opt/lib && \
-        cp -a /tmp/src/libtorch/lib/*.so* /opt/lib/ && \
+        cp -a /tmp/src/libtorch/lib/*.so* /tmp/ffmpeg_libs/libffmpeg_dnn_torch.so /opt/lib/ && \
         echo "/opt/lib" > /etc/ld.so.conf.d/libtorch.conf && \
         ldconfig; \
     fi

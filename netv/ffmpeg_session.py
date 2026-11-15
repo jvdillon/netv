@@ -42,6 +42,7 @@ from netv.fast_start import (
     master_playlist,
     playlist_duration,
     ready_bitrate,
+    remux_command,
     segment_pts,
     surround_audio_bitrate,
 )
@@ -56,10 +57,9 @@ from netv.ffmpeg_command import (
     get_transcode_dir,
     invalidate_series_probe_cache,
     live_video_bitrates,
-    probe_audio,
     probe_closed_captions,
     probe_media,
-    probe_video_codec,
+    probe_segment,
     resolve_hls_master_playlist,
     restore_probe_cache_entry,
     uses_audio_passthrough,
@@ -1136,7 +1136,9 @@ async def _start_fast_live(
 
     try:
         user_agent = get_user_agent()
-        ingest = await startup.launch(ingest_command(url, directory, user_agent), "ingest")
+        # Ffmpeg reads the first-listed variant of a master playlist; pick the best one.
+        source_url = await asyncio.to_thread(resolve_hls_master_playlist, url)
+        ingest = await startup.launch(ingest_command(source_url, directory, user_agent), "ingest")
         session: FastLiveSession = {
             "dir": directory,
             "process": ingest,
@@ -1159,7 +1161,7 @@ async def _start_fast_live(
             "playback_buffer_seconds": 12.0,
             "closed_captions": False,
             "ingest_restart_command": ingest_command(
-                url,
+                source_url,
                 directory,
                 user_agent,
                 restarting=True,
@@ -1184,44 +1186,54 @@ async def _start_fast_live(
         )
         first_input = _first_input_segment(directory)
         origin_pts = segment_pts(first_input)
-        # The local segment reveals audio and caption metadata without re-reading upstream.
-        audio, closed_captions, video_codec = await asyncio.gather(
-            asyncio.to_thread(probe_audio, str(first_input)),
+        # The local segment reveals the source's codecs and captions without re-reading upstream.
+        source, closed_captions = await asyncio.gather(
+            asyncio.to_thread(probe_segment, str(first_input)),
             asyncio.to_thread(probe_closed_captions, str(first_input)),
-            asyncio.to_thread(probe_video_codec, str(first_input)),
         )
-        use_audio_passthrough = uses_audio_passthrough(audio, audio_passthrough)
+        use_audio_passthrough = uses_audio_passthrough(source, audio_passthrough)
         with _transcode_lock:
             _require_current(session_id, session)
             session["origin_pts"] = origin_pts
             session["origin_time"] = time.time()
-            session["audio_info"] = audio
+            session["audio_info"] = source
             session["audio_passthrough"] = use_audio_passthrough
             session["closed_captions"] = closed_captions
         if closed_captions:
             log.info("Fast-start session %s detected embedded captions", session_id)
-        hw = settings["transcode_hw"]
-        encoder = functools.partial(
-            encoder_command,
-            directory,
-            hw,
-            resolution,
-            quality,
-            deinterlace,
-            allow_upscale=not bandwidth_saver,
-            audio=audio,
-            audio_passthrough=audio_passthrough,
-            video_codec=video_codec,
+        # A DVR session needs only server-side retention, so a source every client
+        # plays is copied rather than re-encoded.
+        remux = (
+            not bandwidth_saver
+            and settings["live_dvr_mins"] > 0
+            and can_remux_live(source, resolution, audio_passthrough=audio_passthrough)
         )
+        encoder: Callable[..., list[str]]
+        if remux:
+            log.info("Fast-start session %s stream-copies its source for DVR", session_id)
+            encoder = functools.partial(remux_command, directory)
+        else:
+            encoder = functools.partial(
+                encoder_command,
+                directory,
+                settings["transcode_hw"],
+                resolution,
+                quality,
+                deinterlace,
+                allow_upscale=not bandwidth_saver,
+                audio=source,
+                audio_passthrough=audio_passthrough,
+                video_codec=source.video_codec if source else "",
+            )
         low_restart_command = encoder(restarting=True)
-        low = await startup.launch(encoder(), "encoder")
+        low = await startup.launch(encoder(), "remux" if remux else "encoder")
         with _transcode_lock:
             _require_current(session_id, session)
             session["process"] = low
             session["extra_processes"] = [ingest]
             session["low_restart_command"] = low_restart_command
             session["master_resolution"] = resolution
-            session["master_audio_bitrate"] = surround_audio_bitrate(audio, audio_passthrough)
+            session["master_audio_bitrate"] = surround_audio_bitrate(source, audio_passthrough)
         # A remuxed source is released in source-keyframe-sized bursts. A couple
         # of tiny output segments cannot bridge the next upstream delivery gap.
         input_text = (pathlib.Path(directory) / "input.m3u8").read_text()
@@ -1866,19 +1878,6 @@ async def _try_reuse_session(
     return _build_session_response(existing_id, snap, playlist_path)
 
 
-async def _remuxable_source(
-    url: str,
-    settings: ServerSettings,
-    audio_passthrough: bool,
-) -> str | None:
-    """The resolved variant URL when a live source can be stream-copied, else None."""
-    resolved = await asyncio.to_thread(resolve_hls_master_playlist, url)
-    media_info = (await asyncio.to_thread(probe_media, resolved))[0]
-    max_resolution = settings.get("max_resolution", "1080p")
-    remux = can_remux_live(media_info, max_resolution, audio_passthrough=audio_passthrough)
-    return resolved if remux else None
-
-
 def _probe_enabled(settings: ServerSettings, content_type: ContentType) -> bool:
     """Whether settings ask for probing ``content_type``."""
     match content_type:
@@ -1890,7 +1889,6 @@ def _probe_enabled(settings: ServerSettings, content_type: ContentType) -> bool:
             return settings["probe_live"]
 
 
-# resolved_url: the variant ``url`` already resolved to, saving a second fetch.
 async def _do_start_transcode(
     url: str,
     content_type: ContentType,
@@ -1904,7 +1902,6 @@ async def _do_start_transcode(
     bandwidth_saver: bool = False,
     audio_passthrough: bool = False,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
-    resolved_url: str | None = None,
     *,
     playlist_wait_timeout_sec: float = 30.0,
     seek_wait_timeout_sec: float = 40.0,
@@ -1913,10 +1910,7 @@ async def _do_start_transcode(
     is_archive = _is_archive_url(url)
     request_url = url
     # Resolve HLS master playlist to highest bandwidth variant.
-    if resolved_url is None:
-        url = await asyncio.to_thread(resolve_hls_master_playlist, url)
-    else:
-        url = resolved_url
+    url = await asyncio.to_thread(resolve_hls_master_playlist, url)
 
     settings = get_settings()
     hw = settings["transcode_hw"]
@@ -2543,29 +2537,20 @@ async def _start_or_reuse(
         if error is not None:
             raise fastapi.HTTPException(status_code=429, detail=error)
 
-    resolved: str | None = None
     if (
         fast_start
         and content_type == "live"
         and get_settings().get("max_resolution", "1080p") in ("1080p", "4k")
     ):
-        # A DVR request only needs server-side retention. When the source can
-        # be stream-copied, serve one remux session instead of a fast-start
-        # encoder; otherwise keep the adaptive transcode pipeline.
-        settings = get_settings()
-        dvr = not bandwidth_saver and settings["live_dvr_mins"] > 0 and settings["probe_live"]
-        resolved = await _remuxable_source(url, settings, audio_passthrough) if dvr else None
-        if resolved is None:
-            return await _start_fast_live(
-                url,
-                username,
-                source_id,
-                deinterlace_fallback,
-                bandwidth_saver=bandwidth_saver,
-                is_disconnected=is_disconnected,
-                audio_passthrough=audio_passthrough,
-            )
-        log.info("DVR live session uses a stream-copy remux instead of fast-start: %s", url)
+        return await _start_fast_live(
+            url,
+            username,
+            source_id,
+            deinterlace_fallback,
+            bandwidth_saver=bandwidth_saver,
+            is_disconnected=is_disconnected,
+            audio_passthrough=audio_passthrough,
+        )
 
     # Start fresh transcode (with retry for series probe cache staleness)
     try:
@@ -2582,7 +2567,6 @@ async def _start_or_reuse(
             bandwidth_saver,
             audio_passthrough=audio_passthrough,
             is_disconnected=is_disconnected,
-            resolved_url=resolved,
         )
     except fastapi.HTTPException:
         if series_id is None:

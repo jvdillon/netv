@@ -1373,11 +1373,8 @@ if [ "$ENABLE_LIBTORCH" = "1" ]; then
     # Include CUDA libs if using CUDA variant
     if [[ "$TORCH_VARIANT" == cu* ]]; then
         TORCH_LIBS="-ltorch -lc10 -ltorch_cpu -ltorch_cuda -lc10_cuda"
-        # Needed for ffmpeg extra-libs to ensure libtorch_cuda is linked (not just dlopen'd)
-        TORCH_EXTRA_LIBS="-lc10_cuda -ltorch_cuda"
     else
         TORCH_LIBS="-ltorch -lc10 -ltorch_cpu"
-        TORCH_EXTRA_LIBS=""
     fi
     cat > "$BUILD_DIR/lib/pkgconfig/libtorch.pc" << PCEOF
 prefix=$LIBTORCH_DIR
@@ -1515,6 +1512,28 @@ if [ "$ENABLE_LIBTORCH" = "1" ]; then
     }/' "$TORCH_BACKEND"
 
         echo "Torch TensorRT patch applied"
+    fi
+
+    # Patch 4: Load the backend on first use. Linking libtorch runs its static
+    # initializers (~0.35 s) on every ffmpeg launch, torch filter or not. ffmpeg
+    # links a stub carrying the backend's options instead; the backend itself
+    # becomes libffmpeg_dnn_torch.so (built by build_torch_plugin), which the
+    # stub dlopens when a torch model loads.
+    TORCH_DNN_DIR="$FFMPEG_DIR/libavfilter/dnn"
+    cp "$PATCH_DIR/dnn_backend_torch_stub.c" "$TORCH_DNN_DIR/"
+    # The stub reuses the backend's own option table, so the two cannot drift.
+    awk '/^#define OFFSET\(x\) offsetof\(THOptions, x\)/ {copy = 1}
+         copy {print}
+         copy && /^};/ {exit}' "$TORCH_BACKEND" > "$TORCH_DNN_DIR/dnn_backend_torch_options.h"
+    verify_patch "$TORCH_DNN_DIR/dnn_backend_torch_options.h" "dnn_th_options" "torch backend options extracted" || exit 1
+    sed -i -E 's/^(extern )?const DNNModule ff_dnn_backend_torch = \{/extern "C" __attribute__((visibility("default"))) const DNNModule ff_dnn_backend_torch_impl = {/' "$TORCH_BACKEND"
+    verify_patch "$TORCH_BACKEND" "ff_dnn_backend_torch_impl" "torch backend exports its module to the stub" || exit 1
+    sed -i 's|dnn/dnn_backend_torch\.o|dnn/dnn_backend_torch_stub.o|' "$TORCH_DNN_DIR/Makefile"
+    verify_patch "$TORCH_DNN_DIR/Makefile" "dnn_backend_torch_stub.o" "ffmpeg links the torch stub" || exit 1
+    # library.mak gives HAVE_AV_CONFIG_H (internal headers) only to objects in the
+    # library; the backend left it above but still needs them.
+    if ! grep -q "dnn_backend_torch.o: CPPFLAGS" "$TORCH_DNN_DIR/Makefile"; then
+        echo '$(SUBDIR)dnn/dnn_backend_torch.o: CPPFLAGS += -DHAVE_AV_CONFIG_H' >> "$TORCH_DNN_DIR/Makefile"
     fi
 fi
 
@@ -1731,7 +1750,7 @@ CONFIGURE_CMD=(
     --extra-cflags="$EXTRA_CFLAGS"
     --extra-cxxflags="$EXTRA_CXXFLAGS"
     --extra-ldflags="$EXTRA_LDFLAGS"
-    --extra-libs="-lpthread -lm -ldl${TORCH_EXTRA_LIBS:+ $TORCH_EXTRA_LIBS}"
+    --extra-libs="-lpthread -lm -ldl"
     --ld="g++"
     --bindir="$BIN_DIR"
     --disable-debug
@@ -1796,10 +1815,68 @@ FFMPEG_KEY=$(step_key "$SRC_DIR/$FFMPEG_DIR" \
     "${NVCC_CCBIN:-}" \
     "$(git -C "$SRC_DIR/nv-codec-headers" rev-parse HEAD 2>/dev/null)" \
     "$(sha256sum "$SCRIPT_DIR/install-ffmpeg.sh" "$PATCH_DIR"/* 2>/dev/null | cut -c1-64)")
-if ! step_done ffmpeg "$FFMPEG_KEY" "$BIN_DIR/ffmpeg"; then
+# Build the LibTorch backend plugin (Patch 4) against this configure's flags, and
+# have the ffmpeg programs export exactly the ffmpeg symbols the plugin calls.
+build_torch_plugin() {
+    local plugin="$LIB_DIR/libffmpeg_dnn_torch.so"
+    local torch_libs="-ltorch -ltorch_cpu -lc10"
+    [[ "$TORCH_VARIANT" == cu* ]] && torch_libs="$torch_libs -ltorch_cuda -lc10_cuda"
+    # ffmpeg's own rule compiles the backend with its exact flags (configure adds -fPIC).
+    PATH="$BUILD_PATH" make libavfilter/dnn/dnn_backend_torch.o
+    # --no-as-needed: libtorch_cuda registers torch's CUDA hooks only by being loaded.
+    # shellcheck disable=SC2086  # flag string splits into arguments on purpose
+    g++ -shared -s -o "$plugin" libavfilter/dnn/dnn_backend_torch.o \
+        -L"$LIB_DIR" -Wl,--no-as-needed $torch_libs -Wl,-rpath,"$LIB_DIR"
+
+    local symbols flags="" dynlist="$BUILD_DIR/ffmpeg-dnn-torch.dynlist"
+    symbols=$(nm -D --undefined-only "$plugin" | awk '{print $NF}' | grep -E '^(av|avpriv|ff)_' | sort -u)
+    {
+        echo "{"
+        printf '    %s;\n' $symbols
+        echo "};"
+    } > "$dynlist"
+    # -u keeps each symbol's object linked even if ffmpeg itself never calls it.
+    for symbol in $symbols; do
+        flags="$flags -Wl,-u,$symbol"
+    done
+    sed -i "s|^LDEXEFLAGS=.*|& -Wl,--dynamic-list=$dynlist$flags|" ffbuild/config.mak
+    # Only the plugin uses libtorch; keep it off the programs' link line.
+    sed -i -E '/^EXTRALIBS/ s/ -l(torch|c10)[A-Za-z0-9_]*//g' ffbuild/config.mak
+}
+
+# Fail the build unless libtorch stays out of ffmpeg and the stub can load the plugin.
+verify_torch_plugin() {
+    local plugin="$LIB_DIR/libffmpeg_dnn_torch.so" output
+    if ldd "$BIN_DIR/ffmpeg" | grep -qE 'lib(torch|c10)'; then
+        log_error "ffmpeg links libtorch; every launch would pay its startup cost"
+        exit 1
+    fi
+    if ldd "$plugin" | grep -q 'not found'; then
+        log_error "$plugin has unresolved libraries: $(ldd "$plugin" | grep 'not found')"
+        exit 1
+    fi
+    # Only the plugin reports a missing model, so this message proves it loaded.
+    output=$("$BIN_DIR/ffmpeg" -hide_banner -f lavfi -i color=size=16x16:duration=0.04 \
+        -vf "dnn_processing=dnn_backend=torch:model=/nonexistent.pt" -f null - 2>&1 || true)
+    if ! grep -q "Failed to load torch model" <<< "$output"; then
+        log_error "ffmpeg could not load the LibTorch backend plugin:"
+        echo "$output" >&2
+        exit 1
+    fi
+    log_info "LibTorch backend loads on first use from $plugin"
+}
+
+if ! step_done ffmpeg "$FFMPEG_KEY" "$BIN_DIR/ffmpeg" ||
+    { [ "$ENABLE_LIBTORCH" = "1" ] && [ ! -e "$LIB_DIR/libffmpeg_dnn_torch.so" ]; }; then
     PATH="$BUILD_PATH" PKG_CONFIG_PATH="$BUILD_DIR/lib/pkgconfig:$PKG_CONFIG_PATH" "${CONFIGURE_CMD[@]}"
+    if [ "$ENABLE_LIBTORCH" = "1" ]; then
+        build_torch_plugin
+    fi
     PATH="$BUILD_PATH" make -j "$NPROC"
     make install
+    if [ "$ENABLE_LIBTORCH" = "1" ]; then
+        verify_torch_plugin
+    fi
     step_mark ffmpeg "$FFMPEG_KEY"
 fi
 hash -r

@@ -514,6 +514,8 @@ def test_master_playlist_reserves_surround_audio_bandwidth():
         return MediaInfo(video_codec="", audio_codec=codec, pix_fmt="", audio_channels=channels)
 
     assert fast_start.surround_audio_bitrate(audio("aac", 2), True) == 0
+    assert fast_start.surround_audio_bitrate(audio("aac", 1), False) == 0
+    assert fast_start.surround_audio_bitrate(audio("aac", 0), False) == 384_000
     assert fast_start.surround_audio_bitrate(audio("aac", 6), False) == 384_000
     assert fast_start.surround_audio_bitrate(None, False) == 384_000
     assert fast_start.surround_audio_bitrate(audio("eac3", 6), False) == 384_000
@@ -742,74 +744,179 @@ async def test_encoder_startup_failure_cleans_up(
     assert not list(tmp_path.iterdir())
 
 
+@pytest.mark.parametrize(
+    ("restarting", "start_index", "flags"),
+    [
+        (False, "0", "delete_segments+temp_file"),
+        (True, "-3", "delete_segments+temp_file+append_list+discont_start"),
+    ],
+)
+def test_remux_command_copies_input_into_the_dvr_window(
+    tmp_path: pathlib.Path,
+    restarting: bool,
+    start_index: str,
+    flags: str,
+):
+    configure(tmp_path, live_dvr_mins=30)
+    command = (
+        fast_start.remux_command("/s", restarting=True)
+        if restarting
+        else fast_start.remux_command("/s")
+    )
+    assert command == [
+        "ffmpeg",
+        "-copyts",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-live_start_index",
+        start_index,
+        "-i",
+        "/s/input.m3u8",
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        "-max_delay",
+        "0",
+        "-f",
+        "hls",
+        "-hls_time",
+        "2",
+        "-hls_list_size",
+        "900",
+        "-hls_segment_filename",
+        "/s/low_%06d.ts",
+        "-hls_flags",
+        flags,
+        "/s/low.m3u8",
+    ]
+
+
 @pytest.mark.asyncio
-async def test_dvr_compatible_source_remuxes_without_fast_start(
+async def test_dvr_copyable_source_stream_copies_the_local_input(
     tmp_path: pathlib.Path,
     programs: FakeRun,
     launcher: ProcessLauncher,
 ):
-    """A DVR request for a copy-compatible source must not spawn encoders."""
+    """DVR of a copy-compatible source remuxes the ingest output; upstream is opened once."""
     url = "https://provider/live"
     configure(tmp_path, live_dvr_mins=60)
-    programs.program("ffprobe", Program(stdout=ffprobe_source("h264")), when=url)
+    programs.program("ffprobe", Program(stdout=ffprobe_source("h264")), when="-show_streams")
     task = asyncio.create_task(ffmpeg_session.start_transcode(url, fast_start=True))
-    result = await serve_transcode(launcher, task)
-    assert result["playlist"] == f"/transcode/{result['session_id']}/stream.m3u8"
-    assert "master_playlist" not in result
-    assert len(launcher.launches) == 1
-    command = launcher.commands[0]
-    assert command[command.index("-i") + 1] == url
-    assert command[command.index("-c:v") + 1] == "copy"
-    assert command[command.index("-c:a") + 1] == "copy"
-    # The transcode reuses the routing probe instead of probing upstream again.
-    assert [call[-1] for call in programs.calls] == [url]
+    result = await serve_fast_start(launcher, task)
+    directory = output_dir(launcher, 0)
+    assert result["playlist"] == f"/transcode/{result['session_id']}/low.m3u8"
+    assert "master_playlist" in result
+    ingest_cmd, remux_cmd = launcher.commands
+    assert ingest_cmd[ingest_cmd.index("-i") + 1] == url
+    assert remux_cmd == fast_start.remux_command(str(directory))
+    assert remux_cmd[remux_cmd.index("-i") + 1] == f"{directory}/input.m3u8"
+    assert remux_cmd[remux_cmd.index("-c") + 1] == "copy"
+    # The DVR window: 60 minutes of 2-second segments.
+    assert remux_cmd[remux_cmd.index("-hls_list_size") + 1] == "1800"
+    session = ffmpeg_session.get_session(result["session_id"])
+    assert session is not None
+    assert session.get("low_restart_command") == fast_start.remux_command(
+        str(directory),
+        restarting=True,
+    )
+    # Routing reads the local segment; no probe opens the upstream URL.
+    assert programs.calls
+    assert all(call[-1].endswith("/input_0.ts") for call in programs.calls)
     await ffmpeg_session.stop_session(result["session_id"], force=True)
     assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("video_codec", "bandwidth_saver"), [("hevc", False), ("h264", True)])
-async def test_dvr_keeps_fast_start_when_remux_is_unavailable(
+@pytest.mark.parametrize(
+    ("video_codec", "bandwidth_saver", "live_dvr_mins"),
+    [("hevc", False, 60), ("h264", True, 60), ("h264", False, 0)],
+)
+async def test_live_encodes_when_copy_is_unavailable_or_unneeded(
     tmp_path: pathlib.Path,
     programs: FakeRun,
     launcher: ProcessLauncher,
     video_codec: str,
     bandwidth_saver: bool,
+    live_dvr_mins: int,
 ):
-    """Incompatible sources and bandwidth-saver requests keep fast start."""
+    """Incompatible sources, bandwidth saver, and DVR-off sessions keep the encoder."""
     url = "https://provider/live"
-    configure(tmp_path, live_dvr_mins=60)
-    programs.program("ffprobe", Program(stdout=ffprobe_source(video_codec)), when=url)
+    configure(tmp_path, live_dvr_mins=live_dvr_mins)
+    programs.program("ffprobe", Program(stdout=ffprobe_source(video_codec)), when="-show_streams")
     task = asyncio.create_task(
         ffmpeg_session.start_transcode(url, fast_start=True, bandwidth_saver=bandwidth_saver),
     )
     result = await serve_fast_start(launcher, task)
     assert result["playlist"] == f"/transcode/{result['session_id']}/low.m3u8"
-    assert len(launcher.launches) == 2
-    assert launcher.commands[0][-1].endswith("/input.m3u8")
-    # Bandwidth saver never remuxes, so it skips the upstream probe.
-    upstream_probes = [call for call in programs.calls if call[-1] == url]
-    assert len(upstream_probes) == (0 if bandwidth_saver else 1)
-    await ffmpeg_session.stop_session(result["session_id"], force=True)
-
-
-@pytest.mark.asyncio
-async def test_dvr_disabled_skips_probe_and_uses_fast_start(
-    tmp_path: pathlib.Path,
-    programs: FakeRun,
-    launcher: ProcessLauncher,
-):
-    """Without DVR the fast-start path must not pay a probe round trip."""
-    configure(tmp_path, live_dvr_mins=0)
-    task = asyncio.create_task(
-        ffmpeg_session.start_transcode("https://provider/live", fast_start=True),
-    )
-    result = await serve_fast_start(launcher, task)
-    assert result["playlist"] == f"/transcode/{result['session_id']}/low.m3u8"
-    # Only the local segment is probed (audio, captions, video codec).
-    assert len(programs.calls) == 3
+    encoder_cmd = launcher.commands[1]
+    assert encoder_cmd[encoder_cmd.index("-c:v") + 1] == "libx264"
+    # One segment probe and one caption probe, both local.
+    assert len(programs.calls) == 2
     assert all(call[-1].endswith("/input_0.ts") for call in programs.calls)
     await ffmpeg_session.stop_session(result["session_id"], force=True)
+
+
+@pytest.mark.cli_ffmpeg
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="requires FFmpeg")
+def test_real_remux_copies_ingest_onto_the_source_timeline(tmp_path: pathlib.Path):
+    """The real remux command restates the ingest output without re-encoding or retiming."""
+    source = tmp_path / "source.ts"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=25:duration=6",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=sample_rate=48000:duration=6",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "25",
+            "-c:a",
+            "aac",
+            str(source),
+        ],
+        check=True,
+    )
+    subprocess.run(fast_start.ingest_command(str(source), str(tmp_path), None), check=True)
+    first_input = min(tmp_path.glob("input_*.ts"))
+    result = subprocess.run(
+        fast_start.remux_command(str(tmp_path)),
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    assert fast_start.playlist_duration(str(tmp_path), "low.m3u8") > 4
+    first_low = min(tmp_path.glob("low_*.ts"))
+    assert fast_start.segment_pts(first_low) == fast_start.segment_pts(first_input)
+    # Copied, not re-encoded: the source's codecs and size survive.
+    streams = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_name,height",
+            "-of",
+            "csv=p=0",
+            str(first_low),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert streams == ["h264,180", "aac"]
 
 
 @pytest.mark.cli_ffmpeg

@@ -30,10 +30,9 @@ from netv.ffmpeg_command import (
     http_reconnect_args,
     invalidate_series_probe_cache,
     limit_live_video_bitrate,
-    probe_audio,
     probe_closed_captions,
     probe_media,
-    probe_video_codec,
+    probe_segment,
     resolve_hls_master_playlist,
     restore_probe_cache_entry,
 )
@@ -1790,9 +1789,8 @@ def test_archive_policy_copies_compatible_source_without_ai_upscaling(
 
 @pytest.mark.cli_ffmpeg
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-def test_probes_read_local_segment(tmp_path: Path):
+def test_probe_segment_reads_real_ffprobe_output(tmp_path: Path):
     """The real ffprobe output parses into the video codec and surround audio layout."""
-    # Each ffmpeg/ffprobe launch costs ~0.45 s here, so one segment serves both probes.
     path = tmp_path / "input.ts"
     subprocess.run(
         [
@@ -1817,88 +1815,50 @@ def test_probes_read_local_segment(tmp_path: Path):
         ],
         check=True,
     )
-    assert probe_video_codec(str(path)) == "mpeg2video"
-    info = probe_audio(str(path))
+    info = probe_segment(str(path))
     assert info is not None
+    assert (info.video_codec, info.height) == ("mpeg2video", 64)
     assert (info.audio_codec, info.audio_channels, info.audio_sample_rate) == ("ac3", 6, 48_000)
 
 
-@pytest.mark.parametrize(
-    ("payload", "expected"),
-    [
-        ({"streams": [{"codec_name": "MPEG2VIDEO"}]}, "mpeg2video"),
-        ({"streams": [{}]}, ""),
-        ({"streams": []}, ""),
-        ({}, ""),
-    ],
-)
-def test_probe_video_codec_parses_streams(
-    fake_run: FakeRun,
-    payload: dict[str, object],
-    expected: str,
-):
-    _ffprobe(fake_run, payload)
-    assert probe_video_codec("input.ts") == expected
-    assert fake_run.calls == [
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=codec_name",
-            "-of",
-            "json",
-            "input.ts",
-        ],
-    ]
-    assert fake_run.options == [
-        {"capture_output": True, "text": True, "timeout": 5, "check": False},
-    ]
-
-
-@pytest.mark.parametrize(
-    "failure",
-    [OSError("unavailable"), subprocess.TimeoutExpired("ffprobe", 5)],
-)
-def test_probe_video_codec_handles_process_errors(fake_run: FakeRun, failure: Exception):
-    fake_run.program("ffprobe", Program(error=failure))
-    assert probe_video_codec("input.ts") == ""
-
-
-def test_probe_video_codec_handles_invalid_json(fake_run: FakeRun):
-    fake_run.program("ffprobe", Program(stdout="not json"))
-    assert probe_video_codec("input.ts") == ""
-
-
-@pytest.mark.parametrize(
-    ("payload", "expected"),
-    [
-        (
-            {
-                "streams": [
-                    {"codec_name": "AAC", "channels": 6, "sample_rate": "48000", "profile": "LC"},
-                ],
-            },
-            ("aac", 6, 48_000, "LC"),
-        ),
-        ({"streams": [{}]}, ("", 0, 0, "")),
-    ],
-)
-def test_probe_audio_parses_first_stream(
-    fake_run: FakeRun,
-    payload: dict[str, object],
-    expected: tuple[str, int, int, str],
-):
-    _ffprobe(fake_run, payload)
-    info = probe_audio("input.ts")
-    assert info is not None
-    assert (info.audio_codec, info.audio_channels, info.audio_sample_rate, info.audio_profile) == (
-        expected
+def test_probe_segment_parses_video_and_audio(fake_run: FakeRun):
+    _ffprobe(
+        fake_run,
+        {
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "H264",
+                    "pix_fmt": "yuv420p",
+                    "height": 1080,
+                    "field_order": "tt",
+                },
+                {
+                    "codec_type": "audio",
+                    "codec_name": "AAC",
+                    "channels": 6,
+                    "sample_rate": "48000",
+                    "profile": "LC",
+                },
+            ],
+            "format": {"format_name": "mpegts", "bit_rate": "5000000"},
+        },
     )
-    assert info.video_codec == ""
-    assert fake_run.calls[0][fake_run.calls[0].index("-select_streams") + 1] == "a:0"
+    info = probe_segment("input_0.ts")
+    assert info == MediaInfo(
+        video_codec="h264",
+        audio_codec="aac",
+        pix_fmt="yuv420p",
+        audio_channels=6,
+        audio_sample_rate=48_000,
+        audio_profile="LC",
+        height=1080,
+        video_bitrate=5_000_000,
+        interlaced=True,
+    )
+    assert fake_run.calls == [
+        ["ffprobe", "-v", "error", "-of", "json", "-show_streams", "-show_format", "input_0.ts"],
+    ]
     assert fake_run.options == [
         {"capture_output": True, "text": True, "timeout": 5, "check": False},
     ]
@@ -1908,13 +1868,15 @@ def test_probe_audio_parses_first_stream(
     "outcome",
     [
         Program(error=OSError("unavailable")),
+        Program(error=subprocess.TimeoutExpired("ffprobe", 5)),
         Program(stdout="not json"),
         Program(stdout='{"streams": []}'),
+        Program(stdout='{"streams": [{"codec_type": "audio", "codec_name": "aac"}]}'),
     ],
 )
-def test_probe_audio_unreadable_returns_none(fake_run: FakeRun, outcome: Program):
+def test_probe_segment_without_readable_video_returns_none(fake_run: FakeRun, outcome: Program):
     fake_run.program("ffprobe", outcome)
-    assert probe_audio("input.ts") is None
+    assert probe_segment("input_0.ts") is None
 
 
 @pytest.mark.parametrize(

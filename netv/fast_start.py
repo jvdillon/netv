@@ -179,6 +179,53 @@ def encoder_command(
     return cmd
 
 
+def remux_command(directory: str, *, restarting: bool = False) -> list[str]:
+    """Stream-copy the ingest output into the DVR-length rendition.
+
+    Takes the encoder's place when the source already plays everywhere: same
+    input, output names, segment length, and source timeline, without decoding.
+
+    Args:
+        directory: Session directory holding input.m3u8.
+        restarting: Resume an existing rendition after a pipeline restart.
+
+    Returns:
+        cmd: FFmpeg arguments.
+    """
+    duration = "2"
+    flags = "delete_segments+temp_file" + ("+append_list+discont_start" if restarting else "")
+    return [
+        "ffmpeg",
+        "-copyts",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-live_start_index",
+        "-3" if restarting else "0",
+        "-i",
+        f"{directory}/input.m3u8",
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        # The MPEG-TS muxer otherwise delays every timestamp by 2 x max_delay (1.4 s);
+        # program dates assume segments keep the ingest's timestamps.
+        "-max_delay",
+        "0",
+        "-f",
+        "hls",
+        "-hls_time",
+        duration,
+        "-hls_list_size",
+        str(get_live_hls_list_size(float(duration))),
+        "-hls_segment_filename",
+        f"{directory}/low_%06d.ts",
+        "-hls_flags",
+        flags,
+        f"{directory}/low.m3u8",
+    ]
+
+
 def master_playlist(resolution: str, *, audio_bitrate: int = 0) -> str:
     """Build the master playlist for the session's single local rendition.
 
@@ -221,10 +268,19 @@ def closed_caption_master_playlist(resolution: str, *, audio_bitrate: int = 0) -
 
 
 def surround_audio_bitrate(audio: MediaInfo | None, passthrough: bool) -> int:
-    """Extra bandwidth to advertise for surround output (Dolby copies at up to 640 kbps)."""
+    """Extra bandwidth to advertise for surround output (Dolby copies at up to 640 kbps).
+
+    Args:
+        audio: Probed source audio, or None when unknown.
+        passthrough: Whether the client receives Dolby audio as copied.
+
+    Returns:
+        bitrate: Bits per second to add to the rendition's advertised bandwidth.
+    """
     if audio and passthrough and audio.audio_codec in PASSTHROUGH_AUDIO_CODECS:
         return 640_000
-    if audio is None or audio.audio_channels > 2:
+    # An unknown layout (no audio facts, or 0 channels) may encode as 5.1.
+    if audio is None or audio.audio_channels not in (1, 2):
         return 384_000
     return 0
 

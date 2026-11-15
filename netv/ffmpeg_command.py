@@ -544,91 +544,16 @@ def probe_media(
 
     if data is None:
         return None, []
-
-    video_codec = audio_codec = pix_fmt = audio_profile = ""
-    audio_channels = audio_sample_rate = 0
-    subtitle_codecs: list[str] = []
-    subtitles: list[SubtitleStream] = []
-
-    height = 0
-    video_bitrate = 0
-    interlaced = False
-    is_10bit = False
-    is_hdr = False
-    for stream in data.get("streams", []):
-        codec = stream.get("codec_name", "").lower()
-        codec_type = stream.get("codec_type", "")
-        if codec_type == "video" and not video_codec:
-            video_codec = codec
-            pix_fmt = stream.get("pix_fmt", "")
-            stream_height = stream.get("height")
-            height = 0 if stream_height is None else stream_height
-            # Detect interlacing from field_order (tt, bb, tb, bt = interlaced)
-            field_order = stream.get("field_order", "").lower()
-            interlaced = field_order in ("tt", "bb", "tb", "bt")
-            # Detect 10-bit from pix_fmt (e.g. yuv420p10le, p010le)
-            # Check for "p10" or "10le/10be" to avoid false positive on yuv410p.
-            is_10bit = "p10" in pix_fmt or "10le" in pix_fmt or "10be" in pix_fmt
-            # Detect HDR from color_transfer (PQ = smpte2084, HLG = arib-std-b67)
-            color_transfer = stream.get("color_transfer", "").lower()
-            is_hdr = color_transfer in ("smpte2084", "arib-std-b67")
-            # Try to get bitrate from stream, fall back to format.
-            with suppress(ValueError):
-                video_bitrate = _probe_int(stream.get("bit_rate"))
-        elif codec_type == "audio" and not audio_codec:
-            audio_codec = codec
-            audio_channels = _probe_int(stream.get("channels"))
-            audio_sample_rate = _probe_int(stream.get("sample_rate"))
-            audio_profile = stream.get("profile", "")
-        elif codec_type == "subtitle":
-            subtitle_codecs.append(codec)
-            if codec in {"subrip", "ass", "ssa", "mov_text", "webvtt", "srt"}:
-                idx = stream.get("index")
-                if idx is not None:
-                    tags = stream.get("tags", {})
-                    lang = tags.get("language", "und").lower()
-                    name = tags.get("name", "") or tags.get("title", "") or _lang_display_name(lang)
-                    subtitles.append(
-                        SubtitleStream(
-                            index=idx,
-                            lang=lang,
-                            name=name,
-                        ),
-                    )
-
-    duration = 0.0
-    fmt = data.get("format", {})
-    format_duration = fmt.get("duration")
-    if format_duration is not None and format_duration != "":
-        with suppress(ValueError):
-            duration = float(format_duration)
-    # Fall back to format bitrate if stream bitrate unavailable (common for MKV)
-    if not video_bitrate:
-        with suppress(ValueError):
-            video_bitrate = _probe_int(fmt.get("bit_rate"))
-
-    if not video_codec:
+    media_info, subtitles = _media_info_from_probe(data, is_hls=is_hls)
+    if media_info is None:
         return None, []
-
-    media_info = MediaInfo(
-        video_codec=video_codec,
-        audio_codec=audio_codec,
-        pix_fmt=pix_fmt,
-        audio_channels=audio_channels,
-        audio_sample_rate=audio_sample_rate,
-        audio_profile=audio_profile,
-        subtitle_codecs=subtitle_codecs or None,
-        duration=duration,
-        height=height,
-        video_bitrate=video_bitrate,
-        interlaced=interlaced,
-        is_10bit=is_10bit,
-        is_hdr=is_hdr,
-        is_hls=is_hls,
-    )
     # Only cache if we got valid video info (height > 0)
-    if height <= 0:
-        log.warning("Probe returned invalid height=%d, not caching: %s", height, url[:80])
+    if media_info.height <= 0:
+        log.warning(
+            "Probe returned invalid height=%d, not caching: %s",
+            media_info.height,
+            url[:80],
+        )
         return media_info, subtitles
     with _probe_lock:
         _probe_cache[url] = (time.time(), media_info, subtitles)
@@ -657,6 +582,24 @@ def probe_media(
     if series_id is not None:
         _save_series_probe_cache()
     return media_info, subtitles
+
+
+def probe_segment(path: str) -> MediaInfo | None:
+    """Probe the video and audio facts of a local media segment.
+
+    Args:
+        path: Local segment file.
+
+    Returns:
+        media_info: Source facts, or None when the segment holds no readable video.
+    """
+    cmd = ["ffprobe", "-v", "error", "-of", "json", "-show_streams", "-show_format", path]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
+        data = json_loads(result.stdout, _ProbeOutput)
+    except (OSError, subprocess.SubprocessError, ValueError):  # ReadError is a ValueError.
+        return None
+    return _media_info_from_probe(data, is_hls=False)[0]
 
 
 # ===========================================================================
@@ -784,71 +727,6 @@ def can_remux_live(
         media_info,
         passthrough=audio_passthrough,
     )
-
-
-def probe_audio(path: str) -> MediaInfo | None:
-    """Probe audio facts of a local file; video fields are left empty.
-
-    Args:
-        path: Local media file.
-
-    Returns:
-        audio: First audio stream facts, or None when unreadable.
-    """
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "a:0",
-        "-show_entries",
-        "stream=codec_name,channels,sample_rate,profile",
-        "-of",
-        "json",
-        path,
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
-        stream = json_loads(result.stdout, _ProbeOutput).get("streams", [])[0]
-        return MediaInfo(
-            video_codec="",
-            audio_codec=stream.get("codec_name", "").lower(),
-            pix_fmt="",
-            audio_channels=_probe_int(stream.get("channels")),
-            audio_sample_rate=_probe_int(stream.get("sample_rate")),
-            audio_profile=stream.get("profile", ""),
-        )
-    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
-        return None
-
-
-def probe_video_codec(path: str) -> str:
-    """Probe the video codec of a local file.
-
-    Args:
-        path: Local media file.
-
-    Returns:
-        codec: Lowercase codec name, or "" when unreadable.
-    """
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=codec_name",
-        "-of",
-        "json",
-        path,
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
-        streams = json_loads(result.stdout, _ProbeOutput).get("streams", [])
-        return streams[0].get("codec_name", "").lower()
-    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
-        return ""
 
 
 def probe_closed_captions(path: str) -> bool:
@@ -1773,3 +1651,93 @@ class _ProbeOutput(TypedDict, total=False):
 
     streams: list[_ProbeStream]
     format: _ProbeFormat
+
+
+def _media_info_from_probe(
+    data: _ProbeOutput,
+    *,
+    is_hls: bool,
+) -> tuple[MediaInfo | None, list[SubtitleStream]]:
+    """Parse ffprobe stream and format output into source facts and text subtitles."""
+    video_codec = audio_codec = pix_fmt = audio_profile = ""
+    audio_channels = audio_sample_rate = 0
+    subtitle_codecs: list[str] = []
+    subtitles: list[SubtitleStream] = []
+
+    height = 0
+    video_bitrate = 0
+    interlaced = False
+    is_10bit = False
+    is_hdr = False
+    for stream in data.get("streams", []):
+        codec = stream.get("codec_name", "").lower()
+        codec_type = stream.get("codec_type", "")
+        if codec_type == "video" and not video_codec:
+            video_codec = codec
+            pix_fmt = stream.get("pix_fmt", "")
+            stream_height = stream.get("height")
+            height = 0 if stream_height is None else stream_height
+            # Detect interlacing from field_order (tt, bb, tb, bt = interlaced)
+            field_order = stream.get("field_order", "").lower()
+            interlaced = field_order in ("tt", "bb", "tb", "bt")
+            # Detect 10-bit from pix_fmt (e.g. yuv420p10le, p010le)
+            # Check for "p10" or "10le/10be" to avoid false positive on yuv410p.
+            is_10bit = "p10" in pix_fmt or "10le" in pix_fmt or "10be" in pix_fmt
+            # Detect HDR from color_transfer (PQ = smpte2084, HLG = arib-std-b67)
+            color_transfer = stream.get("color_transfer", "").lower()
+            is_hdr = color_transfer in ("smpte2084", "arib-std-b67")
+            # Try to get bitrate from stream, fall back to format.
+            with suppress(ValueError):
+                video_bitrate = _probe_int(stream.get("bit_rate"))
+        elif codec_type == "audio" and not audio_codec:
+            audio_codec = codec
+            audio_channels = _probe_int(stream.get("channels"))
+            audio_sample_rate = _probe_int(stream.get("sample_rate"))
+            audio_profile = stream.get("profile", "")
+        elif codec_type == "subtitle":
+            subtitle_codecs.append(codec)
+            if codec in {"subrip", "ass", "ssa", "mov_text", "webvtt", "srt"}:
+                idx = stream.get("index")
+                if idx is not None:
+                    tags = stream.get("tags", {})
+                    lang = tags.get("language", "und").lower()
+                    name = tags.get("name", "") or tags.get("title", "") or _lang_display_name(lang)
+                    subtitles.append(
+                        SubtitleStream(
+                            index=idx,
+                            lang=lang,
+                            name=name,
+                        ),
+                    )
+
+    duration = 0.0
+    fmt = data.get("format", {})
+    format_duration = fmt.get("duration")
+    if format_duration is not None and format_duration != "":
+        with suppress(ValueError):
+            duration = float(format_duration)
+    # Fall back to format bitrate if stream bitrate unavailable (common for MKV)
+    if not video_bitrate:
+        with suppress(ValueError):
+            video_bitrate = _probe_int(fmt.get("bit_rate"))
+
+    if not video_codec:
+        return None, []
+
+    media_info = MediaInfo(
+        video_codec=video_codec,
+        audio_codec=audio_codec,
+        pix_fmt=pix_fmt,
+        audio_channels=audio_channels,
+        audio_sample_rate=audio_sample_rate,
+        audio_profile=audio_profile,
+        subtitle_codecs=subtitle_codecs or None,
+        duration=duration,
+        height=height,
+        video_bitrate=video_bitrate,
+        interlaced=interlaced,
+        is_10bit=is_10bit,
+        is_hdr=is_hdr,
+        is_hls=is_hls,
+    )
+    return media_info, subtitles
