@@ -7,17 +7,17 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Thread
-from typing import TypedDict, cast
+from typing import Protocol, TypedDict, cast
 from weakref import finalize
 from xml.etree.ElementTree import Element
 
-import contextlib
-import gzip
 import logging
+import os
 import re
 import sqlite3
 import threading
 import time
+import zlib
 
 import defusedxml.ElementTree as ET  # Safe XML parsing.
 
@@ -422,6 +422,88 @@ def prune_old_programs(before: datetime) -> int:
 # =============================================================================
 
 
+#: Default cap on an EPG feed's size after decompression (NETV_EPG_MAX_BYTES).
+DEFAULT_EPG_MAX_BYTES = 1 << 30
+_EPG_READ_CHUNK = 1 << 20
+_GZIP_MAGIC = b"\x1f\x8b"
+
+
+class EPGTooLargeError(ValueError):
+    """An EPG feed exceeded the size limit, compressed or not."""
+
+
+def max_epg_bytes() -> int:
+    """The EPG size limit: ``NETV_EPG_MAX_BYTES`` if set to a positive integer."""
+    configured = os.environ.get("NETV_EPG_MAX_BYTES", "").strip()
+    try:
+        value = int(configured)
+    except ValueError:
+        return DEFAULT_EPG_MAX_BYTES
+    return value if value > 0 else DEFAULT_EPG_MAX_BYTES
+
+
+class _Readable(Protocol):
+    def read(self, amt: int = ..., /) -> bytes: ...
+
+
+def read_epg_body(resp: _Readable, max_bytes: int) -> bytes:
+    """Read an EPG response, gunzipping it if it is gzip, up to ``max_bytes``.
+
+    Decompression is streamed and bounded, so a small compressed bomb fails
+    with ``EPGTooLargeError`` instead of being expanded in memory.
+
+    Concatenated gzip members are read as one stream, as ``gzip.decompress``
+    does; anything after the last member that is not gzip is ignored.
+
+    Raises:
+        EPGTooLargeError: The (decompressed) body is larger than ``max_bytes``.
+        zlib.error: The body starts like gzip but is not valid gzip.
+        EOFError: The gzip stream ends before its last member is complete.
+    """
+    out = bytearray()
+    data = resp.read(_EPG_READ_CHUNK)
+    if data[:2] != _GZIP_MAGIC:
+        while data:
+            out += data
+            _checked(out, max_bytes)
+            data = resp.read(_EPG_READ_CHUNK)
+        return bytes(out)
+
+    gunzip: zlib._Decompress | None = None  # None between gzip members
+    while True:
+        if gunzip is None:
+            if len(data) < len(_GZIP_MAGIC):
+                more = resp.read(_EPG_READ_CHUNK)
+                if more:
+                    data += more
+                    continue
+                return bytes(out)
+            if data[:2] != _GZIP_MAGIC:
+                return bytes(out)
+            gunzip = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        if data:
+            # max_length bounds each step's output. It is at least 1 here,
+            # because _checked raises once out exceeds max_bytes (0 = unlimited).
+            out += gunzip.decompress(data, max_bytes + 1 - len(out))
+            _checked(out, max_bytes)
+            if gunzip.eof:
+                data, gunzip = gunzip.unused_data, None
+                continue
+            data = gunzip.unconsumed_tail
+            if data:
+                continue
+        data = resp.read(_EPG_READ_CHUNK)
+        if not data:
+            raise EOFError("EPG gzip stream ended before the end of the gzip member")
+
+
+def _checked(out: bytearray, max_bytes: int) -> None:
+    if len(out) > max_bytes:
+        raise EPGTooLargeError(
+            f"EPG feed is larger than {max_bytes} bytes (set NETV_EPG_MAX_BYTES to raise the limit)"
+        )
+
+
 def fetch_epg(
     epg_url: str,
     cache_dir: Path,
@@ -442,10 +524,8 @@ def fetch_epg(
         program_count: Number of programs inserted.
     """
     with safe_urlopen(epg_url, timeout=timeout, user_agent=user_agent) as resp:
-        content = resp.read()
-        with contextlib.suppress(Exception):
-            content = gzip.decompress(content)
-        xml_str = content.decode()
+        content = read_epg_body(resp, max_epg_bytes())
+    xml_str = content.decode()
 
     try:
         root = ET.fromstring(xml_str)

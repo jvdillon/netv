@@ -11,7 +11,9 @@ import gzip
 import logging
 import sqlite3
 import threading
+import tracemalloc
 import warnings
+import zlib
 
 import defusedxml.ElementTree as ET
 import pytest
@@ -764,6 +766,82 @@ class TestSanitize:
         assert '<programme start="1"' in out
         assert "no times" not in out
         assert "junk" not in out
+
+
+class _Chunks:
+    """A response whose reads return the given chunks one at a time."""
+
+    def __init__(self, *chunks: bytes) -> None:
+        self._chunks = list(chunks)
+
+    def read(self, amt: int = -1, /) -> bytes:
+        del amt
+        return self._chunks.pop(0) if self._chunks else b""
+
+
+class TestReadEpgBody:
+    """Size-bounded reading and gunzipping of EPG feeds."""
+
+    def test_gzip_bomb_stops_at_the_limit_without_expanding(self):
+        bomb = gzip.compress(b" " * (64 << 20))  # 64 MiB of spaces, ~64 KiB compressed
+        tracemalloc.start()
+        try:
+            with pytest.raises(epg.EPGTooLargeError):
+                epg.read_epg_body(testing.FakeResponse(bomb), 1 << 20)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        assert peak < 8 << 20
+
+    def test_plain_body_over_the_limit(self):
+        with pytest.raises(epg.EPGTooLargeError):
+            epg.read_epg_body(testing.FakeResponse(b"x" * 101), 100)
+
+    def test_bodies_at_the_limit_are_read(self):
+        body = b"<tv>" + b" " * 96
+        assert epg.read_epg_body(testing.FakeResponse(body), 100) == body
+        assert epg.read_epg_body(testing.FakeResponse(gzip.compress(body)), 100) == body
+
+    def test_gzip_members_split_across_reads(self):
+        first, second = gzip.compress(b"<tv>"), gzip.compress(b"</tv>")
+        # The first member ends exactly at the end of a read.
+        assert epg.read_epg_body(_Chunks(first, second), 100) == b"<tv></tv>"
+        # The second member's magic bytes are split across reads.
+        joined = first + second
+        cut = len(first) + 1
+        assert epg.read_epg_body(_Chunks(joined[:cut], joined[cut:]), 100) == b"<tv></tv>"
+
+    def test_trailing_padding_after_gzip_is_ignored(self):
+        body = gzip.compress(b"<tv/>") + b"\x00" * 512
+        assert epg.read_epg_body(testing.FakeResponse(body), 100) == b"<tv/>"
+
+    def test_truncated_gzip_raises(self):
+        body = gzip.compress(b"<tv>" + b"x" * 1000 + b"</tv>")
+        with pytest.raises(EOFError):
+            epg.read_epg_body(testing.FakeResponse(body[:-12]), 10_000)
+
+    def test_invalid_gzip_raises(self):
+        with pytest.raises(zlib.error):
+            epg.read_epg_body(testing.FakeResponse(b"\x1f\x8bnot gzip at all"), 100)
+
+    def test_limit_comes_from_the_environment(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("NETV_EPG_MAX_BYTES", "4096")
+        assert epg.max_epg_bytes() == 4096
+        for bad in ("", "lots", "0", "-5"):
+            monkeypatch.setenv("NETV_EPG_MAX_BYTES", bad)
+            assert epg.max_epg_bytes() == epg.DEFAULT_EPG_MAX_BYTES
+
+    def test_fetch_epg_rejects_an_oversized_feed(
+        self,
+        db: None,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("NETV_EPG_MAX_BYTES", str(len(XMLTV) - 1))
+        _serve(monkeypatch, "http://epg.example/guide.xml.gz", gzip.compress(XMLTV.encode()))
+        with pytest.raises(epg.EPGTooLargeError):
+            epg.fetch_epg("http://epg.example/guide.xml.gz", tmp_path)
+        assert not epg.has_programs()
 
 
 if __name__ == "__main__":
