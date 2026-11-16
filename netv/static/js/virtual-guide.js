@@ -588,7 +588,10 @@ class VirtualGuide {
 
   renderRow(row, index) {
     const ch = row.channel;
-    const iconUrl = ch.icon ? this.logoUrlFilter(ch.icon) : '';
+    // The server signs proxy URLs (icon_proxy); /api/logo refuses unsigned ones.
+    const iconUrl = ch.icon_proxy !== undefined
+      ? ch.icon_proxy
+      : (ch.icon ? this.logoUrlFilter(ch.icon) : '');
     const height = this.currentRowHeight;
 
     const escapeHtml = escapeGuideHtml;

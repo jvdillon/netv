@@ -485,25 +485,77 @@ def test_json_body_validation(auth_client: TestClient, body: bytes, detail: str)
 # ===========================================================================
 
 
+def _logo(url: str, **params: str) -> str:
+    """A signed /api/logo request path, as _logo_url_filter would emit it."""
+    query = {"url": url, **params, "sig": auth.logo_url_signature(url)}
+    return "/api/logo?" + parse.urlencode(query)
+
+
 def test_logo_requires_url(auth_client: TestClient):
     assert auth_client.get("/api/logo?url=").status_code == 400
 
 
 def test_logo_served_from_cache(auth_client: TestClient, web: FakeWeb):
     cache_module.save_logo("default", "http://x/logo.png", b"png", "image/png")
-    response = auth_client.get("/api/logo?url=http://x/logo.png")
+    response = auth_client.get(_logo("http://x/logo.png"))
     assert response.content == b"png"
     assert response.headers["cache-control"] == "max-age=86400"
     assert web.fetches == []
 
 
 def test_logo_rejects_non_http_scheme(auth_client: TestClient):
-    assert auth_client.get("/api/logo?url=file:///etc/passwd").status_code == 400
+    assert auth_client.get(_logo("file:///etc/passwd")).status_code == 400
+
+
+@pytest.mark.parametrize(
+    "sig",
+    [
+        None,
+        "",
+        "0" * 64,
+        "zz" * 32,
+        "é" * 64,
+        "ABCDEF" * 10 + "abcd",
+    ],
+)
+def test_logo_refuses_unsigned_urls(auth_client: TestClient, web: FakeWeb, sig: str | None):
+    # Any viewer could otherwise make the server fetch internal addresses.
+    url = "http://127.0.0.1:8080/snapshot.jpg"
+    web.routes[url] = FakeResponse(b"img", headers={"Content-Type": "image/png"})
+    query = {"url": url} if sig is None else {"url": url, "sig": sig}
+    response = auth_client.get("/api/logo?" + parse.urlencode(query))
+    assert response.status_code == 403
+    assert web.fetches == []
+
+
+def test_logo_signature_is_bound_to_the_url(auth_client: TestClient, web: FakeWeb):
+    signed = auth.logo_url_signature("http://x/l.png")
+    response = auth_client.get(
+        "/api/logo?" + parse.urlencode({"url": "http://127.0.0.1/l.png", "sig": signed}),
+    )
+    assert response.status_code == 403
+    assert web.fetches == []
+
+
+def test_logo_refuses_unsigned_urls_even_when_cached(auth_client: TestClient):
+    cache_module.save_logo("default", "http://x/logo.png", b"png", "image/png")
+    assert auth_client.get("/api/logo?url=http://x/logo.png").status_code == 403
+
+
+def test_logo_url_filter_signs_proxy_urls():
+    url = "http://logos.example:8080/c.png?x=1"
+    proxied = main._logo_url_filter(url)
+    query = parse.parse_qs(parse.urlparse(proxied).query)
+    assert query["url"] == [url]
+    assert query["source"] == ["logos.example"]
+    assert auth.verify_logo_url_signature(url, query["sig"][0])
+    for local in ("", "/static/x.png", "data:image/png;base64,AA=="):
+        assert main._logo_url_filter(local) == local
 
 
 def test_logo_fetches_and_caches(auth_client: TestClient, web: FakeWeb):
     web.routes["http://x/l.png"] = FakeResponse(b"img", headers={"Content-Type": "image/png"})
-    response = auth_client.get("/api/logo?url=http://x/l.png&source=src")
+    response = auth_client.get(_logo("http://x/l.png", source="src"))
     assert response.content == b"img"
     assert [(f.url, f.timeout) for f in web.fetches] == [("http://x/l.png", 3)]
     saved = cache_module.get_cached_logo("src", "http://x/l.png")
@@ -523,7 +575,7 @@ def test_logo_fetches_and_caches(auth_client: TestClient, web: FakeWeb):
 def test_logo_fetch_errors(auth_client: TestClient, web: FakeWeb, route: Route | None, status: int):
     if route is not None:
         web.routes["https://x/l.png"] = route
-    assert auth_client.get("/api/logo?url=https://x/l.png").status_code == status
+    assert auth_client.get(_logo("https://x/l.png")).status_code == status
 
 
 def test_fetch_logo_returns_image(web: FakeWeb):

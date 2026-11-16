@@ -1190,6 +1190,7 @@ class GuideChannel(TypedDict):
     stream_id: MutablePlainTree
     name: MutablePlainTree
     icon: MutablePlainTree
+    icon_proxy: str
     epg_id: str
     category_ids: list[str]
     catchup_days: int
@@ -2702,6 +2703,7 @@ async def get_logo(
     url: str,
     user: Annotated[TokenClaims, Depends(require_auth)],
     source: str = "default",
+    sig: str = "",
 ):
     """Proxy and cache external logos to avoid mixed-content issues.
 
@@ -2709,10 +2711,15 @@ async def get_logo(
         url: External image URL.
         user: Authenticated viewer claims.
         source: Source name partitioning cached images.
+        sig: Server signature from ``_logo_url_filter``; unsigned URLs are refused.
     """
     del user
     if not url:
         raise HTTPException(400, "Missing url parameter")
+    # Only URLs the server put on a page are proxied: without this, any viewer
+    # could make the server fetch internal addresses and read image replies.
+    if not auth.verify_logo_url_signature(url, sig):
+        raise HTTPException(403, "Invalid logo URL signature")
     # Check cache first.
     cached = get_cached_logo(source, url)
     if cached:
@@ -3214,13 +3221,14 @@ async def settings_set_user_limits(
 
 
 def _logo_url_filter(url: str) -> str:
-    """Wrap external logo URLs through /api/logo proxy."""
+    """Wrap external logo URLs through the signed /api/logo proxy."""
     if not url or url.startswith("/") or url.startswith("data:"):
         return url  # Already local or data URL.
     # Use hostname as source for organization.
     parsed = parse.urlparse(url)
     source = parsed.netloc.split(":")[0] if parsed.netloc else "external"
-    return f"/api/logo?source={parse.quote(source)}&url={parse.quote(url)}"
+    sig = auth.logo_url_signature(url)
+    return f"/api/logo?source={parse.quote(source)}&url={parse.quote(url)}&sig={sig}"
 
 
 def _hidden_sources(username: str) -> set[str]:
@@ -3892,6 +3900,8 @@ def _build_guide_rows(
             "stream_id": s["stream_id"],
             "name": s["name"],
             "icon": icon,
+            # Signed /api/logo URL for the web guide; `icon` stays raw for apps.
+            "icon_proxy": _logo_url_filter(icon) if isinstance(icon, str) else "",
             "epg_id": epg_id,
             "category_ids": category_ids(s),
             "catchup_days": catchup.archive_days(s),

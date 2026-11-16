@@ -291,6 +291,28 @@ def set_user_limits(
     return True
 
 
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def logo_url_signature(url: str) -> str:
+    """HMAC of a logo URL the server chose to proxy through ``/api/logo``.
+
+    Only signed URLs are fetched, so the endpoint cannot be pointed at
+    arbitrary hosts (internal services included) by any signed-in viewer.
+    """
+    data = b"logo-url\n" + url.encode()
+    return hmac.new(_get_secret_key().encode(), data, hashlib.sha256).hexdigest()
+
+
+def verify_logo_url_signature(url: str, signature: str) -> bool:
+    """Whether ``signature`` is the server's ``logo_url_signature`` for ``url``."""
+    # Reject anything but 64 lowercase hex digits before compare_digest, which
+    # raises TypeError for non-ASCII strings.
+    if len(signature) != 64 or not _HEX_DIGITS.issuperset(signature):
+        return False
+    return hmac.compare_digest(signature, logo_url_signature(url))
+
+
 def create_token(payload: TokenClaims, *, expiry_seconds: int = 86_400 * 7) -> str:
     """Create a signed JWT-like token."""
     claims: TokenClaims = {**payload, "exp": int(time.time()) + expiry_seconds}

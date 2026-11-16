@@ -298,19 +298,7 @@ const GUIDE_CONFIG = {
   cats: {{ (effective_cats if effective_cats is defined else cats_param) | tojson }},
   initialRows: {{ grid_data | tojson | safe }},
   sections: {{ (guide_sections if guide_sections is defined else []) | tojson }},
-  // Logo URL proxy (matches _logo_url_filter in Python)
-  logoUrlFilter: function(url) {
-    if (!url || url.startsWith('/') || url.startsWith('data:')) {
-      return url;
-    }
-    try {
-      const parsed = new URL(url);
-      const source = parsed.hostname.split(':')[0] || 'external';
-      return '/api/logo?source=' + encodeURIComponent(source) + '&url=' + encodeURIComponent(url);
-    } catch (e) {
-      return url;
-    }
-  }
+  // Logo proxy URLs are signed by the server (row.channel.icon_proxy).
 };
 
 // Auto-refresh when EPG finishes loading
@@ -356,8 +344,7 @@ localizeGuideTimes(document);
         sections: GUIDE_CONFIG.sections,
         rowHeight: 64,  // 4rem desktop
         rowHeightMobile: 40,  // 2.5rem mobile
-        bufferSize: 50,
-        logoUrlFilter: GUIDE_CONFIG.logoUrlFilter
+        bufferSize: 50
       });
     }
   }
