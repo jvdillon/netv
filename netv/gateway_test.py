@@ -1106,8 +1106,9 @@ def _start_upscale(
     tmp_path: Path,
     client: TestClient,
     web: testing.FakeWeb,
+    launcher: testing.ProcessLauncher | None = None,
 ) -> tuple[testing.ProcessLauncher, int]:
-    """Request the upscaled stream with a scripted ffmpeg that exits at once."""
+    """Request the upscaled stream, by default with a scripted ffmpeg that exits at once."""
     _set_upscale(sr_model=MODEL)
     settings = cache.load_server_settings()
     settings["transcode_dir"] = str(tmp_path / "transcodes")
@@ -1116,7 +1117,8 @@ def _start_upscale(
     probe = testing.FakeRun()
     probe.program("ffprobe", testing.Program(stdout=testing.probed_video_json()))
     testing.install_subprocess(monkeypatch, ffmpeg_command, run=probe)
-    launcher = testing.ProcessLauncher([testing.FakeProcess(exited=True, exit_code=1)])
+    if launcher is None:
+        launcher = testing.ProcessLauncher([testing.FakeProcess(exited=True, exit_code=1)])
     testing.install_launcher(monkeypatch, launcher, ffmpeg_session)
     testing.install_clock(monkeypatch, testing.FakeClock(), ffmpeg_session)
     tasks = testing.BackgroundTasks()
@@ -1124,6 +1126,50 @@ def _start_upscale(
     response = client.get("/live/player/local-pass/41.ts", follow_redirects=False)
     tasks.discard()
     return launcher, response.status_code
+
+
+def _publish_rendition(command: list[str], name: str = "low", first: int = 0) -> None:
+    """Write two playable 2 s segments from number ``first`` (PTS 10 + 2 * number)."""
+    directory = Path(command[-1]).parent
+    lines = ["#EXTM3U"]
+    for i in range(first, first + 2):
+        (directory / f"{name}_{i}.ts").write_bytes(testing.video_packet(10 + 2 * i) * 10)
+        lines += ["#EXTINF:2,", f"{name}_{i}.ts"]
+    (directory / f"{name}.m3u8").write_text("\n".join(lines) + "\n")
+
+
+def test_upscale_playlist_follows_the_rendition_players_should_see(
+    gateway_client: GatewayClient,
+    monkeypatch: pytest.MonkeyPatch,
+    sessions: dict[str, TranscodeSession],
+    tmp_path: Path,
+    web: testing.FakeWeb,
+):
+    client, _ = gateway_client
+    launcher = testing.ProcessLauncher(on_launch=_publish_rendition)
+
+    _, status = _start_upscale(monkeypatch, tmp_path, client, web, launcher)
+
+    assert status == 302
+    [(session_id, session)] = sessions.items()
+    playlist = f"/upscale/{session_id}/low.m3u8"
+    plain = client.get(playlist).text
+    assert _segment_uris(plain) == ["low_0.ts", "low_1.ts"]
+    # The upscaler caught up and took over, as _upgrade_to_upscale leaves it; players
+    # keep requesting low.m3u8 and continue into it where the plain playlist ended.
+    _publish_rendition(launcher.commands[0], "up", first=1)
+    assert ffmpeg_session._is_fast_live(session)
+    session["rendition"] = "up"
+    session["splice_low"] = plain
+    spliced = client.get(playlist)
+    assert spliced.status_code == 200
+    assert _segment_uris(spliced.text) == ["low_0.ts", "low_1.ts", "up_2.ts"]
+    assert spliced.text.index("low_1.ts") < spliced.text.index("#EXT-X-DISCONTINUITY")
+    assert spliced.text.index("#EXT-X-DISCONTINUITY") < spliced.text.index("up_2.ts")
+
+
+def _segment_uris(playlist: str) -> list[str]:
+    return [line for line in playlist.splitlines() if line and not line.startswith("#")]
 
 
 def test_upscale_live_stream_transcodes_resolved_upstream(

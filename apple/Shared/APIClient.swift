@@ -333,7 +333,6 @@ final class APIClient {
             URLQueryItem(name: "deinterlace_fallback", value: deinterlaceFallback ? "1" : "0"),
             URLQueryItem(name: "source_id", value: sourceID),
             URLQueryItem(name: "bandwidth_saver", value: bandwidthSaver && !archive ? "true" : "false"),
-            URLQueryItem(name: "fast_start", value: archive ? "false" : "true"),
             // AVPlayer decodes Dolby Digital (Plus), so surround can pass through untouched.
             URLQueryItem(name: "audio_passthrough", value: "true")
         ]

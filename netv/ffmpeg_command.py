@@ -802,6 +802,7 @@ def build_hls_ffmpeg_cmd(
     video_codec: str = "",
     *,
     sr_segment_duration: float = 2.0,
+    source_height: int = 0,
 ) -> list[str]:
     """Build ffmpeg command for HLS transcoding.
 
@@ -821,6 +822,7 @@ def build_hls_ffmpeg_cmd(
         audio_passthrough: Copy Dolby audio for clients that decode it natively.
         video_codec: Source codec selecting hardware decode without media_info.
         sr_segment_duration: HLS segment length when AI Upscale applies.
+        source_height: Source height selecting the AI Upscale engine without media_info.
 
     Returns:
         cmd: FFmpeg arguments.
@@ -866,7 +868,7 @@ def build_hls_ffmpeg_cmd(
         max_resolution=max_resolution,
         quality=quality,
         is_hdr=media_info.is_hdr if media_info else False,
-        source_height=media_info.height if media_info else 0,
+        source_height=media_info.height if media_info else source_height,
         allow_upscale=allow_upscale,
     )
     audio_args = _build_audio_args(copy_audio=copy_audio, audio=audio)

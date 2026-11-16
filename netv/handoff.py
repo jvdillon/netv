@@ -11,13 +11,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Protocol
 
 import json
 import logging
 import pathlib
 import shutil
-import subprocess
 import threading
 import time
 import uuid
@@ -63,16 +62,25 @@ class _Watch:
     handoff_id: str = ""
 
 
+class Recording(Protocol):
+    """A running recording of a live channel."""
+
+    def finished(self) -> bool: ...
+
+    def stop(self) -> None: ...
+
+
 # Resolves a stream ID and broadcast moment to its channel, or None.
 Resolver = Callable[[str, float], Channel | None]
-# Releases a user's live transcode of a stream URL before it is recorded.
-Releaser = Callable[[str, str], None]
+# Records a user's channel into a directory for some seconds, reusing the
+# user's live session of it when one is playing.
+Recorder = Callable[[str, Channel, pathlib.Path, float], Recording]
 
 _lock = threading.Lock()
 _users_dir: pathlib.Path | None = None
 _records: dict[str, dict[str, Any]] = {}
 _watches: dict[str, _Watch] = {}
-_recorders: dict[str, subprocess.Popen[bytes]] = {}
+_recorders: dict[str, Recording] = {}
 # Bumped on every cancel so a recorder launched concurrently is discarded.
 _generations: dict[str, int] = {}
 
@@ -138,16 +146,6 @@ def cleanup_orphans() -> None:
             shutil.rmtree(directory, ignore_errors=True)
 
 
-def shutdown() -> None:
-    """Stop recorders, keeping what they recorded."""
-    with _lock:
-        processes = list(_recorders.values())
-        _recorders.clear()
-    for process in processes:
-        if process.poll() is None:
-            process.terminate()
-
-
 # ===========================================================================
 # Watching
 # ===========================================================================
@@ -189,7 +187,7 @@ def stop_watch(
     stream_id: str,
     position: float,
     resolve: Resolver,
-    release: Releaser,
+    recorder: Recorder,
     handoff_id: str = "",
     now: float | None = None,
     *,
@@ -202,7 +200,7 @@ def stop_watch(
         stream_id: Live channel being stopped.
         position: Broadcast timestamp on screen.
         resolve: Resolve the channel and its program.
-        release: Release the user's upstream connection before recording.
+        recorder: Record the channel when it has no archive.
         handoff_id: Existing handoff being resumed, if any.
         now: Current timestamp; defaults to the wall clock.
         policy: Retention and recording timing limits; defaults to HandoffPolicy().
@@ -218,7 +216,7 @@ def stop_watch(
             return None
         del _watches[username]
     watch = replace(watch, position=position, last_seen=now)
-    return _hand_off(username, watch, resolve, release, now, policy=policy)
+    return _hand_off(username, watch, resolve, recorder, now, policy=policy)
 
 
 # ===========================================================================
@@ -292,7 +290,7 @@ def cancel(username: str, keep: str = "") -> int:
 
 def sweep(
     resolve: Resolver,
-    release: Releaser,
+    recorder: Recorder,
     now: float | None = None,
     *,
     policy: HandoffPolicy | None = None,
@@ -301,7 +299,7 @@ def sweep(
 
     Args:
         resolve: Resolve a watched channel and its program.
-        release: Release the upstream connection before recording.
+        recorder: Record a channel that has no archive.
         now: Current timestamp; defaults to the wall clock.
         policy: Watch expiry, retention and recording timing limits; defaults to
             HandoffPolicy().
@@ -319,8 +317,8 @@ def sweep(
         expired = [u for u, r in _records.items() if r.get("expires", 0) <= now]
         failed = []
         for username, record in _records.items():
-            process = _recorders.get(record.get("recording_id", ""))
-            if process is not None and process.poll() is not None:
+            recording = _recorders.get(record.get("recording_id", ""))
+            if recording is not None and recording.finished():
                 del _recorders[record["recording_id"]]
                 record["recording_live"] = False
                 _save(username)
@@ -331,7 +329,7 @@ def sweep(
         cancel(username)
     for username, watch in lapsed:
         # The last report is where the device left off.
-        _hand_off(username, watch, resolve, release, now, policy=policy)
+        _hand_off(username, watch, resolve, recorder, now, policy=policy)
 
 
 def _save(username: str) -> None:
@@ -348,53 +346,12 @@ def _save(username: str) -> None:
         log.warning("Could not save handoff for %s: %s", username, e)
 
 
-def _recorder_command(url: str, directory: pathlib.Path, seconds: float) -> list[str]:
-    settings = ffmpeg_command.get_settings()
-    url = ffmpeg_command.resolve_hls_master_playlist(url)
-    media_info = ffmpeg_command.probe_media(url)[0] if settings["probe_live"] else None
-    # The recording is kept like a VOD transcode: every segment stays and
-    # the playlist grows as an event, so any client can play it directly.
-    cmd = ffmpeg_command.build_hls_ffmpeg_cmd(
-        url,
-        settings["transcode_hw"],
-        str(directory),
-        is_vod=True,
-        media_info=media_info,
-        max_resolution=settings.get("max_resolution", "1080p"),
-        quality=settings.get("quality", "high"),
-        user_agent=ffmpeg_command.get_user_agent(),
-        allow_upscale=False,
-    )
-    # Stop reading the input when the program ends; ffmpeg then closes the playlist.
-    i = cmd.index("-i")
-    cmd[i:i] = ["-t", str(int(seconds))]
-    return cmd
-
-
-def _start_recorder(url: str, recording_id: str, seconds: float) -> subprocess.Popen[bytes]:
-    directory = recording_dir(recording_id)
-    directory.mkdir(parents=True, exist_ok=True)
-    cmd = _recorder_command(url, directory, seconds)
-    log.info("Recording handoff %s for %.0fs", recording_id, seconds)
-    with (directory / "ffmpeg.log").open("wb") as stderr:
-        return subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=stderr,
-        )
-
-
 def _stop_recorder(recording_id: str) -> None:
     """Stop and delete a recording. Call without holding the lock."""
     with _lock:
-        process = _recorders.pop(recording_id, None)
-    if process is not None and process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
+        recording = _recorders.pop(recording_id, None)
+    if recording is not None and not recording.finished():
+        recording.stop()
     shutil.rmtree(recording_dir(recording_id), ignore_errors=True)
 
 
@@ -402,7 +359,7 @@ def _hand_off(
     username: str,
     watch: _Watch,
     resolve: Resolver,
-    release: Releaser,
+    recorder: Recorder,
     now: float,
     *,
     policy: HandoffPolicy,
@@ -456,9 +413,10 @@ def _hand_off(
         end = channel.program_end if channel.program_end > now else 0.0
         seconds = min(end - now if end else policy.max_recording_secs, policy.max_recording_secs)
         recording_id = uuid.uuid4().hex
-        release(username, channel.url)
+        directory = recording_dir(recording_id)
         try:
-            process = _start_recorder(channel.url, recording_id, seconds)
+            directory.mkdir(parents=True, exist_ok=True)
+            recording = recorder(username, channel, directory, seconds)
         except Exception as e:
             log.warning("Could not record handoff for %s: %s", username, e)
             shutil.rmtree(recording_dir(recording_id), ignore_errors=True)
@@ -471,12 +429,12 @@ def _hand_off(
             expires=now + seconds + policy.keep_secs,
         )
         with _lock:
-            if _generations.get(username, 0) == generation:
-                _recorders[recording_id] = process
-                process = None
-        if process is not None:
+            current = _generations.get(username, 0) == generation
+            if current:
+                _recorders[recording_id] = recording
+        if not current:
             # Something else started while the recorder was launching.
-            process.terminate()
+            recording.stop()
             shutil.rmtree(recording_dir(recording_id), ignore_errors=True)
             return None
     with _lock:

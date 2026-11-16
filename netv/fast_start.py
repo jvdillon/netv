@@ -128,6 +128,8 @@ def encoder_command(
     audio_passthrough: bool = False,
     restarting: bool = False,
     video_codec: str = "",
+    rendition: str = "low",
+    grid_offset: float = 0.0,
 ) -> list[str]:
     cmd = build_hls_ffmpeg_cmd(
         "pipe:0",
@@ -144,6 +146,7 @@ def encoder_command(
         audio_info=audio,
         audio_passthrough=audio_passthrough,
         video_codec=video_codec,
+        source_height=audio.height if audio else 0,
     )
     cmd[cmd.index("-i") : cmd.index("-i")] = ["-f", "mpegts"]
     cmd[cmd.index("-probesize") + 1] = "5000000"
@@ -160,15 +163,59 @@ def encoder_command(
     cmd += [
         "-bf",
         "0",
-        # Four quarter-second keyframes cut the short first segments, then one a second.
+        # Keyframes on the source clock's quarter-seconds for the short first segments,
+        # then its whole seconds, so workers started apart cut at the same timestamps.
+        # ``t`` counts from the worker's first frame; ``grid_offset`` is that frame's
+        # source time modulo one second.
         "-force_key_frames",
-        "expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+if(lt(n_forced,4),0.25,1)))",
+        f"expr:if(isnan(prev_forced_t),1,if(lt(n_forced,4),"
+        f"gte(floor((t+{grid_offset:.6f})*4),floor((prev_forced_t+{grid_offset:.6f})*4)+1),"
+        f"gte(floor(t+{grid_offset:.6f}),floor(prev_forced_t+{grid_offset:.6f})+1)))",
     ]
     # These encoders mark forced non-IDR I-frames as non-key, so HLS cannot cut there.
     if cmd[cmd.index("-c:v") + 1] in ("h264_nvenc", "libx264"):
         cmd += ["-forced-idr", "1"]
-    cmd += _hls_output(directory, restarting=restarting)
+    cmd += _hls_output(directory, restarting=restarting, rendition=rendition)
     limit_live_video_bitrate(cmd, resolution)
+    return cmd
+
+
+def recorder_command(
+    directory: str,
+    hw: HwAccel,
+    resolution: str,
+    quality: str,
+    seconds: float,
+    source: MediaInfo | None,
+) -> list[str]:
+    """Record the relay as a growing VOD rendition that ends with the program.
+
+    Args:
+        directory: Recording directory receiving stream.m3u8.
+        hw: Hardware acceleration setting.
+        resolution: Maximum output resolution.
+        quality: Encoder quality setting.
+        seconds: Recording length.
+        source: Probed source facts, or None to let ffmpeg probe.
+
+    Returns:
+        cmd: FFmpeg arguments reading the relay from stdin.
+    """
+    cmd = build_hls_ffmpeg_cmd(
+        "pipe:0",
+        hw,
+        directory,
+        True,
+        [],
+        source,
+        resolution,
+        quality,
+        None,
+        True,
+        allow_upscale=False,
+    )
+    # Stop reading when the program ends; ffmpeg then closes the playlist.
+    cmd[cmd.index("-i") : cmd.index("-i")] = ["-f", "mpegts", "-t", str(int(seconds))]
     return cmd
 
 
@@ -451,7 +498,91 @@ def ready_bitrate(
         return 0
 
 
-def _hls_output(directory: str, *, restarting: bool) -> list[str]:
+def playlist_end_pts(directory: str, content: str) -> float | None:
+    """Source timestamp where a playlist's last segment ends.
+
+    Args:
+        directory: Directory holding the segments.
+        content: Media playlist text.
+
+    Returns:
+        end: Last segment's first video timestamp plus its duration, or None.
+    """
+    _, _, segments = _segments(content)
+    if not segments:
+        return None
+    tags, uri = segments[-1]
+    start = segment_pts(pathlib.Path(directory) / uri)
+    duration = next((float(t[8:].split(",")[0]) for t in tags if t.startswith("#EXTINF:")), 0.0)
+    return None if start is None else start + duration
+
+
+def splice_point(directory: str, low: str, up: str) -> int | None:
+    """The upscaled segment that continues the plain rendition's final playlist.
+
+    Both workers cut keyframes on the same source-clock grid, so the upscaler has a
+    segment starting exactly where the plain playlist ends; a later one is used if
+    the grids ever disagree, so playback never waits on an exact match.
+
+    Args:
+        directory: Directory holding both renditions' segments.
+        low: The plain rendition's playlist when it stopped being served.
+        up: The upscaled rendition's current playlist.
+
+    Returns:
+        sequence: The upscaled media sequence number to continue with, or None
+            before the upscaler reaches the plain end.
+    """
+    end = playlist_end_pts(directory, low)
+    _, up_sequence, up_segments = _segments(up)
+    for index, (_, uri) in enumerate(up_segments):
+        start = segment_pts(pathlib.Path(directory) / uri)
+        # Encoders round timestamps to their own tick; a millisecond is the same frame.
+        if start is not None and (end is None or start >= end - 0.001):
+            return up_sequence + index
+    return None
+
+
+def splice_playlists(low: str, up: str, up_from: int | None, *, list_size: int) -> str:
+    """Continue the plain rendition with the upscaled one, as a single live playlist.
+
+    Every plain segment clients may have seen keeps its media sequence number; the
+    upscaled segments from ``up_from`` follow after a discontinuity, renumbered.
+
+    Args:
+        low: The plain rendition's playlist when it stopped being served.
+        up: The upscaled rendition's current playlist.
+        up_from: ``splice_point``'s result, or None before the upscaler reached it.
+        list_size: Segments the live window keeps.
+
+    Returns:
+        content: Playlist a client that was playing the plain rendition can continue.
+    """
+    if up_from is None:
+        return low
+    header, low_sequence, low_segments = _segments(low)
+    _, up_sequence, up_segments = _segments(up)
+    combined = [(low_sequence + i, tags, uri) for i, (tags, uri) in enumerate(low_segments)]
+    after = low_sequence + len(low_segments)
+    for i, (tags, uri) in enumerate(up_segments):
+        number = up_sequence + i
+        if number >= up_from:
+            switch = ["#EXT-X-DISCONTINUITY"] if number == up_from else []
+            combined.append((after + number - up_from, switch + tags, uri))
+    kept = combined[-list_size:]
+    dropped = combined[: len(combined) - len(kept)]
+    rolled = sum(tags.count("#EXT-X-DISCONTINUITY") for _, tags, _ in dropped)
+    # The upscaler's own window may have passed the switch, taking its tag along.
+    rolled += up_sequence > up_from
+    lines = [*header, f"#EXT-X-MEDIA-SEQUENCE:{kept[0][0]}"]
+    if rolled:
+        lines.append(f"#EXT-X-DISCONTINUITY-SEQUENCE:{rolled}")
+    for _, tags, uri in kept:
+        lines += [*tags, uri]
+    return "\n".join(lines) + "\n"
+
+
+def _hls_output(directory: str, *, restarting: bool, rendition: str = "low") -> list[str]:
     """HLS muxer options shared by every worker: short segments over the DVR window."""
     duration = 1.0
     flags = "delete_segments+temp_file" + ("+append_list+discont_start" if restarting else "")
@@ -466,8 +597,43 @@ def _hls_output(directory: str, *, restarting: bool) -> list[str]:
         "-hls_list_size",
         str(get_live_hls_list_size(duration)),
         "-hls_segment_filename",
-        f"{directory}/low_%06d.ts",
+        f"{directory}/{rendition}_%06d.ts",
         "-hls_flags",
         flags,
-        f"{directory}/low.m3u8",
+        f"{directory}/{rendition}.m3u8",
     ]
+
+
+# ``playlist_tags`` describe the whole playlist; every other tag belongs to the segment
+# after it.
+def _segments(
+    content: str,
+    *,
+    playlist_tags: tuple[str, ...] = (
+        "#EXTM3U",
+        "#EXT-X-VERSION",
+        "#EXT-X-TARGETDURATION",
+        "#EXT-X-MEDIA-SEQUENCE",
+        "#EXT-X-DISCONTINUITY-SEQUENCE",
+        "#EXT-X-INDEPENDENT-SEGMENTS",
+        "#EXT-X-PLAYLIST-TYPE",
+        "#EXT-X-ALLOW-CACHE",
+    ),
+) -> tuple[list[str], int, list[tuple[list[str], str]]]:
+    """Split a media playlist into header lines, first media sequence, and segments."""
+    header: list[str] = []
+    sequence = 0
+    segments: list[tuple[list[str], str]] = []
+    tags: list[str] = []
+    for line in content.splitlines():
+        if line.startswith(playlist_tags):
+            if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                sequence = int(line.partition(":")[2])
+            elif not line.startswith("#EXT-X-DISCONTINUITY-SEQUENCE"):
+                header.append(line)
+        elif line.startswith("#"):
+            tags.append(line)
+        elif line:
+            segments.append((tags, line))
+            tags = []
+    return header, sequence, segments

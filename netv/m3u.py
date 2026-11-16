@@ -19,6 +19,8 @@ from netv.cache import (
     get_sources,
     get_user_agent,
     load_file_cache,
+    relay_hints,
+    remember_live_ts,
     save_file_cache,
     update_source_epg_url,
 )
@@ -181,6 +183,7 @@ def fetch_source_live_data(
         client = _make_client(source)
         cats = client.get_live_categories()
         streams = client.get_live_streams()
+        _learn_live_ts(source.id, client)
         for c in cats:
             c["source_id"] = source.id
             c["category_id"] = f"{source.id}_{c['category_id']}"
@@ -476,6 +479,24 @@ def get_first_xtream_client() -> XtreamClient | None:
     return None
 
 
+def live_ts_offered(source_id: str) -> bool:
+    """Whether an Xtream source's panel serves live channels as continuous MPEG-TS.
+
+    Learned at every live refresh; a source not refreshed since is asked now, once.
+
+    Args:
+        source_id: Configured source.
+
+    Returns:
+        offered: True when the panel lists ``ts`` among its output formats.
+    """
+    known = relay_hints()["live_ts"].get(source_id)
+    if known is not None:
+        return known
+    client = get_xtream_client_by_source(source_id)
+    return client is not None and _learn_live_ts(source_id, client)
+
+
 def get_xtream_client_by_source(source_id: str) -> XtreamClient | None:
     """Get Xtream client for a specific source ID."""
     for source in get_sources():
@@ -565,3 +586,16 @@ def _fetch_series_data() -> tuple[list[ProviderRecord], list[ProviderRecord]]:
         except Exception as e:
             log.warning("Failed to fetch series from source %s: %s", source.id, e)
     return all_cats, all_series
+
+
+def _learn_live_ts(source_id: str, client: XtreamClient) -> bool:
+    """Ask the panel for its output formats and remember whether TS is among them."""
+    try:
+        user_info = client.get_server_info().get("user_info")
+    except (OSError, ValueError):
+        log.warning("Xtream source %s did not report its output formats", source_id)
+        return False
+    formats = user_info.get("allowed_output_formats") if isinstance(user_info, dict) else None
+    offered = isinstance(formats, list) and "ts" in formats
+    remember_live_ts(source_id, offered)
+    return offered

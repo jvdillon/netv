@@ -15,13 +15,13 @@ def _relay(
     clock: FakeClock,
     *,
     history_sec: float = 30.0,
-    max_pending_bytes: int = 16 << 20,
+    max_stall_sec: float = 10.0,
 ) -> relay.Relay:
     return relay.Relay(
         lambda: upstream,
         clock=clock.monotonic,
         history_sec=history_sec,
-        max_pending_bytes=max_pending_bytes,
+        max_stall_sec=max_stall_sec,
     )
 
 
@@ -107,14 +107,15 @@ async def test_stats_record_the_longest_silence_between_deliveries():
 async def test_bytes_arriving_after_a_drop_are_not_queued():
     """Chunks already in flight when a subscriber is dropped are discarded, not delivered."""
     clock, upstream = FakeClock(), FakeUpstream()
-    stream = _relay(upstream, clock, max_pending_bytes=4)
+    stream = _relay(upstream, clock)
     await stream.start()
     upstream.feed(b"aaa")
     await stream.wait_for_bytes(3)
     stuck = FakeSink(blocked=True)
     subscription = stream.subscribe(stuck, replay=stream.history())
     await stuck.wait_for(3)
-    # In one tick: a backlog that overflows, then a chunk for the dropped subscriber.
+    clock.advance(11)
+    # In one tick: a chunk that finds the sink stalled, then one for the dropped subscriber.
     subscription._push(b"bbbbb")
     subscription._push(b"c")
     assert subscription.end == relay.SubscriptionEnd.OVERFLOW
@@ -124,17 +125,121 @@ async def test_bytes_arriving_after_a_drop_are_not_queued():
 
 
 @pytest.mark.asyncio
+async def test_defaults_keep_thirty_seconds_and_drop_after_ten_stalled():
+    clock, upstream = FakeClock(), FakeUpstream()
+    stream = relay.Relay(lambda: upstream, clock=clock.monotonic)
+    assert stream.error is None
+    await stream.start()
+    upstream.feed(b"a")
+    await stream.wait_for_bytes(1)
+    # Upstream is read in 64 KiB pieces.
+    assert upstream.requested[0] == 64 << 10
+    stuck = FakeSink(blocked=True)
+    subscription = stream.subscribe(stuck, replay=stream.history())
+    await stuck.wait_for(1)
+    clock.advance(10)
+    subscription._push(b"b")
+    assert subscription.end is None
+    clock.advance(0.5)
+    subscription._push(b"b")
+    assert subscription.end == relay.SubscriptionEnd.OVERFLOW
+    clock.advance(19.5)
+    upstream.feed(b"c")
+    await stream.wait_for_bytes(2)
+    # Thirty seconds of history: "a" arrived exactly 30 s ago.
+    assert stream.history() == b"ac"
+    clock.advance(0.5)
+    upstream.feed(b"d")
+    while not stream.history().endswith(b"d"):
+        await asyncio.sleep(0)
+    assert stream.history() == b"cd"
+    assert subscription.end == relay.SubscriptionEnd.OVERFLOW
+    await stream.close()
+
+
+@pytest.mark.asyncio
+async def test_release_closes_at_once_without_subscribers():
+    clock, upstream = FakeClock(), FakeUpstream()
+    stream = _relay(upstream, clock)
+    await stream.start()
+    await stream.release()
+    assert stream.finished
+    assert upstream.closed
+
+
+@pytest.mark.asyncio
+async def test_a_released_relay_stays_open_until_its_last_subscriber_ends():
+    """A recording keeps the upstream open after the viewer leaves, then frees it."""
+    clock, upstream = FakeClock(), FakeUpstream()
+    stream = _relay(upstream, clock)
+    await stream.start()
+    viewer, recorder = FakeSink(), FakeSink()
+    watching = stream.subscribe(viewer)
+    recording = stream.subscribe(recorder)
+    watching.cancel()
+    await watching.wait_closed()
+    await stream.release()
+    assert not stream.finished
+    upstream.feed(b"live")
+    await recorder.wait_for(4)
+    recording.cancel()
+    await stream.wait_finished()
+    assert upstream.closed
+    assert bytes(viewer.written) == b""
+
+
+@pytest.mark.asyncio
+async def test_closing_an_unstarted_relay_is_quiet():
+    stream = relay.Relay(FakeUpstream, clock=FakeClock().monotonic)
+    await stream.close()
+    assert stream.error is None
+
+
+@pytest.mark.asyncio
+async def test_a_finishing_subscription_takes_no_new_bytes():
+    clock, upstream = FakeClock(), FakeUpstream()
+    stream = _relay(upstream, clock)
+    await stream.start()
+    sink = FakeSink()
+    subscription = stream.subscribe(sink, replay=b"a")
+    subscription._finish(relay.SubscriptionEnd.UPSTREAM_ENDED)
+    subscription._push(b"late")
+    await subscription.wait_closed()
+    assert bytes(sink.written) == b"a"
+    await stream.close()
+
+
+@pytest.mark.asyncio
+async def test_a_burst_while_the_sink_is_briefly_busy_is_kept():
+    """A panel's opening burst (~25 MB) lands while the worker starts up and reads nothing."""
+    clock, upstream = FakeClock(), FakeUpstream()
+    stream = _relay(upstream, clock)
+    await stream.start()
+    upstream.feed(b"a")
+    await stream.wait_for_bytes(1)
+    starting = FakeSink(blocked=True)
+    subscription = stream.subscribe(starting, replay=stream.history())
+    await starting.wait_for(1)
+    clock.advance(9)
+    for _ in range(64):
+        subscription._push(b"x" * (1 << 20))
+    assert subscription.end is None
+    await stream.close()
+
+
+@pytest.mark.asyncio
 async def test_slow_subscriber_is_dropped_without_stalling_others():
     clock, upstream = FakeClock(), FakeUpstream()
-    stream = _relay(upstream, clock, max_pending_bytes=4)
+    stream = _relay(upstream, clock)
     await stream.start()
     upstream.feed(b"aaa")
     await stream.wait_for_bytes(3)
     stuck, healthy = FakeSink(blocked=True), FakeSink()
     stuck_subscription = stream.subscribe(stuck, replay=stream.history())
     stream.subscribe(healthy, replay=stream.history())
-    # The stuck sink is now refusing bytes; what arrives next is a backlog, not a burst.
+    # The stuck sink has refused bytes for longer than a worker takes to start.
     await stuck.wait_for(3)
+    clock.advance(11)
     for chunk in (b"bbb", b"ccc"):
         upstream.feed(chunk)
     await healthy.wait_for(9)
@@ -277,7 +382,7 @@ async def test_feed_yields_what_its_subscription_delivers():
 @pytest.mark.asyncio
 async def test_feed_holds_back_its_subscription_until_pulled():
     clock, upstream = FakeClock(), FakeUpstream()
-    stream = _relay(upstream, clock, max_pending_bytes=4)
+    stream = _relay(upstream, clock)
     await stream.start()
     upstream.feed(b"aaa")
     await stream.wait_for_bytes(3)
@@ -285,6 +390,7 @@ async def test_feed_holds_back_its_subscription_until_pulled():
     subscription = stream.subscribe(feed, replay=stream.history())
     # The pump writes the replay and waits for it to be taken.
     await asyncio.sleep(0)
+    clock.advance(11)
     for chunk in (b"bbb", b"ccc"):
         upstream.feed(chunk)
     # Nothing pulls, so the first chunk is never taken and the rest overflow.

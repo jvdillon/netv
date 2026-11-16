@@ -35,7 +35,13 @@ import uuid
 
 from treekle import json_loads
 
-from netv.cache import HwAccel, ServerSettings, get_user_agent
+from netv.cache import (
+    HwAccel,
+    ServerSettings,
+    get_user_agent,
+    relay_hints,
+    remember_burst_gap,
+)
 from netv.fast_start import (
     closed_caption_master_playlist,
     dated_playlist,
@@ -45,10 +51,14 @@ from netv.fast_start import (
     keyframe_replay,
     live_buffer_durations,
     master_playlist,
+    playlist_end_pts,
     ready_bitrate,
+    recorder_command,
     remux_command,
     segment_pts,
     source_command,
+    splice_playlists,
+    splice_point,
     surround_audio_bitrate,
 )
 from netv.ffmpeg_command import (
@@ -58,6 +68,7 @@ from netv.ffmpeg_command import (
     build_hls_ffmpeg_cmd,
     can_remux_live,
     get_hls_segment_duration,
+    get_live_hls_list_size,
     get_settings,
     get_transcode_dir,
     invalidate_series_probe_cache,
@@ -69,7 +80,7 @@ from netv.ffmpeg_command import (
     restore_probe_cache_entry,
     uses_audio_passthrough,
 )
-from netv.m3u import get_xtream_client_by_source
+from netv.m3u import live_ts_offered
 from netv.playback_policy import LiveRecoveryPolicy, PlaybackHealth, PlaybackPolicy
 from netv.relay import Readable, Relay, Subscription
 from netv.util import safe_urlopen
@@ -102,6 +113,7 @@ class ManagedProcess(Protocol):
 
 
 VodType: TypeAlias = Literal["movie", "series"]
+Rendition: TypeAlias = Literal["low", "up"]
 ContentType: TypeAlias = Literal["live"] | VodType
 
 
@@ -191,6 +203,8 @@ class _FastLivePlan:
         source: MediaInfo | None,
         *,
         restarting: bool,
+        rendition: Rendition = "low",
+        grid_offset: float = 0.0,
     ) -> tuple[list[str], str]:
         """Choose the worker for ``source``: a stream copy when every client plays it.
 
@@ -198,15 +212,19 @@ class _FastLivePlan:
             directory: Session directory.
             source: Probed source facts, or None when unknown.
             restarting: Append to the rendition an earlier worker published.
+            rendition: "low" starts at once; "up" applies AI Upscale where available.
+            grid_offset: Source time of the worker's first frame, modulo one second.
 
         Returns:
             cmd: FFmpeg arguments reading the relay from stdin.
-            role: "remux" or "encoder", for logs.
+            role: "remux", "encoder", or "upscale", for logs.
         """
+        upscale = rendition == "up"
         # A DVR session needs only server-side retention, so a source every client
         # plays is copied rather than re-encoded.
         if (
-            not self.bandwidth_saver
+            not upscale
+            and not self.bandwidth_saver
             and self.dvr
             and can_remux_live(source, self.resolution, audio_passthrough=self.audio_passthrough)
         ):
@@ -217,13 +235,22 @@ class _FastLivePlan:
             self.resolution,
             self.quality,
             self.deinterlace,
-            allow_upscale=not self.bandwidth_saver,
+            allow_upscale=upscale,
             audio=source,
             audio_passthrough=self.audio_passthrough,
             restarting=restarting,
             video_codec=source.video_codec if source else "",
+            rendition=rendition,
+            grid_offset=grid_offset,
         )
-        return cmd, "encoder"
+        return cmd, "upscale" if upscale else "encoder"
+
+    def upscales(self, directory: str, source: MediaInfo | None) -> bool:
+        """Whether an AI Upscale worker would apply to ``source`` (a TensorRT engine fits)."""
+        if self.bandwidth_saver:
+            return False
+        cmd, _ = self.worker(directory, source, restarting=False, rendition="up")
+        return any("dnn_processing" in arg for arg in cmd)
 
 
 class FastLiveSession(TranscodeSession):
@@ -236,6 +263,12 @@ class FastLiveSession(TranscodeSession):
     # Set once the source is probed and a worker launches.
     subscription: NotRequired[Subscription]
     master_audio_bitrate: NotRequired[int]
+    # The rendition low.m3u8 serves: "up" once the AI Upscale worker caught up.
+    rendition: NotRequired[Rendition]
+    # The plain playlist as last served, which the upscaled one continues.
+    splice_low: NotRequired[str]
+    # The upscaled media sequence number that continues it, once known.
+    splice_point: NotRequired[int]
 
 
 class TranscodeResponse(TypedDict):
@@ -287,8 +320,6 @@ _url_to_session: dict[str, str] = {}  # URL -> session_id (all content types)
 _transcode_lock = threading.Lock()
 _background_tasks: set[asyncio.Task[None]] = set()
 _startup_guards: dict[str, _StartupGuard] = {}  # URL -> in-flight lookup-or-start.
-_ts_output: dict[str, bool] = {}  # Xtream source -> whether its panel serves live as TS.
-_source_gaps: dict[str, float] = {}  # Upstream host -> longest silence between bursts.
 
 
 # ===========================================================================
@@ -381,10 +412,15 @@ async def stop_session(session_id: str, force: bool = False) -> None:
 
     await _terminate_processes(processes)
     if _is_fast_live(session):
-        await session["relay"].close()
+        subscription = session.get("subscription")
+        if subscription is not None:
+            subscription.cancel()
+            await subscription.wait_closed()
+        # A recording reading this relay keeps it open until the recording ends.
+        await session["relay"].release()
         # Later sessions from this host buffer past the bursts this one saw.
         host = parse.urlsplit(session["plan"].source_url).netloc
-        _source_gaps[host] = max(_source_gaps.get(host, 0.0), session["relay"].stats.max_gap_sec)
+        await asyncio.to_thread(remember_burst_gap, host, session["relay"].stats.max_gap_sec)
     if cached:
         log.info("Session %s cached (ffmpeg stopped, segments kept)", session_id)
         return
@@ -392,21 +428,100 @@ async def stop_session(session_id: str, force: bool = False) -> None:
     log.info("Stopped transcode session %s", session_id)
 
 
-async def stop_user_stream(username: str, url: str) -> None:
-    """Stop a user's sessions of a stream, freeing its upstream connection.
+@dataclass(frozen=True, kw_only=True, slots=True)
+class LiveRecording:
+    """A recording of a live stream, controllable from any thread."""
+
+    process: asyncio.subprocess.Process
+    relay: Relay
+    loop: asyncio.AbstractEventLoop
+
+    def finished(self) -> bool:
+        return self.process.returncode is not None
+
+    def stop(self) -> None:
+        """Stop recording, keeping what was recorded; call from outside the event loop."""
+        asyncio.run_coroutine_threadsafe(_terminate_process(self.process), self.loop).result()
+
+
+_recordings: set[LiveRecording] = set()
+
+
+async def record_live(
+    username: str,
+    url: str,
+    source_id: str,
+    directory: str,
+    seconds: float,
+) -> LiveRecording:
+    """Record a live stream, taking over the user's session of it if one is playing.
+
+    The recording reads the session's relay, so no second upstream connection
+    opens; the viewer's session stops and the relay closes when the recording ends.
 
     Args:
-        username: Session owner.
-        url: Resolved or requested stream URL.
+        username: User whose stream is recorded.
+        url: Live URL as the client requested it.
+        source_id: Source the URL belongs to.
+        directory: Recording directory receiving stream.m3u8.
+        seconds: Recording length.
+
+    Returns:
+        recording: The running recording.
     """
     with _transcode_lock:
-        matches = [
-            sid
+        viewing = [
+            (sid, s)
             for sid, s in _transcode_sessions.items()
-            if s.get("username") == username and url in (s.get("url"), s.get("request_url"))
+            if _is_fast_live(s) and s.get("username") == username and s["url"] == url
         ]
-    for session_id in matches:
+    if viewing:
+        stream = viewing[0][1]["relay"]
+    else:
+        source_url = await asyncio.to_thread(_relay_url, url, source_id)
+        stream = Relay(
+            functools.partial(_open_source, source_url, get_user_agent()),
+            clock=time.time,
+        )
+        await stream.start()
+    process: asyncio.subprocess.Process | None = None
+    try:
+        sample = await _wait_for_keyframe(stream)
+        received = stream.stats.bytes_received
+        path = pathlib.Path(directory) / "probe.ts"
+        await asyncio.to_thread(path.write_bytes, sample)
+        source = await asyncio.to_thread(probe_segment, str(path))
+        settings = get_settings()
+        cmd = recorder_command(
+            directory,
+            settings["transcode_hw"],
+            settings.get("max_resolution", "1080p"),
+            settings.get("quality", "high"),
+            seconds,
+            source,
+        )
+        process = await _launch_ffmpeg(cmd, stdin=asyncio.subprocess.PIPE)
+        if process.stdin is None:
+            raise ValueError("Expected process.stdin is not None.")
+        subscription = stream.subscribe(process.stdin, replay=_since(stream, sample, received))
+    except BaseException:
+        await _terminate_process(process)
+        if not viewing:
+            await stream.close()
+        raise
+    recording = LiveRecording(process=process, relay=stream, loop=asyncio.get_running_loop())
+    _recordings.add(recording)
+    _spawn_background_task(_finish_recording(recording, subscription, pathlib.Path(directory)))
+    for session_id, _ in viewing:
         await stop_session(session_id, force=True)
+    await stream.release()
+    log.info(
+        "Recording %s for %.0fs from %s",
+        directory,
+        seconds,
+        "its session" if viewing else "upstream",
+    )
+    return recording
 
 
 async def cleanup_expired_sessions() -> None:
@@ -427,10 +542,13 @@ async def shutdown() -> None:
         sessions = list(_transcode_sessions.values())
         processes = [process for session in sessions for process in _retire_session(session)]
         _transcode_sessions.clear()
+    recordings = list(_recordings)
+    _recordings.clear()
+    processes += [recording.process for recording in recordings]
     await _terminate_processes(processes)
-    await asyncio.gather(
-        *(session["relay"].close() for session in sessions if _is_fast_live(session)),
-    )
+    relays = {id(r.relay): r.relay for r in recordings}
+    relays.update({id(s["relay"]): s["relay"] for s in sessions if _is_fast_live(s)})
+    await asyncio.gather(*(relay.close() for relay in relays.values()))
 
 
 # ===========================================================================
@@ -842,8 +960,7 @@ def get_session_progress(session_id: str) -> SessionProgress | None:
     session = get_session(session_id)
     if session is None:
         return None
-    name = "low.m3u8" if session.get("fast_start", False) else "stream.m3u8"
-    playlist_path = pathlib.Path(session["dir"]) / name
+    playlist_path = pathlib.Path(session["dir"]) / playlist_file(session)
     if not playlist_path.exists():
         return {"segment_count": 0, "duration": 0.0}
     durations = re.findall(r"#EXTINF:([\d.]+)", playlist_path.read_text())
@@ -1083,7 +1200,7 @@ def report_playback_health(
         if not bandwidth_saver and _is_process_alive(session.get("process")):
             session["recovery_bitrate"] = max(
                 session.get("recovery_bitrate", 0),
-                ready_bitrate(session["dir"], "low.m3u8"),
+                ready_bitrate(session["dir"], playlist_file(session)),
             )
         # The single encoder has no second rendition to wait for.
         policy = policy.observe(health, now, session.get("recovery_bitrate", 0))
@@ -1102,221 +1219,6 @@ def report_playback_health(
                     generation,
                 )
         return result
-
-
-async def _start_fast_live(
-    url: str,
-    username: str,
-    source_id: str,
-    deinterlace: bool,
-    *,
-    bandwidth_saver: bool = False,
-    is_disconnected: Callable[[], Awaitable[bool]] | None = None,
-    audio_passthrough: bool = False,
-    watchdog_stale_floor_sec: float = 45.0,
-) -> TranscodeResponse:
-    """One upstream reader (the relay), one worker, one session/stream slot."""
-    settings = get_settings()
-    session_id = str(uuid.uuid4())
-    directory = tempfile.mkdtemp(prefix=f"netv_transcode_{session_id}_", dir=get_transcode_dir())
-    started = time.time()
-    try:
-        plan = _FastLivePlan(
-            source_url=await asyncio.to_thread(_relay_url, url, source_id),
-            user_agent=get_user_agent(),
-            hw=settings["transcode_hw"],
-            resolution=_live_resolution(settings, bandwidth_saver=bandwidth_saver),
-            quality="low" if bandwidth_saver else settings.get("quality", "high"),
-            deinterlace=deinterlace,
-            bandwidth_saver=bandwidth_saver,
-            audio_passthrough=audio_passthrough,
-            dvr=settings["live_dvr_mins"] > 0,
-        )
-        session: FastLiveSession = {
-            "dir": directory,
-            "process": None,
-            "started": started,
-            "last_access": started,
-            "url": url,
-            "is_vod": False,
-            "username": username,
-            "source_id": source_id,
-            "bandwidth_saver": bandwidth_saver,
-            "playback_policy": PlaybackPolicy(bandwidth_saver=bandwidth_saver),
-            "live_recovery": LiveRecoveryPolicy(),
-            # Full-quality requirement a saver session must sustain to recover.
-            "recovery_bitrate": live_video_bitrates(settings.get("max_resolution", "1080p"))[1]
-            * 1.1,
-            "fast_start": True,
-            "playlist_generation": 0,
-            "playback_buffer_seconds": 12.0,
-            "closed_captions": False,
-            "plan": plan,
-            "relay": plan.relay(),
-            # Conservative until the probe settles it, so AAC-only clients never
-            # reuse a session that may start copying Dolby.
-            "audio_passthrough": audio_passthrough,
-            "subtitles": [],
-            "duration": 0,
-            "seek_offset": 0,
-        }
-        with _transcode_lock:
-            _transcode_sessions[session_id] = session
-            _url_to_session[url] = session_id
-        await session["relay"].start()
-        process = await _launch_worker(
-            session_id,
-            session,
-            fresh_relay=True,
-            previous_segments=None,
-        )
-        first_byte_at = session["relay"].stats.first_byte_at or started
-        # A source that went silent between bursts before needs output that bridges it.
-        burst_gap = _source_gaps.get(parse.urlsplit(plan.source_url).netloc, 0.0)
-        log.info(
-            "Fast-start session %s: first byte after %.2fs, worker launched after %.2fs",
-            session_id,
-            first_byte_at - started,
-            time.time() - started,
-        )
-        if not await _wait_for_fresh_fast_playlist(
-            directory,
-            "low.m3u8",
-            process,
-            None,
-            minimum_seconds=burst_gap,
-            is_disconnected=is_disconnected,
-        ):
-            log.error(
-                "Fast-start session %s failed waiting for low.m3u8 after %.2fs "
-                "(exit=%s, upstream=%s)",
-                session_id,
-                time.time() - started,
-                process.returncode,
-                session["relay"].error or "open",
-            )
-            raise fastapi.HTTPException(500, "Fast-start stream failed to become ready")
-        content = (pathlib.Path(directory) / "low.m3u8").read_text()
-        # Clients hold two of the longest waits for new output: a segment, or a burst gap.
-        reserve, playback_buffer = live_buffer_durations(
-            [burst_gap, *(float(value) for value in re.findall(r"#EXTINF:([\d.]+)", content))],
-        )
-        with _transcode_lock:
-            _require_current(session_id, session)
-            session["watchdog_stale_after"] = max(watchdog_stale_floor_sec, reserve + 2)
-            session["playback_buffer_seconds"] = playback_buffer
-            session["watchdog_task"] = _spawn_background_task(_watch_fast_live(session_id))
-        log.info(
-            "Fast-start session %s ready at %s after %.2fs with %.1fs playback buffer",
-            session_id,
-            plan.resolution,
-            time.time() - started,
-            playback_buffer,
-        )
-        _publish_fast_master(session)
-        return _adaptive_session_response(session_id)
-    except BaseException:
-        await stop_session(session_id, force=True)
-        await asyncio.to_thread(shutil.rmtree, directory, ignore_errors=True)
-        raise
-
-
-# Nothing before a keyframe decodes, so starting there costs no picture and makes the
-# probe and the worker's own stream analysis nearly instant. A fresh relay also starts
-# the session clock.
-async def _launch_worker(
-    session_id: str,
-    session: FastLiveSession,
-    *,
-    fresh_relay: bool,
-    previous_segments: set[str] | None,
-) -> asyncio.subprocess.Process:
-    """Launch the worker that suits the source, fed from the relay's last keyframe."""
-    stream = session["relay"]
-    plan = session["plan"]
-    started = time.time()
-    sample = await _wait_for_keyframe(stream)
-    path = pathlib.Path(session["dir"]) / "probe.ts"
-    await asyncio.to_thread(path.write_bytes, sample)
-    # Captions only shape the master playlist, published once the worker is ready.
-    captions = asyncio.ensure_future(asyncio.to_thread(probe_closed_captions, str(path)))
-    source = await asyncio.to_thread(probe_segment, str(path))
-    if fresh_relay:
-        history = stream.history()
-        origin_time = stream.stats.first_byte_at or time.time()
-        await _restart_session_clock(session_id, session, first_video_pts(history), origin_time)
-    cmd, role = plan.worker(session["dir"], source, restarting=previous_segments is not None)
-    if previous_segments is not None:
-        cmd = _prepare_encoder_restart(cmd, previous_segments)
-    try:
-        process = await _launch_ffmpeg(cmd, stdin=asyncio.subprocess.PIPE)
-    except BaseException:
-        captions.cancel()
-        raise
-    try:
-        with _transcode_lock:
-            _require_current(session_id, session)
-            if process.stdin is None:
-                raise ValueError("Expected process.stdin is not None.")
-            # Bytes arrived while probing; replay from the keyframe up to now.
-            history = stream.history()
-            session["process"] = process
-            session["subscription"] = stream.subscribe(
-                process.stdin,
-                replay=keyframe_replay(history) or history,
-            )
-            session["audio_info"] = source
-            session["audio_passthrough"] = uses_audio_passthrough(source, plan.audio_passthrough)
-            session["master_audio_bitrate"] = surround_audio_bitrate(source, plan.audio_passthrough)
-        _spawn_background_task(_monitor_fast_process(process, role, session_id))
-        closed_captions = await captions
-        with _transcode_lock:
-            _require_current(session_id, session)
-            session["closed_captions"] = closed_captions
-    except BaseException:
-        captions.cancel()
-        await _terminate_process(process)
-        raise
-    log.info(
-        "Fast-start session %s probed from its keyframe in %.2fs and launched its %s%s",
-        session_id,
-        time.time() - started,
-        role,
-        " (embedded captions)" if closed_captions else "",
-    )
-    return process
-
-
-async def _wait_for_keyframe(stream: Relay, *, max_bytes: int = 4 << 20) -> bytes:
-    """Wait until the relay holds a video keyframe and return the stream from it."""
-    while True:
-        history = stream.history()
-        if (replay := keyframe_replay(history)) is not None:
-            return replay
-        if stream.finished or len(history) >= max_bytes:
-            return history
-        await stream.wait_for_bytes(len(history) + 1)
-
-
-# Panels serve every live channel at both ``.m3u8`` and ``.ts``. The TS stream has no
-# playlist or redirect round trips and needs no remuxer; it measured 2.5-4.3 s to
-# playable output against 5.8-10.3 s through HLS.
-def _relay_url(url: str, source_id: str) -> str:
-    """The URL the relay reads: an Xtream live stream as one continuous MPEG-TS stream."""
-    if not url.endswith(".m3u8"):
-        return url
-    if source_id not in _ts_output:
-        client = get_xtream_client_by_source(source_id)
-        if client is None:
-            return url
-        try:
-            user_info = client.get_server_info().get("user_info")
-        except (OSError, ValueError):
-            log.warning("Xtream source %s did not report its output formats", source_id)
-            return url
-        formats = user_info.get("allowed_output_formats") if isinstance(user_info, dict) else None
-        _ts_output[source_id] = isinstance(formats, list) and "ts" in formats
-    return url.removesuffix(".m3u8") + ".ts" if _ts_output[source_id] else url
 
 
 # The read timeout turns a silent upstream into a relay end the watchdog acts on;
@@ -1351,12 +1253,40 @@ class _ProcessOutput:
         self.stdout.close()
 
 
-def _live_resolution(settings: ServerSettings, *, bandwidth_saver: bool) -> str:
-    """The resolution a live worker encodes: the configured maximum, or at most 720p for saver."""
-    maximum = settings.get("max_resolution", "1080p")
-    if bandwidth_saver and maximum != "480p":
-        return "720p"
-    return maximum
+def playlist_file(session: TranscodeSession) -> str:
+    """The playlist file a session's clients read: stream.m3u8, or its live rendition's."""
+    if not _is_fast_live(session):
+        return "stream.m3u8"
+    return f"{session.get('rendition', 'low')}.m3u8"
+
+
+def live_playlist(session_id: str) -> str | None:
+    """The live playlist a session's clients read, continuing across a rendition switch.
+
+    Args:
+        session_id: Fast-start session.
+
+    Returns:
+        content: Playlist text, or None for an unknown session or an unwritten playlist.
+    """
+    with _transcode_lock:
+        session = _transcode_sessions.get(session_id)
+        if session is None or not _is_fast_live(session):
+            return None
+        directory, name = session["dir"], playlist_file(session)
+        low, point = session.get("splice_low"), session.get("splice_point")
+    try:
+        content = (pathlib.Path(directory) / name).read_text()
+    except OSError:
+        return None
+    if low is None:
+        return content
+    if point is None:
+        point = splice_point(directory, low, content)
+        if point is not None:
+            with _transcode_lock:
+                session["splice_point"] = point
+    return splice_playlists(low, content, point, list_size=get_live_hls_list_size(1.0))
 
 
 def _require_current(session_id: str, session: TranscodeSession) -> None:
@@ -2328,7 +2258,7 @@ async def _restart_fast_pipeline(
                 session["relay"] = stream
             await stream.start()
 
-        low_playlist = pathlib.Path(session["dir"]) / "low.m3u8"
+        low_playlist = pathlib.Path(session["dir"]) / playlist_file(session)
         low_marker = _playlist_marker(low_playlist)
         low_segments = _playlist_segments(low_playlist)
         replacement = await _launch_worker(
@@ -2339,7 +2269,7 @@ async def _restart_fast_pipeline(
         )
         if not await _wait_for_fresh_fast_playlist(
             session["dir"],
-            "low.m3u8",
+            low_playlist.name,
             replacement,
             low_marker,
             previous_segments=low_segments,
@@ -2391,7 +2321,7 @@ async def _restart_session_clock(
 ) -> None:
     """Date the old worker's segments, then move the clock to the new relay."""
     with contextlib.suppress(OSError):
-        content = (pathlib.Path(session["dir"]) / "low.m3u8").read_text()
+        content = (pathlib.Path(session["dir"]) / playlist_file(session)).read_text()
         await asyncio.to_thread(dated_fast_playlist, session_id, content)
     with _transcode_lock:
         _require_current(session_id, session)
@@ -2425,7 +2355,8 @@ async def _check_fast_live_session(session_id: str, session: TranscodeSession) -
     last_byte_at = stream.stats.last_byte_at
     input_ready = last_byte_at is not None and time.time() - last_byte_at <= stale_after
     low_alive = _is_process_alive(session.get("process"))
-    low_ready = bool(low_alive and ready_bitrate(session["dir"], "low.m3u8", max_age=stale_after))
+    playlist = playlist_file(session)
+    low_ready = bool(low_alive and ready_bitrate(session["dir"], playlist, max_age=stale_after))
 
     recovery, input_stalled = recovery.stalled("input", input_alive, input_ready, now)
     recovery, low_stalled = recovery.stalled("low", low_alive, low_ready, now)
@@ -2638,3 +2569,334 @@ class _SessionInfo(TypedDict, total=False):
     source_id: str
     audio_passthrough: bool
     probe: _SessionProbe
+
+
+async def _finish_recording(
+    recording: LiveRecording,
+    subscription: Subscription,
+    directory: pathlib.Path,
+) -> None:
+    """Keep the recorder's stderr in ffmpeg.log; once it exits, stop feeding it."""
+    process = recording.process
+    if process.stderr is None:
+        raise ValueError("Expected process.stderr is not None.")
+    with (directory / "ffmpeg.log").open("ab") as log_file:
+        while line := await process.stderr.readline():
+            log_file.write(line)
+    await process.wait()
+    subscription.cancel()
+    _recordings.discard(recording)
+
+
+async def _start_fast_live(
+    url: str,
+    username: str,
+    source_id: str,
+    deinterlace: bool,
+    *,
+    bandwidth_saver: bool = False,
+    is_disconnected: Callable[[], Awaitable[bool]] | None = None,
+    audio_passthrough: bool = False,
+    watchdog_stale_floor_sec: float = 45.0,
+) -> TranscodeResponse:
+    """One upstream reader (the relay), one worker, one session/stream slot."""
+    settings = get_settings()
+    session_id = str(uuid.uuid4())
+    directory = tempfile.mkdtemp(prefix=f"netv_transcode_{session_id}_", dir=get_transcode_dir())
+    started = time.time()
+    try:
+        plan = _FastLivePlan(
+            source_url=await asyncio.to_thread(_relay_url, url, source_id),
+            user_agent=get_user_agent(),
+            hw=settings["transcode_hw"],
+            resolution=_live_resolution(settings, bandwidth_saver=bandwidth_saver),
+            quality="low" if bandwidth_saver else settings.get("quality", "high"),
+            deinterlace=deinterlace,
+            bandwidth_saver=bandwidth_saver,
+            audio_passthrough=audio_passthrough,
+            dvr=settings["live_dvr_mins"] > 0,
+        )
+        session: FastLiveSession = {
+            "dir": directory,
+            "process": None,
+            "started": started,
+            "last_access": started,
+            "url": url,
+            "is_vod": False,
+            "username": username,
+            "source_id": source_id,
+            "bandwidth_saver": bandwidth_saver,
+            "playback_policy": PlaybackPolicy(bandwidth_saver=bandwidth_saver),
+            "live_recovery": LiveRecoveryPolicy(),
+            # Full-quality requirement a saver session must sustain to recover.
+            "recovery_bitrate": live_video_bitrates(settings.get("max_resolution", "1080p"))[1]
+            * 1.1,
+            "fast_start": True,
+            "playlist_generation": 0,
+            "playback_buffer_seconds": 12.0,
+            "closed_captions": False,
+            "plan": plan,
+            "relay": plan.relay(),
+            # Conservative until the probe settles it, so AAC-only clients never
+            # reuse a session that may start copying Dolby.
+            "audio_passthrough": audio_passthrough,
+            "subtitles": [],
+            "duration": 0,
+            "seek_offset": 0,
+        }
+        with _transcode_lock:
+            _transcode_sessions[session_id] = session
+            _url_to_session[url] = session_id
+        await session["relay"].start()
+        process = await _launch_worker(
+            session_id,
+            session,
+            fresh_relay=True,
+            previous_segments=None,
+        )
+        first_byte_at = session["relay"].stats.first_byte_at or started
+        # A source that went silent between bursts before needs output that bridges it.
+        hints = await asyncio.to_thread(relay_hints)
+        burst_gap = hints["burst_gaps"].get(parse.urlsplit(plan.source_url).netloc, 0.0)
+        log.info(
+            "Fast-start session %s: first byte after %.2fs, worker launched after %.2fs",
+            session_id,
+            first_byte_at - started,
+            time.time() - started,
+        )
+        if not await _wait_for_fresh_fast_playlist(
+            directory,
+            "low.m3u8",
+            process,
+            None,
+            minimum_seconds=burst_gap,
+            is_disconnected=is_disconnected,
+        ):
+            log.error(
+                "Fast-start session %s failed waiting for low.m3u8 after %.2fs "
+                "(exit=%s, upstream=%s)",
+                session_id,
+                time.time() - started,
+                process.returncode,
+                session["relay"].error or "open",
+            )
+            raise fastapi.HTTPException(500, "Fast-start stream failed to become ready")
+        content = (pathlib.Path(directory) / "low.m3u8").read_text()
+        # Clients hold two of the longest waits for new output: a segment, or a burst gap.
+        reserve, playback_buffer = live_buffer_durations(
+            [burst_gap, *(float(value) for value in re.findall(r"#EXTINF:([\d.]+)", content))],
+        )
+        with _transcode_lock:
+            _require_current(session_id, session)
+            session["watchdog_stale_after"] = max(watchdog_stale_floor_sec, reserve + 2)
+            session["playback_buffer_seconds"] = playback_buffer
+            session["watchdog_task"] = _spawn_background_task(_watch_fast_live(session_id))
+        log.info(
+            "Fast-start session %s ready at %s after %.2fs with %.1fs playback buffer",
+            session_id,
+            plan.resolution,
+            time.time() - started,
+            playback_buffer,
+        )
+        _publish_fast_master(session)
+        return _adaptive_session_response(session_id)
+    except BaseException:
+        await stop_session(session_id, force=True)
+        await asyncio.to_thread(shutil.rmtree, directory, ignore_errors=True)
+        raise
+
+
+# Nothing before a keyframe decodes, so starting there costs no picture and makes the
+# probe and the worker's own stream analysis nearly instant. A fresh relay also starts
+# the session clock.
+async def _launch_worker(
+    session_id: str,
+    session: FastLiveSession,
+    *,
+    fresh_relay: bool,
+    previous_segments: set[str] | None,
+) -> asyncio.subprocess.Process:
+    """Launch the worker that suits the source, fed from the relay's last keyframe."""
+    stream = session["relay"]
+    plan = session["plan"]
+    started = time.time()
+    sample = await _wait_for_keyframe(stream)
+    received = stream.stats.bytes_received
+    path = pathlib.Path(session["dir"]) / "probe.ts"
+    await asyncio.to_thread(path.write_bytes, sample)
+    # Captions only shape the master playlist, published once the worker is ready.
+    captions = asyncio.ensure_future(asyncio.to_thread(probe_closed_captions, str(path)))
+    source = await asyncio.to_thread(probe_segment, str(path))
+    if fresh_relay:
+        history = stream.history()
+        origin_time = stream.stats.first_byte_at or time.time()
+        await _restart_session_clock(session_id, session, first_video_pts(history), origin_time)
+    cmd, role = plan.worker(
+        session["dir"],
+        source,
+        restarting=previous_segments is not None,
+        rendition=session.get("rendition", "low"),
+        grid_offset=(first_video_pts(sample) or 0.0) % 1,
+    )
+    if previous_segments is not None:
+        cmd = _prepare_encoder_restart(cmd, previous_segments)
+    try:
+        process = await _launch_ffmpeg(cmd, stdin=asyncio.subprocess.PIPE)
+    except BaseException:
+        captions.cancel()
+        raise
+    try:
+        with _transcode_lock:
+            _require_current(session_id, session)
+            if process.stdin is None:
+                raise ValueError("Expected process.stdin is not None.")
+            session["process"] = process
+            session["subscription"] = stream.subscribe(
+                process.stdin,
+                replay=_since(stream, sample, received),
+            )
+            session["audio_info"] = source
+            session["audio_passthrough"] = uses_audio_passthrough(source, plan.audio_passthrough)
+            session["master_audio_bitrate"] = surround_audio_bitrate(source, plan.audio_passthrough)
+        _spawn_background_task(_monitor_fast_process(process, role, session_id))
+        if previous_segments is None and plan.upscales(session["dir"], source):
+            _spawn_background_task(_upgrade_to_upscale(session_id, session, source))
+        closed_captions = await captions
+        with _transcode_lock:
+            _require_current(session_id, session)
+            session["closed_captions"] = closed_captions
+    except BaseException:
+        captions.cancel()
+        await _terminate_process(process)
+        raise
+    log.info(
+        "Fast-start session %s probed from its keyframe in %.2fs and launched its %s%s",
+        session_id,
+        time.time() - started,
+        role,
+        " (embedded captions)" if closed_captions else "",
+    )
+    return process
+
+
+async def _wait_for_keyframe(stream: Relay, *, max_bytes: int = 4 << 20) -> bytes:
+    """Wait until the relay holds a video keyframe and return the stream from it."""
+    while True:
+        history = stream.history()
+        if (replay := keyframe_replay(history)) is not None:
+            return replay
+        if stream.finished or len(history) >= max_bytes:
+            return history
+        await stream.wait_for_bytes(len(history) + 1)
+
+
+# Panels serve every live channel at both ``.m3u8`` and ``.ts``. The TS stream has no
+# playlist or redirect round trips and needs no remuxer; it measured 2.5-4.3 s to
+# playable output against 5.8-10.3 s through HLS.
+def _relay_url(url: str, source_id: str) -> str:
+    """The URL the relay reads: an Xtream live stream as one continuous MPEG-TS stream."""
+    if url.endswith(".m3u8") and live_ts_offered(source_id):
+        return url.removesuffix(".m3u8") + ".ts"
+    return url
+
+
+def _live_resolution(settings: ServerSettings, *, bandwidth_saver: bool) -> str:
+    """The resolution a live worker encodes: the configured maximum, or at most 720p for saver."""
+    maximum = settings.get("max_resolution", "1080p")
+    if bandwidth_saver and maximum != "480p":
+        return "720p"
+    return maximum
+
+
+# A worker's keyframe grid is computed from its replay's first frame, so it must get
+# that replay, not a newer keyframe that arrived while it launched.
+def _since(stream: Relay, replay: bytes, received: int) -> bytes:
+    """``replay`` plus the bytes the relay received after it was taken."""
+    arrived = stream.stats.bytes_received - received
+    return replay + stream.history()[-arrived:] if arrived else replay
+
+
+# TensorRT takes seconds to load, so playback starts on the plain worker. The upscaled
+# rendition replaces it at the next playlist generation.
+async def _upgrade_to_upscale(
+    session_id: str,
+    session: FastLiveSession,
+    source: MediaInfo | None,
+) -> None:
+    """Run the AI Upscale worker beside the fast one; serve it once it has caught up."""
+    stream = session["relay"]
+    history = stream.history()
+    replay, received = keyframe_replay(history) or history, stream.stats.bytes_received
+    cmd, role = session["plan"].worker(
+        session["dir"],
+        source,
+        restarting=False,
+        rendition="up",
+        grid_offset=(first_video_pts(replay) or 0.0) % 1,
+    )
+    process = await _launch_ffmpeg(cmd, stdin=asyncio.subprocess.PIPE)
+    directory = session["dir"]
+    subscription: Subscription | None = None
+    switched = False
+    try:
+        if process.stdin is None:
+            raise ValueError("Expected process.stdin is not None.")
+        subscription = stream.subscribe(process.stdin, replay=_since(stream, replay, received))
+        _spawn_background_task(_monitor_fast_process(process, role, session_id))
+        if await _wait_for_fresh_fast_playlist(
+            directory,
+            "up.m3u8",
+            process,
+            None,
+        ) and await _caught_up(directory, process):
+            # Snapshot the plain playlist before stopping its worker: a stopped worker
+            # flushes a short last segment, and published sequence numbers stay fixed.
+            low_path = pathlib.Path(directory) / "low.m3u8"
+            with _transcode_lock:
+                _require_current(session_id, session)
+                fast_process, fast_subscription = session["process"], session.get("subscription")
+                session.update(
+                    process=process,
+                    subscription=subscription,
+                    rendition="up",
+                    splice_low=low_path.read_text(),
+                    playlist_generation=session.get("playlist_generation", 0) + 1,
+                )
+            switched = True
+            if fast_subscription is not None:
+                fast_subscription.cancel()
+            await _terminate_process(fast_process)
+            log.info("Fast-start session %s switched to its AI Upscale rendition", session_id)
+        else:
+            log.warning(
+                "Fast-start session %s keeps its plain rendition: AI Upscale failed",
+                session_id,
+            )
+    except KeyError:
+        log.info("Fast-start session %s ended before AI Upscale caught up", session_id)
+    finally:
+        if not switched:
+            if subscription is not None:
+                subscription.cancel()
+            await _terminate_process(process)
+
+
+async def _caught_up(
+    directory: str,
+    process: ManagedProcess,
+    *,
+    timeout_sec: float = 30.0,
+    poll_interval_sec: float = 0.2,
+) -> bool:
+    """Wait until the upscaled rendition reaches where the plain one has got to."""
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline and process.returncode is None:
+        texts = [
+            await asyncio.to_thread((pathlib.Path(directory) / name).read_text)
+            for name in ("low.m3u8", "up.m3u8")
+        ]
+        low_end, up_end = (playlist_end_pts(directory, text) for text in texts)
+        if low_end is not None and up_end is not None and up_end >= low_end:
+            return True
+        await asyncio.sleep(poll_interval_sec)
+    return False

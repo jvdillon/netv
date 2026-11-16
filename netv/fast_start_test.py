@@ -79,8 +79,6 @@ def fresh_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ffmpeg_session, "_transcode_sessions", {})
     monkeypatch.setattr(ffmpeg_session, "_url_to_session", {})
     monkeypatch.setattr(ffmpeg_session, "_startup_guards", {})
-    monkeypatch.setattr(ffmpeg_session, "_ts_output", {})
-    monkeypatch.setattr(ffmpeg_session, "_source_gaps", {})
     monkeypatch.setattr(ffmpeg_command, "_probe_cache", {})
 
 
@@ -392,12 +390,115 @@ def test_encoders_add_no_startup_delay(tmp_path: pathlib.Path):
         assert cmd[cmd.index("-bf") + 1] == "0"
         assert not {"-rc-lookahead", "-look_ahead", "-look_ahead_depth"} & set(cmd)
         assert cmd[cmd.index("-force_key_frames") + 1] == (
-            "expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+if(lt(n_forced,4),0.25,1)))"
+            "expr:if(isnan(prev_forced_t),1,if(lt(n_forced,4),"
+            "gte(floor((t+0.000000)*4),floor((prev_forced_t+0.000000)*4)+1),"
+            "gte(floor(t+0.000000),floor(prev_forced_t+0.000000)+1)))"
         )
         assert cmd[cmd.index("-probesize") + 1] == "5000000"
         # Only encoders that flag forced non-IDR frames as non-key are asked for IDR.
         encoder = cmd[cmd.index("-c:v") + 1]
         assert ("-forced-idr" in cmd) == (encoder in ("h264_nvenc", "libx264"))
+
+
+def test_the_upscale_rendition_publishes_beside_the_plain_one():
+    """The AI Upscale worker writes up.m3u8 so the plain rendition keeps playing meanwhile."""
+    args = ("/s", "nvenc+software", "1080p", "high", False)
+    cmd = fast_start.encoder_command(*args, allow_upscale=True, rendition="up")
+    assert cmd[-1] == "/s/up.m3u8"
+    assert cmd[cmd.index("-hls_segment_filename") + 1] == "/s/up_%06d.ts"
+    assert fast_start.encoder_command(*args, allow_upscale=False)[-1] == "/s/low.m3u8"
+
+
+def _rendition(directory: pathlib.Path, name: str, starts: Sequence[float], msn: int) -> str:
+    """A rendition's playlist of 1 s segments whose video starts at ``starts``."""
+    lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        "#EXT-X-TARGETDURATION:1",
+        f"#EXT-X-MEDIA-SEQUENCE:{msn}",
+    ]
+    for i, start in enumerate(starts):
+        filename = f"{name}_{msn + i:06d}.ts"
+        (directory / filename).write_bytes(video_packet(start) * 10)
+        lines += ["#EXTINF:1.000000,", filename]
+    return "\n".join(lines) + "\n"
+
+
+def test_the_upscaled_rendition_continues_the_plain_one_after_a_discontinuity(
+    tmp_path: pathlib.Path,
+):
+    """A playing client sees low's segments, a discontinuity, then up's from where low ended."""
+    low = _rendition(tmp_path, "low", [10, 11, 12], msn=40)
+    # The upscaler, numbered on its own, cuts at the same source timestamps.
+    up = _rendition(tmp_path, "up", [11, 12, 13, 14], msn=0)
+    assert fast_start.splice_point(str(tmp_path), low, up) == 2
+    spliced = fast_start.splice_playlists(low, up, 2, list_size=10)
+    assert spliced == (
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:40\n"
+        "#EXTINF:1.000000,\nlow_000040.ts\n#EXTINF:1.000000,\nlow_000041.ts\n"
+        "#EXTINF:1.000000,\nlow_000042.ts\n"
+        "#EXT-X-DISCONTINUITY\n#EXTINF:1.000000,\nup_000002.ts\n"
+        "#EXTINF:1.000000,\nup_000003.ts\n"
+    )
+    # Program dates follow the shared source timeline across the switch.
+    _, dates = fast_start.dated_playlist(str(tmp_path), spliced, 10, 1000, {})
+    assert list(dates.values()) == [1000, 1001, 1002, 1003, 1004]
+
+
+def test_misaligned_grids_continue_at_the_next_upscaled_segment(tmp_path: pathlib.Path):
+    low = _rendition(tmp_path, "low", [10, 11], msn=0)
+    up = _rendition(tmp_path, "up", [11.5, 12.5], msn=3)
+    assert fast_start.splice_point(str(tmp_path), low, up) == 4
+    # A plain playlist with no segments yet is continued from the upscaler's first.
+    assert fast_start.splice_point(str(tmp_path), "#EXTM3U\n", up) == 3
+
+
+def test_a_spliced_rendition_slides_its_window_and_counts_rolled_off_discontinuities(
+    tmp_path: pathlib.Path,
+):
+    low = _rendition(tmp_path, "low", [10, 11], msn=5)
+    up = _rendition(tmp_path, "up", [12, 13, 14], msn=7)
+    spliced = fast_start.splice_playlists(low, up, 7, list_size=4)
+    assert "#EXT-X-MEDIA-SEQUENCE:6\n" in spliced
+    assert "low_000006.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:1.000000,\nup_000007.ts" in spliced
+    # Once low has rolled off, the discontinuity it ended with is counted instead.
+    rolled = fast_start.splice_playlists(low, up, 7, list_size=2)
+    assert "#EXT-X-MEDIA-SEQUENCE:8\n#EXT-X-DISCONTINUITY-SEQUENCE:1\n" in rolled
+    assert "low_" not in rolled
+    assert "#EXT-X-DISCONTINUITY\n" not in rolled
+    # The upscaler's own window may already have passed the splice point.
+    later = _rendition(tmp_path, "up", [14, 15], msn=9)
+    assert "#EXT-X-MEDIA-SEQUENCE:9\n#EXT-X-DISCONTINUITY-SEQUENCE:1\n" in (
+        fast_start.splice_playlists(low, later, 7, list_size=2)
+    )
+
+
+def test_nothing_continues_before_the_upscaler_reaches_the_plain_end(tmp_path: pathlib.Path):
+    low = _rendition(tmp_path, "low", [10, 11], msn=0)
+    behind = _rendition(tmp_path, "up", [8, 9], msn=0)
+    assert fast_start.splice_point(str(tmp_path), low, behind) is None
+    assert fast_start.splice_playlists(low, behind, None, list_size=10) == low
+    # Segments whose files are gone reveal no timestamp.
+    gone = "#EXTM3U\n#EXTINF:1,\ngone.ts\n"
+    assert fast_start.splice_point(str(tmp_path), low, gone) is None
+    assert fast_start.playlist_end_pts(str(tmp_path), "#EXTM3U\n") is None
+    assert fast_start.playlist_end_pts(str(tmp_path), gone) is None
+    assert fast_start.playlist_end_pts(str(tmp_path), low) == 12
+
+
+def test_recorder_reads_the_relay_and_stops_with_the_program():
+    source = MediaInfo(video_codec="h264", audio_codec="aac", pix_fmt="yuv420p", height=720)
+    cmd = fast_start.recorder_command("/r", "software", "1080p", "high", 1800.7, source)
+    i = cmd.index("-i")
+    assert cmd[i - 4 : i + 2] == ["-f", "mpegts", "-t", "1800", "-i", "pipe:0"]
+    assert cmd[-1] == "/r/stream.m3u8"
+    # Kept like VOD: every segment stays and the playlist grows as an event.
+    assert cmd[cmd.index("-hls_playlist_type") + 1] == "event"
+    assert cmd[cmd.index("-hls_list_size") + 1] == "0"
+    assert not any("dnn_processing" in arg for arg in cmd)
+    # Without probe facts ffmpeg analyzes the stream itself.
+    unprobed = fast_start.recorder_command("/r", "software", "1080p", "high", 60, None)
+    assert "-analyzeduration" in unprobed
 
 
 def test_restart_commands_append_after_a_discontinuity(tmp_path: pathlib.Path):
@@ -1321,6 +1422,107 @@ def test_real_encoder_probes_past_late_mpeg2_sequence_header(tmp_path: pathlib.P
     assert result.returncode == 0, result.stderr.decode()
     assert b"frames duplicated" not in result.stderr
     assert playlist_seconds(tmp_path / "low.m3u8") > 2
+
+
+@pytest.mark.cli_ffmpeg
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="requires FFmpeg")
+def test_real_upscale_switch_continues_the_plain_rendition_on_the_source_clock(
+    tmp_path: pathlib.Path,
+):
+    """Two real workers on one source: the switch keeps timestamps, numbering, and dates.
+
+    A plain re-encode stands in for TensorRT; the upscaler joins half a GOP later,
+    as after its engine loads. The plain playlist is snapshotted while its worker
+    still runs, then the worker is stopped, as at a real switch.
+    """
+    source = tmp_path / "source.ts"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=30",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=sample_rate=48000",
+            "-t",
+            "8",
+            "-c:v",
+            "mpeg2video",
+            "-g",
+            "15",
+            "-c:a",
+            "ac3",
+            str(source),
+        ],
+        check=True,
+    )
+    data = source.read_bytes()
+    args = (str(tmp_path), "software", "720p", "low", False)
+    plain_input = data[: len(data) // 2]
+    upscaled_input = joined_live(data[len(data) // 4 :])
+    plain = fast_start.encoder_command(
+        *args,
+        allow_upscale=False,
+        grid_offset=(fast_start.first_video_pts(plain_input) or 0) % 1,
+    )
+    upscaled = fast_start.encoder_command(
+        *args,
+        allow_upscale=False,
+        rendition="up",
+        grid_offset=(fast_start.first_video_pts(upscaled_input) or 0) % 1,
+    )
+    process = subprocess.Popen(plain, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    assert process.stdin is not None
+    try:
+        process.stdin.write(plain_input)
+        process.stdin.flush()
+        # Wait until the worker has published everything it can without more input.
+        published, quiet_since = "", time.monotonic()
+        while time.monotonic() - quiet_since < 1.5:
+            current = (
+                (tmp_path / "low.m3u8").read_text() if (tmp_path / "low.m3u8").exists() else ""
+            )
+            if current != published:
+                published, quiet_since = current, time.monotonic()
+            time.sleep(0.05)
+    finally:
+        # As at a real switch: its subscription ends (stdin closes), then it is stopped.
+        process.stdin.close()
+        process.terminate()
+        process.wait()
+    subprocess.run(upscaled, input=upscaled_input, check=True, timeout=60)
+    up = (tmp_path / "up.m3u8").read_text()
+    up_from = fast_start.splice_point(str(tmp_path), published, up)
+    assert up_from is not None
+    spliced = fast_start.splice_playlists(published, up, up_from, list_size=100)
+
+    def numbered(content: str) -> dict[int, str]:
+        first = int(re.findall(r"#EXT-X-MEDIA-SEQUENCE:(\d+)", content)[0])
+        uris = re.findall(r"^(\S+\.ts)$", content, re.MULTILINE)
+        return {first + i: uri for i, uri in enumerate(uris)}
+
+    served = numbered(spliced)
+    # Every sequence number published before the switch still names its segment.
+    assert all(served[number] == uri for number, uri in numbered(published).items())
+    names = list(served.values())
+    switch = next(i for i, name in enumerate(names) if name.startswith("up_"))
+    assert spliced.count("#EXT-X-DISCONTINUITY\n") == 1
+    starts = [fast_start.segment_pts(tmp_path / name) or math.nan for name in names]
+    # The upscaled rendition resumes exactly where the published plain one ends.
+    assert starts[switch] == pytest.approx(
+        fast_start.playlist_end_pts(str(tmp_path), published),
+        abs=0.001,
+    )
+    assert starts == sorted(starts)
+    _, dates = fast_start.dated_playlist(str(tmp_path), spliced, starts[0], 0, {})
+    times = [dates[name] for name in names]
+    assert times == sorted(times)
+    assert len(set(times)) == len(times)
 
 
 @pytest.mark.cli_ffmpeg

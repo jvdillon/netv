@@ -431,6 +431,7 @@ class FakeUpstream(FakeResponse):
     def __init__(self, *, headers: Mapping[str, str] | None = None) -> None:
         super().__init__(headers=headers)
         self._items: queue.Queue[bytes | Exception] = queue.Queue()
+        self.requested: list[int] = []
 
     def feed(self, data: bytes) -> None:
         self._items.put(data)
@@ -443,7 +444,7 @@ class FakeUpstream(FakeResponse):
 
     @override
     def read1(self, amt: int = -1, /) -> bytes:
-        del amt
+        self.requested.append(amt)
         item = self._items.get()
         if isinstance(item, Exception):
             raise item

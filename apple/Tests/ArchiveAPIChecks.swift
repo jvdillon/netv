@@ -129,7 +129,7 @@ struct ArchiveAPIChecks {
         let start = ArchiveTransport.requests.first { $0.url?.path == "/transcode/start" }!
         let query = URLComponents(url: start.url!, resolvingAgainstBaseURL: false)!.queryItems!
         precondition(query.contains(URLQueryItem(name: "content_type", value: "movie")))
-        precondition(query.contains(URLQueryItem(name: "fast_start", value: "false")))
+        precondition(!query.contains { $0.name == "fast_start" })
         precondition(query.contains(URLQueryItem(name: "bandwidth_saver", value: "false")))
         try await client.keepArchiveAlive(server: "http://netv.test", sessionID: "archive")
         precondition(ArchiveTransport.requests.last?.url?.path == "/transcode/progress/archive")
@@ -148,7 +148,7 @@ struct ArchiveAPIChecks {
             url: liveStart.url!, resolvingAgainstBaseURL: false
         )!.queryItems!
         precondition(liveQuery.contains(URLQueryItem(name: "content_type", value: "live")))
-        precondition(liveQuery.contains(URLQueryItem(name: "fast_start", value: "true")))
+        precondition(!liveQuery.contains { $0.name == "fast_start" })
         let health = try await client.reportPlaybackHealth(
             server: "http://netv.test",
             sessionID: "live",

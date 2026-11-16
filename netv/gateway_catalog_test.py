@@ -206,7 +206,8 @@ def test_catalog_maps_full_public_stream_and_access_ids(
 
     snapshot = _catalog(tmp_path).get()
 
-    assert web.urls == [CATEGORIES_URL, STREAMS_URL]
+    # The account API tells live sessions whether the panel serves TS.
+    assert web.urls == [CATEGORIES_URL, STREAMS_URL, API]
     # The guide URL the provider advertises is not saved into the settings.
     assert "epg_url" not in cache.load_server_settings()["sources"][0]
     by_name = {category["category_name"]: category for category in snapshot.categories}

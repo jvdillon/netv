@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Literal, NotRequired, TypeAlias, TypedDict
 from urllib import parse
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -177,6 +178,45 @@ def save_file_cache(name: str, data: object) -> None:
     path = CACHE_DIR / f"{name}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"data": data, "timestamp": time.time()}))
+
+
+class RelayHints(TypedDict):
+    """What live sessions learned about upstreams, kept across restarts."""
+
+    live_ts: dict[str, bool]  # Xtream source -> whether its panel serves live as TS.
+    burst_gaps: dict[str, float]  # Upstream host -> longest silence between bursts.
+
+
+_relay_hints_lock = threading.Lock()
+
+
+def relay_hints() -> RelayHints:
+    """Load the relay hints; unreadable or absent hints start empty.
+
+    Returns:
+        hints: Learned per-source and per-host facts.
+    """
+    cached = load_file_cache("relay_hints")
+    if cached is not None:
+        with contextlib.suppress(ReadError):
+            return from_plain(cached[0], RelayHints)
+    return {"live_ts": {}, "burst_gaps": {}}
+
+
+def remember_live_ts(source_id: str, offered: bool) -> None:
+    """Record whether an Xtream source's panel serves live channels as MPEG-TS."""
+    with _relay_hints_lock:
+        hints = relay_hints()
+        hints["live_ts"][source_id] = offered
+        save_file_cache("relay_hints", hints)
+
+
+def remember_burst_gap(host: str, seconds: float) -> None:
+    """Record a silence between an upstream's bursts; a host keeps its longest."""
+    with _relay_hints_lock:
+        hints = relay_hints()
+        hints["burst_gaps"][host] = max(hints["burst_gaps"].get(host, 0.0), seconds)
+        save_file_cache("relay_hints", hints)
 
 
 def clear_all_caches() -> None:

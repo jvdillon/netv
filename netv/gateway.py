@@ -416,8 +416,11 @@ async def upscale_file(session_id: str, filename: str) -> Response:
         raise HTTPException(404, "File not found")
     headers = {"Cache-Control": "no-cache, no-store, must-revalidate"}
     if safe_filename.endswith(".m3u8"):
+        content = file_path.read_text()
+        if safe_filename == "low.m3u8":
+            content = ffmpeg_session.live_playlist(session_id) or content
         return Response(
-            file_path.read_text(),
+            content,
             media_type="application/vnd.apple.mpegurl",
             headers=headers,
         )

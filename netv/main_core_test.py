@@ -135,6 +135,15 @@ def _insert_program(
     epg.commit()
 
 
+def _publish_rendition(directory: Path) -> None:
+    """Write two playable segments and low.m3u8, as a started live worker would."""
+    lines = ["#EXTM3U"]
+    for i in range(2):
+        (directory / f"low_{i}.ts").write_bytes(testing.video_packet(10 + 2 * i) * 10)
+        lines += ["#EXTINF:2,", f"low_{i}.ts"]
+    (directory / "low.m3u8").write_text("\n".join(lines) + "\n")
+
+
 def _session(
     directory: Path,
     *,
@@ -185,8 +194,21 @@ def test_lifespan_runs_workers_and_shuts_down(
     testing.install_subprocess(monkeypatch, main, run=run)
     signals = testing.SignalRecorder()
     testing.install_signals(monkeypatch, signals, main)
-    recorders = testing.PopenRecorder()
-    testing.install_subprocess(monkeypatch, handoff, popen=recorders)
+    probe = testing.FakeRun()
+    probe.program("ffprobe", testing.Program(stdout=testing.probed_video_json()))
+    testing.install_subprocess(monkeypatch, ffmpeg_command, run=probe)
+
+    def publish(command: list[str]) -> None:
+        if not launcher.launches:  # The viewer's worker; the recorder publishes nothing awaited.
+            _publish_rendition(Path(command[-1]).parent)
+
+    launcher = testing.ProcessLauncher(on_launch=publish)
+    testing.install_launcher(monkeypatch, launcher, ffmpeg_session)
+    tasks = testing.BackgroundTasks()
+    monkeypatch.setattr(ffmpeg_session, "_spawn_background_task", tasks)
+    monkeypatch.setattr(ffmpeg_session, "_startup_guards", {})
+    monkeypatch.setattr(ffmpeg_session, "_recordings", set())
+    upstreams = testing.FakeUpstreams()
     empty: dict[str, object] = {}
     for name, value in (
         ("_records", dict(empty)),
@@ -244,33 +266,19 @@ def test_lifespan_runs_workers_and_shuts_down(
             "http://e/epg": _xmltv_route("ech", "E", now),
         },
     )
-    stream = {
-        "stream_id": "1",
-        "name": "One",
-        "source_id": "x",
-        "source_type": "xtream",
-        "source_url": "http://x",
-        "source_username": "u",
-        "source_password": "p",
-        "category_ids": ["x_1"],
-    }
+    stream_url = "http://up/one.ts"
+    web.routes[stream_url] = upstreams
+    stream = {"stream_id": "1", "name": "One", "source_id": "x", "direct_url": stream_url}
     cache.save_file_cache(
         "live_data",
         {"cats": [], "streams": [stream], "epg_urls": [["http://guide/epg", 5, "x"]]},
     )
     cache.save_file_cache("vod_data", {"cats": [{"category_id": "vc"}], "streams": []})
     cache.save_file_cache("series_data", {"cats": [{"category_id": "sc"}], "series": []})
-    stream_url = "http://x/live/u/p/1.m3u8"
-    viewer = testing.FakeProcess(exit_code=None)
     watcher = testing.FakeProcess(exit_code=None)
-    sessions["stale"] = _session(tmp_path / "stale", username="gone")
-    sessions["viewer"] = {
-        **_session(tmp_path / "viewer", url=stream_url, username="viewer"),
-        "process": viewer,
-        "last_access": time.time(),
-    }
+    sessions["stale"] = _session(tmp_path / "stale", username="gone", is_vod=True)
     sessions["watcher"] = {
-        **_session(tmp_path / "watcher", url="http://up/other", username="watcher"),
+        **_session(tmp_path / "watcher", username="watcher", is_vod=True),
         "process": watcher,
         "last_access": time.time(),
     }
@@ -278,6 +286,7 @@ def test_lifespan_runs_workers_and_shuts_down(
     for user, position in (("viewer", started), ("ghost", math.nan)):
         handoff.report_watch(user, "1", position, now=started)
         handoff.report_watch(user, "1", position, now=started + 200)
+    viewer_sessions: list[str] = []
 
     async def serve() -> None:
         async with main.lifespan(main.app):
@@ -290,6 +299,15 @@ def test_lifespan_runs_workers_and_shuts_down(
             scheduler.run()
             for refresh in threads.threads[6:]:
                 refresh.run()
+            # The viewer is still playing the channel it will be handed off from.
+            viewing = asyncio.create_task(
+                ffmpeg_session.start_transcode(stream_url, username="viewer"),
+            )
+            while not upstreams.opened:
+                assert not viewing.done()
+                await asyncio.sleep(0)
+            upstreams.opened[0].feed(testing.ts_source())
+            viewer_sessions.append((await viewing)["session_id"])
             clock.deadline = clock.now + 60 + 1
             await asyncio.to_thread(cleanup.run)
             # The handoff loop shares the cleanup loop's stop event.
@@ -298,9 +316,18 @@ def test_lifespan_runs_workers_and_shuts_down(
             clock.deadline = clock.now + 15 + 1
             with caplog.at_level(logging.ERROR, logger="netv.main"):
                 await asyncio.to_thread(handoff_loop.run)
+            viewer, recording = launcher.launches
+            await recording.process.stdin.wait_for(len(testing.ts_source()))
+            # The recording took over before shutdown, which would stop the viewer anyway.
+            assert viewer_sessions[0] not in sessions
+            assert viewer.process.signals == ["TERM"]
             assert main._shutdown_event is None
 
-    asyncio.run(serve())
+    try:
+        asyncio.run(serve())
+    finally:
+        tasks.discard()
+        upstreams.close()
 
     shutdown_event = main._shutdown_event
     assert shutdown_event is not None and shutdown_event.is_set()
@@ -313,23 +340,28 @@ def test_lifespan_runs_workers_and_shuts_down(
     assert data.get("vod_categories") == [{"category_id": "vc"}]
     assert data.get("series_categories") == [{"category_id": "sc"}]
     assert [p.title for p in epg.get_programs_in_range("guide", now, now)] == ["Startup"]
-    # The cleanup loop expired the idle session; the sweep released the viewer's
-    # transcode before recording the channel it left, then hit the broken watch.
+    # The cleanup loop expired the idle session. The sweep recorded the channel the
+    # viewer left from its session's relay, stopping that session, then hit the
+    # broken watch.
     assert "stale" not in sessions
-    assert "viewer" not in sessions
-    assert viewer.signals == ["TERM"]
-    assert stream_url in recorders.started[0].args
+    _, recording = launcher.launches
+    assert recording.command[recording.command.index("-i") + 1] == "pipe:0"
+    assert Path(recording.command[-1]).parent.name.startswith("netv_handoff_")
+    assert bytes(recording.process.stdin.written) == testing.ts_source()
     assert "Handoff sweep failed" in caplog.text
     # Five due sources, triggered once each even though the scheduler looped twice.
     assert len(threads.threads) == 6 + 5
     assert sorted(web.urls[1:6]) == sorted(
         ["http://bad", "http://e/epg", "http://m/epg", "http://m/list", xtream_epg],
     )
+    # The recording reused the viewer's one upstream connection.
     assert web.urls[6:] == [stream_url]
     assert not flags
-    # Shutdown stopped the remaining transcode, the recorder and the cast monitor.
+    # Shutdown stopped the remaining transcode, the recorder, its upstream and the
+    # cast monitor.
     assert watcher.signals == ["TERM"]
-    assert recorders.started[0].signals == ["TERM"]
+    assert recording.process.signals == ["TERM"]
+    assert upstreams.opened[0].closed
     assert chromecast.manager._stop.is_set()
 
 

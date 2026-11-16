@@ -405,6 +405,80 @@ class TestFetchSourceLiveDataPersistence:
         assert streams[0]["source_type"] == "xtream"
         assert (epg_url, timeout) == (None, 33)
 
+    @pytest.mark.parametrize(
+        ("answer", "offered"),
+        [
+            ({"user_info": {"allowed_output_formats": ["m3u8", "ts"]}}, True),
+            ({"user_info": {"allowed_output_formats": ["m3u8"]}}, False),
+            ({"user_info": {"allowed_output_formats": "ts"}}, False),
+            ({"user_info": []}, False),
+            ({}, False),
+        ],
+    )
+    def test_xtream_refresh_records_whether_live_is_served_as_ts(
+        self,
+        web: testing.FakeWeb,
+        answer: object,
+        offered: bool,
+    ):
+        """Live sessions read TS where offered; learning it here keeps it off the first play."""
+        config = _serve_xtream(web, "x", get_live_categories=[], get_live_streams=[])
+        _serve(web, "https://x.example/player_api.php?username=u&password=p", answer)
+        _configure(config)
+        m3u.fetch_source_live_data(m3u.get_sources()[0])
+        assert cache.relay_hints()["live_ts"] == {"x": offered}
+
+    def test_xtream_category_ids_fall_back_and_drop_empty_ids(self, web: testing.FakeWeb):
+        config = _serve_xtream(
+            web,
+            "x",
+            get_live_categories=[],
+            get_live_streams=[
+                {"stream_id": 1, "category_ids": [], "category_id": "4"},
+                {"stream_id": 2, "category_ids": ["", 0, 1, None, "7"]},
+            ],
+        )
+        _configure(config)
+        _, streams, _, _ = m3u.fetch_source_live_data(m3u.get_sources()[0])
+        assert [stream["category_ids"] for stream in streams] == [["x_4"], ["x_1", "x_7"]]
+
+    def test_m3u_with_disabled_guide_returns_no_guide_url(self, web: testing.FakeWeb):
+        _configure(
+            {
+                "id": "m",
+                "name": "m",
+                "type": "m3u",
+                "url": "https://m.example/list.m3u",
+                "epg_enabled": False,
+            },
+        )
+        _serve(web, "https://m.example/list.m3u", '#EXTM3U url-tvg="https://m/epg"\n')
+        assert m3u.fetch_source_live_data(m3u.get_sources()[0])[2] is None
+
+    def test_live_ts_is_asked_once_for_sources_not_refreshed_since(self, web: testing.FakeWeb):
+        config = _serve_xtream(web, "x")
+        api = "https://x.example/player_api.php?username=u&password=p"
+        _serve(web, api, {"user_info": {"allowed_output_formats": ["ts"]}})
+        _configure(config)
+        assert m3u.live_ts_offered("x") is True
+        assert m3u.live_ts_offered("x") is True
+        assert web.urls == [api]
+        # Only Xtream panels offer a TS form.
+        assert m3u.live_ts_offered("gone") is False
+        cache.remember_live_ts("x", False)
+        assert m3u.live_ts_offered("x") is False
+
+    def test_xtream_refresh_survives_an_unreachable_account_api(
+        self,
+        web: testing.FakeWeb,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        config = _serve_xtream(web, "x", get_live_categories=[], get_live_streams=[])
+        _configure(config)
+        assert m3u.fetch_source_live_data(m3u.get_sources()[0])[:2] == ([], [])
+        assert cache.relay_hints()["live_ts"] == {}
+        assert "Xtream source x did not report its output formats" in caplog.text
+
     def test_m3u_persists_detected_epg_url(self, web: testing.FakeWeb):
         _configure({"id": "m", "name": "m", "type": "m3u", "url": "https://m.example/list.m3u"})
         _serve(web, "https://m.example/list.m3u", '#EXTM3U url-tvg="https://m/epg"\n')

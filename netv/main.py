@@ -247,13 +247,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     def handoff_loop():
         while not cleanup_stop.wait(15):
             try:
-                handoff.sweep(
-                    _handoff_channel,
-                    lambda username, url: _run_on_loop(
-                        loop,
-                        ffmpeg_session.stop_user_stream(username, url),
-                    ),
-                )
+                handoff.sweep(_handoff_channel, _handoff_recorder(loop))
             except Exception:
                 log.exception("Handoff sweep failed")
 
@@ -318,7 +312,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     scheduler_stop.set()
     await asyncio.to_thread(chromecast.manager.close)
     await ffmpeg_session.shutdown()
-    handoff.shutdown()
 
 
 def _run_on_loop(
@@ -327,6 +320,27 @@ def _run_on_loop(
 ) -> None:
     """Run a session coroutine from a worker thread on the loop that owns its processes."""
     asyncio.run_coroutine_threadsafe(coroutine, loop).result()
+
+
+def _handoff_recorder(loop: asyncio.AbstractEventLoop) -> handoff.Recorder:
+    """Record handoffs on the loop that owns live sessions and their relays."""
+
+    def record(
+        username: str,
+        channel: handoff.Channel,
+        directory: pathlib.Path,
+        seconds: float,
+    ) -> handoff.Recording:
+        recording = ffmpeg_session.record_live(
+            username,
+            channel.url,
+            channel.source_id,
+            str(directory),
+            seconds,
+        )
+        return asyncio.run_coroutine_threadsafe(recording, loop).result()
+
+    return record
 
 
 def _kill_orphaned_ffmpeg() -> None:
@@ -1797,7 +1811,10 @@ async def transcode_file(
         content = file_path.read_text()
         if filename == "low.m3u8" and session.get("fast_start", False):
             content = add_live_start_offset(
-                ffmpeg_session.dated_fast_playlist(session_id, content),
+                ffmpeg_session.dated_fast_playlist(
+                    session_id,
+                    ffmpeg_session.live_playlist(session_id) or content,
+                ),
                 float(session.get("playback_buffer_seconds", 12.0)),
             )
         return Response(
@@ -2962,7 +2979,7 @@ async def handoff_stop_api(
         report.stream_id,
         report.position,
         _handoff_channel,
-        lambda name, url: _run_on_loop(loop, ffmpeg_session.stop_user_stream(name, url)),
+        _handoff_recorder(loop),
         report.handoff_id,
     )
     return {"status": "ok"}

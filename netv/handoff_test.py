@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeVar
 from uuid import UUID
 
 import json
-import subprocess
 import uuid
 
 import pytest
 
-from netv import cache, ffmpeg_command, handoff, testing
+from netv import cache, handoff, testing
 
 
 NOW = 1_800_000_000.0
@@ -22,22 +21,77 @@ CHANNEL_URL = "http://upstream.test/live/u/p/7.m3u8"
 T = TypeVar("T")
 
 
+@dataclass(kw_only=True, slots=True)
+class FakeRecording:
+    """A recording whose end the test decides."""
+
+    done: bool = False
+    stopped: bool = False
+
+    def finished(self) -> bool:
+        return self.done
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class RecordCall:
+    """One request to record a channel."""
+
+    username: str
+    channel: handoff.Channel
+    directory: Path
+    seconds: float
+    directory_existed: bool
+
+
+@dataclass(kw_only=True, slots=True)
+class FakeRecorder:
+    """Stands in for the live-session recorder ``handoff`` is given.
+
+    Args:
+        error: Raise this instead of recording, as when ffmpeg cannot start.
+        during: Work another request does while the recording starts.
+    """
+
+    error: Exception | None = None
+    during: Callable[[], object] | None = None
+    calls: list[RecordCall] = field(default_factory=list)
+    recordings: list[FakeRecording] = field(default_factory=list)
+
+    def __call__(
+        self,
+        username: str,
+        channel: handoff.Channel,
+        directory: Path,
+        seconds: float,
+    ) -> FakeRecording:
+        self.calls.append(
+            RecordCall(
+                username=username,
+                channel=channel,
+                directory=directory,
+                seconds=seconds,
+                directory_existed=directory.is_dir(),
+            ),
+        )
+        if self.during is not None:
+            self.during()
+        if self.error is not None:
+            raise self.error
+        recording = FakeRecording()
+        self.recordings.append(recording)
+        return recording
+
+
 @dataclass(frozen=True, kw_only=True, slots=True)
 class Env:
-    """Handoff state in a temp dir, with fake ffmpeg launches and upstream."""
+    """Handoff state in a temp dir, recording through a fake recorder."""
 
     users: Path
     transcode_dir: Path
-    popen: testing.PopenRecorder
-    web: testing.FakeWeb
-    released: list[tuple[str, str]] = field(default_factory=list)
-
-    def release(self, username: str, url: str) -> None:
-        self.released.append((username, url))
-
-    @property
-    def recorders(self) -> list[testing.FakePopen]:
-        return self.popen.started
+    recorder: FakeRecorder
 
 
 class TestStop:
@@ -51,7 +105,7 @@ class TestStop:
 
     def test_stop_of_another_stream_is_ignored(self, env: Env):
         _watch(600)
-        assert handoff.stop_watch("ann", "8", NOW, lambda *_: _channel(), env.release) is None
+        assert handoff.stop_watch("ann", "8", NOW, lambda *_: _channel(), env.recorder) is None
         assert "ann" in handoff._watches
 
     def test_archived_channel_resumes_as_catchup(self, env: Env):
@@ -64,45 +118,49 @@ class TestStop:
         assert _some(handoff.current("ann", now=NOW))["id"] == _str(record["id"])
         saved = json.loads((env.users / "ann" / "handoff.json").read_text())
         assert saved["id"] == _str(record["id"])
-        assert env.recorders == []
-        assert env.released == []
+        assert env.recorder.calls == []
 
     def test_channel_without_archive_records_until_program_end(self, env: Env):
         _watch(600)
-        record = _some(_stop(env, _channel()))
-        assert env.released == [("ann", CHANNEL_URL)]
-        [recorder] = env.recorders
-        directory = env.transcode_dir / f"netv_handoff_{record['recording_id']}"
-        i = recorder.args.index("-i")
-        assert recorder.args[i - 2 : i + 2] == ["-t", "1800", "-i", CHANNEL_URL]
-        assert recorder.args[-1] == f"{directory}/stream.m3u8"
+        channel = _channel()
+        record = _some(_stop(env, channel))
+        recording_id = _str(record["recording_id"])
+        assert env.recorder.calls == [
+            RecordCall(
+                username="ann",
+                channel=channel,
+                directory=env.transcode_dir / f"netv_handoff_{recording_id}",
+                seconds=1800,
+                directory_existed=True,
+            ),
+        ]
         assert record["mode"] == "recording"
         assert record["recording_live"] is True
         assert record["recording_start"] == NOW
         assert record["expires"] == NOW + 1800 + 24 * 3600
-        assert handoff._recorders == {_str(record["recording_id"]): recorder}
+        assert handoff._recorders == {recording_id: env.recorder.recordings[0]}
 
     def test_recording_without_guide_end_is_capped(self, env: Env):
         _watch(600)
         _stop(env, _channel(program_end=0.0))
-        assert _seconds(env.recorders[0]) == 3 * 3600
+        assert env.recorder.calls[0].seconds == 3 * 3600
 
     def test_recording_of_a_long_program_is_capped(self, env: Env):
         _watch(600)
         _stop(env, _channel(program_end=NOW + 5 * 3600))
-        assert _seconds(env.recorders[0]) == 3 * 3600
+        assert env.recorder.calls[0].seconds == 3 * 3600
 
     def test_stopping_at_program_end_leaves_nothing(self, env: Env):
         _watch(600)
         assert _stop(env, _channel(catchup_days=2, program_end=NOW + 10)) is None
 
-    def test_failed_recorder_leaves_nothing(self, env: Env, monkeypatch: pytest.MonkeyPatch):
-        missing = testing.PopenRecorder(error=FileNotFoundError(2, "No such file", "ffmpeg"))
-        testing.install_subprocess(monkeypatch, handoff, popen=missing)
+    def test_failed_recorder_leaves_nothing(self, env: Env, caplog: pytest.LogCaptureFixture):
+        env.recorder.error = OSError("no ffmpeg")
         _watch(600)
         assert _stop(env, _channel()) is None
         assert handoff.current("ann", now=NOW) is None
         assert list(env.transcode_dir.glob("netv_handoff_*")) == []
+        assert "Could not record handoff for ann: no ffmpeg" in caplog.text
 
 
 class TestResume:
@@ -126,19 +184,28 @@ class TestResume:
         handoff.claim("ann", _str(record["id"]))
         _watch(30, position=NOW + 100, handoff_id=_str(record["id"]), now=NOW + 110)
         moved = _some(_stop(env, _channel(), NOW + 100, _str(record["id"]), now=NOW + 110))
-        assert len(env.recorders) == 1
+        assert len(env.recorder.calls) == 1
         assert moved["id"] == _str(record["id"])
         assert moved["position"] == NOW + 100
+        assert moved["updated"] == NOW + 110
         assert _some(handoff.current("ann", now=NOW))["position"] == NOW + 100
 
     def test_finishing_a_resumed_recording_ends_it(self, env: Env):
         record = self._recorded(env)
         handoff.claim("ann", _str(record["id"]))
-        _watch(30, position=NOW + 1790, handoff_id=_str(record["id"]), now=NOW + 1800)
-        assert _stop(env, _channel(), NOW + 1790, _str(record["id"]), now=NOW + 1800) is None
-        assert env.recorders[0].signals == ["TERM"]
+        _watch(30, position=NOW + 1770, handoff_id=_str(record["id"]), now=NOW + 1800)
+        assert _stop(env, _channel(), NOW + 1770, _str(record["id"]), now=NOW + 1800) is None
+        assert env.recorder.recordings[0].stopped
         assert handoff._records == {}
         assert handoff._recorders == {}
+
+    def test_resumed_recording_just_before_its_end_margin_is_kept(self, env: Env):
+        record = self._recorded(env)
+        handoff.claim("ann", _str(record["id"]))
+        _watch(30, position=NOW + 1769, handoff_id=_str(record["id"]), now=NOW + 1800)
+        moved = _some(_stop(env, _channel(), NOW + 1769, _str(record["id"]), now=NOW + 1800))
+        assert moved["position"] == NOW + 1769
+        assert not env.recorder.recordings[0].stopped
 
     def test_catchup_resume_rolling_into_the_next_program_hands_off_again(self, env: Env):
         _watch(600)
@@ -167,12 +234,30 @@ class TestCancel:
         _watch(600)
         record = _some(_stop(env, _channel()))
         directory = handoff.recording_dir(_str(record["recording_id"]))
-        assert (directory / "ffmpeg.log").exists()
+        assert directory.is_dir()
         handoff.cancel("ann")
-        assert env.recorders[0].signals == ["TERM"]
+        assert env.recorder.recordings[0].stopped
         assert handoff.current("ann", now=NOW) is None
         assert _str(record["recording_id"]) not in handoff._recorders
         assert not directory.exists()
+        assert not (env.users / "ann" / "handoff.json").exists()
+
+    def test_cancel_leaves_a_finished_recording_alone(self, env: Env):
+        _watch(600)
+        record = _some(_stop(env, _channel()))
+        env.recorder.recordings[0].done = True
+        handoff.cancel("ann")
+        assert not env.recorder.recordings[0].stopped
+        assert not handoff.recording_dir(_str(record["recording_id"])).exists()
+
+    def test_cancel_of_a_restored_recording_whose_files_are_gone(self, env: Env):
+        # Recorders do not survive a restart, and the orphan sweep may delete the files.
+        (env.users / "ann" / "handoff.json").write_text(
+            json.dumps({"id": "h", "mode": "recording", "recording_id": "gone"}),
+        )
+        handoff.load(env.users)
+        handoff.cancel("ann")
+        assert handoff._records == {}
         assert not (env.users / "ann" / "handoff.json").exists()
 
     def test_cancel_keeps_the_handoff_being_resumed(self, env: Env):
@@ -183,15 +268,10 @@ class TestCancel:
 
     def test_cancel_during_recorder_launch_discards_it(self, env: Env):
         _watch(600)
-
-        def release(username: str, url: str) -> None:
-            del url
-            handoff.cancel(username)  # Another device starts playing meanwhile.
-
-        assert (
-            handoff.stop_watch("ann", "7", NOW - 5, lambda *_: _channel(), release, now=NOW) is None
-        )
-        assert env.recorders[0].signals == ["TERM"]
+        # Another device starts playing while the recording starts.
+        env.recorder.during = lambda: handoff.cancel("ann")
+        assert _stop(env, _channel()) is None
+        assert env.recorder.recordings[0].stopped
         assert list(env.transcode_dir.glob("netv_handoff_*")) == []
         assert handoff._records == {}
         assert handoff._recorders == {}
@@ -201,21 +281,34 @@ class TestSweep:
     def test_lapsed_watch_is_handed_off_at_its_last_position(self, env: Env):
         handoff.report_watch("ann", "7", NOW - 700, now=NOW - 700)
         handoff.report_watch("ann", "7", NOW - 100, now=NOW - 100)
-        handoff.sweep(lambda *_: _channel(catchup_days=2), env.release, now=NOW)
+        handoff.sweep(lambda *_: _channel(catchup_days=2), env.recorder, now=NOW)
         assert _some(handoff.current("ann", now=NOW))["position"] == NOW - 100
         assert handoff._watches == {}
+
+    def test_lapsed_watch_of_a_live_only_channel_is_recorded(self, env: Env):
+        handoff.report_watch("ann", "7", NOW - 700, now=NOW - 700)
+        handoff.report_watch("ann", "7", NOW - 100, now=NOW - 100)
+        handoff.sweep(lambda *_: _channel(), env.recorder, now=NOW)
+        assert _some(handoff.current("ann", now=NOW))["mode"] == "recording"
+        assert env.recorder.calls[0].seconds == 1800
 
     def test_fresh_watch_is_left_alone(self, env: Env):
         handoff.report_watch("ann", "7", NOW - 700, now=NOW - 700)
         handoff.report_watch("ann", "7", NOW - 10, now=NOW - 10)
-        handoff.sweep(lambda *_: _channel(catchup_days=2), env.release, now=NOW)
+        handoff.sweep(lambda *_: _channel(catchup_days=2), env.recorder, now=NOW)
         assert handoff.current("ann", now=NOW) is None
+        assert "ann" in handoff._watches
+
+    def test_watch_exactly_at_the_timeout_is_left_alone(self, env: Env):
+        handoff.report_watch("ann", "7", NOW - 700, now=NOW - 700)
+        handoff.report_watch("ann", "7", NOW - 45, now=NOW - 45)
+        handoff.sweep(lambda *_: _channel(catchup_days=2), env.recorder, now=NOW)
         assert "ann" in handoff._watches
 
     def test_expired_handoff_is_dropped(self, env: Env):
         _watch(600)
         _stop(env, _channel(catchup_days=2))
-        handoff.sweep(_unresolvable, env.release, now=NOW + 24 * 3600 + 1)
+        handoff.sweep(_unresolvable, env.recorder, now=NOW + 24 * 3600 + 1)
         assert handoff._records == {}
 
     def test_finished_recorder_is_marked_and_kept(self, env: Env):
@@ -223,26 +316,27 @@ class TestSweep:
         record = _some(_stop(env, _channel()))
         directory = handoff.recording_dir(_str(record["recording_id"]))
         (directory / "stream.m3u8").write_text("#EXTM3U\n")
-        env.recorders[0].finish(0)
-        handoff.sweep(_unresolvable, env.release, now=NOW + 1)
+        env.recorder.recordings[0].done = True
+        handoff.sweep(_unresolvable, env.recorder, now=NOW + 1)
         assert handoff._records["ann"]["recording_live"] is False
         assert handoff._recorders == {}
         saved = json.loads((env.users / "ann" / "handoff.json").read_text())
         assert saved["recording_live"] is False
         assert handoff.recording_file(_str(record["recording_id"]), "stream.m3u8")
+        assert not env.recorder.recordings[0].stopped
 
     def test_running_recorder_is_left_alone(self, env: Env):
         _watch(600)
         record = _some(_stop(env, _channel()))
-        handoff.sweep(_unresolvable, env.release, now=NOW + 1)
+        handoff.sweep(_unresolvable, env.recorder, now=NOW + 1)
         assert handoff._records["ann"]["recording_live"] is True
         assert _str(record["recording_id"]) in handoff._recorders
 
     def test_recorder_that_produced_nothing_is_dropped(self, env: Env):
         _watch(600)
         _stop(env, _channel())
-        env.recorders[0].finish(1)
-        handoff.sweep(_unresolvable, env.release, now=NOW + 1)
+        env.recorder.recordings[0].done = True
+        handoff.sweep(_unresolvable, env.recorder, now=NOW + 1)
         assert handoff._records == {}
 
 
@@ -268,24 +362,6 @@ class TestRecordingFiles:
         assert kept.exists()
         assert not orphan.exists()
 
-    def test_recorder_records_the_best_variant_until_the_requested_time(
-        self,
-        env: Env,
-        tmp_path: Path,
-    ):
-        master = "http://upstream.test/7.m3u8"
-        env.web.routes[master] = testing.FakeResponse(
-            b"#EXTM3U\n"
-            b"#EXT-X-STREAM-INF:BANDWIDTH=800000\nlow.m3u8\n"
-            b"#EXT-X-STREAM-INF:BANDWIDTH=5000000\nhigh.m3u8\n",
-        )
-        cmd = handoff._recorder_command(master, tmp_path, 1800.4)
-        i = cmd.index("-i")
-        assert cmd[i - 2 : i + 2] == ["-t", "1800", "-i", "http://upstream.test/high.m3u8"]
-        assert "event" in cmd
-        assert cmd[-1] == f"{tmp_path}/stream.m3u8"
-        assert env.web.urls == [master]
-
 
 class TestLoad:
     def test_load_restores_valid_records_only(self, env: Env):
@@ -301,20 +377,6 @@ class TestLoad:
         assert handoff._records == {"ann": {"id": "h1", "recording_live": False}}
 
 
-class TestShutdown:
-    def test_terminates_only_running_recorders(self, env: Env):
-        handoff._recorders.update(
-            a=handoff._start_recorder(CHANNEL_URL, "a", 60),
-            b=handoff._start_recorder(CHANNEL_URL, "b", 60),
-        )
-        running, done = env.recorders
-        done.finish(0)
-        handoff.shutdown()
-        assert running.signals == ["TERM"]
-        assert done.signals == []
-        assert handoff._recorders == {}
-
-
 class TestSave:
     def test_without_users_dir_is_noop(self, env: Env):
         handoff._users_dir = None
@@ -327,37 +389,6 @@ class TestSave:
         handoff._records["zed"] = {"id": "h"}
         handoff._save("zed")
         assert "Could not save handoff for zed" in caplog.text
-
-
-class TestRecorderProcess:
-    def test_start_recorder_launches_ffmpeg_with_log(self, env: Env):
-        started = handoff._start_recorder("http://u.test/7", "rid", 60)
-        directory = env.transcode_dir / "netv_handoff_rid"
-        [process] = env.recorders
-        assert process is started
-        i = process.args.index("-i")
-        assert process.args[0] == "ffmpeg"
-        assert process.args[i - 2 : i + 2] == ["-t", "60", "-i", "http://u.test/7"]
-        assert process.args[-1] == f"{directory}/stream.m3u8"
-        assert process.options["stdin"] == subprocess.DEVNULL
-        assert process.options["stdout"] == subprocess.DEVNULL
-        assert (directory / "ffmpeg.log").exists()
-
-    def test_stop_recorder_kills_unresponsive_process(self, env: Env):
-        handoff._recorders["rid"] = handoff._start_recorder(CHANNEL_URL, "rid", 60)
-        [process] = env.recorders
-        process.ignores_terminate = True
-        handoff._stop_recorder("rid")
-        assert process.signals == ["TERM", "KILL"]
-        assert not handoff.recording_dir("rid").exists()
-
-    def test_stop_recorder_leaves_finished_process_alone(self, env: Env):
-        handoff._recorders["rid"] = handoff._start_recorder(CHANNEL_URL, "rid", 60)
-        [process] = env.recorders
-        process.finish(0)
-        handoff._stop_recorder("rid")
-        assert process.signals == []
-        assert handoff._recorders == {}
 
 
 class TestHandOffRaces:
@@ -399,17 +430,13 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
     (users / "ann").mkdir(parents=True)
     transcode_dir = tmp_path / "transcode"
     cache.save_server_settings(
-        {**cache.load_server_settings(), "transcode_dir": str(transcode_dir), "probe_live": False},
+        {**cache.load_server_settings(), "transcode_dir": str(transcode_dir)},
     )
-    popen = testing.PopenRecorder()
-    testing.install_subprocess(monkeypatch, handoff, popen=popen)
-    web = testing.FakeWeb({CHANNEL_URL: lambda: testing.FakeResponse(b"#EXTM3U\n")})
-    testing.install_web(monkeypatch, web, ffmpeg_command)
     for name in ("_records", "_watches", "_recorders", "_generations"):
         monkeypatch.setattr(handoff, name, {})
     monkeypatch.setattr(handoff, "_users_dir", None)
     handoff.load(users)
-    return Env(users=users, transcode_dir=transcode_dir, popen=popen, web=web)
+    return Env(users=users, transcode_dir=transcode_dir, recorder=FakeRecorder())
 
 
 def _channel(
@@ -434,10 +461,6 @@ def _unresolvable(stream_id: str, position: float) -> handoff.Channel | None:
     del stream_id, position
 
 
-def _seconds(recorder: testing.FakePopen) -> int:
-    return int(recorder.args[recorder.args.index("-t") + 1])
-
-
 def _watch(
     seconds: float,
     position: float = NOW - 5,
@@ -460,7 +483,7 @@ def _stop(
         "7",
         position,
         lambda _stream_id, _position: channel,
-        env.release,
+        env.recorder,
         handoff_id,
         now=now,
     )

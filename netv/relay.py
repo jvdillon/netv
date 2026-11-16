@@ -71,16 +71,18 @@ class Subscription:
         self,
         sink: Sink,
         *,
-        max_pending_bytes: int,
+        max_stall_sec: float,
+        clock: Callable[[], float],
         on_closed: Callable[[Subscription], None],
     ) -> None:
         self.end: SubscriptionEnd | None = None
         self._sink = sink
-        self._max_pending_bytes = max_pending_bytes
+        self._max_stall_sec = max_stall_sec
+        self._clock = clock
         self._on_closed = on_closed
         self._queue: deque[bytes] = deque()
-        self._pending_bytes = 0
-        self._draining = False
+        # When the sink last started refusing bytes, or None while it accepts them.
+        self._stalled_since: float | None = None
         self._ending: SubscriptionEnd | None = None
         self._wake = asyncio.Event()
         self._closed = asyncio.Event()
@@ -100,13 +102,13 @@ class Subscription:
     def _push(self, chunk: bytes) -> None:
         if self.end is not None or self._ending is not None:
             return
-        # Only a sink that is refusing bytes (stuck in drain) is behind. Bytes
-        # that arrive faster than the pump is scheduled are a burst, not a backlog.
-        if self._draining and self._pending_bytes + len(chunk) > self._max_pending_bytes:
+        # A sink is behind only once it has refused bytes for a while: a worker
+        # starting up reads nothing while a provider's opening burst arrives.
+        stalled_since = self._stalled_since
+        if stalled_since is not None and self._clock() - stalled_since > self._max_stall_sec:
             self._stop(SubscriptionEnd.OVERFLOW)
             return
         self._queue.append(chunk)
-        self._pending_bytes += len(chunk)
         self._wake.set()
 
     def _finish(self, end: SubscriptionEnd) -> None:
@@ -123,12 +125,10 @@ class Subscription:
         try:
             while True:
                 while self._queue:
-                    chunk = self._queue.popleft()
-                    self._pending_bytes -= len(chunk)
-                    self._sink.write(chunk)
-                    self._draining = True
+                    self._sink.write(self._queue.popleft())
+                    self._stalled_since = self._clock()
                     await self._sink.drain()
-                    self._draining = False
+                    self._stalled_since = None
                 if self._ending is not None:
                     self.end = self._ending
                     return
@@ -188,7 +188,7 @@ class Relay:
     Args:
         open_upstream: Opens the upstream body; called once, in a worker thread.
         history_sec: Seconds of recent bytes kept for late subscribers.
-        max_pending_bytes: Queued bytes beyond which a subscriber is dropped.
+        max_stall_sec: Seconds a subscriber may refuse bytes before it is dropped.
         chunk_size: Bytes requested per upstream read.
         clock: Monotonic clock timing history and stats.
     """
@@ -198,13 +198,13 @@ class Relay:
         open_upstream: Callable[[], Readable],
         *,
         history_sec: float = 30.0,
-        max_pending_bytes: int = 16 << 20,
+        max_stall_sec: float = 10.0,
         chunk_size: int = 64 << 10,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._open_upstream = open_upstream
         self._history_sec = history_sec
-        self._max_pending_bytes = max_pending_bytes
+        self._max_stall_sec = max_stall_sec
         self._chunk_size = chunk_size
         self._clock = clock
         self._history: deque[tuple[float, bytes]] = deque()
@@ -220,6 +220,8 @@ class Relay:
         self._upstream: Readable | None = None
         self._error: BaseException | None = None
         self._reader: asyncio.Task[None] | None = None
+        self._released = False
+        self._closing: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         """Start reading upstream in a worker thread."""
@@ -250,8 +252,9 @@ class Relay:
         """
         subscription = Subscription(
             sink,
-            max_pending_bytes=self._max_pending_bytes,
-            on_closed=self._subscriptions.discard,
+            max_stall_sec=self._max_stall_sec,
+            clock=self._clock,
+            on_closed=self._unsubscribed,
         )
         if replay:
             subscription._push(replay)
@@ -283,6 +286,17 @@ class Relay:
     async def wait_finished(self) -> None:
         """Wait until upstream ended, failed, or the relay was closed."""
         await self._finished.wait()
+
+    async def release(self) -> None:
+        """Close now when no one subscribes, else once the last subscription ends."""
+        self._released = True
+        if not self._subscriptions:
+            await self.close()
+
+    def _unsubscribed(self, subscription: Subscription) -> None:
+        self._subscriptions.discard(subscription)
+        if self._released and not self._subscriptions and self._closing is None:
+            self._closing = asyncio.ensure_future(self.close())
 
     async def close(self) -> None:
         """Stop reading, close upstream, and cancel every subscription."""

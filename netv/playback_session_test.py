@@ -130,12 +130,15 @@ async def test_fallback_command_and_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     transcode_dir: Path,
+    programs: FakeRun,
     launcher: ProcessLauncher,
     upstreams: FakeUpstreams,
     configured_resolution: cache.MaxResolution,
     expected_resolution: str,
 ):
-    # AI Upscale is installed and selected, so only the saver must keep it off.
+    # A 240p source on an installed and selected AI Upscale: only the saver keeps it off.
+    small = '{"streams": [{"codec_type": "video", "codec_name": "mpeg2video", "height": 240}]}'
+    programs.program("ffprobe", Program(stdout=small))
     engines = tmp_path / "engines"
     engines.mkdir()
     (engines / "2x-nomosuni-compact_1080p_fp16.engine").touch()
@@ -169,8 +172,12 @@ async def test_fallback_command_and_cleanup(
             allow_upscale=True,
             audio=source,
             video_codec="mpeg2video",
+            rendition="up",
         )
         assert any("dnn_processing=" in arg for arg in upscaled)
+        # Nor does the session start an AI Upscale worker beside it.
+        assert ffmpeg_session._is_fast_live(session)
+        assert not session["plan"].upscales(encoder[0], source)
         settings = cache.load_server_settings()
         assert settings["transcode_hw"] == "nvenc+software"
         assert settings.get("max_resolution") == configured_resolution

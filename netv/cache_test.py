@@ -109,6 +109,29 @@ class TestFileCache:
         assert cache.load_file_cache("corrupted") is None
 
 
+class TestRelayHints:
+    """What live sessions learned about upstreams, kept across restarts."""
+
+    def test_hints_start_empty_then_persist(self):
+        assert cache.relay_hints() == {"live_ts": {}, "burst_gaps": {}}
+        cache.remember_live_ts("x", True)
+        cache.remember_live_ts("y", False)
+        cache.remember_burst_gap("panel", 9.5)
+        cache.remember_burst_gap("panel", 4.0)
+        cache.remember_burst_gap("tuner", 0.2)
+        # A shorter gap never lowers the reserve a host has needed.
+        assert cache.relay_hints() == {
+            "live_ts": {"x": True, "y": False},
+            "burst_gaps": {"panel": 9.5, "tuner": 0.2},
+        }
+
+    def test_unreadable_hints_start_over(self):
+        (cache.CACHE_DIR / "relay_hints.json").write_text(
+            '{"data": {"live_ts": 3}, "timestamp": 0}',
+        )
+        assert cache.relay_hints() == {"live_ts": {}, "burst_gaps": {}}
+
+
 class TestMemoryCache:
     def test_get_cache_returns_reference(self):
         cache.get_cache()["epg_error"] = "down"
