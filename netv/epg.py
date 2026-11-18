@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Thread
@@ -451,13 +451,7 @@ class _Readable(Protocol):
 
 
 def read_epg_body(resp: _Readable, max_bytes: int, *, chunk_size: int = 1 << 20) -> bytes:
-    """Read an EPG response, gunzipping it if it is gzip, up to ``max_bytes``.
-
-    Decompression is streamed and bounded, so a small compressed bomb fails
-    with ``EPGTooLargeError`` instead of being expanded in memory.
-
-    Concatenated gzip members are read as one stream, as ``gzip.decompress``
-    does; anything after the last member that is not gzip is ignored.
+    """Read a whole EPG response, gunzipping it if it is gzip, up to ``max_bytes``.
 
     Args:
         resp: Response to read from.
@@ -472,14 +466,42 @@ def read_epg_body(resp: _Readable, max_bytes: int, *, chunk_size: int = 1 << 20)
         zlib.error: The body starts like gzip but is not valid gzip.
         EOFError: The gzip stream ends before its last member is complete.
     """
-    out = bytearray()
+    return b"".join(iter_epg_body(resp, max_bytes, chunk_size=chunk_size))
+
+
+def iter_epg_body(resp: _Readable, max_bytes: int, *, chunk_size: int = 1 << 20) -> Iterator[bytes]:
+    """Yield an EPG response in chunks, gunzipping it if it is gzip, up to ``max_bytes``.
+
+    Decompression is streamed and bounded, so a small compressed bomb fails
+    with ``EPGTooLargeError`` instead of being expanded in memory. No chunk is
+    larger than ``chunk_size``, compressed or not, so a parser reading the
+    stream holds only a chunk of the feed at a time.
+
+    Concatenated gzip members are read as one stream, as ``gzip.decompress``
+    does; anything after the last member that is not gzip is ignored.
+
+    Args:
+        resp: Response to read from.
+        max_bytes: Largest (decompressed) body allowed.
+        chunk_size: Bytes requested from ``resp`` per read, and the most yielded at once.
+
+    Yields:
+        chunk: The next piece of the (decompressed) EPG body.
+
+    Raises:
+        EPGTooLargeError: The (decompressed) body is larger than ``max_bytes``.
+        zlib.error: The body starts like gzip but is not valid gzip.
+        EOFError: The gzip stream ends before its last member is complete.
+    """
+    size = 0
     data = resp.read(chunk_size)
     if data[:2] != _GZIP_MAGIC:
         while data:
-            out += data
-            _checked(out, max_bytes)
+            size += len(data)
+            _checked(size, max_bytes)
+            yield data
             data = resp.read(chunk_size)
-        return bytes(out)
+        return
 
     gunzip: zlib._Decompress | None = None  # None between gzip members.
     while True:
@@ -489,22 +511,89 @@ def read_epg_body(resp: _Readable, max_bytes: int, *, chunk_size: int = 1 << 20)
                 if more:
                     data += more
                     continue
-                return bytes(out)
+                return
             if data[:2] != _GZIP_MAGIC:
-                return bytes(out)
+                return
             gunzip = zlib.decompressobj(16 + zlib.MAX_WBITS)
         if data:
-            # max_length bounds each step's output. It is at least 1 here,
-            # because _checked raises once out exceeds max_bytes (0 = unlimited).
-            out += gunzip.decompress(data, max_bytes + 1 - len(out))
-            _checked(out, max_bytes)
+            # max_length bounds each step's output to a chunk and to the budget. It
+            # is at least 1, because _checked raises once size exceeds max_bytes.
+            chunk = gunzip.decompress(data, min(chunk_size, max_bytes + 1 - size))
+            size += len(chunk)
+            _checked(size, max_bytes)
+            if chunk:
+                yield chunk
             if gunzip.eof:
                 data, gunzip = gunzip.unused_data, None
                 continue
-            # No unconsumed_tail: input is left over only once output hits the limit.
+            # Input the chunk bound left undecompressed is decompressed before reading on.
+            data = gunzip.unconsumed_tail
+            if data:
+                continue
         data = resp.read(chunk_size)
         if not data:
             raise EOFError("EPG gzip stream ended before the end of the gzip member")
+
+
+class _ChunkReader:
+    """A file-like ``read`` over byte chunks, so ``iterparse`` can parse a stream.
+
+    Like a raw stream, a read may return fewer bytes than asked for.
+    """
+
+    def __init__(self, chunks: Iterator[bytes]) -> None:
+        self._chunks = chunks
+        self._chunk = b""
+        self._pos = 0
+
+    def read(self, size: int = -1) -> bytes:
+        """Return up to ``size`` bytes of the current chunk, or all of it.
+
+        Args:
+            size: Most bytes to return; negative means the rest of the chunk.
+
+        Returns:
+            data: The next bytes, or ``b""`` once the chunks run out.
+        """
+        while self._pos >= len(self._chunk):
+            chunk = next(self._chunks, None)
+            if chunk is None:
+                return b""
+            self._chunk, self._pos = chunk, 0
+        end = len(self._chunk) if size < 0 else self._pos + size
+        out = self._chunk[self._pos : end]
+        self._pos += len(out)
+        return out
+
+
+ProgramRow = tuple[str, str, float, float, str, str]
+
+
+@dataclass(kw_only=True, slots=True)
+class _ParsedEpg:
+    """What a feed adds to the database, gathered before any of it is written."""
+
+    channels: list[tuple[str, str, str | None]] = field(default_factory=list)  # `id`, name, icon.
+    programs: list[ProgramRow] = field(default_factory=list)
+    program_channel_ids: set[str] = field(default_factory=set)
+
+    def add(self, element: Element, source_id: str) -> None:
+        """Record one top-level XMLTV element; anything but a channel or programme is ignored.
+
+        Args:
+            element: A child of the feed's root element.
+            source_id: Source the feed belongs to.
+        """
+        if element.tag == "channel":
+            ch_id = element.get("id", "")
+            name = _element_text(element.find("display-name"), default=ch_id)
+            icon_el = element.find("icon")
+            icon = None if icon_el is None else icon_el.get("src", "")
+            self.channels.append((ch_id, name, icon))
+        elif element.tag == "programme":
+            row = _program_row(element, source_id, self.program_channel_ids)
+            if row is not None:
+                self.programs.append(row)
 
 
 def fetch_epg(
@@ -513,8 +602,13 @@ def fetch_epg(
     timeout: int = 120,
     source_id: str = "",
     user_agent: str | None = None,
+    *,
+    chunk_size: int = 1 << 20,
 ) -> int:
     """Fetch and parse XMLTV EPG data directly into sqlite.
+
+    The feed is parsed as it streams in, and rows are written once it has all
+    parsed.
 
     Args:
         epg_url: URL of the XMLTV EPG feed
@@ -522,46 +616,33 @@ def fetch_epg(
         timeout: Request timeout in seconds
         source_id: Source identifier for multi-source support
         user_agent: User-Agent header to send. If None, uses default.
+        chunk_size: Bytes read from the response, and parsed, at a time.
 
     Returns:
         program_count: Number of programs inserted.
     """
-    with safe_urlopen(epg_url, timeout=timeout, user_agent=user_agent) as resp:
-        content = read_epg_body(resp, max_epg_bytes())
-    xml_str = content.decode()
-
+    # Nothing is written until the whole feed has parsed: feeds load in parallel,
+    # and a write transaction held through a download would lock out the others.
     try:
-        root = ET.fromstring(xml_str)
+        with safe_urlopen(epg_url, timeout=timeout, user_agent=user_agent) as resp:
+            chunks = iter_epg_body(resp, max_epg_bytes(), chunk_size=chunk_size)
+            parsed = _parse_epg_stream(_ChunkReader(chunks), source_id)
     except ET.ParseError as e:
-        debug_file = cache_dir / f"epg_debug_{int(time.time())}.xml"
-        debug_file.write_text(xml_str)
         log.warning("EPG parse failed (%s), attempting sanitization...", e)
-        try:
-            sanitized = _sanitize_epg_xml(xml_str)
-            root = ET.fromstring(sanitized)
-            log.info("Sanitized EPG parsed successfully")
-        except ET.ParseError as e2:
-            log.error("Sanitized EPG also failed: %s", e2)
-            raise
+        parsed = _parse_sanitized_epg(epg_url, cache_dir, timeout, source_id, user_agent)
 
-    # Parse channels directly into sqlite.
     channel_ids: set[str] = set()
-    for ch in root.findall("channel"):
-        ch_id = ch.get("id", "")
+    for ch_id, name, icon in parsed.channels:
         channel_ids.add(ch_id)
-        name = _element_text(ch.find("display-name"), default=ch_id)
         insert_channel(ch_id, name, source_id)
-        icon_el = ch.find("icon")
-        if icon_el is not None:
-            insert_icon(ch_id, icon_el.get("src", ""))
-
-    program_channel_ids: set[str] = set()
-    program_count = insert_programs(_program_rows(root, source_id, program_channel_ids))
+        if icon is not None:
+            insert_icon(ch_id, icon)
+    program_count = insert_programs(parsed.programs)
     commit()
     log.debug(
         "EPG parsed: %d channels, %d unique program channel IDs, %d programs",
         len(channel_ids),
-        len(program_channel_ids),
+        len(parsed.program_channel_ids),
         program_count,
     )
     return program_count
@@ -607,27 +688,22 @@ def _dedupe_programs(programs: list[Program], preferred_source_id: str) -> list[
 
 # A programme without both times is skipped: placing it at "now" would show it as airing
 # on every refresh.
-def _program_rows(
-    root: Element,
-    source_id: str,
-    channel_ids: set[str],
-) -> Iterator[tuple[str, str, float, float, str, str]]:
-    """Yield an insert row per well-formed ``programme``, adding its channel to ``channel_ids``."""
-    for prog in root.findall("programme"):
-        ch_id = prog.get("channel", "")
-        channel_ids.add(ch_id)
-        start_str = prog.get("start")
-        stop_str = prog.get("stop")
-        if start_str is None or stop_str is None:
-            continue
-        try:
-            start = _parse_epg_time(start_str)
-            stop = _parse_epg_time(stop_str)
-        except ValueError:
-            continue
-        title = _element_text(prog.find("title"), default="Unknown")
-        desc = _element_text(prog.find("desc"), default="")
-        yield ch_id, title, start.timestamp(), stop.timestamp(), desc, source_id
+def _program_row(prog: Element, source_id: str, channel_ids: set[str]) -> ProgramRow | None:
+    """Return the insert row for a well-formed ``programme``, adding its channel to ``channel_ids``."""
+    ch_id = prog.get("channel", "")
+    channel_ids.add(ch_id)
+    start_str = prog.get("start")
+    stop_str = prog.get("stop")
+    if start_str is None or stop_str is None:
+        return None
+    try:
+        start = _parse_epg_time(start_str)
+        stop = _parse_epg_time(stop_str)
+    except ValueError:
+        return None
+    title = _element_text(prog.find("title"), default="Unknown")
+    desc = _element_text(prog.find("desc"), default="")
+    return ch_id, title, start.timestamp(), stop.timestamp(), desc, source_id
 
 
 def _parse_epg_time(s: str) -> datetime:
@@ -669,8 +745,56 @@ def _sanitize_epg_xml(xml_str: str) -> str:
     return '<?xml version="1.0"?>\n<tv>\n' + "\n".join(channels) + "\n".join(programmes) + "\n</tv>"
 
 
-def _checked(out: bytearray, max_bytes: int) -> None:
-    if len(out) > max_bytes:
+def _checked(size: int, max_bytes: int) -> None:
+    if size > max_bytes:
         raise EPGTooLargeError(
             f"EPG feed is larger than {max_bytes} bytes (set NETV_EPG_MAX_BYTES to raise the limit)",
         )
+
+
+# Only the rows are kept, never the document or its tree, so memory follows the size of
+# the guide data rather than a multiple of the feed.
+def _parse_epg_stream(source: _ChunkReader, source_id: str) -> _ParsedEpg:
+    """Parse XMLTV as it arrives, dropping each element once it is recorded."""
+    parsed = _ParsedEpg()
+    root: Element | None = None
+    depth = 0
+    events = cast("Iterator[tuple[str, Element]]", ET.iterparse(source, events=("start", "end")))
+    for event, element in events:
+        if event == "start":
+            depth += 1
+            if root is None:
+                root = element
+            continue
+        depth -= 1
+        if depth == 1 and root is not None:
+            parsed.add(element, source_id)
+            # The finished element is root's only child, so clearing root frees it.
+            root.clear()
+    return parsed
+
+
+# The streamed copy is gone by the time parsing fails, and the repair works on the full
+# text, so this rare path holds the feed in memory as before.
+def _parse_sanitized_epg(
+    epg_url: str,
+    cache_dir: Path,
+    timeout: int,
+    source_id: str,
+    user_agent: str | None,
+) -> _ParsedEpg:
+    """Fetch the feed again, whole, and parse what ``_sanitize_epg_xml`` can salvage."""
+    with safe_urlopen(epg_url, timeout=timeout, user_agent=user_agent) as resp:
+        xml_str = read_epg_body(resp, max_epg_bytes()).decode()
+    debug_file = cache_dir / f"epg_debug_{int(time.time())}.xml"
+    debug_file.write_text(xml_str)
+    try:
+        root = ET.fromstring(_sanitize_epg_xml(xml_str))
+        log.info("Sanitized EPG parsed successfully")
+    except ET.ParseError as e:
+        log.error("Sanitized EPG also failed: %s", e)
+        raise
+    parsed = _ParsedEpg()
+    for element in root:
+        parsed.add(element, source_id)
+    return parsed
