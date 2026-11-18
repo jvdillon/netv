@@ -38,7 +38,7 @@ def settings_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path / "server_settings.json"
 
 
-SOURCE = {
+SOURCE: cache.SourceConfig = {
     "id": "s1",
     "name": "Example",
     "type": "xtream",
@@ -49,9 +49,9 @@ SOURCE = {
 }
 
 
-def _save(source: dict[str, object]) -> None:
+def _save(source: cache.SourceConfig) -> None:
     settings = cache.load_server_settings()
-    settings["sources"] = [source]  # type: ignore[list-item]
+    settings["sources"] = [source]
     cache.save_server_settings(settings)
 
 
@@ -85,7 +85,9 @@ class TestValues:
             credentials.encrypt("enc:v1:my-password")
 
     def test_missing_key_fails_instead_of_returning_nothing(
-        self, key: str, monkeypatch: pytest.MonkeyPatch
+        self,
+        key: str,
+        monkeypatch: pytest.MonkeyPatch,
     ):
         del key
         token = credentials.encrypt("x")
@@ -97,23 +99,29 @@ class TestValues:
         del key
         token = credentials.encrypt("x")
         monkeypatch.setenv(credentials.KEY_ENV, Fernet.generate_key().decode())
-        with pytest.raises(credentials.CredentialsKeyError, match="cannot be decrypted"):
+        message = r"^Source credentials cannot be decrypted with the configured key\.$"
+        with pytest.raises(credentials.CredentialsKeyError, match=message):
             credentials.decrypt(token)
 
     @pytest.mark.parametrize("bad", ["not-a-key", "c2hvcnQ=", "é" * 44])
     def test_invalid_key_in_environment_is_a_key_error(
-        self, monkeypatch: pytest.MonkeyPatch, bad: str
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        bad: str,
     ):
         monkeypatch.setenv(credentials.KEY_ENV, bad)
         for call in (lambda: credentials.encrypt("x"), lambda: credentials.decrypt("enc:v1:t")):
             with pytest.raises(
-                credentials.CredentialsKeyError, match="not a valid Fernet key"
+                credentials.CredentialsKeyError,
+                match="not a valid Fernet key",
             ) as e:
                 call()
             assert bad not in str(e.value)
 
     def test_key_file_outside_the_data_directory(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ):
         secret = tmp_path / "secrets" / "netv.key"
         secret.parent.mkdir()
@@ -124,7 +132,9 @@ class TestValues:
         assert credentials.decrypt(token) == "x"
 
     def test_unreadable_key_file_is_a_key_error(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ):
         monkeypatch.setenv(credentials.KEY_FILE_ENV, str(tmp_path / "missing.key"))
         with pytest.raises(credentials.CredentialsKeyError, match="cannot be read"):
@@ -140,14 +150,14 @@ class TestValues:
 
 class TestSettingsFile:
     def test_without_a_key_the_file_is_plain_as_before(self, settings_file: Path):
-        _save(dict(SOURCE))
+        _save(SOURCE)
         stored = json.loads(settings_file.read_text())["sources"][0]
         assert {k: stored.get(k) for k in SOURCE} == SOURCE
         assert sorted(p.name for p in settings_file.parent.iterdir()) == ["server_settings.json"]
 
     @pytest.mark.usefixtures("key")
     def test_saved_file_holds_no_plain_credentials(self, settings_file: Path):
-        _save(dict(SOURCE))
+        _save(SOURCE)
         text = settings_file.read_text()
         assert "hunter2" not in text
         assert "alice" not in text
@@ -159,7 +169,9 @@ class TestSettingsFile:
         assert {k: loaded.get(k) for k in SOURCE} == SOURCE
 
     def test_plain_settings_are_encrypted_on_the_first_save_with_a_key(
-        self, settings_file: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        settings_file: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ):
         settings_file.write_text(json.dumps({"sources": [SOURCE], "secret_key": "s"}))
         monkeypatch.setenv(credentials.KEY_ENV, Fernet.generate_key().decode())
@@ -173,11 +185,11 @@ class TestSettingsFile:
 
     @pytest.mark.usefixtures("key")
     def test_saving_twice_keeps_the_values(self, settings_file: Path):
-        _save(dict(SOURCE))
+        _save(SOURCE)
         cache.save_server_settings(cache.load_server_settings())
         loaded = cache.load_server_settings()["sources"][0]
         assert loaded.get("password") == "hunter2"
-        assert loaded.get("epg_url") == SOURCE["epg_url"]
+        assert loaded.get("epg_url") == SOURCE.get("epg_url")
 
     @pytest.mark.usefixtures("key")
     def test_a_password_that_looks_encrypted_survives_save_and_load(self, settings_file: Path):
@@ -185,12 +197,21 @@ class TestSettingsFile:
         assert cache.load_server_settings()["sources"][0].get("password") == "enc:v1:not-a-token"
 
     def test_lost_key_stops_loading_instead_of_blanking_credentials(
-        self, settings_file: Path, key: str, monkeypatch: pytest.MonkeyPatch
+        self,
+        settings_file: Path,
+        key: str,
+        monkeypatch: pytest.MonkeyPatch,
     ):
         del key
-        _save(dict(SOURCE))
+        _save(SOURCE)
         before = settings_file.read_text()
         monkeypatch.delenv(credentials.KEY_ENV)
         with pytest.raises(credentials.CredentialsKeyError):
             cache.load_server_settings()
         assert settings_file.read_text() == before
+
+
+if __name__ == "__main__":
+    from codedoctor.lib.testing.runner import test_main
+
+    test_main(__file__)

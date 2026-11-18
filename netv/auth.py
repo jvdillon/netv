@@ -300,6 +300,12 @@ def logo_url_signature(url: str) -> str:
 
     Only signed URLs are fetched, so the endpoint cannot be pointed at
     arbitrary hosts (internal services included) by any signed-in viewer.
+
+    Args:
+        url: External logo URL the server put on a page.
+
+    Returns:
+        signature: Hex HMAC-SHA256 of the label and URL under the secret key.
     """
     data = b"logo-url\n" + url.encode()
     return hmac.new(_get_secret_key().encode(), data, hashlib.sha256).hexdigest()
@@ -345,9 +351,6 @@ def verify_token(token: str) -> TokenClaims | None:
     return payload
 
 
-_STREAM_URL_TOKEN = re.compile(r"[0-9a-f]{64}")
-
-
 def stream_url_token(username: str, url: str) -> str:
     """Token proving the server handed ``url`` to ``username`` on a player page.
 
@@ -369,7 +372,7 @@ def stream_url_token(username: str, url: str) -> str:
 def verify_stream_url_token(username: str, url: str, token: str) -> bool:
     """Whether ``token`` is the stream URL token for this user and URL."""
     # compare_digest raises on non-ASCII strings; anything but 64 hex digits is no token.
-    if not _STREAM_URL_TOKEN.fullmatch(token):
+    if not re.fullmatch(r"[0-9a-f]{64}", token):
         return False
     return hmac.compare_digest(token, stream_url_token(username, url))
 

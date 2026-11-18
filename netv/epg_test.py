@@ -783,7 +783,7 @@ class TestReadEpgBody:
     """Size-bounded reading and gunzipping of EPG feeds."""
 
     def test_gzip_bomb_stops_at_the_limit_without_expanding(self):
-        bomb = gzip.compress(b" " * (64 << 20))  # 64 MiB of spaces, ~64 KiB compressed
+        bomb = gzip.compress(b" " * (64 << 20))  # 64 MiB of spaces, ~64 KiB compressed.
         tracemalloc.start()
         try:
             with pytest.raises(epg.EPGTooLargeError):
@@ -794,7 +794,10 @@ class TestReadEpgBody:
         assert peak < 8 << 20
 
     def test_plain_body_over_the_limit(self):
-        with pytest.raises(epg.EPGTooLargeError):
+        message = (
+            r"^EPG feed is larger than 100 bytes \(set NETV_EPG_MAX_BYTES to raise the limit\)$"
+        )
+        with pytest.raises(epg.EPGTooLargeError, match=message):
             epg.read_epg_body(testing.FakeResponse(b"x" * 101), 100)
 
     def test_bodies_at_the_limit_are_read(self):
@@ -815,6 +818,9 @@ class TestReadEpgBody:
         body = gzip.compress(b"<tv/>") + b"\x00" * 512
         assert epg.read_epg_body(testing.FakeResponse(body), 100) == b"<tv/>"
 
+    def test_trailing_padding_in_a_later_read_is_ignored(self):
+        assert epg.read_epg_body(_Chunks(gzip.compress(b"<tv/>"), b"\x00" * 512), 100) == b"<tv/>"
+
     def test_truncated_gzip_raises(self):
         body = gzip.compress(b"<tv>" + b"x" * 1000 + b"</tv>")
         with pytest.raises(EOFError):
@@ -829,7 +835,7 @@ class TestReadEpgBody:
         assert epg.max_epg_bytes() == 4096
         for bad in ("", "lots", "0", "-5"):
             monkeypatch.setenv("NETV_EPG_MAX_BYTES", bad)
-            assert epg.max_epg_bytes() == epg.DEFAULT_EPG_MAX_BYTES
+            assert epg.max_epg_bytes() == 1 << 30
 
     def test_fetch_epg_rejects_an_oversized_feed(
         self,

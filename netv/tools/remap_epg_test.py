@@ -214,6 +214,18 @@ def test_source_countries(tmp_path: pathlib.Path) -> None:
     assert remap_epg.source_countries(tmp_path) == {"gb": "UK"}
 
 
+def test_source_countries_skips_undecryptable_url(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NETV_CREDENTIALS_KEY", raising=False)
+    monkeypatch.delenv("NETV_CREDENTIALS_KEY_FILE", raising=False)
+    (tmp_path / "server_settings.json").write_text(
+        json.dumps({"sources": [{"id": "gb", "type": "epg", "url": "enc:v1:token"}]}),
+    )
+    assert remap_epg.source_countries(tmp_path) == {}
+
+
 def test_source_countries_skips_source_without_id(tmp_path: pathlib.Path) -> None:
     (tmp_path / "server_settings.json").write_text(
         json.dumps({"sources": [{"type": "epg", "url": "http://x/epg_US.xml"}]}),

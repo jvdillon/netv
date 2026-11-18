@@ -283,6 +283,31 @@ class TestTokens:
 
 
 @pytest.mark.usefixtures("auth_module")
+class TestUrlSignatures:
+    def test_logo_url_signature_verifies_only_its_url(self):
+        sig = auth.logo_url_signature("http://x/a.png")
+        assert auth.verify_logo_url_signature("http://x/a.png", sig)
+        assert not auth.verify_logo_url_signature("http://x/b.png", sig)
+
+    @pytest.mark.parametrize("bad", ["", "0" * 63, "A" * 64, "é" * 64])
+    def test_logo_url_signature_rejects_malformed(self, bad: str):
+        assert not auth.verify_logo_url_signature("http://x/a.png", bad)
+
+    def test_stream_url_token_is_bound_to_user_and_url(self):
+        token = auth.stream_url_token("ann", "http://x/live")
+        assert auth.verify_stream_url_token("ann", "http://x/live", token)
+        assert not auth.verify_stream_url_token("bob", "http://x/live", token)
+        assert not auth.verify_stream_url_token("ann", "http://x/other", token)
+
+    def test_stream_url_token_differs_from_logo_signature(self):
+        assert auth.stream_url_token("", "u") != auth.logo_url_signature("u")
+
+    @pytest.mark.parametrize("bad", ["", "0" * 63, "A" * 64, "é" * 64])
+    def test_stream_url_token_rejects_malformed(self, bad: str):
+        assert not auth.verify_stream_url_token("ann", "http://x/live", bad)
+
+
+@pytest.mark.usefixtures("auth_module")
 class TestSecretKey:
     def test_get_secret_key_generates_and_persists(self):
         key1 = auth._get_secret_key()

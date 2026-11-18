@@ -1037,6 +1037,19 @@ def test_favorite_covers_are_saved_as_provider_urls(auth_client: TestClient):
     }
 
 
+def test_favorites_of_other_shapes_are_saved_as_they_are(auth_client: TestClient):
+    raw = "https://img.example/film.jpg"
+    favorites = {"movies": {"1": {"name": "Film", "cover": raw}, "2": "Film"}, "series": {"3": 3}}
+    assert auth_client.post("/api/user-prefs", json={"favorites": favorites}).json() == {"ok": True}
+    assert cache_module.load_user_settings("testuser")["favorites"] == favorites
+    cache_module.get_cache()["vod_streams"] = [{"stream_id": 2, "stream_icon": raw}]
+    page = main_test._fields(auth_client.get("/api/user-prefs"))["favorites"]
+    assert page == {
+        "movies": {"1": {"name": "Film", "cover": ""}, "2": "Film"},
+        "series": {"3": 3},
+    }
+
+
 def test_favorite_saved_before_signing_still_loads_its_cover(auth_client: TestClient, web: FakeWeb):
     raw = "https://img.example/film.jpg"
     web.routes[raw] = FakeResponse(b"img", headers={"Content-Type": "image/png"})

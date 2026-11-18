@@ -3241,71 +3241,6 @@ def _logo_url_filter(url: str) -> str:
 
 Favorites = dict[str, dict[str, MutablePlainTree]]
 
-# Favorite kind -> (catalog cache key, id field, cover field).
-_FAVORITE_CATALOGS: dict[str, tuple[Literal["vod_streams", "series"], str, str]] = {
-    "movies": ("vod_streams", "stream_id", "stream_icon"),
-    "series": ("series", "series_id", "cover"),
-}
-
-
-def _raw_logo_url(url: str) -> str:
-    """Return the external URL inside a ``/api/logo`` link, or ``url`` unchanged."""
-    if not url.startswith("/api/logo?"):
-        return url
-    return parse.parse_qs(parse.urlsplit(url).query).get("url", [url])[0]
-
-
-def _with_cover(entry: MutablePlainTree, cover: str) -> MutablePlainTree:
-    """Copy a favorite entry with its cover replaced; other shapes pass through."""
-    if not isinstance(entry, dict):
-        return entry
-    return {**entry, "cover": cover}
-
-
-def _stored_favorites(favorites: Favorites) -> Favorites:
-    """Favorites as saved: covers hold the provider URL, never a signed proxy link.
-
-    Pages post back the covers they were given, which are signed ``/api/logo``
-    links. Storing the raw URL keeps saved favorites valid if ``secret_key`` changes.
-    """
-    return {
-        kind: {fid: _stored_entry(entry) for fid, entry in entries.items()}
-        for kind, entries in favorites.items()
-    }
-
-
-def _stored_entry(entry: MutablePlainTree) -> MutablePlainTree:
-    """One saved favorite: a text cover is unwrapped to the provider URL."""
-    if not isinstance(entry, dict):
-        return entry
-    cover = entry.get("cover")
-    return _with_cover(entry, _raw_logo_url(cover)) if isinstance(cover, str) else entry
-
-
-def _page_favorites(settings: UserSettings) -> Favorites:
-    """The viewer's favorites, with covers signed for ``/api/logo``.
-
-    Covers come from the provider catalog, looked up by the favorite's id. The
-    stored cover is never signed: viewers write favorites through
-    ``/api/user-prefs``, so signing it would let any viewer proxy any URL. A
-    favorite missing from the loaded catalog shows no cover.
-    """
-    favorites = settings.get("favorites", {"series": {}, "movies": {}})
-    page: Favorites = {}
-    for kind, entries in favorites.items():
-        covers: dict[str, str] = {}
-        catalog = _FAVORITE_CATALOGS.get(kind)
-        if catalog and entries:
-            key, id_field, cover_field = catalog
-            for item in get_cache().get(key, []):
-                item_id = text_field(item, id_field)
-                if item_id in entries:
-                    covers[item_id] = _logo_url_filter(text_field(item, cover_field))
-        page[kind] = {
-            fid: _with_cover(entry, covers.get(fid, "")) for fid, entry in entries.items()
-        }
-    return page
-
 
 def _hidden_sources(username: str) -> set[str]:
     """Sources not assigned to this user (admins see all)."""
@@ -4659,6 +4594,66 @@ class _UserPrefsUpdate(TypedDict, total=False):
     virtual_scroll: bool
     sort_live_by_views: bool
     guide_selected_cats: list[str] | None
+
+
+def _raw_logo_url(url: str) -> str:
+    """Return the external URL inside a ``/api/logo`` link, or ``url`` unchanged."""
+    if not url.startswith("/api/logo?"):
+        return url
+    return parse.parse_qs(parse.urlsplit(url).query).get("url", [url])[0]
+
+
+def _with_cover(entry: MutablePlainTree, cover: str) -> MutablePlainTree:
+    """Copy a favorite entry with its cover replaced; other shapes pass through."""
+    if not isinstance(entry, dict):
+        return entry
+    return {**entry, "cover": cover}
+
+
+# Pages post back the covers they were given, which are signed ``/api/logo`` links.
+# Storing the raw URL keeps saved favorites valid if ``secret_key`` changes.
+def _stored_favorites(favorites: Favorites) -> Favorites:
+    """Favorites as saved: covers hold the provider URL, never a signed proxy link."""
+    return {
+        kind: {fid: _stored_entry(entry) for fid, entry in entries.items()}
+        for kind, entries in favorites.items()
+    }
+
+
+def _stored_entry(entry: MutablePlainTree) -> MutablePlainTree:
+    """One saved favorite: a text cover is unwrapped to the provider URL."""
+    if not isinstance(entry, dict):
+        return entry
+    cover = entry.get("cover")
+    return _with_cover(entry, _raw_logo_url(cover)) if isinstance(cover, str) else entry
+
+
+# Covers come from the provider catalog, looked up by the favorite's id. The stored
+# cover is never signed: viewers write favorites through ``/api/user-prefs``, so signing
+# it would let any viewer proxy any URL. A favorite missing from the loaded catalog
+# shows no cover.
+def _page_favorites(settings: UserSettings) -> Favorites:
+    """The viewer's favorites, with covers signed for ``/api/logo``."""
+    favorites = settings.get("favorites", {"series": {}, "movies": {}})
+    memory = get_cache()
+    # Favorite kind -> (provider catalog, id field, cover field).
+    catalogs: dict[str, tuple[list[ProviderRecord], str, str]] = {
+        "movies": (memory.get("vod_streams", []), "stream_id", "stream_icon"),
+        "series": (memory.get("series", []), "series_id", "cover"),
+    }
+    page: Favorites = {}
+    for kind, entries in favorites.items():
+        covers: dict[str, str] = {}
+        if kind in catalogs and entries:
+            items, id_field, cover_field = catalogs[kind]
+            for item in items:
+                item_id = text_field(item, id_field)
+                if item_id in entries:
+                    covers[item_id] = _logo_url_filter(text_field(item, cover_field))
+        page[kind] = {
+            fid: _with_cover(entry, covers.get(fid, "")) for fid, entry in entries.items()
+        }
+    return page
 
 
 if __name__ == "__main__":

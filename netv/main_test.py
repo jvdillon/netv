@@ -619,7 +619,9 @@ def start_recorder(monkeypatch: pytest.MonkeyPatch) -> _StartRecorder:
 
 @pytest.mark.parametrize("case", ["missing", "other-user", "other-url", "forged", "not-hex"])
 def test_transcode_start_refuses_urls_the_server_did_not_issue(
-    auth_client: TestClient, start_recorder: _StartRecorder, case: str
+    auth_client: TestClient,
+    start_recorder: _StartRecorder,
+    case: str,
 ):
     url = "http://169.254.169.254/x"
     params = {"url": url}
@@ -638,14 +640,15 @@ def test_transcode_start_refuses_urls_the_server_did_not_issue(
 
 
 def test_player_page_token_starts_that_stream_for_that_user(
-    auth_client: TestClient, start_recorder: _StartRecorder
+    auth_client: TestClient,
+    start_recorder: _StartRecorder,
 ):
     _set_live(
         {
             "stream_id": "test",
             "name": "Test channel",
             "direct_url": "https://provider.example/live.m3u8?user=a&pass=b",
-        }
+        },
     )
     page = auth_client.get("/play/live/test")
     url_match = re.search(r"rawUrl: (\"[^\"]*\")", page.text)
@@ -689,7 +692,10 @@ async def test_disconnected_adaptive_start_is_cleaned_up(fast_live: _FastLive, d
     scope: Scope = {"type": "http", "method": "GET", "headers": [], "query_string": b""}
     request = Request(scope, _gone if disconnected else _connected)
     start = main.transcode_start(
-        request, {"sub": "testuser"}, PROVIDER, auth.stream_url_token("testuser", PROVIDER)
+        request,
+        {"sub": "testuser"},
+        PROVIDER,
+        auth.stream_url_token("testuser", PROVIDER),
     )
     if disconnected:
         with pytest.raises(HTTPException) as excinfo:
@@ -2492,7 +2498,8 @@ class TestSourceAssignment:
         self._setup(auth_client, [])
         auth_client.cookies.set("token", auth.create_token({"sub": "kid"}))
         resp = auth_client.get(
-            "/transcode/start", params=_start("http://a/x.ts", user="kid", source_id="fam")
+            "/transcode/start",
+            params=_start("http://a/x.ts", user="kid", source_id="fam"),
         )
         assert resp.status_code == 403
 

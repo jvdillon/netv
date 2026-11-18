@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Thread
-from typing import Protocol, TypedDict, cast
+from typing import Final, Protocol, TypedDict, cast
 from weakref import finalize
 from xml.etree.ElementTree import Element
 
@@ -422,31 +422,35 @@ def prune_old_programs(before: datetime) -> int:
 # =============================================================================
 
 
-#: Default cap on an EPG feed's size after decompression (NETV_EPG_MAX_BYTES).
-DEFAULT_EPG_MAX_BYTES = 1 << 30
-_EPG_READ_CHUNK = 1 << 20
-_GZIP_MAGIC = b"\x1f\x8b"
+_GZIP_MAGIC: Final = b"\x1f\x8b"
 
 
 class EPGTooLargeError(ValueError):
     """An EPG feed exceeded the size limit, compressed or not."""
 
 
-def max_epg_bytes() -> int:
-    """The EPG size limit: ``NETV_EPG_MAX_BYTES`` if set to a positive integer."""
+def max_epg_bytes(*, default: int = 1 << 30) -> int:
+    """The EPG size limit: ``NETV_EPG_MAX_BYTES`` if set to a positive integer.
+
+    Args:
+        default: Limit on the decompressed feed size when the variable is unset or invalid.
+
+    Returns:
+        max_bytes: Largest EPG body to read, in bytes.
+    """
     configured = os.environ.get("NETV_EPG_MAX_BYTES", "").strip()
     try:
         value = int(configured)
     except ValueError:
-        return DEFAULT_EPG_MAX_BYTES
-    return value if value > 0 else DEFAULT_EPG_MAX_BYTES
+        return default
+    return value if value > 0 else default
 
 
 class _Readable(Protocol):
     def read(self, amt: int = ..., /) -> bytes: ...
 
 
-def read_epg_body(resp: _Readable, max_bytes: int) -> bytes:
+def read_epg_body(resp: _Readable, max_bytes: int, *, chunk_size: int = 1 << 20) -> bytes:
     """Read an EPG response, gunzipping it if it is gzip, up to ``max_bytes``.
 
     Decompression is streamed and bounded, so a small compressed bomb fails
@@ -455,25 +459,33 @@ def read_epg_body(resp: _Readable, max_bytes: int) -> bytes:
     Concatenated gzip members are read as one stream, as ``gzip.decompress``
     does; anything after the last member that is not gzip is ignored.
 
+    Args:
+        resp: Response to read from.
+        max_bytes: Largest (decompressed) body allowed.
+        chunk_size: Bytes requested from ``resp`` per read.
+
+    Returns:
+        body: The (decompressed) EPG body.
+
     Raises:
         EPGTooLargeError: The (decompressed) body is larger than ``max_bytes``.
         zlib.error: The body starts like gzip but is not valid gzip.
         EOFError: The gzip stream ends before its last member is complete.
     """
     out = bytearray()
-    data = resp.read(_EPG_READ_CHUNK)
+    data = resp.read(chunk_size)
     if data[:2] != _GZIP_MAGIC:
         while data:
             out += data
             _checked(out, max_bytes)
-            data = resp.read(_EPG_READ_CHUNK)
+            data = resp.read(chunk_size)
         return bytes(out)
 
-    gunzip: zlib._Decompress | None = None  # None between gzip members
+    gunzip: zlib._Decompress | None = None  # None between gzip members.
     while True:
         if gunzip is None:
             if len(data) < len(_GZIP_MAGIC):
-                more = resp.read(_EPG_READ_CHUNK)
+                more = resp.read(chunk_size)
                 if more:
                     data += more
                     continue
@@ -489,19 +501,10 @@ def read_epg_body(resp: _Readable, max_bytes: int) -> bytes:
             if gunzip.eof:
                 data, gunzip = gunzip.unused_data, None
                 continue
-            data = gunzip.unconsumed_tail
-            if data:
-                continue
-        data = resp.read(_EPG_READ_CHUNK)
+            # No unconsumed_tail: input is left over only once output hits the limit.
+        data = resp.read(chunk_size)
         if not data:
             raise EOFError("EPG gzip stream ended before the end of the gzip member")
-
-
-def _checked(out: bytearray, max_bytes: int) -> None:
-    if len(out) > max_bytes:
-        raise EPGTooLargeError(
-            f"EPG feed is larger than {max_bytes} bytes (set NETV_EPG_MAX_BYTES to raise the limit)"
-        )
 
 
 def fetch_epg(
@@ -664,3 +667,10 @@ def _sanitize_epg_xml(xml_str: str) -> str:
     ]
     log.info("Sanitized EPG: extracted %d channels, %d programmes", len(channels), len(programmes))
     return '<?xml version="1.0"?>\n<tv>\n' + "\n".join(channels) + "\n".join(programmes) + "\n</tv>"
+
+
+def _checked(out: bytearray, max_bytes: int) -> None:
+    if len(out) > max_bytes:
+        raise EPGTooLargeError(
+            f"EPG feed is larger than {max_bytes} bytes (set NETV_EPG_MAX_BYTES to raise the limit)",
+        )
