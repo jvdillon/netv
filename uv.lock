@@ -2996,7 +2996,7 @@ wheels = [
 
 [[package]]
 name = "pynetv"
-version = "0.4.3"
+version = "0.5.0"
 source = { editable = "." }
 default-groups = ["cuda", "dev"]
 
