@@ -38,9 +38,11 @@ from netv import (
     testing,
     util,
 )
+from netv.auth import TokenClaims
 from netv.epg import Program
 from netv.ffmpeg_command import MediaInfo
 from netv.main import CatchupListing, GuideRowsResponse, PlayerInfo, PlaylistPayload
+from netv.playback_policy import PlaybackHealth
 from netv.playlists import NameMatch, StreamSummary
 from netv.xtream import ProviderRecord
 
@@ -603,10 +605,12 @@ class _StartRecorder:
 
     def __init__(self) -> None:
         self.urls: list[str] = []
+        self.options: list[dict[str, object]] = []
 
     async def __call__(self, url: str, *args: object, **kwargs: object) -> dict[str, str]:
-        del args, kwargs
+        del args
         self.urls.append(url)
+        self.options.append(kwargs)
         return {"session_id": "s"}
 
 
@@ -615,6 +619,73 @@ def start_recorder(monkeypatch: pytest.MonkeyPatch) -> _StartRecorder:
     recorder = _StartRecorder()
     monkeypatch.setattr(ffmpeg_session, "start_transcode", recorder)
     return recorder
+
+
+class _Prestarts:
+    """Stands in for ``ffmpeg_session.prestart_live``: play pages start no real stream."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def __call__(self, url: str, **options: object) -> None:
+        self.calls.append((url, options))
+
+
+@pytest.fixture(autouse=True)
+def prestarts(monkeypatch: pytest.MonkeyPatch) -> _Prestarts:
+    recorder = _Prestarts()
+    monkeypatch.setattr(ffmpeg_session, "prestart_live", recorder)
+    return recorder
+
+
+_OTA = "http://tuner.test:5004/auto/v9.1"
+
+
+def test_a_live_page_starts_its_stream_while_its_scripts_load(
+    auth_client: TestClient,
+    prestarts: _Prestarts,
+):
+    _set_live({"stream_id": "ota", "name": "KQED", "direct_url": _OTA, "source_id": "tuner"})
+    assert auth_client.get("/play/live/ota").status_code == 200
+    assert prestarts.calls == [
+        (
+            _OTA,
+            {
+                "username": "testuser",
+                "source_id": "tuner",
+                "deinterlace_fallback": True,
+                "user_max_streams": 0,
+                "source_max_streams": 0,
+            },
+        ),
+    ]
+
+
+def test_a_page_that_will_not_transcode_starts_nothing(
+    auth_client: TestClient,
+    prestarts: _Prestarts,
+):
+    _set_live({"stream_id": "ota", "name": "KQED", "direct_url": _OTA, "source_id": "tuner"})
+    cache_module.save_server_settings(
+        {**cache_module.load_server_settings(), "transcode_mode": "never"},
+    )
+    assert auth_client.get("/play/live/ota").status_code == 200
+    assert prestarts.calls == []
+
+
+def test_a_stream_playing_on_a_tv_is_not_started_again(
+    auth_client: TestClient,
+    prestarts: _Prestarts,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _set_live({"stream_id": "ota", "name": "KQED", "direct_url": _OTA, "source_id": "tuner"})
+
+    def casting(url: str) -> bool:
+        return url == _OTA
+
+    monkeypatch.setattr(chromecast.manager, "owns_url", casting)
+    assert auth_client.get("/play/live/ota").status_code == 200
+    assert prestarts.calls == []
 
 
 @pytest.mark.parametrize("case", ["missing", "other-user", "other-url", "forged", "not-hex"])
@@ -664,12 +735,41 @@ def test_player_page_token_starts_that_stream_for_that_user(
     assert start_recorder.urls == [url]
 
 
+@pytest.mark.parametrize(("query", "expected"), [({}, 2), ({"min_segments": "1"}, 1)])
+def test_a_start_can_ask_to_be_answered_at_the_first_segment(
+    auth_client: TestClient,
+    start_recorder: _StartRecorder,
+    query: dict[str, str],
+    expected: int,
+):
+    url = "http://provider/live"
+    response = auth_client.get("/transcode/start", params=_start(url, **query))
+    assert response.status_code == 200
+    assert start_recorder.options[0].get("min_segments") == expected
+
+
+@pytest.mark.parametrize("value", ["0", "3"])
+def test_a_start_cannot_ask_for_other_segment_counts(
+    auth_client: TestClient,
+    start_recorder: _StartRecorder,
+    value: str,
+):
+    response = auth_client.get(
+        "/transcode/start",
+        params=_start("http://provider/live", min_segments=value),
+    )
+    assert response.status_code == 422
+    assert start_recorder.urls == []
+
+
 @pytest.mark.asyncio
 async def test_adaptive_start_uses_shared_backend(auth_client: TestClient, fast_live: _FastLive):
     session_id = await fast_live.start()
     response = auth_client.get("/transcode/start", params=_start(PROVIDER))
     assert response.status_code == 200
-    assert response.json() == {
+    body = _fields(response)
+    assert re.fullmatch(r"[0-9a-f]{32}", str(body.pop("viewer_id")))
+    assert body == {
         "session_id": session_id,
         "playlist": f"/transcode/{session_id}/low.m3u8",
         "master_playlist": f"/transcode/{session_id}/master.m3u8",
@@ -1701,6 +1801,27 @@ class TestTranscodeRoutes:
                 "low_0.ts": pytest.approx(origin),
                 "low_1.ts": pytest.approx(origin + 2),
             }
+        # Only the web player asks for blocking reload; other clients poll as before.
+        assert "SERVER-CONTROL" not in response.text
+        assert "?blocking=1" not in response.text
+        await ffmpeg_session.stop_session(session_id, force=True)
+
+    @pytest.mark.asyncio
+    async def test_the_web_player_reloads_its_playlist_by_blocking(
+        self,
+        client: TestClient,
+        fast_live: _FastLive,
+    ):
+        session_id = await fast_live.start()
+
+        master = client.get(f"/transcode/{session_id}/master.m3u8?blocking=1").text
+        playlist = client.get(f"/transcode/{session_id}/low.m3u8?blocking=1").text
+        # Both segments are listed, so asking for the second returns at once.
+        listed = client.get(f"/transcode/{session_id}/low.m3u8?blocking=1&_HLS_msn=1").text
+
+        assert "\nlow.m3u8?blocking=1\n" in master
+        assert "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES\n" in playlist
+        assert "low_1.ts" in listed
         await ffmpeg_session.stop_session(session_id, force=True)
 
     def test_segmented_webvtt_is_mapped_to_the_video_clock(
@@ -1818,6 +1939,77 @@ async def _until(condition: Callable[[], bool], task: asyncio.Task[object]) -> N
             raise AssertionError("task finished before the condition held")
         await asyncio.sleep(0)
     raise AssertionError("condition never held")
+
+
+async def _open_page(fast_live: _FastLive) -> ffmpeg_session.TranscodeResponse:
+    """A player page starting testuser's provider stream, as the first viewer."""
+    task = asyncio.create_task(ffmpeg_session.start_transcode(PROVIDER, username="testuser"))
+    await fast_live.feed(task, connection=0, data=testing.ts_source(seconds=10.0))
+    return await task
+
+
+class TestSharedLiveSessions:
+    """Each page load is one viewer; a stream stops only when its last viewer leaves."""
+
+    @pytest.mark.asyncio
+    async def test_a_reloaded_page_keeps_the_stream_its_old_page_stops(self, fast_live: _FastLive):
+        old_page = await _open_page(fast_live)
+        new_page = await ffmpeg_session.start_transcode(PROVIDER, username="testuser")
+        session_id = old_page["session_id"]
+        assert new_page["session_id"] == session_id
+        assert old_page.get("viewer_id") != new_page.get("viewer_id")
+        [worker] = fast_live.launcher.processes
+        user: TokenClaims = {"sub": "testuser"}
+
+        # The old page's close beacon lands after the new page joined.
+        await main.transcode_stop_post(
+            session_id,
+            user,
+            force=True,
+            viewer=old_page.get("viewer_id", ""),
+        )
+        assert session_id in ffmpeg_session._transcode_sessions
+        assert worker.signals == []
+
+        await main.transcode_stop(
+            session_id,
+            user,
+            force=True,
+            viewer=new_page.get("viewer_id", ""),
+        )
+        assert session_id not in ffmpeg_session._transcode_sessions
+        assert worker.signals == ["TERM"]
+
+    @pytest.mark.asyncio
+    async def test_a_viewer_that_stopped_reporting_does_not_hold_the_stream(
+        self,
+        fast_live: _FastLive,
+    ):
+        """A closed tab whose beacon never arrived expires with its heartbeat."""
+        watching = await _open_page(fast_live)
+        await ffmpeg_session.start_transcode(PROVIDER, username="testuser")
+        session_id = watching["session_id"]
+        user: TokenClaims = {"sub": "testuser"}
+        health = PlaybackHealth(buffer_seconds=12, waiting=False)
+        fast_live.clock.advance(31)
+        await main.transcode_health(session_id, health, user, viewer=watching.get("viewer_id", ""))
+
+        await main.transcode_stop(
+            session_id,
+            user,
+            force=True,
+            viewer=watching.get("viewer_id", ""),
+        )
+
+        assert session_id not in ffmpeg_session._transcode_sessions
+
+    @pytest.mark.asyncio
+    async def test_a_stop_without_a_viewer_ends_the_stream(self, fast_live: _FastLive):
+        """Clients that predate viewer ids, and the server's own cleanup, stop it outright."""
+        page = await _open_page(fast_live)
+        await ffmpeg_session.start_transcode(PROVIDER, username="testuser")
+        await main.transcode_stop(page["session_id"], {"sub": "testuser"}, force=True)
+        assert page["session_id"] not in ffmpeg_session._transcode_sessions
 
 
 class TestFastStartRoutes:

@@ -432,6 +432,8 @@ class FakeUpstream(FakeResponse):
         super().__init__(headers=headers)
         self._items: queue.Queue[bytes | Exception] = queue.Queue()
         self.requested: list[int] = []
+        # Set once a reader is blocked in read1, as a socket read waits.
+        self.reading = threading.Event()
 
     def feed(self, data: bytes) -> None:
         self._items.put(data)
@@ -445,6 +447,7 @@ class FakeUpstream(FakeResponse):
     @override
     def read1(self, amt: int = -1, /) -> bytes:
         self.requested.append(amt)
+        self.reading.set()
         item = self._items.get()
         if isinstance(item, Exception):
             raise item

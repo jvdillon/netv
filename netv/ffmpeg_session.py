@@ -49,6 +49,7 @@ from netv.fast_start import (
     first_video_pts,
     is_hls_url,
     keyframe_replay,
+    last_media_sequence,
     live_buffer_durations,
     master_playlist,
     playlist_end_pts,
@@ -256,6 +257,9 @@ class _FastLivePlan:
 class FastLiveSession(TranscodeSession):
     """A fast-start session: one relay reading upstream, feeding one worker."""
 
+    # Player page loads sharing the session -> when each last reported. A reloaded
+    # page joins before its old page's stop arrives, so stops count viewers.
+    viewers: dict[str, float]
     live_recovery: LiveRecoveryPolicy
     playback_policy: PlaybackPolicy
     plan: _FastLivePlan
@@ -281,6 +285,8 @@ class TranscodeResponse(TypedDict):
     master_playlist: NotRequired[str]
     playback_buffer_seconds: NotRequired[float]
     transcoded_duration: NotRequired[float]
+    # This page load's id in a shared live session; sent back with health and stop.
+    viewer_id: NotRequired[str]
 
 
 class HealthResponse(TypedDict):
@@ -378,17 +384,36 @@ def is_session_valid(
 # ===========================================================================
 
 
-async def stop_session(session_id: str, force: bool = False) -> None:
+async def stop_session(
+    session_id: str,
+    force: bool = False,
+    *,
+    viewer: str = "",
+    heartbeat_timeout_sec: float = 30.0,
+) -> None:
     """Stop a transcode session once its processes have exited.
 
     Args:
         session_id: Session to stop.
         force: Bypass recent-access protection and remove cached segments.
+        viewer: The leaving page's ``viewer_id``. A live session another viewer
+            reported to within ``heartbeat_timeout_sec`` keeps playing; without
+            one, the session stops.
+        heartbeat_timeout_sec: How long a silent viewer still counts.
     """
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
         if session is None:
             return
+        if viewer and _is_fast_live(session):
+            viewers = session["viewers"]
+            viewers.pop(viewer, None)
+            cutoff = time.time() - heartbeat_timeout_sec
+            for silent in [v for v, heard in viewers.items() if heard < cutoff]:
+                del viewers[silent]
+            if viewers:
+                log.info("Viewer left session %s; %d remain", session_id, len(viewers))
+                return
 
         # Archive seeks open another upstream URL, and a fast-start session
         # cannot resume once its pipeline stops, so neither keeps a cached slot.
@@ -875,6 +900,7 @@ async def start_transcode(
     bandwidth_saver: bool = False,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
     audio_passthrough: bool = False,
+    min_segments: int = 2,
 ) -> TranscodeResponse:
     """Start or reuse a transcode session; every live stream is read through a relay.
 
@@ -892,6 +918,8 @@ async def start_transcode(
         bandwidth_saver: Start live playback at reduced quality.
         is_disconnected: Reports whether the requesting client has gone away.
         audio_passthrough: The client decodes AC-3/E-AC-3, so Dolby may be copied.
+        min_segments: Live segments a new session publishes before it is returned;
+            one for a client that waits for its own buffer, two for any player.
 
     Returns:
         response: Session identifier, playlist URLs, and playback metadata.
@@ -915,7 +943,43 @@ async def start_transcode(
             bandwidth_saver,
             is_disconnected,
             audio_passthrough,
+            min_segments,
         )
+
+
+def prestart_live(
+    url: str,
+    *,
+    username: str,
+    source_id: str,
+    deinterlace_fallback: bool,
+    user_max_streams: int,
+    source_max_streams: int,
+) -> None:
+    """Start the live session a play page is about to request, without a viewer.
+
+    The tuner, probe, and encoder start while the page's scripts load; the page's
+    ``/transcode/start`` then joins the startup in progress and becomes its viewer.
+    A start that fails is left for the page's own request to report.
+
+    Args:
+        url: Live stream URL the page will play.
+        username: Viewer the page belongs to.
+        source_id: Source used for access checks and stream limits.
+        deinterlace_fallback: Deinterlace when probe data is unavailable.
+        user_max_streams: Per-user stream limit; zero disables it.
+        source_max_streams: Per-source stream limit; zero disables it.
+    """
+    _spawn_background_task(
+        _prestart(
+            url,
+            username,
+            source_id,
+            deinterlace_fallback,
+            user_max_streams,
+            source_max_streams,
+        ),
+    )
 
 
 # ===========================================================================
@@ -945,6 +1009,19 @@ def touch_session(session_id: str) -> bool:
             session["last_access"] = time.time()
             return True
         return False
+
+
+def note_viewer(session_id: str, viewer: str) -> None:
+    """Record that a player page still watches a live session.
+
+    Args:
+        session_id: Live session the page reported on.
+        viewer: The page's ``viewer_id``; empty for clients without one.
+    """
+    with _transcode_lock:
+        session = _transcode_sessions.get(session_id)
+        if viewer and session is not None and _is_fast_live(session):
+            session["viewers"][viewer] = time.time()
 
 
 def get_session_progress(session_id: str) -> SessionProgress | None:
@@ -1259,6 +1336,30 @@ def playlist_file(session: TranscodeSession) -> str:
     if not _is_fast_live(session):
         return "stream.m3u8"
     return f"{session.get('rendition', 'low')}.m3u8"
+
+
+async def wait_for_segment(
+    session_id: str,
+    msn: int,
+    *,
+    timeout_sec: float = 3.0,
+    poll_sec: float = 0.02,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Return once the session's live playlist lists segment ``msn``, or at the timeout.
+
+    Args:
+        session_id: Fast-start session.
+        msn: Media sequence number a blocking playlist reload asked for.
+        timeout_sec: Longest wait; the client then gets the playlist as it is.
+        poll_sec: How often the playlist is checked.
+        sleep: Waits between checks.
+    """
+    for _ in range(round(timeout_sec / poll_sec)):
+        content = live_playlist(session_id)
+        if content is None or last_media_sequence(content) >= msn:
+            return
+        await sleep(poll_sec)
 
 
 def live_playlist(session_id: str) -> str | None:
@@ -1709,6 +1810,8 @@ def _adaptive_session_response(
     *,
     default_playback_buffer_seconds: float = 12.0,
 ) -> TranscodeResponse:
+    """The response handing a live session to one more player page, its new viewer."""
+    viewer_id = ""
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
         if session is None:
@@ -1722,6 +1825,9 @@ def _adaptive_session_response(
                 "playback_buffer_seconds",
                 default_playback_buffer_seconds,
             )
+            if _is_fast_live(session):
+                viewer_id = uuid.uuid4().hex
+                session["viewers"][viewer_id] = time.time()
     response: TranscodeResponse = {
         "session_id": session_id,
         "playlist": _fast_playlist_url(session_id, "low.m3u8", generation),
@@ -1737,6 +1843,8 @@ def _adaptive_session_response(
             "low-captions.m3u8",
             generation,
         )
+    if viewer_id:
+        response["viewer_id"] = viewer_id
     return response
 
 
@@ -2430,6 +2538,7 @@ async def _start_or_reuse(
     bandwidth_saver: bool,
     is_disconnected: Callable[[], Awaitable[bool]] | None,
     audio_passthrough: bool,
+    min_segments: int,
 ) -> TranscodeResponse:
     """Reuse the URL's session or start one; callers hold the URL's startup guard."""
     # A quality change replaces the current stream; release its slot first.
@@ -2493,6 +2602,7 @@ async def _start_or_reuse(
             bandwidth_saver=bandwidth_saver,
             is_disconnected=is_disconnected,
             audio_passthrough=audio_passthrough,
+            min_segments=min_segments,
         )
 
     # Start fresh transcode (with retry for series probe cache staleness)
@@ -2598,6 +2708,7 @@ async def _start_fast_live(
     bandwidth_saver: bool = False,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
     audio_passthrough: bool = False,
+    min_segments: int = 2,
     watchdog_stale_floor_sec: float = 45.0,
 ) -> TranscodeResponse:
     """One upstream reader (the relay), one worker, one session/stream slot."""
@@ -2633,6 +2744,7 @@ async def _start_fast_live(
             "recovery_bitrate": live_video_bitrates(settings.get("max_resolution", "1080p"))[1]
             * 1.1,
             "fast_start": True,
+            "viewers": {},
             "playlist_generation": 0,
             "playback_buffer_seconds": 12.0,
             "closed_captions": False,
@@ -2670,6 +2782,7 @@ async def _start_fast_live(
             "low.m3u8",
             process,
             None,
+            minimum_segments=min_segments,
             minimum_seconds=burst_gap,
             is_disconnected=is_disconnected,
         ):
@@ -2901,3 +3014,31 @@ async def _caught_up(
             return True
         await asyncio.sleep(poll_interval_sec)
     return False
+
+
+async def _prestart(
+    url: str,
+    username: str,
+    source_id: str,
+    deinterlace_fallback: bool,
+    user_max_streams: int,
+    source_max_streams: int,
+) -> None:
+    try:
+        response = await start_transcode(
+            url,
+            "live",
+            deinterlace_fallback=deinterlace_fallback,
+            username=username,
+            source_id=source_id,
+            user_max_streams=user_max_streams,
+            source_max_streams=source_max_streams,
+            min_segments=1,
+        )
+    except fastapi.HTTPException as error:
+        log.info("Live prestart did not start: %s", error.detail)
+        return
+    with _transcode_lock:
+        session = _transcode_sessions.get(response["session_id"])
+        if session is not None and _is_fast_live(session):
+            session["viewers"].pop(response.get("viewer_id", ""), None)

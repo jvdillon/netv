@@ -261,6 +261,55 @@ def remux_command(directory: str, *, restarting: bool = False) -> list[str]:
     ]
 
 
+def last_media_sequence(content: str) -> int:
+    """The media sequence number of a playlist's last segment, or -1 when it lists none.
+
+    Args:
+        content: HLS media playlist text.
+
+    Returns:
+        msn: ``EXT-X-MEDIA-SEQUENCE`` plus the number of listed segments, minus one.
+    """
+    first = 0
+    segments = 0
+    for line in content.splitlines():
+        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            first = int(line.removeprefix("#EXT-X-MEDIA-SEQUENCE:"))
+        elif line and not line.startswith("#"):
+            segments += 1
+    return first + segments - 1
+
+
+# A segment is published only once complete, and a polling client then finds it up to
+# a target duration later; with blocking reload it asks for the next one and gets it
+# as soon as it is listed.
+def with_blocking_reload(content: str) -> str:
+    """Advertise blocking playlist reload (LL-HLS ``_HLS_msn``) in a media playlist.
+
+    Args:
+        content: HLS media playlist text.
+
+    Returns:
+        playlist: ``content`` with an ``EXT-X-SERVER-CONTROL`` tag after its header.
+    """
+    header = "#EXTM3U\n"
+    if not content.startswith(header) or "#EXT-X-SERVER-CONTROL:" in content:
+        return content
+    return f"{header}#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES\n{content.removeprefix(header)}"
+
+
+def blocking_master(content: str) -> str:
+    """A master playlist whose rendition is the blocking-reload media playlist.
+
+    Args:
+        content: Master playlist listing ``low.m3u8``.
+
+    Returns:
+        playlist: The master listing ``low.m3u8?blocking=1`` instead.
+    """
+    return content.replace("\nlow.m3u8\n", "\nlow.m3u8?blocking=1\n")
+
+
 def master_playlist(resolution: str, *, audio_bitrate: int = 0) -> str:
     """Build the master playlist for the session's single local rendition.
 
@@ -602,10 +651,6 @@ def _hls_output(directory: str, *, restarting: bool, rendition: str = "low") -> 
         f"{directory}/{rendition}_%06d.ts",
         "-hls_flags",
         flags,
-        # Broadcasts mux audio up to ~1 s behind its video; waiting to interleave it
-        # holds every segment, the first included, back by that much.
-        "-max_interleave_delta",
-        "100000",
         f"{directory}/{rendition}.m3u8",
     ]
 

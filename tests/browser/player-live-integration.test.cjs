@@ -53,6 +53,7 @@ async function player({
   transcodedDuration = 0,
   stopReady = null, stopFailure = false, startReady = null, startGeneration = 0,
   playbackBufferSeconds = 12, captionsEnabled = false, ccLang = '', language = 'en-US',
+  bufferedRange = [0, 12], levelEdge = 12, viewerIds = true, embeddedCaptions = false,
 } = {}) {
   isVod = isVod || catchup;
   const elements = new Map();
@@ -67,7 +68,11 @@ async function player({
     currentTime: 0, duration: isVod ? 3600 : Infinity,
     paused: true, ended: false, readyState: 4, muted: false, volume: 1,
     videoWidth: 1280, videoHeight: 720,
-    buffered: { length: 1, start: () => 0, end: () => 12 },
+    buffered: {
+      length: bufferedRange[1] > bufferedRange[0] ? 1 : 0,
+      start: () => bufferedRange[0],
+      end: () => bufferedRange[1],
+    },
     seekable,
     textTracks: Object.assign([], element()),
     play: async () => { video.paused = false; },
@@ -89,7 +94,8 @@ async function player({
   class Hls {
     static Events = {
       MANIFEST_PARSED: 'manifest', ERROR: 'error', FRAG_LOADED: 'fragment',
-      LEVEL_SWITCHED: 'level', SUBTITLE_TRACKS_UPDATED: 'subtitles',
+      LEVEL_SWITCHED: 'level', SUBTITLE_TRACKS_UPDATED: 'subtitles', LEVEL_LOADED: 'levelLoaded',
+      FRAG_BUFFERED: 'fragBuffered',
     };
     static ErrorTypes = { NETWORK_ERROR: 'network', MEDIA_ERROR: 'media' };
     static isSupported() { return !native; }
@@ -116,11 +122,17 @@ async function player({
     }
     loadSource(url) {
       this.sources.push(url);
-      if (url.endsWith('/master.m3u8')) {
-        // The server's master lists its single rendition.
+      const [path, query] = url.split('?');
+      if (path.endsWith('/master.m3u8')) {
+        // The server's master lists its single rendition, blocking when asked to.
         this.levels = ['low'].map(name => ({
-          uri: 'http://netv.test' + url.replace('master.m3u8', `${name}.m3u8`),
-          details: { get fragments() { return [{ start: windowStart }]; } },
+          uri: 'http://netv.test' + path.replace('master.m3u8', `${name}.m3u8`) +
+            (query === 'blocking=1' ? '?blocking=1' : ''),
+          details: {
+            get fragments() { return [{ start: windowStart }]; },
+            get fragmentStart() { return windowStart; },
+            edge: levelEdge,
+          },
         }));
         this.currentLevel = 0;
         this.loadLevel = 0;
@@ -202,6 +214,8 @@ async function player({
             !isVod && startGeneration ? `?generation=${startGeneration}` : ''
           }`,
           ...(!isVod ? {
+            ...(viewerIds ? { viewer_id: `viewer${sessionNumber}` } : {}),
+            ...(embeddedCaptions ? { caption_playlist: `/transcode/${id}/low-captions.m3u8` } : {}),
             master_playlist: `/transcode/${id}/master.m3u8`,
             playback_buffer_seconds: playbackBufferSeconds,
           } : {}),
@@ -211,7 +225,7 @@ async function player({
         if (stopFailure) return { ok: false, status: 503 };
       } else if (url.startsWith('/transcode/progress/')) {
         data = { duration: transcodedDuration };
-      } else if (url.endsWith('/health')) {
+      } else if (url.includes('/health')) {
         data = {
           playlist: `/transcode/session${sessionNumber}/low.m3u8${
             startGeneration ? `?generation=${startGeneration}` : ''
@@ -245,6 +259,7 @@ async function player({
   return {
     video, window, document, elements, engines, calls, beacons, errors, timers, pickerCalls, browserLoads,
     setWindowStart: value => { windowStart = value; },
+    setBuffered: (start, end) => { bufferedRange = [start, end]; video.buffered.length = end > start ? 1 : 0; },
     setTranscodedDuration: value => { transcodedDuration = value; },
     setLiveEdge: value => { for (const engine of engines) engine.liveSyncPosition = value; },
     async tickProgram() {
@@ -274,20 +289,26 @@ test('web live startup and health polls use one shared adaptive session', async 
   assert.equal(params.get('content_type'), 'live');
   assert.equal(params.get('url'), 'https://provider.example/live.m3u8');
   assert.equal(params.get('url_token'), 'token-1');
+  // The player waits for its own lead, so the server answers at the first segment.
+  assert.equal(params.get('min_segments'), '1');
   assert.equal(p.engines.length, 1);
   const hls = p.engines[0];
-  assert.deepEqual(hls.sources, ['/transcode/session1/master.m3u8']);
+  // The web player reloads its playlist by blocking, so new segments arrive at once.
+  assert.deepEqual(hls.sources, ['/transcode/session1/master.m3u8?blocking=1']);
+  assert.equal(hls.config.lowLatencyMode, true);
   assert.equal(hls.config.startPosition, -1);
   assert.equal(hls.config.liveSyncDuration, 12);
   assert.equal(hls.config.maxBufferLength, 30);
   await p.pollHealth();
+  // Health polls name this page, keeping it a viewer of the shared session.
+  assert.ok(p.calls.some(call => call.url === '/transcode/session1/health?viewer=viewer1'));
   // Health feedback for the same generation leaves playback alone.
   assert.equal(hls.nextLevel, undefined);
   assert.equal(p.engines.length, 1);
   assert.equal(p.calls.filter(call => call.url.startsWith('/transcode/start?')).length, 1);
   assert.equal(p.calls.some(call => call.url.includes('/progress/')), false);
   await p.window.emit('pagehide');
-  assert.deepEqual(p.beacons, ['/transcode/session1/stop?force=true']);
+  assert.deepEqual(p.beacons, ['/transcode/session1/stop?force=true&viewer=viewer1']);
   assert.deepEqual(p.errors, []);
 });
 
@@ -330,6 +351,72 @@ test('captions turned off hide a track the browser showed', async () => {
   p.video.textTracks.push(...tracks);
   await p.video.textTracks.emit('change');
   assert.deepEqual(captionModes(p.video), ['hidden', 'hidden']);
+});
+
+test('against a server without viewer ids, health and stop name no viewer', async () => {
+  // The new player against an older server: no viewer_id in the start response.
+  const p = await player({ viewerIds: false });
+  await p.pollHealth();
+  assert.ok(p.calls.some(call => call.url === '/transcode/session1/health'));
+  assert.equal(p.calls.some(call => call.url.includes('viewer')), false);
+  await p.window.emit('pagehide');
+  assert.deepEqual(p.beacons, ['/transcode/session1/stop?force=true']);
+  assert.deepEqual(p.errors, []);
+});
+
+test('a stream with embedded captions keeps CC available before the first caption', async () => {
+  // hls.js creates the caption track only when it decodes the first cue.
+  const p = await player({ embeddedCaptions: true });
+  await p.fireTimer(1000);
+  p.engines[0].emit('subtitles');
+  assert.equal(p.elements.get('toggle-cc').disabled, false);
+  assert.deepEqual(p.errors, []);
+});
+
+test('a stream without captions disables CC once none appeared', async () => {
+  const p = await player();
+  await p.fireTimer(1000);
+  assert.equal(p.elements.get('toggle-cc').disabled, true);
+});
+
+test('live playback waits until the media buffer leads by a segment', async () => {
+  // Real-time output: playing from the first fragment stalls on the next full segment.
+  const p = await player({ bufferedRange: [0.6, 0.7], levelEdge: 0 });
+  const buffered = end => { p.setBuffered(0.6, end); p.engines[0].emit('fragBuffered'); };
+  assert.equal(p.video.paused, true);
+  // Lead counts from where playback will begin: the start of the buffer.
+  buffered(1.7);
+  assert.equal(p.video.paused, true);
+  // The paused playhead moves into the buffer: hls.js skips gaps only while playing,
+  // and loads nothing more for a playhead stuck before its first fragment.
+  assert.equal(p.video.currentTime, 0.6);
+  buffered(1.85);
+  assert.equal(p.video.paused, false);
+  // Later fragments do not restart anything.
+  p.video.pause();
+  buffered(3);
+  assert.equal(p.video.paused, true);
+  assert.deepEqual(p.errors, []);
+});
+
+test('live playback starts anyway once the playlist leads by seconds', async () => {
+  // A source whose audio and video never overlap leaves the media buffer empty.
+  const p = await player({ bufferedRange: [0, 0], levelEdge: 0 });
+  const listed = edge => p.engines[0].emit('levelLoaded', { details: { fragmentStart: 0, edge } });
+  listed(2.9);
+  assert.equal(p.video.paused, true);
+  listed(3);
+  assert.equal(p.video.paused, false);
+});
+
+test('a session already holding a segment of lead plays at once', async () => {
+  const p = await player({ levelEdge: 30 });
+  assert.equal(p.video.paused, false);
+});
+
+test('VOD plays as soon as its manifest is parsed', async () => {
+  const p = await player({ isVod: true, bufferedRange: [0, 0.1] });
+  assert.equal(p.video.paused, false);
 });
 
 test('web live playback honors the measured buffer target', async () => {
@@ -397,7 +484,7 @@ test('failed casting keeps local playback and exposes the receiver error', async
   assert.equal(p.elements.get('cast-overlay').classList.contains('hidden'), true);
   assert.equal(p.video.paused, false);
   await p.window.emit('pagehide');
-  assert.deepEqual(p.beacons, ['/transcode/session1/stop?force=true']);
+  assert.deepEqual(p.beacons, ['/transcode/session1/stop?force=true&viewer=viewer1']);
 });
 
 test('direct live playback prepares local HLS before casting', async () => {
@@ -467,22 +554,23 @@ test('web restart stops the live session before starting a replacement', async (
   const p = await player();
   await p.elements.get('menu-restart').emit('click');
   await flush();
-  const stop = p.calls.findIndex(call => call.url === '/transcode/session1?force=true');
+  const stop = p.calls.findIndex(call => call.url === '/transcode/session1?force=true&viewer=viewer1');
   const starts = p.calls.flatMap((call, index) => call.url.startsWith('/transcode/start?') ? [index] : []);
   assert.equal(starts.length, 2);
   assert.ok(stop > starts[0] && stop < starts[1]);
   assert.equal(p.engines[0].destroyed, true);
-  assert.deepEqual(p.engines[1].sources, ['/transcode/session2/master.m3u8']);
+  assert.deepEqual(p.engines[1].sources, ['/transcode/session2/master.m3u8?blocking=1']);
   assert.deepEqual(p.errors, []);
 });
 
 test('web VOD keeps its existing media playlist, seek configuration, and progress polls', async () => {
   const p = await player({ isVod: true });
   assert.equal(p.calls[0].url.includes('fast_start'), false);
+  assert.equal(p.calls[0].url.includes('min_segments'), false);
   assert.deepEqual(p.engines[0].sources, ['/transcode/session1/stream.m3u8']);
   assert.equal(p.engines[0].config.startPosition, 0);
   assert.equal(p.calls.some(call => call.url.includes('/progress/')), true);
-  assert.equal(p.calls.some(call => call.url.endsWith('/health')), false);
+  assert.equal(p.calls.some(call => call.url.includes('/health')), false);
   await p.window.emit('pagehide');
   assert.deepEqual(p.beacons, ['/transcode/session1/stop?force=false']);
   assert.deepEqual(p.errors, []);
@@ -492,14 +580,14 @@ test('native HLS stays on low while maintaining the shared live session', async 
   const p = await player({ native: true });
   assert.equal(p.engines.length, 0);
   assert.equal(p.video.src, '/transcode/session1/low.m3u8');
-  assert.equal(p.calls.some(call => call.url.endsWith('/health')), true);
+  assert.equal(p.calls.some(call => call.url.includes('/health')), true);
   assert.deepEqual(p.errors, []);
 });
 
 test('native HLS recognizes a recovered fast-start session', async () => {
   const p = await player({ native: true, startGeneration: 3 });
   assert.equal(p.video.src, '/transcode/session1/low.m3u8?generation=3');
-  assert.equal(p.calls.some(call => call.url.endsWith('/health')), true);
+  assert.equal(p.calls.some(call => call.url.includes('/health')), true);
   assert.deepEqual(p.errors, []);
 });
 
@@ -517,7 +605,7 @@ test('returning from the browser back-forward cache can restart playback', async
   await p.window.emit('pageshow', { persisted: true });
   await flush();
   assert.equal(p.engines.length, 2);
-  assert.deepEqual(p.engines[1].sources, ['/transcode/session2/master.m3u8']);
+  assert.deepEqual(p.engines[1].sources, ['/transcode/session2/master.m3u8?blocking=1']);
   assert.equal(p.engines[0].destroyed, true);
   assert.deepEqual(p.errors, []);
 });

@@ -87,7 +87,7 @@ from netv.cache import (
     update_source_epg_url,
 )
 from netv.epg import fetch_epg
-from netv.fast_start import add_live_start_offset
+from netv.fast_start import add_live_start_offset, blocking_master, with_blocking_reload
 from netv.m3u import (
     cached_live_data,
     cached_series_data,
@@ -1385,6 +1385,24 @@ async def player_page(
         if watch_entry is not None:
             resume_position = watch_entry["position"]
 
+    # The page starts a live stream it must transcode as soon as its scripts load;
+    # starting it now overlaps the tuner's first keyframe with the page load.
+    if (
+        stream_type == "live"
+        and not is_catchup
+        and transcode_mode == "always"
+        and not chromecast.manager.owns_url(info.url)
+    ):
+        user_max_streams, source_max_streams = _stream_limits(username, info.source_id)
+        ffmpeg_session.prestart_live(
+            info.url,
+            username=username,
+            source_id=info.source_id,
+            deinterlace_fallback=info.deinterlace_fallback,
+            user_max_streams=user_max_streams,
+            source_max_streams=source_max_streams,
+        )
+
     # For series, stream_id is episode_id.
     episode_id = int(stream_id) if stream_type == "series" and stream_id.isdigit() else None
     # Extract series name from channel_name (format: "Series Name (Year)" or just "Series Name")
@@ -1671,6 +1689,7 @@ async def transcode_start(
     source_id: str = "",
     bandwidth_saver: bool = False,
     audio_passthrough: bool = False,  # `client` decodes AC-3/E-AC-3.
+    min_segments: Annotated[int, Query(ge=1, le=2)] = 2,
 ):
     """Start a transcode session and return its identifier.
 
@@ -1687,6 +1706,8 @@ async def transcode_start(
         source_id: Source used for access checks and stream limits.
         bandwidth_saver: Request the lower-bandwidth rendition.
         audio_passthrough: Whether the client decodes Dolby audio.
+        min_segments: Live segments to wait for: 1 for a client that holds its own
+            buffer before playing (the web player), else 2.
     """
     username = user.get("sub", "")
     # The server opens this URL, so it must be one a player page issued to this
@@ -1710,20 +1731,7 @@ async def transcode_start(
     ):
         raise HTTPException(403, "Access to this source is restricted")
 
-    # Get user limits for this source.
-    user_limits = auth.get_user_limits(username)
-    max_streams_per_source = user_limits.get("max_streams_per_source", {})
-    user_max_streams = max_streams_per_source.get(source_id, 0) if source_id else 0
-
-    # Get source max_streams (global limit for this source)
-    source_max_streams = 0
-    if source_id:
-        settings = load_server_settings()
-        sources = settings["sources"]
-        source = next((s for s in sources if s.get("id") == source_id), None)
-        if source is not None:
-            source_max_streams = source.get("max_streams", 0)
-
+    user_max_streams, source_max_streams = _stream_limits(username, source_id)
     result = await ffmpeg_session.start_transcode(
         url,
         content_type,
@@ -1738,6 +1746,7 @@ async def transcode_start(
         bandwidth_saver=bandwidth_saver,
         is_disconnected=request.is_disconnected,
         audio_passthrough=audio_passthrough,
+        min_segments=min_segments,
     )
     if content_type == "live" and await request.is_disconnected():
         await ffmpeg_session.stop_session(result["session_id"], force=True)
@@ -1750,8 +1759,11 @@ async def transcode_health(
     session_id: str,
     health: PlaybackHealth,
     user: Annotated[TokenClaims, Depends(require_auth)],
+    viewer: str = "",
 ):
-    return ffmpeg_session.report_playback_health(session_id, user.get("sub", ""), health)
+    decision = ffmpeg_session.report_playback_health(session_id, user.get("sub", ""), health)
+    ffmpeg_session.note_viewer(session_id, viewer)
+    return decision
 
 
 @app.get("/transcode/seek/{session_id}")
@@ -1785,6 +1797,8 @@ async def transcode_file(
     request: Request,
     session_id: str,
     filename: str,
+    blocking: bool = False,
+    hls_msn: Annotated[int | None, Query(alias="_HLS_msn")] = None,
 ):
     """Serve HLS playlists or segments using unguessable session identifiers.
 
@@ -1792,6 +1806,9 @@ async def transcode_file(
         request: Request used for receiver diagnostics.
         session_id: Active playback session identifier.
         filename: Playlist, subtitle or segment filename.
+        blocking: Serve a live session's playlists for blocking reload (the web
+            player); other clients poll the plain ones.
+        hls_msn: Segment a blocking reload waits for before the playlist is sent.
     """
     # Prevent path traversal.
     safe_filename = pathlib.Path(filename).name
@@ -1817,8 +1834,11 @@ async def transcode_file(
 
     cors = {"Access-Control-Allow-Origin": "*"}
     if filename.endswith(".m3u8"):
+        fast_start = session.get("fast_start", False)
+        if fast_start and filename == "low.m3u8" and blocking and hls_msn is not None:
+            await ffmpeg_session.wait_for_segment(session_id, hls_msn)
         content = file_path.read_text()
-        if filename == "low.m3u8" and session.get("fast_start", False):
+        if fast_start and filename == "low.m3u8":
             content = add_live_start_offset(
                 ffmpeg_session.dated_fast_playlist(
                     session_id,
@@ -1826,6 +1846,10 @@ async def transcode_file(
                 ),
                 float(session.get("playback_buffer_seconds", 12.0)),
             )
+            if blocking:
+                content = with_blocking_reload(content)
+        elif fast_start and blocking:
+            content = blocking_master(content)
         return Response(
             content=content,
             media_type="application/vnd.apple.mpegurl",
@@ -1882,6 +1906,7 @@ async def transcode_stop(
     session_id: str,
     user: Annotated[TokenClaims, Depends(require_auth)],
     force: bool = False,
+    viewer: str = "",
 ):
     """Stop a transcode session while retaining reusable VOD caches.
 
@@ -1889,6 +1914,8 @@ async def transcode_stop(
         session_id: Playback session identifier.
         user: Authenticated viewer claims used to verify forced-stop ownership.
         force: Remove the session and its cache immediately.
+        viewer: The leaving page's ``viewer_id``; a live session other pages
+            still watch keeps playing.
     """
     if chromecast.manager.owns_session(session_id):
         return {"status": "casting"}
@@ -1896,7 +1923,7 @@ async def transcode_stop(
     force = force or (session is not None and session.get("is_archive", False))
     if force and session is not None and session.get("username") != user["sub"]:
         raise HTTPException(404, "Session not found")
-    await ffmpeg_session.stop_session(session_id, force=force)
+    await ffmpeg_session.stop_session(session_id, force=force, viewer=viewer)
     return {"status": "stopped"}
 
 
@@ -1905,9 +1932,10 @@ async def transcode_stop_post(
     session_id: str,
     user: Annotated[TokenClaims, Depends(require_auth)],
     force: bool = False,
+    viewer: str = "",
 ):
     """Stop a transcode session (POST for sendBeacon, VOD cached)."""
-    return await transcode_stop(session_id, user, force=force)
+    return await transcode_stop(session_id, user, force=force, viewer=viewer)
 
 
 @app.delete("/transcode-clear")
@@ -4654,6 +4682,20 @@ def _page_favorites(settings: UserSettings) -> Favorites:
             fid: _with_cover(entry, covers.get(fid, "")) for fid, entry in entries.items()
         }
     return page
+
+
+# Zero is unlimited.
+def _stream_limits(username: str, source_id: str) -> tuple[int, int]:
+    """The user's and the source's stream limits for ``source_id``."""
+    if not source_id:
+        return 0, 0
+    user_max_streams = auth.get_user_limits(username).get("max_streams_per_source", {})
+    source = next(
+        (s for s in load_server_settings()["sources"] if s.get("id") == source_id),
+        None,
+    )
+    source_max = 0 if source is None else source.get("max_streams", 0)
+    return user_max_streams.get(source_id, 0), source_max
 
 
 if __name__ == "__main__":

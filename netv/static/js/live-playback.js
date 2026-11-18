@@ -11,6 +11,9 @@
     constructor(isVod) {
       this.isVod = isVod;
       this.sessionId = null;
+      // This page's id among the viewers of a shared live session: a stop then
+      // ends only this page's viewing, so a reload's late beacon cannot kill it.
+      this.viewerId = null;
       this.generation = 0;
       this.pending = Promise.resolve();
       this.closed = false;
@@ -22,14 +25,20 @@
       return operation;
     }
 
+    stopQuery() {
+      const viewer = this.viewerId ? `&viewer=${encodeURIComponent(this.viewerId)}` : '';
+      return `?force=${!this.isVod}${viewer}`;
+    }
+
     async release() {
       if (!this.sessionId) return;
       const response = await fetch(
-        `/transcode/${encodeURIComponent(this.sessionId)}?force=${!this.isVod}`,
+        `/transcode/${encodeURIComponent(this.sessionId)}${this.stopQuery()}`,
         { method: 'DELETE', keepalive: this.closed }
       );
       if (!response.ok) throw new Error(`Transcode stop failed: ${response.status}`);
       this.sessionId = null;
+      this.viewerId = null;
     }
 
     start(url) {
@@ -42,6 +51,7 @@
         const data = await response.json();
         if (!data.session_id) throw new Error('Transcode response has no session ID');
         this.sessionId = data.session_id;
+        this.viewerId = data.viewer_id || null;
         if (this.closed || generation !== this.generation) {
           await this.release();
           return null;
@@ -59,6 +69,7 @@
       // The receiver now owns this session; page-close cleanup must not stop it.
       ++this.generation;
       this.sessionId = null;
+      this.viewerId = null;
     }
 
     reopen() {
@@ -69,7 +80,7 @@
       this.closed = true;
       ++this.generation;
       if (!this.sessionId) return;
-      const url = `/transcode/${encodeURIComponent(this.sessionId)}/stop?force=${!this.isVod}`;
+      const url = `/transcode/${encodeURIComponent(this.sessionId)}/stop${this.stopQuery()}`;
       if (!navigator.sendBeacon(url, new Blob([], { type: 'application/json' }))) {
         fetch(url, { method: 'POST', keepalive: true }).then(response => {
           if (!response.ok) throw new Error(`Transcode stop failed: ${response.status}`);
@@ -79,10 +90,12 @@
   }
 
   class AdaptiveLivePlayback {
-    constructor({ video, hls, sessionId, playlist }) {
+    constructor({ video, hls, sessionId, viewerId = null, playlist }) {
       this.video = video;
       this.hls = hls;
       this.sessionId = sessionId;
+      this.healthUrl = `/transcode/${encodeURIComponent(sessionId)}/health` +
+        (viewerId ? `?viewer=${encodeURIComponent(viewerId)}` : '');
       this.playlist = new URL(playlist, window.location.href).href;
       this.bytes = 0;
       this.downloadMs = 0;
@@ -146,7 +159,7 @@
       this.requestTimer = setTimeout(() => this.abort.abort(), 8000);
       try {
         const response = await fetch(
-          `/transcode/${encodeURIComponent(this.sessionId)}/health`,
+          this.healthUrl,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

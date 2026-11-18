@@ -998,6 +998,8 @@
       if (cfg.seriesName) url += '&series_name=' + encodeURIComponent(cfg.seriesName);
       if (cfg.deinterlaceFallback !== undefined) url += '&deinterlace_fallback=' + (cfg.deinterlaceFallback ? '1' : '0');
       if (cfg.sourceId) url += '&source_id=' + encodeURIComponent(cfg.sourceId);
+      // This player holds live playback for its own lead (playWhenBuffered).
+      if (!cfg.isVod) url += '&min_segments=1';
       const data = await transcodeSession.start(url);
       if (!data) return;
       transcodeSessionId = data.session_id;
@@ -1053,7 +1055,7 @@
         applyCaptionsSetting();
         restorePosition();
         if (transcodeSessionId && !adaptiveSession) startProgressPolling();
-        video.play().catch(() => { if (!video.muted) { autoMutedByPolicy = true; video.muted = true; } video.play(); });
+        startPlayback();
       }, { once: true });
       video.addEventListener('error', function() {
         if (onError) onError();
@@ -1072,8 +1074,13 @@
         liveSyncDuration: adaptiveBufferSeconds,
         liveSyncDurationCount: undefined,
         maxBufferLength: Math.max(30, adaptiveBufferSeconds),
+        // Request each next segment by blocking reload (?blocking=1 below) instead of
+        // polling, so it arrives as soon as the server lists it.
+        lowLatencyMode: true,
       } : {}),
     });
+    const source = adaptiveSession && url === adaptiveSession.master_playlist
+      ? url + '?blocking=1' : url;
     currentHls = hls;
     let recoveryAttempts = 0;
     let hasLoaded = false;
@@ -1136,17 +1143,23 @@
       }
       if (transcodeSessionId && !adaptiveSession) startProgressPolling();
       restorePosition();
-      video.play().catch(() => { if (!video.muted) { autoMutedByPolicy = true; video.muted = true; } video.play(); });
+      if (adaptiveSession) playWhenBuffered(hls);
+      else startPlayback();
       setTimeout(() => {
-        if (hls.subtitleTracks.length === 0 && video.textTracks.length === 0) disableCcButton();
+        if (!hasCaptions()) disableCcButton();
       }, 1000);
     });
+
+    // The server reports embedded (CEA-608) captions at startup, but hls.js creates
+    // their track only when it decodes the first cue, which can be many seconds in.
+    const hasCaptions = () => !!adaptiveSession?.caption_playlist ||
+      hls.subtitleTracks.length > 0 || video.textTracks.length > 0;
 
     hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, () => {
       if (hls.subtitleTracks.length > 0 && ccBtn.disabled) {
         enableCcButton();
         if (cfg.captionsEnabled) hls.subtitleTrack = getPreferredSubtitleTrack(hls.subtitleTracks);
-      } else if (hls.subtitleTracks.length === 0 && !ccBtn.disabled) {
+      } else if (!hasCaptions() && !ccBtn.disabled) {
         disableCcButton();
       }
     });
@@ -1200,8 +1213,44 @@
         else showError();
       }
     });
-    hls.loadSource(url);
+    hls.loadSource(source);
     hls.attachMedia(video);
+  }
+
+  function startPlayback() {
+    video.play().catch(() => { if (!video.muted) { autoMutedByPolicy = true; video.muted = true; } video.play(); });
+  }
+
+  // A live session is produced in real time, so playing from its first fragment
+  // drains the buffer and stalls while the next full segment is still being made.
+  // Wait until the media buffer leads by a segment; the first frame shows meanwhile.
+  // If the media buffer stays empty (audio and video that never overlap), start once
+  // the playlist is well ahead and let hls.js skip the gap. With 1 s segments, a
+  // 0.9 s lead stalled once in ten live loads; 1.2 s stalled in none of fifteen.
+  function playWhenBuffered(hls, leadSeconds = 1.2, listedSeconds = 3) {
+    const buffered = () => {
+      const ranges = video.buffered;
+      if (!ranges.length) return 0;
+      // hls.js skips a gap only while playing; paused before the first fragment, it
+      // loads nothing more. Moving into the buffer also shows the first frame.
+      if (video.currentTime < ranges.start(0)) video.currentTime = ranges.start(0);
+      return ranges.end(ranges.length - 1) - video.currentTime;
+    };
+    const listed = details => details
+      ? details.edge - Math.max(video.currentTime, details.fragmentStart) : 0;
+    const start = () => {
+      hls.off(Hls.Events.FRAG_BUFFERED, onBuffered);
+      hls.off(Hls.Events.LEVEL_LOADED, onListed);
+      startPlayback();
+    };
+    const onBuffered = () => { if (buffered() >= leadSeconds) start(); };
+    const onListed = (_event, data) => { if (listed(data.details) >= listedSeconds) start(); };
+    if (buffered() >= leadSeconds || listed(hls.levels[0]?.details) >= listedSeconds) {
+      startPlayback();
+      return;
+    }
+    hls.on(Hls.Events.FRAG_BUFFERED, onBuffered);
+    hls.on(Hls.Events.LEVEL_LOADED, onListed);
   }
 
   function startAdaptivePlayback(hls) {
@@ -1209,6 +1258,7 @@
       video,
       hls,
       sessionId: transcodeSessionId,
+      viewerId: transcodeSession.viewerId,
       playlist: adaptiveSession.playlist,
     });
   }

@@ -305,6 +305,7 @@ def _fast_session(
         started=_NOW,
         last_access=_NOW,
         url="http://live",
+        viewers={},
         live_recovery=live_recovery or LiveRecoveryPolicy(),
         playback_policy=PlaybackPolicy(),
         plan=plan,
@@ -591,6 +592,111 @@ async def test_a_short_session_keeps_the_burst_gap_a_longer_one_learned(
     await _receiving(session)
     await ffmpeg_session.stop_session("s")
     assert cache.relay_hints()["recurring_gaps"] == {"live": 9.5}
+
+
+def _watched(
+    env: _Env,
+    directory: pathlib.Path,
+    viewers: dict[str, float],
+) -> ffmpeg_session.FastLiveSession:
+    """A running fast-start session ``s`` whose pages last reported at ``viewers``."""
+    session = _fast_session(directory, FakeProcess(exit_code=None))
+    session.update(fast_start=True, viewers=viewers)
+    env.sessions["s"] = session
+    env.urls["http://live"] = "s"
+    return session
+
+
+@pytest.mark.asyncio
+async def test_a_page_leaving_a_shared_session_keeps_it_for_the_others(
+    env: _Env,
+    tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    """A reloaded page joins before its old page's stop arrives."""
+    session = _watched(env, tmp_path, {"old": _NOW, "new": _NOW})
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
+        await ffmpeg_session.stop_session("s", force=True, viewer="old")
+    assert env.sessions == {"s": session}
+    assert session["viewers"] == {"new": _NOW}
+    assert "Viewer left session s; 1 remain" in caplog.messages
+    await ffmpeg_session.stop_session("s", force=True, viewer="new")
+    assert not env.sessions
+    assert not tmp_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_pages_silent_past_the_heartbeat_no_longer_hold_the_session(
+    env: _Env,
+    tmp_path: pathlib.Path,
+):
+    _watched(env, tmp_path, {"leaving": _NOW, "silent": _NOW - 30.5, "recent": _NOW - 30})
+    await ffmpeg_session.stop_session("s", force=True, viewer="leaving")
+    assert env.sessions["s"].get("viewers") == {"recent": _NOW - 30}
+    await ffmpeg_session.stop_session("s", force=True, viewer="unknown", heartbeat_timeout_sec=29)
+    assert not env.sessions
+
+
+@pytest.mark.asyncio
+async def test_only_live_sessions_count_viewers(env: _Env, tmp_path: pathlib.Path):
+    env.sessions["s"] = _live(tmp_path)
+    await ffmpeg_session.stop_session("s", force=True, viewer="page")
+    assert not env.sessions
+
+
+def test_a_reporting_page_counts_as_watching(env: _Env, tmp_path: pathlib.Path):
+    session = _watched(env, tmp_path, {"page": _NOW - 20})
+    env.clock.advance(5)
+    ffmpeg_session.note_viewer("s", "page")
+    ffmpeg_session.note_viewer("s", "")
+    ffmpeg_session.note_viewer("missing", "page")
+    env.sessions["vod"] = _live(tmp_path)
+    ffmpeg_session.note_viewer("vod", "page")
+    assert session["viewers"] == {"page": _NOW + 5}
+    assert "viewers" not in env.sessions["vod"]
+
+
+class _Sleeps:
+    """Records each poll's sleep and runs ``on_sleep`` instead of waiting."""
+
+    def __init__(self, on_sleep: Callable[[], object] = lambda: None) -> None:
+        self.calls: list[float] = []
+        self.on_sleep = on_sleep
+
+    async def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+        self.on_sleep()
+
+
+@pytest.mark.asyncio
+async def test_a_blocking_reload_returns_once_the_segment_is_listed(
+    env: _Env,
+    tmp_path: pathlib.Path,
+):
+    session = _fast_session(tmp_path)
+    env.sessions["s"] = session
+    playlist = tmp_path / "low.m3u8"
+    playlist.write_text("#EXTM3U\n#EXTINF:1,\nlow_0.ts\n")
+    sleeps = _Sleeps(lambda: playlist.write_text(playlist.read_text() + "#EXTINF:1,\nlow_1.ts\n"))
+
+    await ffmpeg_session.wait_for_segment("s", 1, sleep=sleeps)
+
+    assert sleeps.calls == [0.02]
+    # A listed segment returns at once.
+    await ffmpeg_session.wait_for_segment("s", 0, sleep=sleeps)
+    assert sleeps.calls == [0.02]
+
+
+@pytest.mark.asyncio
+async def test_a_blocking_reload_gives_up_after_its_timeout(env: _Env, tmp_path: pathlib.Path):
+    env.sessions["s"] = _fast_session(tmp_path)
+    (tmp_path / "low.m3u8").write_text("#EXTM3U\n#EXTINF:1,\nlow_0.ts\n")
+    sleeps = _Sleeps()
+    await ffmpeg_session.wait_for_segment("s", 5, sleep=sleeps)
+    assert sleeps.calls == [0.02] * 150
+    # Unknown sessions have nothing to wait for.
+    await ffmpeg_session.wait_for_segment("missing", 0, sleep=sleeps)
+    assert len(sleeps.calls) == 150
 
 
 @pytest.mark.asyncio
@@ -3050,6 +3156,79 @@ async def test_sources_that_deliver_in_bursts_start_with_a_reserve_that_bridges_
     assert second.get("playback_buffer_seconds") == 20.0
     assert env.sessions[second["session_id"]].get("watchdog_stale_after") == 45.0
     await ffmpeg_session.stop_session(second["session_id"], force=True)
+
+
+@pytest.mark.asyncio
+async def test_a_client_holding_its_own_lead_is_answered_at_the_first_segment(
+    env: _Env,
+    fast_env: BackgroundTasks,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The web player waits for its own buffer, so one segment is enough to answer it."""
+    del fast_env
+
+    def first_segment(command: list[str]) -> None:
+        _media_playlist(pathlib.Path(command[-1]), ["low_000000.ts"], duration=0.25)
+
+    install_launcher(monkeypatch, ProcessLauncher(on_launch=first_segment), ffmpeg_session)
+    result = await ffmpeg_session.start_transcode("http://live", min_segments=1)
+    assert result["session_id"] in env.sessions
+    await ffmpeg_session.stop_session(result["session_id"], force=True)
+
+
+@pytest.mark.asyncio
+async def test_a_prestarted_live_session_waits_for_its_page(env: _Env, fast_env: BackgroundTasks):
+    """The play page starts the stream while its scripts load; the page then joins it."""
+    ffmpeg_session.prestart_live(
+        "http://live",
+        username="alice",
+        source_id="src",
+        deinterlace_fallback=False,
+        user_max_streams=0,
+        source_max_streams=0,
+    )
+    assert _coroutine_names(fast_env) == ["_prestart"]
+    await fast_env.tasks[0].run()
+    [session_id] = env.sessions
+    # Nobody watches yet: the prestart is not a viewer that would hold the stream.
+    assert env.sessions[session_id].get("viewers") == {}
+
+    page = await ffmpeg_session.start_transcode(
+        "http://live",
+        username="alice",
+        source_id="src",
+        min_segments=1,
+    )
+
+    assert page["session_id"] == session_id
+    session = env.sessions[session_id]
+    assert ffmpeg_session._is_fast_live(session)
+    assert list(session["viewers"]) == [page.get("viewer_id")]
+    assert len(env.launcher.launches) == 1
+    await ffmpeg_session.stop_session(session_id, force=True)
+
+
+@pytest.mark.asyncio
+async def test_a_prestart_that_cannot_start_leaves_it_to_the_page(
+    env: _Env,
+    tasks: BackgroundTasks,
+    tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    env.sessions["bob"] = _live(tmp_path)
+    env.sessions["bob"].update(username="bob", source_id="src")
+    ffmpeg_session.prestart_live(
+        "http://live",
+        username="alice",
+        source_id="src",
+        deinterlace_fallback=False,
+        user_max_streams=0,
+        source_max_streams=1,
+    )
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
+        await tasks.tasks[0].run()
+    assert set(env.sessions) == {"bob"}
+    assert "Live prestart did not start: Source at capacity (1 streams)" in caplog.messages
 
 
 def test_master_without_known_captions_declares_none(tmp_path: pathlib.Path):

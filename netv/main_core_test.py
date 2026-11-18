@@ -57,6 +57,19 @@ def api() -> TestClient:
     return _client("testuser")
 
 
+@pytest.fixture(autouse=True)
+def prestarts(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Live play pages start their stream early; record it instead of opening one."""
+    urls: list[str] = []
+
+    def prestart(url: str, **options: object) -> None:
+        del options
+        urls.append(url)
+
+    monkeypatch.setattr(ffmpeg_session, "prestart_live", prestart)
+    return urls
+
+
 @pytest.fixture
 def web(monkeypatch: pytest.MonkeyPatch) -> testing.FakeWeb:
     """The internet as seen by provider, guide and playlist fetches."""
@@ -830,6 +843,7 @@ def test_player_enforces_group_restrictions(
 def test_player_live_playlist_stream_transcodes_with_source_and_guide(
     api: TestClient,
     guide_db: None,
+    prestarts: list[str],
 ) -> None:
     del guide_db
     cache.save_server_settings(
@@ -854,6 +868,8 @@ def test_player_live_playlist_stream_transcodes_with_source_and_guide(
     assert resp.status_code == 200
     # Playlist streams always go through the server; the source keeps its default.
     assert 'transcodeMode: "always"' in resp.text
+    # So the server starts the stream while the page loads.
+    assert prestarts == ["http://m/1.ts"]
     assert "deinterlaceFallback: true" in resp.text
     assert ">Breaking</div>" in resp.text
 

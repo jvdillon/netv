@@ -109,6 +109,23 @@ test('VOD retains cached-stop semantics; live page close forces release', async 
   }
 });
 
+test('a live page stops and closes as its own viewer of the shared session', async () => {
+  const calls = [];
+  const env = runtime(async (url, options) => {
+    calls.push([url, options?.method || 'GET']);
+    return ok({ session_id: 'shared', viewer_id: 'page 1', playlist: '/playlist' });
+  });
+  const session = new env.TranscodeSession(false);
+  await session.start('/start');
+  assert.equal(session.viewerId, 'page 1');
+  await session.stop();
+  assert.deepEqual(calls.at(-1), ['/transcode/shared?force=true&viewer=page%201', 'DELETE']);
+  assert.equal(session.viewerId, null);
+  await session.start('/start');
+  session.close();
+  assert.deepEqual(env.beacons, ['/transcode/shared/stop?force=true&viewer=page%201']);
+});
+
 test('playback buffer hints retain compatibility defaults and bounded latency', () => {
   const env = runtime(async () => ok({}));
   assert.equal(env.playbackBufferSeconds(undefined), 12);
@@ -178,6 +195,18 @@ test('backend health keeps the single rendition and reports telemetry', async ()
   assert.deepEqual(engine.switches, []);
   playback.destroy();
   assert.equal(env.timers.size, 0);
+});
+
+test('health reports name the page as a viewer, keeping it counted', async () => {
+  const urls = [];
+  const env = runtime(async url => { urls.push(url); return ok({}); });
+  const playback = new env.AdaptiveLivePlayback({
+    video: video(), hls: hls(), sessionId: 'shared', viewerId: 'page 1',
+    playlist: '/transcode/shared/low.m3u8',
+  });
+  await flush();
+  assert.deepEqual(urls, ['/transcode/shared/health?viewer=page%201']);
+  playback.destroy();
 });
 
 test('each recovery generation reloads the rendition in place', async () => {

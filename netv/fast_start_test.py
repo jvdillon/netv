@@ -313,6 +313,34 @@ def test_live_start_offset_requires_playlist_header():
     assert fast_start.add_live_start_offset(content, 24) == content
 
 
+def test_last_media_sequence_counts_from_the_playlist_start():
+    assert fast_start.last_media_sequence("#EXTM3U\n#EXT-X-TARGETDURATION:1\n") == -1
+    assert fast_start.last_media_sequence("#EXTM3U\n#EXTINF:1,\na.ts\n#EXTINF:1,\nb.ts\n") == 1
+    deleted = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:40\n#EXT-X-DISCONTINUITY\n#EXTINF:1,\nc.ts\n"
+    assert fast_start.last_media_sequence(deleted) == 40
+
+
+def test_blocking_reload_is_advertised_once_after_the_header():
+    content = "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:1,\na.ts\n"
+    blocking = fast_start.with_blocking_reload(content)
+    assert blocking == (
+        "#EXTM3U\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES\n#EXT-X-VERSION:3\n#EXTINF:1,\na.ts\n"
+    )
+    assert fast_start.with_blocking_reload(blocking) == blocking
+    assert fast_start.with_blocking_reload("#EXT-X-VERSION:3\n") == "#EXT-X-VERSION:3\n"
+
+
+def test_a_blocking_master_points_its_rendition_at_the_blocking_playlist():
+    master = fast_start.master_playlist("1080p")
+    assert fast_start.blocking_master(master) == master.replace(
+        "\nlow.m3u8\n",
+        "\nlow.m3u8?blocking=1\n",
+    )
+    assert "low.m3u8?blocking=1" in fast_start.blocking_master(
+        fast_start.closed_caption_master_playlist("1080p"),
+    )
+
+
 def test_live_buffers_follow_upstream_segment_cadence():
     # A steady tuner delivers short segments: two of them bridge any gap, so
     # startup waits seconds of real time, not a fixed 8s.
@@ -709,6 +737,7 @@ def fast_session(
         dir=str(directory),
         username="u",
         fast_start=True,
+        viewers={},
         process=FakeProcess(exit_code=None),
         playback_policy=PlaybackPolicy(bandwidth_saver=bandwidth_saver),
         live_recovery=LiveRecoveryPolicy(),
@@ -828,7 +857,9 @@ async def test_shared_session_runs_one_worker_fed_by_the_relay(
         "probe.ts",
     ]
     reused = await ffmpeg_session.start_transcode(PROVIDER)
-    assert reused == result
+    # The same session, handed to a second page: its own viewer id.
+    assert {**reused, "viewer_id": ""} == {**result, "viewer_id": ""}
+    assert reused.get("viewer_id") not in (None, result.get("viewer_id"))
     [upstream] = upstreams.opened
     await ffmpeg_session.stop_session(result["session_id"], force=True)
     assert launch.process.returncode is not None
@@ -1168,8 +1199,6 @@ def test_remux_command_copies_the_relay_into_the_dvr_window(
         "/s/low_%06d.ts",
         "-hls_flags",
         flags,
-        "-max_interleave_delta",
-        "100000",
         "/s/low.m3u8",
     ]
 
@@ -1426,6 +1455,74 @@ def test_real_encoder_probes_past_late_mpeg2_sequence_header(tmp_path: pathlib.P
     assert result.returncode == 0, result.stderr.decode()
     assert b"frames duplicated" not in result.stderr
     assert playlist_seconds(tmp_path / "low.m3u8") > 2
+
+
+def _mux_audio_late(data: bytes, audio_pid: int, packets: int) -> bytes:
+    """Move each ``audio_pid`` packet ``packets`` packets later, as broadcasts mux audio."""
+    out: list[bytes] = []
+    pending: list[tuple[int, bytes]] = []
+    for index in range(0, len(data) - 187, 188):
+        packet = data[index : index + 188]
+        if (packet[1] & 0x1F) << 8 | packet[2] == audio_pid:
+            pending.append((index // 188 + packets, packet))
+            continue
+        out.append(packet)
+        while pending and pending[0][0] <= index // 188:
+            out.append(pending.pop(0)[1])
+    return b"".join(out + [packet for _, packet in pending])
+
+
+def _stream_pts(path: pathlib.Path, stream: str) -> list[float]:
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", stream, "-show_entries", "packet=pts_time"]
+        + ["-of", "csv=p=0", str(path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [float(value) for value in probe.stdout.split()]
+
+
+@pytest.mark.cli_ffmpeg
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="requires FFmpeg")
+def test_real_encoder_segments_hold_their_own_audio_when_it_is_muxed_late(
+    tmp_path: pathlib.Path,
+):
+    """Broadcasts mux audio ~0.9 s behind its video; each segment must still pair them.
+
+    A segment whose audio covers earlier times than its video leaves the browser's
+    media buffer (their intersection) empty, and hls.js stops loading: playback froze.
+    """
+    source = tmp_path / "source.ts"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30"]
+        + ["-f", "lavfi", "-i", "sine=sample_rate=48000", "-t", "5", "-c:v", "mpeg2video"]
+        + ["-b:v", "4M", "-g", "15", "-c:a", "ac3", "-streamid", "1:0x101", str(source)],
+        check=True,
+    )
+    whole = source.read_bytes()
+    late = _mux_audio_late(whole, 0x101, round(0.9 * len(whole) / 188 / 5))
+    result = subprocess.run(
+        fast_start.encoder_command(
+            str(tmp_path),
+            "software",
+            "720p",
+            "low",
+            False,
+            allow_upscale=False,
+        ),
+        input=joined_live(late),
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    segments = sorted(tmp_path.glob("low_*.ts"))
+    assert len(segments) >= 3
+    for segment in segments[:-1]:
+        video, audio = _stream_pts(segment, "v"), _stream_pts(segment, "a")
+        assert audio, f"{segment.name} has no audio"
+        assert max(audio) >= min(video), f"{segment.name} audio ends before its video starts"
 
 
 @pytest.mark.cli_ffmpeg
