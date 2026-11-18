@@ -576,7 +576,8 @@ def _append_connection(conns: list[sqlite3.Connection]) -> None:
 
 
 def _serve(monkeypatch: pytest.MonkeyPatch, url: str, body: bytes) -> testing.FakeWeb:
-    web = testing.FakeWeb({url: testing.FakeResponse(body)})
+    # A fresh response per request, as a server sends: a failed parse fetches again.
+    web = testing.FakeWeb({url: lambda: testing.FakeResponse(body)})
     testing.install_web(monkeypatch, web, util)
     return web
 
@@ -721,9 +722,11 @@ class TestFetchEpg:
             "<title>Kept</title></programme>"
             "</tv>"
         )
-        _serve(monkeypatch, "http://epg.example/bad.xml", body.encode())
+        web = _serve(monkeypatch, "http://epg.example/bad.xml", body.encode())
 
         assert epg.fetch_epg("http://epg.example/bad.xml", tmp_path) == 1
+        # The streamed copy is gone when parsing fails, so the repair fetches it again.
+        assert len(_requests(web)) == 2
         debug_files = list(tmp_path.glob("epg_debug_*.xml"))
         assert len(debug_files) == 1
         assert debug_files[0].read_text() == body
@@ -749,6 +752,91 @@ class TestFetchEpg:
             epg.fetch_epg("http://epg.example/worse.xml", tmp_path)
         assert len(list(tmp_path.glob("epg_debug_*.xml"))) == 1
         assert caplog.messages[-1] == f"Sanitized EPG also failed: {error.value}"
+
+
+class TestStreaming:
+    def test_fetch_does_not_hold_the_feed_in_memory(
+        self,
+        db: None,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        # Detail the guide does not store, such as credits, is most of a real feed.
+        credits = "<credits>" + "<actor>Someone Quite Famous</actor>" * 100 + "</credits>"
+        prog = (
+            '<programme start="20241130120000 +0000" stop="20241130130000 +0000" channel="c">'
+            f"<title>T</title>{credits}</programme>"
+        )
+        n = 2000
+        feed = f"<tv>{prog * n}</tv>".encode()
+        url = "http://epg.example/guide.xml.gz"
+        _serve(monkeypatch, url, gzip.compress(feed))
+
+        tracemalloc.start()
+        try:
+            # Small reads keep the fixed buffers small, so the peak shows what grows with the feed.
+            assert epg.fetch_epg(url, tmp_path, chunk_size=64 << 10) == n
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        # Holding the feed, its text or its tree would each cost about its size or more.
+        assert peak < len(feed) / 4
+
+    def test_a_feed_that_breaks_late_writes_only_the_repaired_parse(
+        self,
+        db: None,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        prog = (
+            '<programme start="20241130120000 +0000" stop="20241130130000 +0000" channel="c">'
+            "<title>T</title></programme>"
+        )
+        # Both programmes stream through before the parse fails at the garbage.
+        body = f"<tv>{prog}{prog}<garbage & stuff</tv>"
+        url = "http://epg.example/late.xml"
+        web = _serve(monkeypatch, url, body.encode())
+        count = epg.fetch_epg(url, tmp_path, timeout=7, source_id="src1", user_agent="UA/1")
+        assert count == 2
+        assert epg.get_program_count() == 2
+        # The repair fetches the feed again exactly as the first request did.
+        assert _requests(web) == [(url, 7, {"User-agent": "UA/1"})] * 2
+        conn = epg._get_conn()
+        assert {row[0] for row in conn.execute("SELECT source_id FROM programs")} == {"src1"}
+
+    def test_only_top_level_channels_and_programmes_are_read(
+        self,
+        db: None,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        prog = (
+            '<programme start="20241130120000 +0000" stop="20241130130000 +0000" channel="{}">'
+            "<title>T</title></programme>"
+        )
+        nested = f'<extra><channel id="inner"/>{prog.format("inner")}</extra>'
+        body = f'<tv><channel id="outer"/>{nested}{prog.format("outer")}</tv>'
+        _serve(monkeypatch, "http://epg.example/nested.xml", body.encode())
+        assert epg.fetch_epg("http://epg.example/nested.xml", tmp_path) == 1
+        conn = epg._get_conn()
+        assert [row[0] for row in conn.execute("SELECT id FROM channels")] == ["outer"]
+        assert [row[0] for row in conn.execute("SELECT channel_id FROM programs")] == ["outer"]
+
+    def test_gunzip_yields_no_chunk_larger_than_a_read(self):
+        chunk_size = 64 << 10
+        plain = b"x" * (5 * chunk_size)
+        body = testing.FakeResponse(gzip.compress(plain))
+        chunks = list(epg.iter_epg_body(body, 10 * chunk_size, chunk_size=chunk_size))
+        assert b"".join(chunks) == plain
+        assert max(len(chunk) for chunk in chunks) <= chunk_size
+
+    def test_chunk_reader_returns_short_reads_until_the_end(self):
+        reader = epg._ChunkReader(iter([b"abc", b"", b"defg"]))
+        assert reader.read(2) == b"ab"
+        assert reader.read(5) == b"c"
+        assert reader.read(-1) == b"defg"
+        assert reader.read(1) == b""
 
 
 class TestSanitize:
