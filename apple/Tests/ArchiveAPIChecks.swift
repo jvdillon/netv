@@ -25,6 +25,7 @@ private final class ArchiveTransport: URLProtocol {
         } else if url.path.hasPrefix("/play/live/") {
             body = """
                 rawUrl: "https://upstream.test/timeshift/user/pass/60/2026-09-28:10-00/1.ts",
+                rawUrlToken: "token-1",
                 transcodeMode: "always", sourceId: "test", deinterlaceFallback: false,
                 catchupStart: 1700000580.0, catchupSeek: 45.0, liveDvrMins: 999
                 """
@@ -130,6 +131,10 @@ struct ArchiveAPIChecks {
         let query = URLComponents(url: start.url!, resolvingAgainstBaseURL: false)!.queryItems!
         precondition(query.contains(URLQueryItem(name: "content_type", value: "movie")))
         precondition(!query.contains { $0.name == "fast_start" })
+        precondition(query.contains(URLQueryItem(name: "url_token", value: "token-1")))
+        precondition(query.contains(URLQueryItem(
+            name: "url", value: "https://upstream.test/timeshift/user/pass/60/2026-09-28:10-00/1.ts"
+        )))
         precondition(query.contains(URLQueryItem(name: "bandwidth_saver", value: "false")))
         try await client.keepArchiveAlive(server: "http://netv.test", sessionID: "archive")
         precondition(ArchiveTransport.requests.last?.url?.path == "/transcode/progress/archive")

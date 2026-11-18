@@ -252,6 +252,7 @@
 <script>
 window.PLAYER_CONFIG = {
   rawUrl: {{ raw_url | tojson }},
+  rawUrlToken: {{ raw_url_token | default('') | tojson }},
   transcodeMode: {{ transcode_mode | tojson }},
   liveDvrMins: {{ live_dvr_mins | tojson }},
   captionsEnabled: {{ captions_enabled | tojson }},

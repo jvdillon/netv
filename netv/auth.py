@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import pathlib
+import re
 import secrets
 import time
 
@@ -320,6 +321,35 @@ def verify_token(token: str) -> TokenClaims | None:
     if payload.get("exp", 0) < time.time():
         return None
     return payload
+
+
+_STREAM_URL_TOKEN = re.compile(r"[0-9a-f]{64}")
+
+
+def stream_url_token(username: str, url: str) -> str:
+    """Token proving the server handed ``url`` to ``username`` on a player page.
+
+    ``/transcode/start`` makes the server open the URL it is given, so it only
+    accepts URLs that come with this token. The data starts with a fixed label,
+    so it can never equal the JSON a session token signs.
+
+    Args:
+        username: Viewer the URL was issued to.
+        url: Upstream media URL as the player page lists it.
+
+    Returns:
+        token: Hex HMAC-SHA256 of the label, user and URL under the secret key.
+    """
+    data = f"stream-url\n{username}\n{url}".encode()
+    return hmac.new(_get_secret_key().encode(), data, hashlib.sha256).hexdigest()
+
+
+def verify_stream_url_token(username: str, url: str, token: str) -> bool:
+    """Whether ``token`` is the stream URL token for this user and URL."""
+    # compare_digest raises on non-ASCII strings; anything but 64 hex digits is no token.
+    if not _STREAM_URL_TOKEN.fullmatch(token):
+        return False
+    return hmac.compare_digest(token, stream_url_token(username, url))
 
 
 def _get_settings_file() -> pathlib.Path:

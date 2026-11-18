@@ -973,7 +973,8 @@
       if (castController?.active) return;
       // Archived programs are finite and seekable, so they play like a movie
       const contentType = cfg.catchup ? 'movie' : cfg.streamType;
-      let url = '/transcode/start?url=' + encodeURIComponent(cfg.rawUrl) + '&content_type=' + contentType;
+      let url = '/transcode/start?url=' + encodeURIComponent(cfg.rawUrl) +
+        '&url_token=' + encodeURIComponent(cfg.rawUrlToken || '') + '&content_type=' + contentType;
       if (cfg.seriesId) url += '&series_id=' + cfg.seriesId;
       if (cfg.episodeId) url += '&episode_id=' + cfg.episodeId;
       if (cfg.seriesName) url += '&series_name=' + encodeURIComponent(cfg.seriesName);

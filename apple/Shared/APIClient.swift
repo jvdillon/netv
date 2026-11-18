@@ -171,7 +171,8 @@ final class APIClient {
         if transcodeMode == "always" {
             configuration = try await startTranscode(
                 baseURL: baseURL,
-                rawURL: rawURL,
+                rawURLString: rawURLString,
+                rawURLToken: playerConfigString("rawUrlToken", in: html) ?? "",
                 sourceID: playerConfigString("sourceId", in: html) ?? "",
                 deinterlaceFallback: playerConfigBool("deinterlaceFallback", in: html) ?? true,
                 bandwidthSaver: bandwidthSaver,
@@ -316,7 +317,8 @@ final class APIClient {
 
     private func startTranscode(
         baseURL: URL,
-        rawURL: URL,
+        rawURLString: String,
+        rawURLToken: String,
         sourceID: String,
         deinterlaceFallback: Bool,
         bandwidthSaver: Bool,
@@ -327,7 +329,11 @@ final class APIClient {
             resolvingAgainstBaseURL: false
         )
         components?.queryItems = [
-            URLQueryItem(name: "url", value: rawURL.absoluteString),
+            // The exact string the page listed: the token signs it, and URL parsing
+            // could re-encode it.
+            URLQueryItem(name: "url", value: rawURLString),
+            // The server only opens URLs it issued, proven by this token.
+            URLQueryItem(name: "url_token", value: rawURLToken),
             // Archived programs are finite recordings, so they play as seekable VOD.
             URLQueryItem(name: "content_type", value: archive ? "movie" : "live"),
             URLQueryItem(name: "deinterlace_fallback", value: deinterlaceFallback ? "1" : "0"),

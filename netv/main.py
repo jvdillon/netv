@@ -1396,6 +1396,7 @@ async def player_page(
         "player.html",
         {
             "raw_url": info.url,
+            "raw_url_token": auth.stream_url_token(username, info.url),
             "stream_id": stream_id,
             "transcode_mode": transcode_mode,
             "live_dvr_mins": server_settings["live_dvr_mins"],
@@ -1659,6 +1660,7 @@ async def transcode_start(
     request: Request,
     user: Annotated[TokenClaims, Depends(require_auth)],
     url: str,
+    url_token: str = "",
     content_type: ffmpeg_session.ContentType = "live",
     series_id: int | None = None,
     episode_id: int | None = None,
@@ -1674,6 +1676,7 @@ async def transcode_start(
         request: Request used to detect disconnected playback clients.
         user: Authenticated viewer claims.
         url: Upstream media URL.
+        url_token: ``stream_url_token`` for ``url``, from the player page.
         content_type: Live, movie or series content type.
         series_id: Parent series identifier.
         episode_id: Episode identifier for probe caching.
@@ -1683,13 +1686,17 @@ async def transcode_start(
         bandwidth_saver: Request the lower-bandwidth rendition.
         audio_passthrough: Whether the client decodes Dolby audio.
     """
+    username = user.get("sub", "")
+    # The server opens this URL, so it must be one a player page issued to this
+    # user: otherwise any account could point ffmpeg at internal hosts or files.
+    if not auth.verify_stream_url_token(username, url, url_token):
+        raise HTTPException(403, "This stream link is not valid. Reload the player page.")
     if chromecast.manager.owns_url(url):
         raise HTTPException(
             409,
             "This stream is playing on a TV. Stop casting before starting it here.",
         )
     deinterlace_fb = deinterlace_fallback == "1"
-    username = user.get("sub", "")
 
     hidden = _hidden_sources(username)
     if hidden and (
