@@ -151,7 +151,7 @@ jobs:
           docker system prune -af || true
           df -h
           IMG=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cuda${{ steps.cuda.outputs.version }}-${{ steps.cuda.outputs.os }}
-          docker pull $IMG
+          for i in 1 2 3 4 5; do docker pull "$IMG" && break; [ $i = 5 ] && exit 1; sleep $((i * 10)); done
           # Verify everything that should be enabled is actually linked
           # Note: --entrypoint bypasses the default entrypoint which tries to build TensorRT engines (requires GPU)
           docker run --rm --entrypoint sh "$IMG" -c "
