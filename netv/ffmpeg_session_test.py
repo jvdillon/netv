@@ -2977,7 +2977,7 @@ async def test_smart_seek_reuses_existing_segment(env: _Env, seek_dir: pathlib.P
 
 @pytest.mark.asyncio
 async def test_seek_into_a_dead_transcode_restarts_ffmpeg(env: _Env, seek_dir: pathlib.Path):
-    # ffmpeg stopped (a full disk); a segment it left behind cannot carry playback on.
+    # Ffmpeg stopped (a full disk); a segment it left behind cannot carry playback on.
     env.sessions["v"]["process"] = FakeProcess(exited=True, exit_code=134)
     (seek_dir / "seg001.ts").write_bytes(b"x" * 2000)
     result = await ffmpeg_session.seek_transcode("v", 4.0)

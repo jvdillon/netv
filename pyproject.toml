@@ -1,6 +1,6 @@
 [project]
 name = "pynetv"
-version = "0.5.2"
+version = "0.5.3"
 description = "Minimal self-hosted IPTV web interface with EPG guide, VOD, and Chromecast"
 readme = "README.md"
 license = "Apache-2.0"
