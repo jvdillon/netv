@@ -607,6 +607,98 @@ XMLTV = """<?xml version="1.0"?>
 """
 
 
+def _guide(*programmes: tuple[str, str, str]) -> bytes:
+    """An XMLTV feed of ``(channel, start hour on 2024-11-30, title)`` hour-long programmes."""
+    rows = "".join(
+        f'<programme start="20241130{hour}0000 +0000" stop="20241130{int(hour) + 1:02d}0000 +0000"'
+        f' channel="{channel}"><title>{title}</title></programme>'
+        for channel, hour, title in programmes
+    )
+    return f"<tv>{rows}</tv>".encode()
+
+
+def _titles(source_id: str) -> list[tuple[str, str]]:
+    rows = epg._get_conn().execute(
+        "SELECT channel_id, title FROM programs WHERE source_id = ? ORDER BY channel_id, start_ts",
+        (source_id,),
+    )
+    return [(str(channel), str(title)) for channel, title in rows]
+
+
+class TestRefetch:
+    """A source fetched again replaces its schedule instead of adding a second copy."""
+
+    def test_refetch_replaces_the_schedule_from_the_feed_start(
+        self,
+        db: None,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        url = "http://epg.example/guide.xml"
+        _serve(
+            monkeypatch,
+            url,
+            _guide(("c", "10", "Earlier"), ("c", "12", "Old"), ("d", "13", "Gone")),
+        )
+        epg.fetch_epg(url, tmp_path, source_id="src1")
+        _serve(monkeypatch, url, _guide(("c", "12", "New"), ("c", "13", "Next")))
+        assert epg.fetch_epg(url, tmp_path, source_id="src1") == 2
+        # Listings before the new feed's first programme stay for catch-up; later ones are
+        # replaced. Channels the new feed omits are kept: another guide may supply them.
+        assert _titles("src1") == [
+            ("c", "Earlier"),
+            ("c", "New"),
+            ("c", "Next"),
+            ("d", "Gone"),
+        ]
+
+    def test_one_of_a_source_s_guides_leaves_the_others_channels_alone(
+        self,
+        db: None,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        # A playlist can name several guide URLs, all loaded for one source.
+        _serve(monkeypatch, "http://epg.example/a.xml", _guide(("a", "12", "From A")))
+        epg.fetch_epg("http://epg.example/a.xml", tmp_path, source_id="src1")
+        _serve(monkeypatch, "http://epg.example/b.xml", _guide(("b", "12", "From B")))
+        epg.fetch_epg("http://epg.example/b.xml", tmp_path, source_id="src1")
+        assert _titles("src1") == [("a", "From A"), ("b", "From B")]
+
+    def test_refetch_leaves_other_sources_alone(
+        self,
+        db: None,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        url = "http://epg.example/guide.xml"
+        _serve(monkeypatch, url, _guide(("c", "12", "Other")))
+        epg.fetch_epg(url, tmp_path, source_id="src2")
+        _serve(monkeypatch, url, _guide(("c", "12", "Mine")))
+        epg.fetch_epg(url, tmp_path, source_id="src1")
+        epg.fetch_epg(url, tmp_path, source_id="src1")
+        assert _titles("src2") == [("c", "Other")]
+        assert _titles("src1") == [("c", "Mine")]
+
+    def test_a_feed_without_programmes_or_source_deletes_nothing(
+        self,
+        db: None,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        url = "http://epg.example/guide.xml"
+        _serve(monkeypatch, url, _guide(("c", "12", "Kept")))
+        epg.fetch_epg(url, tmp_path, source_id="src1")
+        epg.fetch_epg(url, tmp_path)
+        _serve(monkeypatch, url, _guide())
+        assert epg.fetch_epg(url, tmp_path, source_id="src1") == 0
+        assert _titles("src1") == [("c", "Kept")]
+        # Feeds without a source share one, so none replaces another's listings.
+        _serve(monkeypatch, url, _guide(("c", "12", "Second")))
+        epg.fetch_epg(url, tmp_path)
+        assert len(_titles("")) == 2
+
+
 class TestFetchEpg:
     """Tests for fetch_epg against a fake EPG server."""
 

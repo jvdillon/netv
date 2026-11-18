@@ -164,6 +164,22 @@ def insert_programs(programs: Iterable[tuple[str, str, float, float, str, str]])
     ).rowcount
 
 
+def clear_source_from(source_id: str, channel_ids: Iterable[str], start_ts: float) -> None:
+    """Delete a source's programs on ``channel_ids`` starting at or after ``start_ts``.
+
+    The caller commits.
+
+    Args:
+        source_id: Source whose listings a fresh feed replaces.
+        channel_ids: Channels the fresh feed lists programs for.
+        start_ts: Start of the fresh feed's earliest program.
+    """
+    _get_conn().executemany(
+        "DELETE FROM programs WHERE source_id = ? AND channel_id = ? AND start_ts >= ?",  # pragma: no mutate[case-insensitive]
+        ((source_id, channel_id, start_ts) for channel_id in channel_ids),
+    )
+
+
 def commit() -> None:
     """Commit current transaction."""
     _get_conn().commit()
@@ -637,6 +653,12 @@ def fetch_epg(
         insert_channel(ch_id, name, source_id)
         if icon is not None:
             insert_icon(ch_id, icon)
+    # Replace this feed's channels from its first programme onward, so a refetch does not
+    # duplicate them. Earlier listings stay for catch-up. Other channels are kept, since a
+    # source may load several guides. Feeds without a source all share "", so skip them.
+    if source_id and parsed.programs:
+        start_ts = min(row[2] for row in parsed.programs)
+        clear_source_from(source_id, parsed.program_channel_ids, start_ts)
     program_count = insert_programs(parsed.programs)
     commit()
     log.debug(
