@@ -202,7 +202,7 @@ def source_countries(cache_dir: pathlib.Path) -> dict[str, str]:
         if s.get("type") != "epg":
             continue
         try:
-            url = credentials.decrypt(s.get("url", ""), cache_dir)
+            url = credentials.decrypt(s.get("url", ""))
         except credentials.CredentialsKeyError:
             continue
         m = re.search(r"epg_([A-Za-z]{2})\.", url)

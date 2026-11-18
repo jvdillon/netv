@@ -589,10 +589,8 @@ def load_server_settings() -> ServerSettings:
     raw = read_json_object(SERVER_SETTINGS_FILE)
     sources = raw.get("sources")
     if isinstance(sources, list):
-        settings_dir = SERVER_SETTINGS_FILE.parent
         decrypted: list[MutablePlainTree] = [
-            credentials.decrypt_source(s, settings_dir) if isinstance(s, dict) else s
-            for s in sources
+            credentials.decrypt_source(s) if isinstance(s, dict) else s for s in sources
         ]
         raw["sources"] = decrypted
     live_dvr_mins = raw.get("live_dvr_mins", 120)
@@ -627,11 +625,8 @@ def save_server_settings(settings: ServerSettings) -> None:
         settings: Settings as ``load_server_settings`` returned them, edited.
     """
     initialize_paths()
-    settings_dir = SERVER_SETTINGS_FILE.parent
     stored: dict[str, object] = dict(settings)
-    stored["sources"] = [
-        credentials.encrypt_source(dict(s), settings_dir) for s in settings["sources"]
-    ]
+    stored["sources"] = [credentials.encrypt_source(dict(s)) for s in settings["sources"]]
     write_json_object(SERVER_SETTINGS_FILE, stored, ServerSettings)
 
 
