@@ -788,6 +788,10 @@ async def test_adaptive_start_uses_shared_backend(auth_client: TestClient, fast_
 @pytest.mark.parametrize("disconnected", [True, False])
 async def test_disconnected_adaptive_start_is_cleaned_up(fast_live: _FastLive, disconnected: bool):
     session_id = await fast_live.start()
+    # The start above was a server prestart, which is no viewer of its own.
+    session = ffmpeg_session._transcode_sessions[session_id]
+    assert ffmpeg_session._is_fast_live(session)
+    session["viewers"].clear()
     [worker] = fast_live.launcher.processes
     scope: Scope = {"type": "http", "method": "GET", "headers": [], "query_string": b""}
     request = Request(scope, _gone if disconnected else _connected)
@@ -801,6 +805,8 @@ async def test_disconnected_adaptive_start_is_cleaned_up(fast_live: _FastLive, d
         with pytest.raises(HTTPException) as excinfo:
             await start
         assert excinfo.value.status_code == 499
+        # Only this request's viewing ends; with no one else, the stream follows.
+        await _end_grace(fast_live)
         assert session_id not in ffmpeg_session._transcode_sessions
         assert worker.signals == ["TERM"]
         assert fast_live.upstreams.opened[0].closed
@@ -1941,6 +1947,13 @@ async def _until(condition: Callable[[], bool], task: asyncio.Task[object]) -> N
     raise AssertionError("condition never held")
 
 
+async def _end_grace(fast_live: _FastLive) -> None:
+    """Let each pending grace for an unwatched live session run out."""
+    for task in fast_live.tasks.tasks:
+        if not task.done() and getattr(task.coroutine, "__name__", "") == "stop_when_unwatched":
+            await task.run()
+
+
 async def _open_page(fast_live: _FastLive) -> ffmpeg_session.TranscodeResponse:
     """A player page starting testuser's provider stream, as the first viewer."""
     task = asyncio.create_task(ffmpeg_session.start_transcode(PROVIDER, username="testuser"))
@@ -1977,8 +1990,31 @@ class TestSharedLiveSessions:
             force=True,
             viewer=new_page.get("viewer_id", ""),
         )
+        await _end_grace(fast_live)
         assert session_id not in ffmpeg_session._transcode_sessions
         assert worker.signals == ["TERM"]
+
+    @pytest.mark.asyncio
+    async def test_a_reload_whose_old_stop_lands_first_rejoins_the_stream(
+        self,
+        fast_live: _FastLive,
+    ):
+        """The old page's close beacon usually arrives before the new page asks."""
+        old_page = await _open_page(fast_live)
+        session_id = old_page["session_id"]
+        user: TokenClaims = {"sub": "testuser"}
+        await main.transcode_stop_post(
+            session_id,
+            user,
+            force=True,
+            viewer=old_page.get("viewer_id", ""),
+        )
+        new_page = await ffmpeg_session.start_transcode(PROVIDER, username="testuser")
+        await _end_grace(fast_live)
+        assert new_page["session_id"] == session_id
+        assert session_id in ffmpeg_session._transcode_sessions
+        assert len(fast_live.launcher.launches) == 1
+        await ffmpeg_session.stop_session(session_id, force=True)
 
     @pytest.mark.asyncio
     async def test_a_viewer_that_stopped_reporting_does_not_hold_the_stream(
@@ -2000,6 +2036,7 @@ class TestSharedLiveSessions:
             force=True,
             viewer=watching.get("viewer_id", ""),
         )
+        await _end_grace(fast_live)
 
         assert session_id not in ffmpeg_session._transcode_sessions
 

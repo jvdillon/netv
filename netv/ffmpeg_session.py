@@ -398,7 +398,7 @@ async def stop_session(
         force: Bypass recent-access protection and remove cached segments.
         viewer: The leaving page's ``viewer_id``. A live session another viewer
             reported to within ``heartbeat_timeout_sec`` keeps playing; without
-            one, the session stops.
+            one, it stops after a grace (``stop_when_unwatched``).
         heartbeat_timeout_sec: How long a silent viewer still counts.
     """
     with _transcode_lock:
@@ -413,7 +413,10 @@ async def stop_session(
                 del viewers[silent]
             if viewers:
                 log.info("Viewer left session %s; %d remain", session_id, len(viewers))
-                return
+            else:
+                log.info("Last viewer left session %s", session_id)
+                _spawn_background_task(stop_when_unwatched(session_id))
+            return
 
         # Archive seeks open another upstream URL, and a fast-start session
         # cannot resume once its pipeline stops, so neither keeps a cached slot.
@@ -947,6 +950,24 @@ async def start_transcode(
         )
 
 
+# A reload's old page sends its stop as it unloads, usually before the new page asks
+# for the stream: stopping at once would make the new page start it from scratch.
+async def stop_when_unwatched(session_id: str, *, grace_sec: float = 10.0) -> None:
+    """Stop a live session that still has no viewer ``grace_sec`` from now.
+
+    Args:
+        session_id: Live session whose last viewer left, or that no page joined yet.
+        grace_sec: How long a page has to join before the stream stops.
+    """
+    await asyncio.sleep(grace_sec)
+    with _transcode_lock:
+        session = _transcode_sessions.get(session_id)
+        if session is None or not _is_fast_live(session) or session["viewers"]:
+            return
+    log.info("No viewer joined session %s within %.0fs", session_id, grace_sec)
+    await stop_session(session_id)
+
+
 def prestart_live(
     url: str,
     *,
@@ -1020,7 +1041,9 @@ def note_viewer(session_id: str, viewer: str) -> None:
     """
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
-        if viewer and session is not None and _is_fast_live(session):
+        # Only a page still counted is refreshed: a report in flight when its page
+        # left must not bring it back and hold the stream.
+        if session is not None and _is_fast_live(session) and viewer in session["viewers"]:
             session["viewers"][viewer] = time.time()
 
 
@@ -3038,7 +3061,6 @@ async def _prestart(
     except fastapi.HTTPException as error:
         log.info("Live prestart did not start: %s", error.detail)
         return
-    with _transcode_lock:
-        session = _transcode_sessions.get(response["session_id"])
-        if session is not None and _is_fast_live(session):
-            session["viewers"].pop(response.get("viewer_id", ""), None)
+    # Not a viewer itself: a page that never asks for the stream lets it stop.
+    if "viewer_id" in response:
+        await stop_session(response["session_id"], viewer=response["viewer_id"])

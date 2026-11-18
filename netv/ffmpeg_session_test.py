@@ -620,20 +620,61 @@ async def test_a_page_leaving_a_shared_session_keeps_it_for_the_others(
     assert env.sessions == {"s": session}
     assert session["viewers"] == {"new": _NOW}
     assert "Viewer left session s; 1 remain" in caplog.messages
-    await ffmpeg_session.stop_session("s", force=True, viewer="new")
+
+
+@pytest.mark.asyncio
+async def test_the_last_viewer_leaving_stops_the_session_after_a_grace(
+    env: _Env,
+    tasks: BackgroundTasks,
+    tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    """A reloaded page's old stop often lands before the new page asks again."""
+    _watched(env, tmp_path, {"page": _NOW})
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
+        await ffmpeg_session.stop_session("s", force=True, viewer="page")
+        assert "s" in env.sessions
+        assert caplog.messages == ["Last viewer left session s"]
+        await tasks.run_all()
+    assert env.clock.now == _NOW + 10
     assert not env.sessions
     assert not tmp_path.exists()
+    assert "No viewer joined session s within 10s" in caplog.messages
+
+
+@pytest.mark.asyncio
+async def test_a_session_gone_before_the_grace_ends_needs_no_stop(env: _Env):
+    await ffmpeg_session.stop_when_unwatched("gone")
+    assert env.clock.now == _NOW + 10
+    assert not env.sessions
+
+
+@pytest.mark.asyncio
+async def test_a_page_joining_within_the_grace_keeps_the_session(
+    env: _Env,
+    tasks: BackgroundTasks,
+    tmp_path: pathlib.Path,
+):
+    session = _watched(env, tmp_path, {"old": _NOW})
+    await ffmpeg_session.stop_session("s", force=True, viewer="old")
+    # A new page joins as start hands it the session.
+    response = ffmpeg_session._adaptive_session_response("s")
+    assert session["viewers"] == {response.get("viewer_id"): _NOW}
+    await tasks.run_all()
+    assert env.sessions == {"s": session}
 
 
 @pytest.mark.asyncio
 async def test_pages_silent_past_the_heartbeat_no_longer_hold_the_session(
     env: _Env,
+    tasks: BackgroundTasks,
     tmp_path: pathlib.Path,
 ):
     _watched(env, tmp_path, {"leaving": _NOW, "silent": _NOW - 30.5, "recent": _NOW - 30})
     await ffmpeg_session.stop_session("s", force=True, viewer="leaving")
     assert env.sessions["s"].get("viewers") == {"recent": _NOW - 30}
     await ffmpeg_session.stop_session("s", force=True, viewer="unknown", heartbeat_timeout_sec=29)
+    await tasks.run_all()
     assert not env.sessions
 
 
@@ -654,6 +695,21 @@ def test_a_reporting_page_counts_as_watching(env: _Env, tmp_path: pathlib.Path):
     ffmpeg_session.note_viewer("vod", "page")
     assert session["viewers"] == {"page": _NOW + 5}
     assert "viewers" not in env.sessions["vod"]
+
+
+@pytest.mark.asyncio
+async def test_a_report_landing_after_its_page_left_does_not_bring_it_back(
+    env: _Env,
+    tasks: BackgroundTasks,
+    tmp_path: pathlib.Path,
+):
+    """A page's last health report can be in flight when its stop arrives."""
+    session = _watched(env, tmp_path, {"page": _NOW})
+    await ffmpeg_session.stop_session("s", force=True, viewer="page")
+    ffmpeg_session.note_viewer("s", "page")
+    assert session["viewers"] == {}
+    await tasks.run_all()
+    assert not env.sessions
 
 
 class _Sleeps:
@@ -3206,6 +3262,92 @@ async def test_a_prestarted_live_session_waits_for_its_page(env: _Env, fast_env:
     assert list(session["viewers"]) == [page.get("viewer_id")]
     assert len(env.launcher.launches) == 1
     await ffmpeg_session.stop_session(session_id, force=True)
+
+
+class _Starts:
+    """Stands in for ``start_transcode``, answering with ``response``."""
+
+    def __init__(self, response: ffmpeg_session.TranscodeResponse) -> None:
+        self.response = response
+        self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    async def __call__(self, *args: object, **kwargs: object) -> ffmpeg_session.TranscodeResponse:
+        self.calls.append((args, kwargs))
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_a_prestart_asks_for_the_page_stream_answered_at_one_segment(
+    env: _Env,
+    tasks: BackgroundTasks,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    session = _watched(env, tmp_path, {"prestart": _NOW, "page": _NOW})
+    response: ffmpeg_session.TranscodeResponse = {
+        "session_id": "s",
+        "playlist": "/transcode/s/low.m3u8",
+        "subtitles": [],
+        "duration": 0,
+        "seek_offset": 0,
+        "viewer_id": "prestart",
+    }
+    starts = _Starts(response)
+    monkeypatch.setattr(ffmpeg_session, "start_transcode", starts)
+    ffmpeg_session.prestart_live(
+        "http://live",
+        username="alice",
+        source_id="src",
+        deinterlace_fallback=False,
+        user_max_streams=2,
+        source_max_streams=3,
+    )
+    await tasks.tasks[0].run()
+    assert starts.calls == [
+        (
+            ("http://live", "live"),
+            {
+                "deinterlace_fallback": False,
+                "username": "alice",
+                "source_id": "src",
+                "user_max_streams": 2,
+                "source_max_streams": 3,
+                "min_segments": 1,
+            },
+        ),
+    ]
+    # Its own viewer is released; the page keeps watching.
+    assert session["viewers"] == {"page": _NOW}
+
+
+@pytest.mark.asyncio
+async def test_a_prestart_answered_without_a_viewer_releases_nothing(
+    env: _Env,
+    tasks: BackgroundTasks,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    session = _watched(env, tmp_path, {"page": _NOW})
+    response: ffmpeg_session.TranscodeResponse = {
+        "session_id": "s",
+        "playlist": "/transcode/s/low.m3u8",
+        "subtitles": [],
+        "duration": 0,
+        "seek_offset": 0,
+    }
+    monkeypatch.setattr(ffmpeg_session, "start_transcode", _Starts(response))
+    ffmpeg_session.prestart_live(
+        "http://live",
+        username="alice",
+        source_id="src",
+        deinterlace_fallback=True,
+        user_max_streams=0,
+        source_max_streams=0,
+    )
+    await tasks.tasks[0].run()
+    assert env.sessions == {"s": session}
+    assert session["viewers"] == {"page": _NOW}
+    assert len(tasks.tasks) == 1
 
 
 @pytest.mark.asyncio

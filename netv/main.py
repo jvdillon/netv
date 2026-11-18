@@ -1749,7 +1749,12 @@ async def transcode_start(
         min_segments=min_segments,
     )
     if content_type == "live" and await request.is_disconnected():
-        await ffmpeg_session.stop_session(result["session_id"], force=True)
+        # A reload disconnects the old page's request: end only its viewing.
+        await ffmpeg_session.stop_session(
+            result["session_id"],
+            force=True,
+            viewer=result.get("viewer_id", ""),
+        )
         raise HTTPException(499, "Playback request disconnected")
     return result
 
