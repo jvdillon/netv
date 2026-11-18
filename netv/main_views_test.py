@@ -1005,6 +1005,83 @@ def test_user_prefs_saves_each_field(auth_client: TestClient):
     assert {key: saved.get(key) for key in prefs} == prefs
 
 
+class _FavoriteEntry(TypedDict):
+    cover: str
+
+
+class _FavoritePrefs(TypedDict):
+    favorites: dict[str, dict[str, _FavoriteEntry]]
+
+
+def _favorite_covers(auth_client: TestClient) -> dict[str, dict[str, str]]:
+    """Each favorite's cover, as ``/api/user-prefs`` hands it to a page."""
+    favorites = main_test._body(auth_client.get("/api/user-prefs"), _FavoritePrefs)["favorites"]
+    return {
+        kind: {fid: entry["cover"] for fid, entry in entries.items()}
+        for kind, entries in favorites.items()
+    }
+
+
+def test_favorite_covers_are_saved_as_provider_urls(auth_client: TestClient):
+    raw = "https://img.example/film.jpg"
+    legacy = "/api/logo?" + parse.urlencode({"source": "img.example", "url": raw})
+    favorites = {
+        "movies": {"1": {"name": "Film", "cover": _logo(raw), "ext": "mkv"}},
+        "series": {"2": {"name": "Show", "cover": legacy}},
+    }
+    assert auth_client.post("/api/user-prefs", json={"favorites": favorites}).json() == {"ok": True}
+    saved = cache_module.load_user_settings("testuser")["favorites"]
+    assert saved == {
+        "movies": {"1": {"name": "Film", "cover": raw, "ext": "mkv"}},
+        "series": {"2": {"name": "Show", "cover": raw}},
+    }
+
+
+def test_favorite_saved_before_signing_still_loads_its_cover(auth_client: TestClient, web: FakeWeb):
+    raw = "https://img.example/film.jpg"
+    web.routes[raw] = FakeResponse(b"img", headers={"Content-Type": "image/png"})
+    # Saved before /api/logo needed a signature: an unsigned proxy link.
+    settings = cache_module.load_user_settings("testuser")
+    settings["favorites"] = {
+        "series": {},
+        "movies": {"7": {"name": "Film", "cover": "/api/logo?source=img.example&url=" + raw}},
+    }
+    cache_module.save_user_settings("testuser", settings)
+    cache_module.get_cache()["vod_streams"] = [{"stream_id": 7, "stream_icon": raw}]
+
+    cover = _favorite_covers(auth_client)["movies"]["7"]
+
+    assert cover == main._logo_url_filter(raw)
+    response = auth_client.get(cover)
+    assert response.status_code == 200
+    assert response.content == b"img"
+
+
+def test_favorite_covers_are_signed_only_from_the_catalog(auth_client: TestClient):
+    # Favorites are written by viewers, so their stored covers must not be signed.
+    internal = "http://169.254.169.254/latest/meta-data"
+    settings = cache_module.load_user_settings("testuser")
+    settings["favorites"] = {
+        "movies": {
+            "7": {"name": "Listed", "cover": internal},
+            "8": {"name": "Not listed", "cover": internal},
+        },
+        "series": {"3": {"name": "Show", "cover": internal}},
+    }
+    cache_module.save_user_settings("testuser", settings)
+    cache_module.get_cache()["vod_streams"] = [
+        {"stream_id": 7, "stream_icon": "https://img.example/7.jpg"},
+    ]
+    cache_module.get_cache()["series"] = [{"series_id": 3, "cover": ""}]
+
+    covers = _favorite_covers(auth_client)
+
+    assert covers == {
+        "movies": {"7": main._logo_url_filter("https://img.example/7.jpg"), "8": ""},
+        "series": {"3": ""},
+    }
+
+
 def test_user_prefs_rejects_mistyped_field(auth_client: TestClient):
     before = cache_module.load_user_settings("testuser")
     response = auth_client.post("/api/user-prefs", json={"cc_style": "large"})
