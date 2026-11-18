@@ -2976,6 +2976,66 @@ async def test_smart_seek_reuses_existing_segment(env: _Env, seek_dir: pathlib.P
 
 
 @pytest.mark.asyncio
+async def test_seek_into_a_dead_transcode_restarts_ffmpeg(env: _Env, seek_dir: pathlib.Path):
+    # ffmpeg stopped (a full disk); a segment it left behind cannot carry playback on.
+    env.sessions["v"]["process"] = FakeProcess(exited=True, exit_code=134)
+    (seek_dir / "seg001.ts").write_bytes(b"x" * 2000)
+    result = await ffmpeg_session.seek_transcode("v", 4.0)
+    assert result == {"ok": True, "segment": 1, "time": 4.0}
+    (command,) = env.launcher.commands
+    assert command[-2:] == ["-start_number", "1"]
+
+
+def _served(session_id: str, number: int) -> int:
+    return ffmpeg_session.note_segment_served(session_id, f"seg{number:03d}.ts", keep_behind_sec=6)
+
+
+def test_segments_far_behind_playback_are_deleted(seek_dir: pathlib.Path):
+    for number in range(8):
+        (seek_dir / f"seg{number:03d}.ts").write_bytes(b"x")
+    assert _served("v", 1) == 0
+    assert _served("v", 4) == 2
+    assert sorted(p.name for p in seek_dir.glob("seg*.ts"))[:2] == ["seg002.ts", "seg003.ts"]
+    assert _served("v", 6) == 2
+    assert not (seek_dir / "seg003.ts").exists()
+    # A seek back regenerates earlier segments; moving forward again evicts those too.
+    for number in (0, 1, 2):
+        (seek_dir / f"seg{number:03d}.ts").write_bytes(b"x")
+    assert _served("v", 1) == 0
+    assert _served("v", 5) == 3
+    assert {p.name for p in seek_dir.glob("seg*.ts")} == {
+        "seg004.ts",
+        "seg005.ts",
+        "seg006.ts",
+        "seg007.ts",
+    }
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["stream.m3u8", "sub0_000001.vtt", "segxyz.ts", "seg001.vtt", "missing", "seg.ts"],
+)
+def test_only_vod_segments_count_as_served(seek_dir: pathlib.Path, filename: str):
+    (seek_dir / "seg000.ts").write_bytes(b"x")
+    assert ffmpeg_session.note_segment_served("v", filename, keep_behind_sec=0) == 0
+    assert (seek_dir / "seg000.ts").exists()
+
+
+def test_served_segments_of_live_or_unknown_sessions_are_kept(
+    env: _Env,
+    seek_dir: pathlib.Path,
+):
+    (seek_dir / "seg000.ts").write_bytes(b"x")
+    assert ffmpeg_session.note_segment_served("missing", "seg009.ts", keep_behind_sec=0) == 0
+    env.sessions["v"]["fast_start"] = True
+    assert ffmpeg_session.note_segment_served("v", "seg009.ts", keep_behind_sec=0) == 0
+    env.sessions["v"]["fast_start"] = False
+    env.sessions["v"]["is_vod"] = False
+    assert ffmpeg_session.note_segment_served("v", "seg009.ts", keep_behind_sec=0) == 0
+    assert (seek_dir / "seg000.ts").exists()
+
+
+@pytest.mark.asyncio
 async def test_seek_restarts_ffmpeg_at_target(env: _Env, seek_dir: pathlib.Path):
     old = env.sessions["v"]["process"]
     (seek_dir / "seg000.ts").write_bytes(b"x" * 2000)
@@ -4166,6 +4226,31 @@ async def test_existing_vod_without_segments_is_released(env: _Env, vod_dir: pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("playlist", ["#EXTINF:3.0,\nseg000.ts\n", "", None])
+async def test_existing_vod_that_died_after_a_seek_is_replaced(
+    env: _Env,
+    vod_dir: pathlib.Path,
+    playlist: str | None,
+):
+    # Ffmpeg stopped partway (a full disk left an empty playlist); its segments end early.
+    if playlist is None:
+        (vod_dir / "stream.m3u8").unlink()
+    else:
+        (vod_dir / "stream.m3u8").write_text(playlist)
+    env.sessions["v"].update(seek_offset=30)
+    env.urls["http://movie"] = "v"
+    result = await ffmpeg_session._handle_existing_vod_session(
+        "v",
+        "http://movie",
+        "software",
+        False,
+    )
+    assert result is None
+    assert "v" not in env.sessions
+    assert "http://movie" not in env.urls
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("captioned", [True, False])
 async def test_existing_vod_with_seek_offset_returns_cache(
     env: _Env,
@@ -4174,6 +4259,8 @@ async def test_existing_vod_with_seek_offset_returns_cache(
 ):
     """A cached session links its caption master only when it has subtitle tracks."""
     (vod_dir / "captions.m3u8").write_text("#EXTM3U\n")
+    with (vod_dir / "stream.m3u8").open("a") as playlist:
+        playlist.write("#EXT-X-ENDLIST\n")
     subs: list[ffmpeg_session.StoredSubtitle | int] = [
         {"index": 2, "lang": "eng", "name": "English"},
     ]

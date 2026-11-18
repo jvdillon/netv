@@ -1801,6 +1801,7 @@ async def transcode_file(
         raise HTTPException(404, "File not found")
 
     ffmpeg_session.touch_session(session_id)
+    ffmpeg_session.note_segment_served(session_id, safe_filename)
 
     # Log Chromecast requests.
     ua = request.headers.get("user-agent", "")

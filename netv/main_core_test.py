@@ -1086,6 +1086,7 @@ def test_transcode_seek_and_progress(
     sessions: dict[str, TranscodeSession],
 ) -> None:
     sessions["abc"] = _session(tmp_path / "abc", is_vod=True)
+    sessions["abc"]["process"] = testing.FakeProcess(exit_code=None)
     for segment in ("seg003.ts", "seg004.ts"):
         (tmp_path / "abc" / segment).write_bytes(b"\x47" * 1_001)
     seek = api.get("/transcode/seek/abc?time=10")

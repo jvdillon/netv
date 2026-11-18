@@ -162,6 +162,7 @@ class TranscodeSession(TypedDict, total=False):
     subtitles: list[StoredSubtitle | int]
     duration: float
     seek_offset: float
+    evicted_below: int  # VOD segments numbered below this were deleted after playback.
     series_id: int | None
     episode_id: int | None
     audio_passthrough: bool
@@ -1044,6 +1045,53 @@ def touch_session(session_id: str) -> bool:
         return False
 
 
+def note_segment_served(
+    session_id: str,
+    filename: str,
+    *,
+    keep_behind_sec: float = 1_200,
+) -> int:
+    """Delete VOD segments far behind the one a player just fetched.
+
+    A long movie transcoded whole would not fit a RAM-backed transcode dir. A seek
+    back to a deleted segment restarts ffmpeg there, as any seek past the transcode does.
+
+    Args:
+        session_id: Session the segment belongs to.
+        filename: Served file name.
+        keep_behind_sec: Seconds of played segments kept for seeking back.
+
+    Returns:
+        deleted: Number of segment files removed.
+    """
+    stem = filename.removesuffix(".ts")
+    if stem == filename or not stem.startswith(SEG_PREFIX):
+        return 0
+    try:
+        served = int(stem[len(SEG_PREFIX) :])
+    except ValueError:
+        return 0
+    keep = int(keep_behind_sec / get_hls_segment_duration())
+    with _transcode_lock:
+        session = _transcode_sessions.get(session_id)
+        if session is None or not session.get("is_vod", False) or session.get("fast_start", False):
+            return 0
+        evicted_below = session.get("evicted_below", 0)
+        # Playback moved back (a seek restarted ffmpeg earlier): evict from there again.
+        if served < evicted_below:
+            evicted_below = max(0, served - keep)
+        cutoff = served - keep
+        session["evicted_below"] = max(evicted_below, cutoff)
+        directory = pathlib.Path(session["dir"])
+    deleted = 0
+    for number in range(evicted_below, cutoff):
+        path = directory / f"{SEG_PREFIX}{number:03d}.ts"
+        if path.exists():
+            path.unlink(missing_ok=True)
+            deleted += 1
+    return deleted
+
+
 def note_viewer(session_id: str, viewer: str) -> None:
     """Record that a player page still watches a live session.
 
@@ -1142,8 +1190,13 @@ async def seek_transcode(
     output_path = pathlib.Path(info.output_dir)
     target_segment = output_path / f"{SEG_PREFIX}{segment_num:03d}.ts"
 
-    # Smart seek: if target segment exists, no need to restart ffmpeg.
-    if target_segment.exists() and target_segment.stat().st_size > min_segment_size_bytes:
+    # Smart seek: if target segment exists, no need to restart ffmpeg. A dead ffmpeg
+    # (crashed, or killed by a full disk) would leave the stream ending where it stopped.
+    if (
+        _is_process_alive(info.process)
+        and target_segment.exists()
+        and target_segment.stat().st_size > min_segment_size_bytes
+    ):
         log.info(
             "Smart seek: segment %d exists for time %.1fs, skipping ffmpeg restart",
             segment_num,
@@ -1733,6 +1786,14 @@ def _caption_timestamp_origin(output_dir: str) -> float | None:
     return None
 
 
+def _playlist_complete(path: pathlib.Path) -> bool:
+    """Whether ffmpeg finished ``path``, so its segments run to the end of the source."""
+    try:
+        return "#EXT-X-ENDLIST" in path.read_text()
+    except OSError:
+        return False
+
+
 def _regenerate_playlist(
     output_dir: pathlib.Path,
     start_segment: int,
@@ -1939,14 +2000,19 @@ async def _handle_existing_vod_session(
         )
         return _build_session_response(existing_id, snap, playlist_path)
 
-    # Case 2: Dead session with no segments - invalid.
-    if not segments or _is_archive_url(url):
+    # Case 2: Dead session with no segments, or one that died partway after a seek
+    # (only a finished playlist covers the rest of the source) - invalid.
+    if (
+        not segments
+        or _is_archive_url(url)
+        or (snap.seek_offset > 0 and not _playlist_complete(playlist_path))
+    ):
         await stop_session(existing_id, force=True)
         with _transcode_lock:
             _url_to_session.pop(url, None)
         return None
 
-    # Case 3: Dead session with seek_offset - return cached content.
+    # Case 3: Finished session with seek_offset - return cached content.
     if snap.seek_offset > 0:
         log.info(
             "Returning cached session %s (seek_offset=%.1f)",

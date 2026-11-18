@@ -620,6 +620,15 @@ class TestHlsAssemblyContract:
                 "500000" if is_vod else "5000000",
             ]
         expected += ["-fflags", "+discardcorrupt+genpts", "-err_detect", "ignore_err", *_RECONNECT]
+        if is_vod:
+            expected += [
+                "-readrate",
+                "1",
+                "-readrate_initial_burst",
+                "120",
+                "-readrate_catchup",
+                "2",
+            ]
         if user_agent is not None:
             expected += ["-user_agent", user_agent]
         if has_media:

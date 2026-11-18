@@ -925,6 +925,7 @@ def build_hls_ffmpeg_cmd(
     audio_passthrough: bool = False,
     *,
     sr_segment_duration: float = 2.0,
+    vod_read_burst_sec: int = 120,
 ) -> list[str]:
     """Build ffmpeg command for HLS transcoding.
 
@@ -945,6 +946,8 @@ def build_hls_ffmpeg_cmd(
             decision but stream copy.
         audio_passthrough: Copy Dolby audio for clients that decode it natively.
         sr_segment_duration: HLS segment length when AI Upscale applies.
+        vod_read_burst_sec: Seconds of a network VOD input read at full speed
+            before reading holds to real time.
 
     Returns:
         cmd: FFmpeg arguments.
@@ -1032,6 +1035,19 @@ def build_hls_ffmpeg_cmd(
         ],
     )
     cmd.extend(http_reconnect_args(input_url))
+    if is_vod and input_url.startswith(("http://", "https://")):
+        # Copying video outruns playback many times over and fills the transcode dir
+        # (often a RAM tmpfs) with a whole movie; stay a burst ahead of real time instead.
+        cmd.extend(
+            [
+                "-readrate",
+                "1",
+                "-readrate_initial_burst",
+                str(vod_read_burst_sec),
+                "-readrate_catchup",
+                "2",
+            ],
+        )
     if user_agent is not None:
         cmd.extend(["-user_agent", user_agent])
     # Use HLS demuxer options if probe detected HLS format.

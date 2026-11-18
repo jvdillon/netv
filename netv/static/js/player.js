@@ -912,6 +912,23 @@
     transcodeSessionId = null;
   }
 
+  // A VOD transcode that stops mid-play (ffmpeg exited, or segments played long ago
+  // were deleted) restarts at the current position; repeated failures give up.
+  let vodRecoveries = [];
+  function recoverVod() {
+    const now = Date.now();
+    vodRecoveries = vodRecoveries.filter(t => now - t < 60000);
+    if (!transcodeSessionId || vodRecoveries.length >= 2) {
+      showError();
+      return;
+    }
+    vodRecoveries.push(now);
+    const position = seekOffset + (video.currentTime || 0);
+    console.warn('[VOD] Stream stopped; restarting at', position);
+    seekInProgress = false;
+    handleSeekToPosition(position);
+  }
+
   async function handleSeekToPosition(targetTime) {
     // Upstream archives can't be byte-seeked, so a server-side seek would
     // re-read the recording from its start; reopen the archive instead.
@@ -968,13 +985,13 @@
       hls.on(Hls.Events.ERROR, (event, data) => {
         if (data.fatal) {
           recoveryAttempts++;
-          if (recoveryAttempts <= 3) {
-            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
-            else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-            else { console.error('[SEEK] HLS error:', data); showError(); }
+          if (recoveryAttempts <= 3 && data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            hls.startLoad();
+          } else if (recoveryAttempts <= 3 && data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            hls.recoverMediaError();
           } else {
-            console.error('[SEEK] HLS error after retries:', data);
-            showError();
+            console.error('[SEEK] HLS error:', data);
+            recoverVod();
           }
         }
       });
@@ -1216,6 +1233,7 @@
         hls.destroy();
         currentHls = null;
         if (!hasLoaded && onError) onError();
+        else if (hasLoaded && isTranscoding && cfg.isVod) recoverVod();
         else showError();
       }
     });
