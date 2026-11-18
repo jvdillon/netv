@@ -377,10 +377,12 @@ def test_workers_start_playback_with_short_segments(tmp_path: pathlib.Path):
         assert cmd[cmd.index("-hls_init_time") + 1] == "0.25"
 
 
-def test_workers_analyze_only_until_the_first_audio():
-    """The relay starts workers at a keyframe, where every stream parameter is at hand."""
-    for cmd in _workers("/s"):
-        assert cmd[cmd.index("-analyzeduration") + 1] == "800000"
+def test_workers_analyze_only_as_long_as_they_must():
+    """Encoders decode audio whenever it arrives; a copy must see it before writing."""
+    *encoders, remux = _workers("/s")
+    for cmd in encoders:
+        assert cmd[cmd.index("-analyzeduration") + 1] == "300000"
+    assert remux[remux.index("-analyzeduration") + 1] == "800000"
 
 
 def test_encoders_add_no_startup_delay(tmp_path: pathlib.Path):
@@ -1166,6 +1168,8 @@ def test_remux_command_copies_the_relay_into_the_dvr_window(
         "/s/low_%06d.ts",
         "-hls_flags",
         flags,
+        "-max_interleave_delta",
+        "100000",
         "/s/low.m3u8",
     ]
 
@@ -1422,6 +1426,66 @@ def test_real_encoder_probes_past_late_mpeg2_sequence_header(tmp_path: pathlib.P
     assert result.returncode == 0, result.stderr.decode()
     assert b"frames duplicated" not in result.stderr
     assert playlist_seconds(tmp_path / "low.m3u8") > 2
+
+
+@pytest.mark.cli_ffmpeg
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="requires FFmpeg")
+def test_real_encoder_keeps_audio_that_starts_after_the_analysis_window(
+    tmp_path: pathlib.Path,
+):
+    """Audio first muxed 0.9 s after the keyframe, past the window, still plays."""
+    source = tmp_path / "source.ts"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=30",
+            "-itsoffset",
+            "0.9",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=sample_rate=48000",
+            "-t",
+            "4",
+            "-c:v",
+            "mpeg2video",
+            "-g",
+            "15",
+            "-c:a",
+            "ac3",
+            str(source),
+        ],
+        check=True,
+    )
+    result = subprocess.run(
+        fast_start.encoder_command(
+            str(tmp_path),
+            "software",
+            "720p",
+            "low",
+            False,
+            allow_upscale=False,
+        ),
+        input=joined_live(source.read_bytes()),
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    first_low = min(tmp_path.glob("low_*.ts"))
+    streams = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0"]
+        + [str(first_low)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert streams == ["video", "audio"]
 
 
 @pytest.mark.cli_ffmpeg

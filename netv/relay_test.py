@@ -89,18 +89,28 @@ async def test_history_keeps_only_the_configured_window():
 
 
 @pytest.mark.asyncio
-async def test_stats_record_the_longest_silence_between_deliveries():
+async def test_stats_record_a_recurring_silence_between_deliveries():
     """Panels relaying HLS send TS in segment bursts; clients must buffer past the gaps."""
     clock, upstream = FakeClock(), FakeUpstream()
     stream = _relay(upstream, clock)
     await stream.start()
-    assert stream.stats.max_gap_sec == 0
-    for delay, chunk in ((0, b"a"), (3, b"b"), (1, b"c")):
+    assert stream.stats.burst_gap_sec == 0
+    for delay, chunk in ((0, b"a"), (9, b"b"), (3, b"c"), (1, b"d"), (4, b"e"), (0.5, b"f")):
         clock.advance(delay)
         upstream.feed(chunk)
         await stream.wait_for_bytes(len(stream.history()) + 1)
-    assert stream.stats.max_gap_sec == 3
+        if chunk == b"d":
+            # Two long silences are not yet a pattern.
+            assert stream.stats.burst_gap_sec == 1
+    # The third longest: a single 9 s stall does not set the reserve.
+    assert stream.stats.burst_gap_sec == 3
+    assert stream.stats.delivery_sec == 17.5
     await stream.close()
+
+
+def test_stats_before_any_delivery_span_nothing():
+    stats = relay.RelayStats(bytes_received=0, first_byte_at=None, last_byte_at=None)
+    assert stats.delivery_sec == 0
 
 
 @pytest.mark.asyncio

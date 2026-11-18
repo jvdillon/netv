@@ -56,8 +56,16 @@ class RelayStats:
     bytes_received: int
     first_byte_at: float | None
     last_byte_at: float | None
-    # Longest silence between deliveries: how far ahead a client must buffer.
-    max_gap_sec: float = 0.0
+    # A silence between deliveries that recurred (the third longest): how far ahead a
+    # client must buffer. One stall, as when a tuner retunes, is not a burst pattern.
+    burst_gap_sec: float = 0.0
+
+    @property
+    def delivery_sec(self) -> float:
+        """Seconds from the first delivery to the last."""
+        if self.first_byte_at is None or self.last_byte_at is None:
+            return 0.0
+        return self.last_byte_at - self.first_byte_at
 
 
 class Subscription:
@@ -212,7 +220,7 @@ class Relay:
         self._bytes_received = 0
         self._first_byte_at: float | None = None
         self._last_byte_at: float | None = None
-        self._max_gap_sec = 0.0
+        self._longest_gaps: list[float] = []  # The three longest, longest first.
         self._subscriptions: set[Subscription] = set()
         self._grew = asyncio.Event()
         self._finished = asyncio.Event()
@@ -220,7 +228,7 @@ class Relay:
         self._upstream: Readable | None = None
         self._error: BaseException | None = None
         self._reader: asyncio.Task[None] | None = None
-        self._released = False
+        self._released = asyncio.Event()
         self._closing: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
@@ -270,7 +278,7 @@ class Relay:
             bytes_received=self._bytes_received,
             first_byte_at=self._first_byte_at,
             last_byte_at=self._last_byte_at,
-            max_gap_sec=self._max_gap_sec,
+            burst_gap_sec=self._longest_gaps[2] if len(self._longest_gaps) == 3 else 0.0,
         )
 
     @property
@@ -289,13 +297,13 @@ class Relay:
 
     async def release(self) -> None:
         """Close now when no one subscribes, else once the last subscription ends."""
-        self._released = True
+        self._released.set()
         if not self._subscriptions:
             await self.close()
 
     def _unsubscribed(self, subscription: Subscription) -> None:
         self._subscriptions.discard(subscription)
-        if self._released and not self._subscriptions and self._closing is None:
+        if self._released.is_set() and not self._subscriptions and self._closing is None:
             self._closing = asyncio.ensure_future(self.close())
 
     async def close(self) -> None:
@@ -354,7 +362,12 @@ class Relay:
         self._buffered_bytes += len(chunk)
         self._bytes_received += len(chunk)
         if self._last_byte_at is not None:
-            self._max_gap_sec = max(self._max_gap_sec, now - self._last_byte_at)
+            gaps = self._longest_gaps
+            gap = now - self._last_byte_at
+            if len(gaps) < 3 or gap > gaps[-1]:
+                gaps.append(gap)
+                gaps.sort(reverse=True)
+                del gaps[3:]
         if self._first_byte_at is None:
             self._first_byte_at = now
         self._last_byte_at = now

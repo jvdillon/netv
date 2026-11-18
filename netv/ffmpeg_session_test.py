@@ -490,8 +490,43 @@ class TestStopSession:
         assert "s" in env.sessions
         assert process.returncode is None
 
-    def test_stop_session_caches_vod(self, env: _Env, tmp_path: pathlib.Path):
-        """Stop caches VOD session instead of removing it."""
+    def test_stop_spares_a_recently_accessed_session_by_default(
+        self,
+        env: _Env,
+        tmp_path: pathlib.Path,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        env.sessions["s"] = _live(tmp_path)
+        env.sessions["s"]["is_vod"] = True
+        with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
+            asyncio.run(ffmpeg_session.stop_session("s"))
+        assert "s" in env.sessions
+        assert "Ignoring stop for recently-accessed session s" in caplog.messages
+
+    def test_a_session_never_accessed_stops(
+        self,
+        env: _Env,
+        tmp_path: pathlib.Path,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        _save_settings_cache(vod_mins=0)
+        session = _live(tmp_path, url="http://vod")
+        del session["last_access"]
+        env.sessions["s"] = session
+        env.urls["http://vod"] = "s"
+        with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
+            asyncio.run(ffmpeg_session.stop_session("s"))
+        assert not env.sessions
+        assert not env.urls
+        assert "Stopped transcode session s" in caplog.messages
+
+    def test_stop_session_caches_vod(
+        self,
+        env: _Env,
+        tmp_path: pathlib.Path,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Stop caches VOD session instead of removing it, even for one minute."""
         process = FakeProcess(exit_code=None)
         env.sessions["s"] = ffmpeg_session.TranscodeSession(
             process=process,
@@ -501,12 +536,14 @@ class TestStopSession:
             last_access=_NOW - 5,
             started=_NOW,
         )
-        _save_settings_cache(vod_mins=60)
-        asyncio.run(ffmpeg_session.stop_session("s", force=False))
+        _save_settings_cache(vod_mins=1)
+        with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
+            asyncio.run(ffmpeg_session.stop_session("s", force=False))
         assert "s" in env.sessions
         assert env.sessions["s"].get("last_access") == _NOW
         assert process.signals == ["TERM"]
         assert tmp_path.exists()
+        assert "Session s cached (ffmpeg stopped, segments kept)" in caplog.messages
 
     def test_stale_vod_session_without_cache_is_removed(self, env: _Env, tmp_path: pathlib.Path):
         _save_settings_cache(vod_mins=0)
@@ -540,6 +577,20 @@ async def test_stop_fast_session_cancels_the_watchdog_and_closes_the_relay(
     assert worker.stdin.closed
     assert "s" not in env.sessions
     assert not tmp_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_short_session_keeps_the_burst_gap_a_longer_one_learned(
+    env: _Env,
+    tmp_path: pathlib.Path,
+):
+    cache.remember_burst_gap("live", 9.5, 30)
+    session = _fast_session(tmp_path, FakeProcess(exit_code=None))
+    session["fast_start"] = True
+    env.sessions["s"] = session
+    await _receiving(session)
+    await ffmpeg_session.stop_session("s")
+    assert cache.relay_hints()["recurring_gaps"] == {"live": 9.5}
 
 
 @pytest.mark.asyncio
@@ -2981,9 +3032,11 @@ async def test_sources_that_deliver_in_bursts_start_with_a_reserve_that_bridges_
     assert ffmpeg_session._is_fast_live(session)
     # Continuous so far: two 4 s segments suffice and clients hold the 12 s default.
     assert first.get("playback_buffer_seconds") == 12.0
-    env.clock.advance(10)
-    upstreams.opened[0].feed(video_packet(11))
-    await session["relay"].wait_for_bytes(len(session["relay"].history()) + 1)
+    # A pattern: one silence alone could be a stall.
+    for pts in (11, 21, 31):
+        env.clock.advance(10)
+        upstreams.opened[0].feed(video_packet(pts))
+        await session["relay"].wait_for_bytes(len(session["relay"].history()) + 1)
     await ffmpeg_session.stop_session(first["session_id"], force=True)
     # The next session on this source waits for output covering the gap.
     task = asyncio.create_task(ffmpeg_session._start_fast_live("http://live", "bob", "src", False))

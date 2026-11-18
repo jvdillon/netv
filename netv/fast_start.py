@@ -150,9 +150,10 @@ def encoder_command(
     )
     cmd[cmd.index("-i") : cmd.index("-i")] = ["-f", "mpegts"]
     cmd[cmd.index("-probesize") + 1] = "5000000"
-    # The relay starts workers at a keyframe (keyframe_replay); the window only
-    # needs to reach the first audio, muxed up to ~0.7 s behind its video.
-    cmd[cmd.index("-analyzeduration") + 1] = "800000"
+    # The relay starts workers at a keyframe (keyframe_replay). Audio first seen
+    # after the window still decodes, unlike remux_command's copy, so a longer one
+    # only holds the first segment back (0.8 s measured 0.4 s slower than 0.3 s).
+    cmd[cmd.index("-analyzeduration") + 1] = "300000"
     # Preserve the source timeline that program dates are derived from.
     cmd[1:1] = ["-copyts"]
     # Every B-frame or lookahead frame holds output back from a starting viewer.
@@ -238,7 +239,8 @@ def remux_command(directory: str, *, restarting: bool = False) -> list[str]:
         "-hide_banner",
         "-loglevel",
         "error",
-        # Input starts at a keyframe; reach the first audio (see encoder_command).
+        # Input starts at a keyframe. Copied audio needs its parameters before the
+        # header is written, so the window must reach audio muxed ~0.7 s late.
         "-analyzeduration",
         "800000",
         "-f",
@@ -600,6 +602,10 @@ def _hls_output(directory: str, *, restarting: bool, rendition: str = "low") -> 
         f"{directory}/{rendition}_%06d.ts",
         "-hls_flags",
         flags,
+        # Broadcasts mux audio up to ~1 s behind its video; waiting to interleave it
+        # holds every segment, the first included, back by that much.
+        "-max_interleave_delta",
+        "100000",
         f"{directory}/{rendition}.m3u8",
     ]
 

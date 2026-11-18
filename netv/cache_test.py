@@ -113,23 +113,34 @@ class TestRelayHints:
     """What live sessions learned about upstreams, kept across restarts."""
 
     def test_hints_start_empty_then_persist(self):
-        assert cache.relay_hints() == {"live_ts": {}, "burst_gaps": {}}
+        assert cache.relay_hints() == {"live_ts": {}, "recurring_gaps": {}}
         cache.remember_live_ts("x", True)
         cache.remember_live_ts("y", False)
-        cache.remember_burst_gap("panel", 9.5)
-        cache.remember_burst_gap("panel", 4.0)
-        cache.remember_burst_gap("tuner", 0.2)
-        # A shorter gap never lowers the reserve a host has needed.
+        cache.remember_burst_gap("panel", 9.5, 5)
+        cache.remember_burst_gap("panel", 4.0, 29.9)
+        cache.remember_burst_gap("tuner", 0.2, 5)
+        # A short session never lowers the reserve a host has needed.
         assert cache.relay_hints() == {
             "live_ts": {"x": True, "y": False},
-            "burst_gaps": {"panel": 9.5, "tuner": 0.2},
+            "recurring_gaps": {"panel": 9.5, "tuner": 0.2},
         }
+
+    def test_hints_from_older_releases_keep_live_ts(self):
+        (cache.CACHE_DIR / "relay_hints.json").write_text(
+            '{"data": {"live_ts": {"x": true}, "burst_gaps": {"tuner": 1.08}}, "timestamp": 0}',
+        )
+        assert cache.relay_hints() == {"live_ts": {"x": True}, "recurring_gaps": {}}
+
+    def test_a_settled_session_replaces_the_burst_gap(self):
+        cache.remember_burst_gap("tuner", 1.08, 5)
+        cache.remember_burst_gap("tuner", 0.08, 30)
+        assert cache.relay_hints()["recurring_gaps"] == {"tuner": 0.08}
 
     def test_unreadable_hints_start_over(self):
         (cache.CACHE_DIR / "relay_hints.json").write_text(
             '{"data": {"live_ts": 3}, "timestamp": 0}',
         )
-        assert cache.relay_hints() == {"live_ts": {}, "burst_gaps": {}}
+        assert cache.relay_hints() == {"live_ts": {}, "recurring_gaps": {}}
 
 
 class TestMemoryCache:

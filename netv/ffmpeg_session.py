@@ -392,23 +392,23 @@ async def stop_session(session_id: str, force: bool = False) -> None:
 
         # Archive seeks open another upstream URL, and a fast-start session
         # cannot resume once its pipeline stops, so neither keeps a cached slot.
-        force = force or session.get("fast_start", False) or _is_archive_url(session.get("url", ""))
+        force = force or session.get("fast_start") or _is_archive_url(session["url"])
         # Skip stop if session was accessed recently (race with seeking/resume,
         # or multiple users watching same stream)
-        if not force and time.time() - session.get("last_access", 0) < 5.0:
+        last_access = session.get("last_access")
+        if not force and last_access is not None and time.time() - last_access < 5.0:
             log.info("Ignoring stop for recently-accessed session %s", session_id)
             return
 
         processes = _retire_session(session)
-        # Only VOD reaches here unforced; cache it if timeout > 0.
-        cached = not force and get_vod_cache_timeout() > 0
+        # Only VOD reaches here unforced; cache it if a timeout is set.
+        cached = not force and bool(get_vod_cache_timeout())
         if cached:
             session["last_access"] = time.time()
         else:
-            _transcode_sessions.pop(session_id, None)
-            url = session.get("url")
-            if url and _url_to_session.get(url) == session_id:
-                _url_to_session.pop(url, None)
+            del _transcode_sessions[session_id]
+            if _url_to_session.get(session["url"]) == session_id:
+                del _url_to_session[session["url"]]
 
     await _terminate_processes(processes)
     if _is_fast_live(session):
@@ -420,7 +420,8 @@ async def stop_session(session_id: str, force: bool = False) -> None:
         await session["relay"].release()
         # Later sessions from this host buffer past the bursts this one saw.
         host = parse.urlsplit(session["plan"].source_url).netloc
-        await asyncio.to_thread(remember_burst_gap, host, session["relay"].stats.max_gap_sec)
+        stats = session["relay"].stats
+        await asyncio.to_thread(remember_burst_gap, host, stats.burst_gap_sec, stats.delivery_sec)
     if cached:
         log.info("Session %s cached (ffmpeg stopped, segments kept)", session_id)
         return
@@ -2657,7 +2658,7 @@ async def _start_fast_live(
         first_byte_at = session["relay"].stats.first_byte_at or started
         # A source that went silent between bursts before needs output that bridges it.
         hints = await asyncio.to_thread(relay_hints)
-        burst_gap = hints["burst_gaps"].get(parse.urlsplit(plan.source_url).netloc, 0.0)
+        burst_gap = hints["recurring_gaps"].get(parse.urlsplit(plan.source_url).netloc, 0.0)
         log.info(
             "Fast-start session %s: first byte after %.2fs, worker launched after %.2fs",
             session_id,

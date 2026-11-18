@@ -299,9 +299,15 @@
     `;
   }
 
+  // With no language chosen, follow the browser's: broadcasts often carry a second
+  // language (CC3), and whichever caption channel arrives first would otherwise win.
+  function captionLanguage() {
+    return cfg.ccLang || (navigator.language || 'en').slice(0, 2).toLowerCase();
+  }
+
   function getPreferredSubtitleTrack(tracks) {
-    const prefLang = cfg.ccLang || '';
-    if (!prefLang || tracks.length === 0) return 0;
+    const prefLang = captionLanguage();
+    if (tracks.length === 0) return 0;
     // Handle CC1-CC4 (CEA-608 channels)
     if (/^cc[1-4]$/i.test(prefLang)) {
       const ccNum = prefLang.toUpperCase();
@@ -330,7 +336,7 @@
       return;
     }
     if (tracks.length === 0) return;
-    const prefLang = cfg.ccLang || '';
+    const prefLang = captionLanguage();
     const langNames = {en: 'english', es: 'spanish', fr: 'french', de: 'german', it: 'italian', pt: 'portuguese', ja: 'japanese', ko: 'korean', zh: 'chinese'};
     let preferredIdx = 0;
     if (prefLang) {
@@ -344,8 +350,20 @@
         }
       }
     }
-    tracks.forEach((t, i) => t.mode = i === preferredIdx ? 'showing' : 'hidden');
+    tracks.forEach((t, i) => {
+      const mode = i === preferredIdx ? 'showing' : 'hidden';
+      if (t.mode !== mode) t.mode = mode;
+    });
   }
+
+  // Chrome can switch a newly added caption channel to showing on its own, so a
+  // broadcast with CC1 and CC3 rendered both languages at once. One showing track
+  // (the preferred one, or the viewer's pick) is left alone.
+  video.textTracks.addEventListener('change', () => {
+    const showing = Array.from(video.textTracks).filter(t =>
+      (t.kind === 'subtitles' || t.kind === 'captions') && t.mode === 'showing');
+    if (showing.length > (ccEnabled ? 1 : 0)) applyCaptionsSetting();
+  });
 
   function startSubtitlePolling(subtitles, prefIdx) {
     if (subtitlePollTimerId) {

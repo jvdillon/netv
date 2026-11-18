@@ -185,7 +185,7 @@ class RelayHints(TypedDict):
     """What live sessions learned about upstreams, kept across restarts."""
 
     live_ts: dict[str, bool]  # Xtream source -> whether its panel serves live as TS.
-    burst_gaps: dict[str, float]  # Upstream host -> longest silence between bursts.
+    recurring_gaps: dict[str, float]  # Upstream host -> recurring silence between bursts.
 
 
 _relay_hints_lock = threading.Lock()
@@ -197,11 +197,13 @@ def relay_hints() -> RelayHints:
     Returns:
         hints: Learned per-source and per-host facts.
     """
+    empty: RelayHints = {"live_ts": {}, "recurring_gaps": {}}
     cached = load_file_cache("relay_hints")
-    if cached is not None:
+    if cached is not None and isinstance(cached[0], dict):
         with contextlib.suppress(ReadError):
-            return from_plain(cached[0], RelayHints)
-    return {"live_ts": {}, "burst_gaps": {}}
+            # Hints from older releases lack keys added since; they start empty.
+            return from_plain({**empty, **cached[0]}, RelayHints)
+    return empty
 
 
 def remember_live_ts(source_id: str, offered: bool) -> None:
@@ -212,11 +214,31 @@ def remember_live_ts(source_id: str, offered: bool) -> None:
         save_file_cache("relay_hints", hints)
 
 
-def remember_burst_gap(host: str, seconds: float) -> None:
-    """Record a silence between an upstream's bursts; a host keeps its longest."""
+def remember_burst_gap(
+    host: str,
+    seconds: float,
+    observed_sec: float,
+    *,
+    settled_sec: float = 30.0,
+) -> None:
+    """Record the recurring silence between an upstream's bursts.
+
+    A session long enough to show the host's pattern replaces what earlier
+    sessions saw, so a host that stopped bursting stops delaying starts. A
+    shorter one can only raise it.
+
+    Args:
+        host: Upstream host the relay read.
+        seconds: The session's recurring silence between deliveries.
+        observed_sec: How long the session received data.
+        settled_sec: Shortest session that replaces the remembered gap.
+    """
     with _relay_hints_lock:
         hints = relay_hints()
-        hints["burst_gaps"][host] = max(hints["burst_gaps"].get(host, 0.0), seconds)
+        known = hints["recurring_gaps"].get(host, 0.0)
+        hints["recurring_gaps"][host] = (
+            seconds if observed_sec >= settled_sec else max(known, seconds)
+        )
         save_file_cache("relay_hints", hints)
 
 

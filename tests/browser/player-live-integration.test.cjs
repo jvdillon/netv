@@ -52,7 +52,7 @@ async function player({
   catchup = false, catchupDays = catchup ? 2 : 0, catchupStart = programStart, catchupSeek = 0,
   transcodedDuration = 0,
   stopReady = null, stopFailure = false, startReady = null, startGeneration = 0,
-  playbackBufferSeconds = 12,
+  playbackBufferSeconds = 12, captionsEnabled = false, ccLang = '', language = 'en-US',
 } = {}) {
   isVod = isVod || catchup;
   const elements = new Map();
@@ -69,7 +69,7 @@ async function player({
     videoWidth: 1280, videoHeight: 720,
     buffered: { length: 1, start: () => 0, end: () => 12 },
     seekable,
-    textTracks: Object.assign([], { addEventListener() {} }),
+    textTracks: Object.assign([], element()),
     play: async () => { video.paused = false; },
     pause: () => { video.paused = true; },
     load() {},
@@ -140,7 +140,7 @@ async function player({
       liveDvrMins: isVod ? 0 : 60,
       streamId: '1', programStart, programEnd,
       catchup, catchupDays, catchupStart, catchupSeek,
-      ccStyle: {}, captionsEnabled: false, sourceId: 'provider', isHttps: false,
+      ccStyle: {}, captionsEnabled, ccLang, sourceId: 'provider', isHttps: false,
     },
     location: { href: 'http://netv.test/play/live/1', origin: 'http://netv.test', hostname: 'netv.test' },
     ...(airplay ? { WebKitPlaybackTargetAvailabilityEvent: function() {} } : {}),
@@ -183,7 +183,7 @@ async function player({
   });
   const context = createContext({
     window, document, Hls, URL, Blob, AbortController, AbortSignal, Date,
-    navigator: { sendBeacon: url => { beacons.push(url); return true; } },
+    navigator: { language, sendBeacon: url => { beacons.push(url); return true; } },
     performance: { now: () => 1000 },
     localStorage: { getItem: () => null, setItem() {} },
     setTimeout: setTimer, clearTimeout: id => timers.delete(id),
@@ -289,6 +289,47 @@ test('web live startup and health polls use one shared adaptive session', async 
   await p.window.emit('pagehide');
   assert.deepEqual(p.beacons, ['/transcode/session1/stop?force=true']);
   assert.deepEqual(p.errors, []);
+});
+
+// A broadcast's CEA-608 channels as hls.js names them: CC1 English, CC3 unlabeled.
+const broadcastCaptions = () => [
+  { kind: 'captions', label: 'Unknown CC', language: '', mode: 'showing' },
+  { kind: 'captions', label: 'English', language: 'en', mode: 'showing' },
+];
+const captionModes = video => Array.from(video.textTracks, track => track.mode);
+
+test('captions follow the browser language when none is chosen', async () => {
+  const p = await player({ captionsEnabled: true, language: 'en-US' });
+  p.video.textTracks.push(...broadcastCaptions());
+  // Chrome switched the second channel on by itself.
+  await p.video.textTracks.emit('change');
+  assert.deepEqual(captionModes(p.video), ['hidden', 'showing']);
+  assert.deepEqual(p.errors, []);
+});
+
+test('a chosen caption language wins over the browser language', async () => {
+  const p = await player({ captionsEnabled: true, ccLang: 'en', language: 'es-MX' });
+  p.video.textTracks.push(...broadcastCaptions());
+  await p.video.textTracks.emit('change');
+  assert.deepEqual(captionModes(p.video), ['hidden', 'showing']);
+});
+
+test('one showing caption track is the viewer\'s pick and stays', async () => {
+  const p = await player({ captionsEnabled: true, language: 'en-US' });
+  const tracks = broadcastCaptions();
+  tracks[1].mode = 'hidden';
+  p.video.textTracks.push(...tracks);
+  await p.video.textTracks.emit('change');
+  assert.deepEqual(captionModes(p.video), ['showing', 'hidden']);
+});
+
+test('captions turned off hide a track the browser showed', async () => {
+  const p = await player({ captionsEnabled: false });
+  const tracks = broadcastCaptions();
+  tracks[0].mode = 'hidden';
+  p.video.textTracks.push(...tracks);
+  await p.video.textTracks.emit('change');
+  assert.deepEqual(captionModes(p.video), ['hidden', 'hidden']);
 });
 
 test('web live playback honors the measured buffer target', async () => {
