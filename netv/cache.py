@@ -20,6 +20,7 @@ import time
 
 from treekle import MutablePlainTree, ReadError, from_plain, json_loads
 
+from netv import credentials
 from netv.util import atomic_write_json, data_dir, read_json_object, write_json_object
 from netv.xtream import ProviderRecord
 
@@ -586,6 +587,12 @@ def load_server_settings() -> ServerSettings:
     """
     initialize()
     raw = read_json_object(SERVER_SETTINGS_FILE)
+    sources = raw.get("sources")
+    if isinstance(sources, list):
+        decrypted: list[MutablePlainTree] = [
+            credentials.decrypt_source(s) if isinstance(s, dict) else s for s in sources
+        ]
+        raw["sources"] = decrypted
     live_dvr_mins = raw.get("live_dvr_mins", 120)
     if not isinstance(live_dvr_mins, int):
         raise TypeError("live_dvr_mins must be an integer")
@@ -618,7 +625,9 @@ def save_server_settings(settings: ServerSettings) -> None:
         settings: Settings as ``load_server_settings`` returned them, edited.
     """
     initialize_paths()
-    write_json_object(SERVER_SETTINGS_FILE, settings, ServerSettings)
+    stored: dict[str, object] = dict(settings)
+    stored["sources"] = [credentials.encrypt_source(dict(s)) for s in settings["sources"]]
+    write_json_object(SERVER_SETTINGS_FILE, stored, ServerSettings)
 
 
 def get_user_agent() -> str | None:
