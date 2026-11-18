@@ -44,6 +44,7 @@ from netv.testing import (
     install_web,
     pat_packet,
     pmt_packet,
+    probe_capture,
     probed_video_json,
     ts_source,
     video_packet,
@@ -276,18 +277,81 @@ def _live(directory: pathlib.Path, url: str = "http://live") -> ffmpeg_session.T
     )
 
 
-def _plan(source_url: str = "http://live") -> ffmpeg_session._FastLivePlan:
+def _plan(
+    source_url: str = "http://live",
+    *,
+    hw: cache.HwAccel = "software",
+    deinterlace: bool = False,
+) -> ffmpeg_session._FastLivePlan:
     return ffmpeg_session._FastLivePlan(
         source_url=source_url,
         user_agent=None,
-        hw="software",
+        hw=hw,
         resolution="1080p",
         quality="high",
-        deinterlace=False,
+        deinterlace=deinterlace,
         bandwidth_saver=False,
         audio_passthrough=False,
         dvr=False,
     )
+
+
+# Captured probes (testing.probe_capture). Each row is what the live encoder must do:
+# (capture, deinterlaced, tone-mapped, GPU-decoded on an h264-only NVDEC, 5.1 audio).
+_PROBED_SOURCES = [
+    ("ota_1080i_mpeg2", True, False, False, True),
+    ("ota_480i_mpeg2", True, False, False, False),
+    ("ota_720p_mpeg2", False, False, False, True),
+    ("ota_720p_h264", False, False, True, False),
+    ("iptv_1080p_h264_aac", False, False, True, False),
+    ("iptv_2160p_hevc_hdr", False, True, False, True),
+]
+
+
+@pytest.mark.parametrize(
+    ("capture", "deinterlaced", "tone_mapped", "gpu_decoded", "surround"),
+    _PROBED_SOURCES,
+)
+@pytest.mark.parametrize("hw", ["software", "nvenc+software"])
+def test_the_live_encoder_acts_on_what_the_startup_probe_found(
+    env: _Env,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capture: str,
+    deinterlaced: bool,
+    tone_mapped: bool,
+    gpu_decoded: bool,
+    surround: bool,
+    hw: cache.HwAccel,
+):
+    """The probe the worker takes at startup decides decoding, filters and audio.
+
+    The source's deinterlace setting is off here: it applies only when no probe is had.
+    """
+    monkeypatch.setattr(ffmpeg_command, "_gpu_nvdec_codecs", {"h264"})
+    env.run.program("ffprobe", Program(stdout=probe_capture(capture)), when="-show_streams")
+    source = ffmpeg_command.probe_segment(str(tmp_path / "probe.ts"))
+    assert source is not None
+
+    cmd, role = _plan(hw=hw).worker(str(tmp_path), source, restarting=False)
+
+    assert role == "encoder"
+    video_filter = cmd[cmd.index("-vf") + 1]
+    assert ("yadif" in video_filter) == deinterlaced
+    assert ("tonemap" in video_filter or "libplacebo" in video_filter) == tone_mapped
+    assert ("-hwaccel" in cmd) == (gpu_decoded and hw == "nvenc+software")
+    assert ("aformat=channel_layouts=5.1" in cmd) == surround
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_without_a_probe_the_source_setting_decides_deinterlacing(
+    env: _Env,
+    tmp_path: pathlib.Path,
+    fallback: bool,
+):
+    del env
+    cmd, _ = _plan(deinterlace=fallback).worker(str(tmp_path), None, restarting=False)
+    assert ("yadif" in cmd[cmd.index("-vf") + 1]) == fallback
 
 
 def _fast_session(

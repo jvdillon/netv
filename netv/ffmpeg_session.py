@@ -237,10 +237,9 @@ class _FastLivePlan:
             self.quality,
             self.deinterlace,
             allow_upscale=upscale,
-            audio=source,
+            source=source,
             audio_passthrough=self.audio_passthrough,
             restarting=restarting,
-            video_codec=source.video_codec if source else "",
             rendition=rendition,
             grid_offset=grid_offset,
         )

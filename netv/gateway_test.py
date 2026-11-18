@@ -1107,6 +1107,7 @@ def _start_upscale(
     client: TestClient,
     web: testing.FakeWeb,
     launcher: testing.ProcessLauncher | None = None,
+    probe_json: str = testing.probed_video_json(),
 ) -> tuple[testing.ProcessLauncher, int]:
     """Request the upscaled stream, by default with a scripted ffmpeg that exits at once."""
     _set_upscale(sr_model=MODEL)
@@ -1115,7 +1116,7 @@ def _start_upscale(
     cache.save_server_settings(settings)
     web.routes[UPSTREAM] = testing.ended_upstream
     probe = testing.FakeRun()
-    probe.program("ffprobe", testing.Program(stdout=testing.probed_video_json()))
+    probe.program("ffprobe", testing.Program(stdout=probe_json))
     testing.install_subprocess(monkeypatch, ffmpeg_command, run=probe)
     if launcher is None:
         launcher = testing.ProcessLauncher([testing.FakeProcess(exited=True, exit_code=1)])
@@ -1180,7 +1181,8 @@ def test_upscale_live_stream_transcodes_resolved_upstream(
 ):
     client, _ = gateway_client
 
-    launcher, status = _start_upscale(monkeypatch, tmp_path, client, web)
+    interlaced = '{"streams": [{"codec_type": "video", "codec_name": "mpeg2video", "height": 1080, "field_order": "tt"}]}'
+    launcher, status = _start_upscale(monkeypatch, tmp_path, client, web, probe_json=interlaced)
 
     # The scripted ffmpeg exited at once, so the start itself fails.
     assert status == 500
@@ -1189,7 +1191,7 @@ def test_upscale_live_stream_transcodes_resolved_upstream(
     [command] = launcher.commands
     assert UPSTREAM not in command
     assert command[command.index("-i") + 1] == "pipe:0"
-    # Without interlacing facts a source deinterlaces by default.
+    # The probe found interlaced video, so the worker deinterlaces it.
     assert any("yadif" in arg for arg in command)
 
 
@@ -1202,7 +1204,9 @@ def test_upscale_live_stream_applies_source_settings(
     client, _ = gateway_client
     _set_sources({**_source(), "max_streams": 3, "deinterlace_fallback": False})
 
-    launcher, status = _start_upscale(monkeypatch, tmp_path, client, web)
+    # Without a probe of the video, the source's setting decides deinterlacing.
+    no_video = '{"streams": []}'
+    launcher, status = _start_upscale(monkeypatch, tmp_path, client, web, probe_json=no_video)
 
     assert status == 500
     [command] = launcher.commands

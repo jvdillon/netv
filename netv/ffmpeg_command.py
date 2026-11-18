@@ -797,12 +797,10 @@ def build_hls_ffmpeg_cmd(
     user_agent: str | None = None,
     deinterlace_fallback: bool | None = None,
     allow_upscale: bool = True,
-    audio_info: MediaInfo | None = None,
+    source: MediaInfo | None = None,
     audio_passthrough: bool = False,
-    video_codec: str = "",
     *,
     sr_segment_duration: float = 2.0,
-    source_height: int = 0,
 ) -> list[str]:
     """Build ffmpeg command for HLS transcoding.
 
@@ -818,24 +816,25 @@ def build_hls_ffmpeg_cmd(
         user_agent: HTTP User-Agent for the input.
         deinterlace_fallback: Deinterlace when probe data is unavailable.
         allow_upscale: Whether AI Upscale may apply.
-        audio_info: Audio facts used when media_info is unavailable.
+        source: Facts probed from a sample of an input the command still probes and
+            re-encodes (a live relay); used in place of ``media_info`` for every
+            decision but stream copy.
         audio_passthrough: Copy Dolby audio for clients that decode it natively.
-        video_codec: Source codec selecting hardware decode without media_info.
         sr_segment_duration: HLS segment length when AI Upscale applies.
-        source_height: Source height selecting the AI Upscale engine without media_info.
 
     Returns:
         cmd: FFmpeg arguments.
     """
-    audio = audio_info or media_info
-    # Check if we can copy streams directly (compatible codecs, no processing needed)
+    # Every decision below reads this one record, so no caller can pass some probed
+    # facts and drop others. Only stream copy needs media_info: a ``source`` is re-encoded.
+    probed = media_info or source
     copy_video = _can_copy_video(media_info, max_resolution, allow_upscale=allow_upscale)
-    copy_audio = _can_copy_audio(audio, passthrough=audio_passthrough)
+    copy_audio = _can_copy_audio(probed, passthrough=audio_passthrough)
 
     # Full hardware pipeline if GPU supports the codec
     # Parse hw to get encoder type.
     enc_type, _ = _parse_hw(hw)
-    codec = media_info.video_codec if media_info else video_codec
+    codec = probed.video_codec if probed else ""
     use_hw_pipeline = bool(
         not copy_video
         and codec
@@ -856,8 +855,7 @@ def build_hls_ffmpeg_cmd(
     # (fallback defaults to True for live, False for VOD when not explicitly set)
     fallback = deinterlace_fallback if deinterlace_fallback is not None else (not is_vod)
     # If probe failed (height=0), don't trust interlaced flag - use fallback.
-    probe_valid = media_info is not None and media_info.height > 0
-    deinterlace = media_info.interlaced if probe_valid and media_info else fallback
+    deinterlace = probed.interlaced if probed and probed.height > 0 else fallback
 
     # Build component arg lists.
     video_pre, video_post = _build_video_args(
@@ -867,11 +865,11 @@ def build_hls_ffmpeg_cmd(
         use_hw_pipeline=use_hw_pipeline,
         max_resolution=max_resolution,
         quality=quality,
-        is_hdr=media_info.is_hdr if media_info else False,
-        source_height=media_info.height if media_info else source_height,
+        is_hdr=probed.is_hdr if probed else False,
+        source_height=probed.height if probed else 0,
         allow_upscale=allow_upscale,
     )
-    audio_args = _build_audio_args(copy_audio=copy_audio, audio=audio)
+    audio_args = _build_audio_args(copy_audio=copy_audio, audio=probed)
     sr_applied = any("dnn_processing=" in arg for arg in video_post)
     segment_duration = sr_segment_duration if sr_applied else get_hls_segment_duration()
 

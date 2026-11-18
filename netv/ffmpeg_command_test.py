@@ -713,8 +713,9 @@ class TestHlsAssemblyContract:
         assert default[default.index("-c:a") + 1] == "aac"
         assert passthrough[passthrough.index("-c:a") + 1] == "copy"
 
-    @pytest.mark.parametrize("separate_audio", [False, True])
-    def test_explicit_forwarding(self, separate_audio: bool):
+    @pytest.mark.parametrize("probed_as", ["media_info", "source"])
+    def test_explicit_forwarding(self, probed_as: str):
+        """Probed facts drive video and audio alike, however the caller holds them."""
         media = _media_info(
             height=2160,
             is_hdr=True,
@@ -722,17 +723,12 @@ class TestHlsAssemblyContract:
             audio_channels=6,
             audio_profile="Main",
         )
-        audio = (
-            _media_info(audio_codec="mp3", audio_sample_rate=32_000, audio_channels=1)
-            if separate_audio
-            else None
-        )
         cmd = build_hls_ffmpeg_cmd(
             "input",
             "software",
             "/output",
-            media_info=media,
-            audio_info=audio,
+            media_info=media if probed_as == "media_info" else None,
+            source=media if probed_as == "source" else None,
             max_resolution="720p",
             quality="low",
         )
@@ -742,32 +738,18 @@ class TestHlsAssemblyContract:
         )
         video = _software_video(deinterlace=False, height=720, crf="32")
         video[1] = tonemap + video[1]
-        if separate_audio:
-            audio_args = [
-                "-c:a",
-                "aac",
-                "-ac",
-                "2",
-                "-ar",
-                "48000",
-                "-b:a",
-                "192k",
-                "-profile:a",
-                "aac_low",
-            ]
-        else:
-            audio_args = [
-                "-c:a",
-                "aac",
-                "-af",
-                "aformat=channel_layouts=5.1",
-                "-ar",
-                "44100",
-                "-b:a",
-                "384k",
-                "-profile:a",
-                "aac_low",
-            ]
+        audio_args = [
+            "-c:a",
+            "aac",
+            "-af",
+            "aformat=channel_layouts=5.1",
+            "-ar",
+            "44100",
+            "-b:a",
+            "384k",
+            "-profile:a",
+            "aac_low",
+        ]
         assert _between(cmd, "0:a:0", "-max_delay") == [*video, *audio_args]
 
     @pytest.mark.parametrize("hw", ["nvenc+software", "vaapi", "qsv", "amf+software", "software"])
@@ -777,7 +759,7 @@ class TestHlsAssemblyContract:
     )
     def test_hardware_pipeline(self, fake_run: FakeRun, hw: HwAccel, codec: str):
         fake_run.program("nvidia-smi", Program(stdout="NVIDIA GeForce GTX 960, 5.2\n"))
-        cmd = build_hls_ffmpeg_cmd("input", hw, "/output", video_codec=codec)
+        cmd = build_hls_ffmpeg_cmd("input", hw, "/output", source=_media_info(video_codec=codec))
         supported = {
             "nvenc+software": {"h264"},
             "vaapi": {"h264", "hevc", "mpeg2video", "vp8", "vp9", "vc1", "av1"},
@@ -797,13 +779,13 @@ class TestHlsAssemblyContract:
         assert "-hwaccel" not in cmd
         assert fake_run.calls == []
 
-    def test_media_codec_overrides_hint(self):
+    def test_media_info_overrides_source(self):
         cmd = build_hls_ffmpeg_cmd(
             "input",
             "qsv",
             "/output",
             media_info=_media_info(video_codec="vp8"),
-            video_codec="h264",
+            source=_media_info(video_codec="h264"),
         )
         assert "-hwaccel" not in cmd
         assert cmd[cmd.index("-c:v") + 1] == "h264_qsv"
@@ -812,12 +794,14 @@ class TestHlsAssemblyContract:
     @pytest.mark.parametrize("fallback", [None, False, True])
     @pytest.mark.parametrize("height", [None, 0, 1])
     @pytest.mark.parametrize("interlaced", [False, True])
+    @pytest.mark.parametrize("probed_as", ["media_info", "source"])
     def test_deinterlace_selection(
         self,
         is_vod: bool,
         fallback: bool | None,
         height: int | None,
         interlaced: bool,
+        probed_as: str,
     ):
         media = (
             None
@@ -829,7 +813,8 @@ class TestHlsAssemblyContract:
             "software",
             "/output",
             is_vod=is_vod,
-            media_info=media,
+            media_info=media if probed_as == "media_info" else None,
+            source=media if probed_as == "source" else None,
             deinterlace_fallback=fallback,
         )
         expected = interlaced if height == 1 else (not is_vod if fallback is None else fallback)
@@ -960,7 +945,7 @@ class TestBuildHlsFfmpegCmd:
         "codec,passthrough,expected",
         [("eac3", True, ["-c:a", "copy"]), ("ac3", True, ["-c:a", "copy"]), ("eac3", False, None)],
     )
-    def test_audio_info_without_media_info(
+    def test_source_audio_without_media_info(
         self,
         codec: str,
         passthrough: bool,
@@ -978,7 +963,7 @@ class TestBuildHlsFfmpegCmd:
             "http://test",
             "software",
             "/tmp",
-            audio_info=audio,
+            source=audio,
             audio_passthrough=passthrough,
         )
         assert cmd[cmd.index("-c:v") + 1] != "copy"

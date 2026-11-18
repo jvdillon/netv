@@ -29,6 +29,7 @@ import asyncio
 import hashlib
 import importlib
 import inspect
+import json
 import os
 import queue
 import subprocess
@@ -62,6 +63,187 @@ class FakeStream:
 def probed_video_json() -> str:
     """What ffprobe reports for a sample holding a video frame size and no audio."""
     return '{"streams": [{"codec_type": "video", "codec_name": "mpeg2video", "height": 1080}]}'
+
+
+def probe_capture(name: str) -> str:
+    """What ``ffprobe -show_streams -show_format`` reported for a captured source.
+
+    ``ota_*`` are samples from a live HDHomeRun tuner taken as the relay takes them
+    (from the first keyframe); ``iptv_*`` are files made with ffmpeg. Only the keys
+    netv reads are kept.
+
+    Args:
+        name: Capture name, such as ``"ota_1080i_mpeg2"``.
+
+    Returns:
+        report: The probe's JSON text.
+    """
+    captures = {
+        "iptv_1080p_h264_aac": {
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_name": "h264",
+                    "profile": "Constrained Baseline",
+                    "codec_type": "video",
+                    "height": 1080,
+                    "pix_fmt": "yuv420p",
+                    "field_order": "progressive",
+                },
+                {
+                    "index": 1,
+                    "codec_name": "aac",
+                    "profile": "LC",
+                    "codec_type": "audio",
+                    "sample_rate": "48000",
+                    "channels": 2,
+                    "bit_rate": "107599",
+                },
+            ],
+            "format": {"format_name": "mpegts", "duration": "1.021333", "bit_rate": "15668307"},
+        },
+        "iptv_2160p_hevc_hdr": {
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_name": "hevc",
+                    "profile": "Main 10",
+                    "codec_type": "video",
+                    "height": 2160,
+                    "pix_fmt": "yuv420p10le",
+                    "color_transfer": "smpte2084",
+                },
+                {
+                    "index": 1,
+                    "codec_name": "eac3",
+                    "codec_type": "audio",
+                    "sample_rate": "48000",
+                    "channels": 6,
+                    "bit_rate": "448000",
+                },
+            ],
+            "format": {"format_name": "mpegts", "duration": "1.005333", "bit_rate": "13233808"},
+        },
+        "ota_1080i_mpeg2": {
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_name": "mpeg2video",
+                    "profile": "Main",
+                    "codec_type": "video",
+                    "height": 1080,
+                    "pix_fmt": "yuv420p",
+                    "field_order": "tt",
+                },
+                {
+                    "index": 1,
+                    "codec_name": "ac3",
+                    "codec_type": "audio",
+                    "sample_rate": "48000",
+                    "channels": 6,
+                    "bit_rate": "384000",
+                    "tags": {"language": "eng"},
+                },
+                {
+                    "index": 2,
+                    "codec_name": "ac3",
+                    "codec_type": "audio",
+                    "sample_rate": "48000",
+                    "channels": 1,
+                    "bit_rate": "96000",
+                    "tags": {"language": "fre"},
+                },
+                {
+                    "index": 3,
+                    "codec_name": "ac3",
+                    "codec_type": "audio",
+                    "sample_rate": "48000",
+                    "channels": 1,
+                    "bit_rate": "96000",
+                    "tags": {"language": "spa"},
+                },
+            ],
+            "format": {"format_name": "mpegts", "duration": "0.666812", "bit_rate": "3780327"},
+        },
+        "ota_480i_mpeg2": {
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_name": "mpeg2video",
+                    "profile": "Main",
+                    "codec_type": "video",
+                    "height": 480,
+                    "pix_fmt": "yuv420p",
+                    "field_order": "tt",
+                },
+                {
+                    "index": 1,
+                    "codec_name": "ac3",
+                    "codec_type": "audio",
+                    "sample_rate": "48000",
+                    "channels": 2,
+                    "bit_rate": "128000",
+                },
+            ],
+            "format": {"format_name": "mpegts", "duration": "1.594134", "bit_rate": "701933"},
+        },
+        "ota_720p_h264": {
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_name": "h264",
+                    "profile": "Main",
+                    "codec_type": "video",
+                    "height": 720,
+                    "pix_fmt": "yuv420p",
+                    "color_transfer": "bt709",
+                    "field_order": "progressive",
+                },
+                {
+                    "index": 1,
+                    "codec_name": "ac3",
+                    "codec_type": "audio",
+                    "sample_rate": "0",
+                    "channels": 0,
+                    "tags": {"language": "eng"},
+                },
+            ],
+            "format": {"format_name": "mpegts", "duration": "0.008333", "bit_rate": "8482899"},
+        },
+        "ota_720p_mpeg2": {
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_name": "mpeg2video",
+                    "profile": "Main",
+                    "codec_type": "video",
+                    "height": 720,
+                    "pix_fmt": "yuv420p",
+                    "field_order": "progressive",
+                },
+                {
+                    "index": 1,
+                    "codec_name": "ac3",
+                    "codec_type": "audio",
+                    "sample_rate": "48000",
+                    "channels": 6,
+                    "bit_rate": "384000",
+                    "tags": {"language": "eng"},
+                },
+                {
+                    "index": 2,
+                    "codec_name": "ac3",
+                    "codec_type": "audio",
+                    "sample_rate": "48000",
+                    "channels": 2,
+                    "bit_rate": "192000",
+                    "tags": {"language": "eng"},
+                },
+            ],
+            "format": {"format_name": "mpegts", "duration": "1.633400", "bit_rate": "5382578"},
+        },
+    }
+    return json.dumps(captures[name])
 
 
 def pat_packet() -> bytes:

@@ -121,13 +121,12 @@ def encoder_command(
     hw: HwAccel,
     resolution: str,
     quality: str,
-    deinterlace: bool,
+    deinterlace_fallback: bool,
     *,
     allow_upscale: bool,
-    audio: MediaInfo | None = None,
+    source: MediaInfo | None = None,
     audio_passthrough: bool = False,
     restarting: bool = False,
-    video_codec: str = "",
     rendition: str = "low",
     grid_offset: float = 0.0,
 ) -> list[str]:
@@ -141,12 +140,10 @@ def encoder_command(
         resolution,
         quality,
         None,
-        deinterlace,
+        deinterlace_fallback,
         allow_upscale=allow_upscale,
-        audio_info=audio,
+        source=source,
         audio_passthrough=audio_passthrough,
-        video_codec=video_codec,
-        source_height=audio.height if audio else 0,
     )
     cmd[cmd.index("-i") : cmd.index("-i")] = ["-f", "mpegts"]
     cmd[cmd.index("-probesize") + 1] = "5000000"

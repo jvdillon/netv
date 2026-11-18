@@ -589,17 +589,130 @@ def test_encoder_keeps_surround_audio(tmp_path: pathlib.Path, upscale: bool):
         audio_sample_rate=48_000,
     )
     args = (str(tmp_path), "software", "1080p" if upscale else "720p", "low", False)
-    aac = fast_start.encoder_command(*args, allow_upscale=upscale, audio=audio)
+    aac = fast_start.encoder_command(*args, allow_upscale=upscale, source=audio)
     assert aac[aac.index("-c:a") + 1] == "aac"
     assert aac[aac.index("-af") + 1] == "aformat=channel_layouts=5.1"
     dolby = fast_start.encoder_command(
         *args,
         allow_upscale=upscale,
-        audio=audio,
+        source=audio,
         audio_passthrough=True,
     )
     assert dolby[dolby.index("-c:a") + 1] == "copy"
     assert dolby[dolby.index("-c:v") + 1] != "copy"
+
+
+def test_encoder_command_for_an_interlaced_surround_broadcast(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The whole command a 1080i, 5.1 broadcast gets on an NVENC host."""
+    configure(tmp_path)
+    monkeypatch.setattr(ffmpeg_command, "_gpu_nvdec_codecs", {"h264"})
+    source = MediaInfo(
+        video_codec="h264",
+        audio_codec="ac3",
+        pix_fmt="yuv420p",
+        audio_channels=6,
+        audio_sample_rate=48_000,
+        height=1080,
+        interlaced=True,
+    )
+    cmd = fast_start.encoder_command(
+        "/s",
+        "nvenc+software",
+        "1080p",
+        "high",
+        False,
+        allow_upscale=False,
+        source=source,
+    )
+    keyframes = (
+        "expr:if(isnan(prev_forced_t),1,if(lt(n_forced,4),"
+        "gte(floor((t+0.000000)*4),floor((prev_forced_t+0.000000)*4)+1),"
+        "gte(floor(t+0.000000),floor(prev_forced_t+0.000000)+1)))"
+    )
+    assert cmd == [
+        "ffmpeg",
+        "-copyts",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-noautorotate",
+        "-hwaccel",
+        "cuda",
+        "-hwaccel_output_format",
+        "cuda",
+        "-extra_hw_frames",
+        "3",
+        "-probesize",
+        "5000000",
+        "-analyzeduration",
+        "300000",
+        "-fflags",
+        "+discardcorrupt+genpts",
+        "-err_detect",
+        "ignore_err",
+        "-f",
+        "mpegts",
+        "-i",
+        "pipe:0",
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+        "-vf",
+        "yadif_cuda=0,scale_cuda=-2:min(ih\\,1080):format=nv12",
+        "-c:v",
+        "h264_nvenc",
+        "-preset",
+        "p4",
+        "-spatial-aq",
+        "1",
+        "-temporal-aq",
+        "1",
+        "-g",
+        "60",
+        "-c:a",
+        "aac",
+        "-af",
+        "aformat=channel_layouts=5.1",
+        "-ar",
+        "48000",
+        "-b:a",
+        "384k",
+        "-profile:a",
+        "aac_low",
+        "-max_delay",
+        "5000000",
+        "-bf",
+        "0",
+        "-force_key_frames",
+        keyframes,
+        "-forced-idr",
+        "1",
+        "-f",
+        "hls",
+        "-hls_time",
+        "1",
+        "-hls_init_time",
+        "0.25",
+        "-hls_list_size",
+        "30",
+        "-hls_segment_filename",
+        "/s/low_%06d.ts",
+        "-hls_flags",
+        "delete_segments+temp_file",
+        "-rc",
+        "vbr",
+        "-b:v",
+        "6000000",
+        "-maxrate",
+        "8000000",
+        "-bufsize",
+        "8000000",
+        "/s/low.m3u8",
+    ]
 
 
 def test_ready_bitrate_counts_one_segment_when_asked(tmp_path: pathlib.Path):
@@ -667,14 +780,15 @@ def test_encoders_decode_on_gpu_when_source_codec_is_known(
     monkeypatch.setattr(ffmpeg_command, "_gpu_nvdec_codecs", None)
     for upscale in (False, True):
         args = (str(tmp_path), "nvenc+software", "1080p", "high", False)
-        cmd = fast_start.encoder_command(*args, allow_upscale=upscale, video_codec="h264")
+        h264 = MediaInfo(video_codec="h264", audio_codec="", pix_fmt="")
+        cmd = fast_start.encoder_command(*args, allow_upscale=upscale, source=h264)
         assert cmd[cmd.index("-hwaccel") + 1] == "cuda"
         assert "hwupload_cuda" not in cmd[cmd.index("-vf") + 1]
         assert "-hwaccel" not in fast_start.encoder_command(*args, allow_upscale=upscale)
         assert "-hwaccel" not in fast_start.encoder_command(
             *args,
             allow_upscale=upscale,
-            video_codec="hevc",
+            source=MediaInfo(video_codec="hevc", audio_codec="", pix_fmt=""),
         )
 
 
@@ -826,8 +940,7 @@ async def test_shared_session_runs_one_worker_fed_by_the_relay(
     assert worker == fast_start.encoder_command(
         *encoder,
         allow_upscale=upscale,
-        audio=session["audio_info"],
-        video_codec="mpeg2video",
+        source=session["audio_info"],
     )
     # The session clock starts at the source's first timestamp, when it arrived.
     assert (session.get("origin_pts"), session.get("origin_time")) == (10, first_byte_at)

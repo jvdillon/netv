@@ -163,15 +163,13 @@ async def test_fallback_command_and_cleanup(
         assert command == fast_start.encoder_command(
             *encoder,
             allow_upscale=False,
-            audio=source,
-            video_codec="mpeg2video",
+            source=source,
         )
         assert not any("dnn_processing=" in arg for arg in command)
         upscaled = fast_start.encoder_command(
             *encoder,
             allow_upscale=True,
-            audio=source,
-            video_codec="mpeg2video",
+            source=source,
             rendition="up",
         )
         assert any("dnn_processing=" in arg for arg in upscaled)
