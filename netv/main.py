@@ -63,6 +63,7 @@ from netv.auth import TokenClaims, create_token, verify_password, verify_token
 from netv.cache import (
     AVAILABLE_ENCODERS,
     Source,
+    UserSettings,
     clamp_live_dvr_mins,
     clear_all_caches,
     clear_all_file_caches,
@@ -905,7 +906,7 @@ async def vod_page(
                 "current_category": category,
                 "current_sort": sort,
                 "loading": True,
-                "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
+                "favorites": _page_favorites(user_settings),
             },
         )
 
@@ -959,7 +960,7 @@ async def vod_page(
             "streams": streams,
             "current_category": category,
             "current_sort": sort,
-            "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
+            "favorites": _page_favorites(user_settings),
             "content_access": _get_content_access(username),
         },
     )
@@ -989,7 +990,7 @@ async def series_page(
                 "current_category": category,
                 "current_sort": sort,
                 "loading": True,
-                "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
+                "favorites": _page_favorites(user_settings),
             },
         )
 
@@ -1043,7 +1044,7 @@ async def series_page(
             "series": series,
             "current_category": category,
             "current_sort": sort,
-            "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
+            "favorites": _page_favorites(user_settings),
             "content_access": _get_content_access(username),
         },
     )
@@ -1115,7 +1116,7 @@ async def series_detail_page(
         {
             "series": series_data,
             "series_id": series_id,
-            "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
+            "favorites": _page_favorites(user_settings),
         },
     )
 
@@ -1148,7 +1149,7 @@ async def movie_detail_page(
         "movie_detail.html",
         {
             "movie": movie,
-            "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
+            "favorites": _page_favorites(user_settings),
         },
     )
 
@@ -1190,6 +1191,7 @@ class GuideChannel(TypedDict):
     stream_id: MutablePlainTree
     name: MutablePlainTree
     icon: MutablePlainTree
+    icon_proxy: str
     epg_id: str
     category_ids: list[str]
     catchup_days: int
@@ -1610,7 +1612,7 @@ async def search_page(
             "search_vod": vod and content_access["movies"],
             "search_series": series and content_access["series"],
             "limit": limit,
-            "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
+            "favorites": _page_favorites(user_settings),
             "content_access": content_access,
         },
     )
@@ -2512,7 +2514,7 @@ async def get_user_prefs(user: Annotated[TokenClaims, Depends(require_auth)]):
     username = user.get("sub", "")
     settings = load_user_settings(username)
     return {
-        "favorites": settings.get("favorites", {}),
+        "favorites": _page_favorites(settings),
         "cc_lang": settings.get("cc_lang", ""),
         "cc_style": settings.get("cc_style", {}),
         "cast_host": settings.get("cast_host", ""),
@@ -2546,7 +2548,7 @@ async def save_user_prefs(
         raise HTTPException(400, f"Invalid preferences: {exc}") from exc
     settings = load_user_settings(username)
     if "favorites" in prefs:
-        settings["favorites"] = prefs["favorites"]
+        settings["favorites"] = _stored_favorites(prefs["favorites"])
     if "cc_lang" in prefs:
         settings["cc_lang"] = prefs["cc_lang"]
     if "cc_style" in prefs:
@@ -2709,6 +2711,7 @@ async def get_logo(
     url: str,
     user: Annotated[TokenClaims, Depends(require_auth)],
     source: str = "default",
+    sig: str = "",
 ):
     """Proxy and cache external logos to avoid mixed-content issues.
 
@@ -2716,10 +2719,15 @@ async def get_logo(
         url: External image URL.
         user: Authenticated viewer claims.
         source: Source name partitioning cached images.
+        sig: Server signature from ``_logo_url_filter``; unsigned URLs are refused.
     """
     del user
     if not url:
         raise HTTPException(400, "Missing url parameter")
+    # Only URLs the server put on a page are proxied: without this, any viewer
+    # could make the server fetch internal addresses and read image replies.
+    if not auth.verify_logo_url_signature(url, sig):
+        raise HTTPException(403, "Invalid logo URL signature")
     # Check cache first.
     cached = get_cached_logo(source, url)
     if cached:
@@ -3221,13 +3229,82 @@ async def settings_set_user_limits(
 
 
 def _logo_url_filter(url: str) -> str:
-    """Wrap external logo URLs through /api/logo proxy."""
+    """Wrap external logo URLs through the signed /api/logo proxy."""
     if not url or url.startswith("/") or url.startswith("data:"):
         return url  # Already local or data URL.
     # Use hostname as source for organization.
     parsed = parse.urlparse(url)
     source = parsed.netloc.split(":")[0] if parsed.netloc else "external"
-    return f"/api/logo?source={parse.quote(source)}&url={parse.quote(url)}"
+    sig = auth.logo_url_signature(url)
+    return f"/api/logo?source={parse.quote(source)}&url={parse.quote(url)}&sig={sig}"
+
+
+Favorites = dict[str, dict[str, MutablePlainTree]]
+
+# Favorite kind -> (catalog cache key, id field, cover field).
+_FAVORITE_CATALOGS: dict[str, tuple[Literal["vod_streams", "series"], str, str]] = {
+    "movies": ("vod_streams", "stream_id", "stream_icon"),
+    "series": ("series", "series_id", "cover"),
+}
+
+
+def _raw_logo_url(url: str) -> str:
+    """Return the external URL inside a ``/api/logo`` link, or ``url`` unchanged."""
+    if not url.startswith("/api/logo?"):
+        return url
+    return parse.parse_qs(parse.urlsplit(url).query).get("url", [url])[0]
+
+
+def _with_cover(entry: MutablePlainTree, cover: str) -> MutablePlainTree:
+    """Copy a favorite entry with its cover replaced; other shapes pass through."""
+    if not isinstance(entry, dict):
+        return entry
+    return {**entry, "cover": cover}
+
+
+def _stored_favorites(favorites: Favorites) -> Favorites:
+    """Favorites as saved: covers hold the provider URL, never a signed proxy link.
+
+    Pages post back the covers they were given, which are signed ``/api/logo``
+    links. Storing the raw URL keeps saved favorites valid if ``secret_key`` changes.
+    """
+    return {
+        kind: {fid: _stored_entry(entry) for fid, entry in entries.items()}
+        for kind, entries in favorites.items()
+    }
+
+
+def _stored_entry(entry: MutablePlainTree) -> MutablePlainTree:
+    """One saved favorite: a text cover is unwrapped to the provider URL."""
+    if not isinstance(entry, dict):
+        return entry
+    cover = entry.get("cover")
+    return _with_cover(entry, _raw_logo_url(cover)) if isinstance(cover, str) else entry
+
+
+def _page_favorites(settings: UserSettings) -> Favorites:
+    """The viewer's favorites, with covers signed for ``/api/logo``.
+
+    Covers come from the provider catalog, looked up by the favorite's id. The
+    stored cover is never signed: viewers write favorites through
+    ``/api/user-prefs``, so signing it would let any viewer proxy any URL. A
+    favorite missing from the loaded catalog shows no cover.
+    """
+    favorites = settings.get("favorites", {"series": {}, "movies": {}})
+    page: Favorites = {}
+    for kind, entries in favorites.items():
+        covers: dict[str, str] = {}
+        catalog = _FAVORITE_CATALOGS.get(kind)
+        if catalog and entries:
+            key, id_field, cover_field = catalog
+            for item in get_cache().get(key, []):
+                item_id = text_field(item, id_field)
+                if item_id in entries:
+                    covers[item_id] = _logo_url_filter(text_field(item, cover_field))
+        page[kind] = {
+            fid: _with_cover(entry, covers.get(fid, "")) for fid, entry in entries.items()
+        }
+    return page
 
 
 def _hidden_sources(username: str) -> set[str]:
@@ -3899,6 +3976,8 @@ def _build_guide_rows(
             "stream_id": s["stream_id"],
             "name": s["name"],
             "icon": icon,
+            # Signed /api/logo URL for the web guide; `icon` stays raw for apps.
+            "icon_proxy": _logo_url_filter(icon) if isinstance(icon, str) else "",
             "epg_id": epg_id,
             "category_ids": category_ids(s),
             "catchup_days": catchup.archive_days(s),

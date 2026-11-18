@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Protocol, TypedDict, TypeVar, cast, override
+from urllib import parse
 from zoneinfo import ZoneInfo
 
 import asyncio
@@ -971,6 +972,32 @@ class TestGuide:
         payload = _body(resp, GuideRowsResponse)
         assert payload["categories"] == [{"category_id": "1", "category_name": "News"}]
         assert payload["rows"][0]["channel"]["category_ids"] == ["1"]
+
+    def test_guide_rows_carry_raw_icon_and_signed_proxy(self, auth_client: TestClient):
+        icon = "https://logos.example/cnn.png"
+        cache_module.get_cache()["live_categories"] = [
+            {"category_id": "1", "category_name": "News"},
+        ]
+        cache_module.get_cache()["live_streams"] = [
+            {
+                "stream_id": 1,
+                "name": "CNN",
+                "category_ids": ["1"],
+                "epg_channel_id": "",
+                "stream_icon": icon,
+            },
+        ]
+
+        payload = _body(auth_client.get("/api/guide/rows?cats=1"), GuideRowsResponse)
+
+        channel = payload["rows"][0]["channel"]
+        # Apps load the raw icon themselves; the web guide uses the signed proxy.
+        assert channel["icon"] == icon
+        proxy = parse.urlparse(channel["icon_proxy"])
+        assert proxy.path == "/api/logo"
+        query = parse.parse_qs(proxy.query)
+        assert query["url"] == [icon]
+        assert auth.verify_logo_url_signature(icon, query["sig"][0])
 
     def test_guide_rows_categories_cover_all_pages(self, auth_client: TestClient):
         categories: list[ProviderRecord] = [

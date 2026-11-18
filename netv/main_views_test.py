@@ -485,25 +485,77 @@ def test_json_body_validation(auth_client: TestClient, body: bytes, detail: str)
 # ===========================================================================
 
 
+def _logo(url: str, **params: str) -> str:
+    """A signed /api/logo request path, as _logo_url_filter would emit it."""
+    query = {"url": url, **params, "sig": auth.logo_url_signature(url)}
+    return "/api/logo?" + parse.urlencode(query)
+
+
 def test_logo_requires_url(auth_client: TestClient):
     assert auth_client.get("/api/logo?url=").status_code == 400
 
 
 def test_logo_served_from_cache(auth_client: TestClient, web: FakeWeb):
     cache_module.save_logo("default", "http://x/logo.png", b"png", "image/png")
-    response = auth_client.get("/api/logo?url=http://x/logo.png")
+    response = auth_client.get(_logo("http://x/logo.png"))
     assert response.content == b"png"
     assert response.headers["cache-control"] == "max-age=86400"
     assert web.fetches == []
 
 
 def test_logo_rejects_non_http_scheme(auth_client: TestClient):
-    assert auth_client.get("/api/logo?url=file:///etc/passwd").status_code == 400
+    assert auth_client.get(_logo("file:///etc/passwd")).status_code == 400
+
+
+@pytest.mark.parametrize(
+    "sig",
+    [
+        None,
+        "",
+        "0" * 64,
+        "zz" * 32,
+        "é" * 64,
+        "ABCDEF" * 10 + "abcd",
+    ],
+)
+def test_logo_refuses_unsigned_urls(auth_client: TestClient, web: FakeWeb, sig: str | None):
+    # Any viewer could otherwise make the server fetch internal addresses.
+    url = "http://127.0.0.1:8080/snapshot.jpg"
+    web.routes[url] = FakeResponse(b"img", headers={"Content-Type": "image/png"})
+    query = {"url": url} if sig is None else {"url": url, "sig": sig}
+    response = auth_client.get("/api/logo?" + parse.urlencode(query))
+    assert response.status_code == 403
+    assert web.fetches == []
+
+
+def test_logo_signature_is_bound_to_the_url(auth_client: TestClient, web: FakeWeb):
+    signed = auth.logo_url_signature("http://x/l.png")
+    response = auth_client.get(
+        "/api/logo?" + parse.urlencode({"url": "http://127.0.0.1/l.png", "sig": signed}),
+    )
+    assert response.status_code == 403
+    assert web.fetches == []
+
+
+def test_logo_refuses_unsigned_urls_even_when_cached(auth_client: TestClient):
+    cache_module.save_logo("default", "http://x/logo.png", b"png", "image/png")
+    assert auth_client.get("/api/logo?url=http://x/logo.png").status_code == 403
+
+
+def test_logo_url_filter_signs_proxy_urls():
+    url = "http://logos.example:8080/c.png?x=1"
+    proxied = main._logo_url_filter(url)
+    query = parse.parse_qs(parse.urlparse(proxied).query)
+    assert query["url"] == [url]
+    assert query["source"] == ["logos.example"]
+    assert auth.verify_logo_url_signature(url, query["sig"][0])
+    for local in ("", "/static/x.png", "data:image/png;base64,AA=="):
+        assert main._logo_url_filter(local) == local
 
 
 def test_logo_fetches_and_caches(auth_client: TestClient, web: FakeWeb):
     web.routes["http://x/l.png"] = FakeResponse(b"img", headers={"Content-Type": "image/png"})
-    response = auth_client.get("/api/logo?url=http://x/l.png&source=src")
+    response = auth_client.get(_logo("http://x/l.png", source="src"))
     assert response.content == b"img"
     assert [(f.url, f.timeout) for f in web.fetches] == [("http://x/l.png", 3)]
     saved = cache_module.get_cached_logo("src", "http://x/l.png")
@@ -523,7 +575,7 @@ def test_logo_fetches_and_caches(auth_client: TestClient, web: FakeWeb):
 def test_logo_fetch_errors(auth_client: TestClient, web: FakeWeb, route: Route | None, status: int):
     if route is not None:
         web.routes["https://x/l.png"] = route
-    assert auth_client.get("/api/logo?url=https://x/l.png").status_code == status
+    assert auth_client.get(_logo("https://x/l.png")).status_code == status
 
 
 def test_fetch_logo_returns_image(web: FakeWeb):
@@ -951,6 +1003,83 @@ def test_user_prefs_saves_each_field(auth_client: TestClient):
     assert response.json() == {"ok": True}
     saved: dict[str, object] = {**cache_module.load_user_settings("testuser")}
     assert {key: saved.get(key) for key in prefs} == prefs
+
+
+class _FavoriteEntry(TypedDict):
+    cover: str
+
+
+class _FavoritePrefs(TypedDict):
+    favorites: dict[str, dict[str, _FavoriteEntry]]
+
+
+def _favorite_covers(auth_client: TestClient) -> dict[str, dict[str, str]]:
+    """Each favorite's cover, as ``/api/user-prefs`` hands it to a page."""
+    favorites = main_test._body(auth_client.get("/api/user-prefs"), _FavoritePrefs)["favorites"]
+    return {
+        kind: {fid: entry["cover"] for fid, entry in entries.items()}
+        for kind, entries in favorites.items()
+    }
+
+
+def test_favorite_covers_are_saved_as_provider_urls(auth_client: TestClient):
+    raw = "https://img.example/film.jpg"
+    legacy = "/api/logo?" + parse.urlencode({"source": "img.example", "url": raw})
+    favorites = {
+        "movies": {"1": {"name": "Film", "cover": _logo(raw), "ext": "mkv"}},
+        "series": {"2": {"name": "Show", "cover": legacy}},
+    }
+    assert auth_client.post("/api/user-prefs", json={"favorites": favorites}).json() == {"ok": True}
+    saved = cache_module.load_user_settings("testuser")["favorites"]
+    assert saved == {
+        "movies": {"1": {"name": "Film", "cover": raw, "ext": "mkv"}},
+        "series": {"2": {"name": "Show", "cover": raw}},
+    }
+
+
+def test_favorite_saved_before_signing_still_loads_its_cover(auth_client: TestClient, web: FakeWeb):
+    raw = "https://img.example/film.jpg"
+    web.routes[raw] = FakeResponse(b"img", headers={"Content-Type": "image/png"})
+    # Saved before /api/logo needed a signature: an unsigned proxy link.
+    settings = cache_module.load_user_settings("testuser")
+    settings["favorites"] = {
+        "series": {},
+        "movies": {"7": {"name": "Film", "cover": "/api/logo?source=img.example&url=" + raw}},
+    }
+    cache_module.save_user_settings("testuser", settings)
+    cache_module.get_cache()["vod_streams"] = [{"stream_id": 7, "stream_icon": raw}]
+
+    cover = _favorite_covers(auth_client)["movies"]["7"]
+
+    assert cover == main._logo_url_filter(raw)
+    response = auth_client.get(cover)
+    assert response.status_code == 200
+    assert response.content == b"img"
+
+
+def test_favorite_covers_are_signed_only_from_the_catalog(auth_client: TestClient):
+    # Favorites are written by viewers, so their stored covers must not be signed.
+    internal = "http://169.254.169.254/latest/meta-data"
+    settings = cache_module.load_user_settings("testuser")
+    settings["favorites"] = {
+        "movies": {
+            "7": {"name": "Listed", "cover": internal},
+            "8": {"name": "Not listed", "cover": internal},
+        },
+        "series": {"3": {"name": "Show", "cover": internal}},
+    }
+    cache_module.save_user_settings("testuser", settings)
+    cache_module.get_cache()["vod_streams"] = [
+        {"stream_id": 7, "stream_icon": "https://img.example/7.jpg"},
+    ]
+    cache_module.get_cache()["series"] = [{"series_id": 3, "cover": ""}]
+
+    covers = _favorite_covers(auth_client)
+
+    assert covers == {
+        "movies": {"7": main._logo_url_filter("https://img.example/7.jpg"), "8": ""},
+        "series": {"3": ""},
+    }
 
 
 def test_user_prefs_rejects_mistyped_field(auth_client: TestClient):
