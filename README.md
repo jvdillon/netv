@@ -2,8 +2,8 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/pynetv.svg)](https://pypi.org/project/pynetv/)
 [![CI](https://github.com/jvdillon/netv/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jvdillon/netv/actions/workflows/ci.yml)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://github.com/jvdillon/netv/blob/main/pyproject.toml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/jvdillon/netv/blob/main/LICENSE)
 
 A fast, self-hosted IPTV experience for the web, Apple TV, iPhone, macOS,
 Chromecast, and Xtream-compatible players.
@@ -80,15 +80,15 @@ The native SwiftUI source for all three apps is in [`apple/`](apple/). See
 > and iPad -- with full-program seeking and no interruption while browsing.
 > [Explore catchup playback](#catchup-playback).
 
-![EPG Guide](assets/epg.png)
+![EPG Guide](https://raw.githubusercontent.com/jvdillon/netv/main/assets/epg.png)
 
-![Player](assets/player.png)
+![Player](https://raw.githubusercontent.com/jvdillon/netv/main/assets/player.png)
 
-![VOD](assets/vod.png)
+![VOD](https://raw.githubusercontent.com/jvdillon/netv/main/assets/vod.png)
 
-![Series](assets/series.png)
+![Series](https://raw.githubusercontent.com/jvdillon/netv/main/assets/series.png)
 
-![Settings](assets/settings.png)
+![Settings](https://raw.githubusercontent.com/jvdillon/netv/main/assets/settings.png)
 
 ## Why This Exists
 
@@ -298,9 +298,9 @@ server-controlled 4K experience.
 
 | Before (720p source) | After (4K AI Upscale) |
 |---|---|
-| ![Before](assets/ai-upscale_price-is-right_disabled.png) | ![After](assets/ai-upscale_price-is-right_enabled.png) |
-| ![Before](assets/ai-upscale_cleopatra_disabled.png) | ![After](assets/ai-upscale_cleopatra_enabled.png) |
-| ![Before](assets/ai-upscale_batman_disabled.png) | ![After](assets/ai-upscale_batman_enabled.png) |
+| ![Before](https://raw.githubusercontent.com/jvdillon/netv/main/assets/ai-upscale_price-is-right_disabled.png) | ![After](https://raw.githubusercontent.com/jvdillon/netv/main/assets/ai-upscale_price-is-right_enabled.png) |
+| ![Before](https://raw.githubusercontent.com/jvdillon/netv/main/assets/ai-upscale_cleopatra_disabled.png) | ![After](https://raw.githubusercontent.com/jvdillon/netv/main/assets/ai-upscale_cleopatra_enabled.png) |
+| ![Before](https://raw.githubusercontent.com/jvdillon/netv/main/assets/ai-upscale_batman_disabled.png) | ![After](https://raw.githubusercontent.com/jvdillon/netv/main/assets/ai-upscale_batman_enabled.png) |
 
 Requires an NVIDIA GPU and the [AI Upscale image](#ai-upscale-image-nvidia-gpu).
 The Settings page shows AI Upscale options when TensorRT engines are available.
@@ -903,7 +903,7 @@ uv run python -m netv.tools.zap2xml --zip 90210 --path .cache/tools
 uv run python -m netv.tools.alignm3u --input .cache/tools/lineup.m3u --xmltv .cache/tools/xmltv.xml --output .cache/tools/ota.m3u
 ```
 
-See the [example HDHomeRun playlist](assets/example.m3u) for guide IDs and
+See the [example HDHomeRun playlist](https://raw.githubusercontent.com/jvdillon/netv/main/assets/example.m3u) for guide IDs and
 channel groups. Replace its tuner and XMLTV addresses with your own.
 
 Then add `.cache/tools/ota.m3u` as an M3U source in neTV settings.

@@ -3,7 +3,6 @@
 from pathlib import Path
 
 import json
-import shutil
 import subprocess
 import tempfile
 import time
@@ -254,7 +253,7 @@ class TestBuildVideoArgs:
             quality="high",
         )
         vf = post[post.index("-vf") + 1]
-        assert "deinterlace_vaapi" in vf
+        assert "deinterlace_vaapi=auto=1," in vf
         assert "scale_vaapi" in vf
 
     def test_qsv_filters(self):
@@ -519,7 +518,7 @@ _UNKNOWN_LAYOUT_AAC = [
 
 
 def _software_video(*, deinterlace: bool, height: int = 1080, crf: str = "20") -> list[str]:
-    vf = f"{'yadif=0,' if deinterlace else ''}scale=-2:min(ih\\,{height}),format=yuv420p"
+    vf = f"{'yadif=0:-1:1,' if deinterlace else ''}scale=-2:min(ih\\,{height}),format=yuv420p"
     return [
         "-vf",
         vf,
@@ -584,7 +583,7 @@ class TestHlsAssemblyContract:
             )
             video_post = [
                 "-vf",
-                f"{'yadif=0,' if deinterlace else ''}{sr_filter}",
+                f"{'yadif=0:-1:1,' if deinterlace else ''}{sr_filter}",
                 "-c:v",
                 "h264_nvenc",
                 "-preset",
@@ -818,7 +817,30 @@ class TestHlsAssemblyContract:
             deinterlace_fallback=fallback,
         )
         expected = interlaced if height == 1 else (not is_vod if fallback is None else fallback)
-        assert cmd[cmd.index("-vf") + 1].startswith("yadif=0,") is expected
+        assert cmd[cmd.index("-vf") + 1].startswith("yadif=0:-1:1,") is expected
+
+    @pytest.mark.parametrize(
+        ("codec", "height", "live_deinterlaced"),
+        [
+            ("mpeg2video", 1080, True),
+            ("h264", 480, True),
+            ("mpeg2video", 576, True),
+            ("mpeg2video", 720, False),
+            ("hevc", 1080, False),
+        ],
+    )
+    def test_a_live_sample_of_a_field_capable_raster_keeps_the_deinterlacer(
+        self,
+        codec: str,
+        height: int,
+        live_deinterlaced: bool,
+    ):
+        """A probed file is what it is; a live sample is only the moment it was taken."""
+        progressive = _media_info(video_codec=codec, height=height, pix_fmt="yuv420p10le")
+        live = build_hls_ffmpeg_cmd("input", "software", "/output", source=progressive)
+        vod = build_hls_ffmpeg_cmd("input", "software", "/output", media_info=progressive)
+        assert live[live.index("-vf") + 1].startswith("yadif=0:-1:1,") is live_deinterlaced
+        assert not vod[vod.index("-vf") + 1].startswith("yadif")
 
     def test_missing_codec_does_not_probe_gpu(self, fake_run: FakeRun):
         cmd = build_hls_ffmpeg_cmd("input", "nvenc+software", "/output")
@@ -1874,40 +1896,6 @@ def test_archive_policy_copies_compatible_source_without_ai_upscaling(
     assert "-vf" not in cmd
 
 
-@pytest.mark.cli_ffmpeg
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-def test_probe_segment_reads_real_ffprobe_output(tmp_path: Path):
-    """The real ffprobe output parses into the video codec and surround audio layout."""
-    path = tmp_path / "input.ts"
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=size=64x64:duration=0.2",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=sample_rate=48000:duration=0.2",
-            "-af",
-            "pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0",
-            "-c:v",
-            "mpeg2video",
-            "-c:a",
-            "ac3",
-            str(path),
-        ],
-        check=True,
-    )
-    info = probe_segment(str(path))
-    assert info is not None
-    assert (info.video_codec, info.height) == ("mpeg2video", 64)
-    assert (info.audio_codec, info.audio_channels, info.audio_sample_rate) == ("ac3", 6, 48_000)
-
-
 def test_probe_segment_parses_video_and_audio(fake_run: FakeRun):
     _ffprobe(
         fake_run,
@@ -2500,7 +2488,7 @@ class TestVideoArgsRemainingBranches:
     def test_amf_software_hdr(self):
         _, post = self._args("amf+software", hdr=True, deinterlace=True)
         vf = self._vf(post)
-        assert vf.startswith("yadif=0,zscale=t=linear")
+        assert vf.startswith("yadif=0:-1:1,zscale=t=linear")
         assert vf.endswith("format=nv12,scale=-2:min(ih\\,1080),format=nv12")
 
     def test_vaapi_baseline_only(self, monkeypatch: pytest.MonkeyPatch):

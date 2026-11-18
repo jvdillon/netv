@@ -226,6 +226,19 @@ def test_probed_video_json_reports_a_video_frame_size_without_audio():
     assert (stream["codec_type"], stream["height"]) == ("video", 1080)
 
 
+def test_probe_capture_is_the_json_ffprobe_reported():
+    report = json.loads(testing.probe_capture("ota_1080i_mpeg2"))
+    video = next(s for s in report["streams"] if s["codec_type"] == "video")
+    assert (video["codec_name"], video["height"], video["field_order"]) == (
+        "mpeg2video",
+        1080,
+        "tt",
+    )
+    assert report["format"]["format_name"] == "mpegts"
+    with pytest.raises(KeyError):
+        testing.probe_capture("missing")
+
+
 def test_ts_source_opens_with_tables_and_a_replayable_keyframe():
     source = testing.ts_source(12, packets=3)
     assert len(source) == 188 * 6

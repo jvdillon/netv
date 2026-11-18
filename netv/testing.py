@@ -124,6 +124,30 @@ def probe_capture(name: str) -> str:
             ],
             "format": {"format_name": "mpegts", "duration": "1.005333", "bit_rate": "13233808"},
         },
+        # KPIX (5.1) while a progressive segment aired; it carries 60i video too.
+        "ota_1080_mpeg2_progressive_segment": {
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_name": "mpeg2video",
+                    "profile": "Main",
+                    "codec_type": "video",
+                    "height": 1080,
+                    "pix_fmt": "yuv420p",
+                    "field_order": "progressive",
+                },
+                {
+                    "index": 1,
+                    "codec_name": "ac3",
+                    "codec_type": "audio",
+                    "sample_rate": "48000",
+                    "channels": 6,
+                    "bit_rate": "384000",
+                    "tags": {"language": "eng"},
+                },
+            ],
+            "format": {"format_name": "mpegts", "duration": "1.637011", "bit_rate": "10332196"},
+        },
         "ota_1080i_mpeg2": {
             "streams": [
                 {

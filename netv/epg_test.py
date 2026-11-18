@@ -847,7 +847,7 @@ class TestFetchEpg:
 
 
 class TestStreaming:
-    def test_fetch_does_not_hold_the_feed_in_memory(
+    def test_fetch_memory_does_not_grow_with_the_feed(
         self,
         db: None,
         tmp_path: Path,
@@ -859,21 +859,22 @@ class TestStreaming:
             '<programme start="20241130120000 +0000" stop="20241130130000 +0000" channel="c">'
             f"<title>T</title>{credits}</programme>"
         )
-        n = 2000
-        feed = f"<tv>{prog * n}</tv>".encode()
-        url = "http://epg.example/guide.xml.gz"
-        _serve(monkeypatch, url, gzip.compress(feed))
+        peaks: list[int] = []
+        sizes: list[int] = []
+        for n in (20, 80):
+            feed = f"<tv>{prog * n}</tv>".encode()
+            url = f"http://epg.example/{n}.xml.gz"
+            _serve(monkeypatch, url, gzip.compress(feed, 1))
+            tracemalloc.start()
+            try:
+                assert epg.fetch_epg(url, tmp_path, chunk_size=4 << 10) == n
+                peaks.append(tracemalloc.get_traced_memory()[1])
+            finally:
+                tracemalloc.stop()
+            sizes.append(len(feed))
 
-        tracemalloc.start()
-        try:
-            # Small reads keep the fixed buffers small, so the peak shows what grows with the feed.
-            assert epg.fetch_epg(url, tmp_path, chunk_size=64 << 10) == n
-            _, peak = tracemalloc.get_traced_memory()
-        finally:
-            tracemalloc.stop()
-
-        # Holding the feed, its text or its tree would each cost about its size or more.
-        assert peak < len(feed) / 4
+        # Holding the feed, its text or its tree would grow the peak by the feed's growth.
+        assert peaks[1] - peaks[0] < (sizes[1] - sizes[0]) / 8
 
     def test_a_feed_that_breaks_late_writes_only_the_repaired_parse(
         self,
@@ -963,15 +964,15 @@ class TestReadEpgBody:
     """Size-bounded reading and gunzipping of EPG feeds."""
 
     def test_gzip_bomb_stops_at_the_limit_without_expanding(self):
-        bomb = gzip.compress(b" " * (64 << 20))  # 64 MiB of spaces, ~64 KiB compressed.
+        bomb = gzip.compress(b" " * (8 << 20), 1)  # 8 MiB of spaces, ~36 KiB compressed.
         tracemalloc.start()
         try:
             with pytest.raises(epg.EPGTooLargeError):
-                epg.read_epg_body(testing.FakeResponse(bomb), 1 << 20)
+                epg.read_epg_body(testing.FakeResponse(bomb), 64 << 10, chunk_size=16 << 10)
             peak = tracemalloc.get_traced_memory()[1]
         finally:
             tracemalloc.stop()
-        assert peak < 8 << 20
+        assert peak < 1 << 20
 
     def test_plain_body_over_the_limit(self):
         message = (

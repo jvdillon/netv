@@ -300,10 +300,13 @@ def _plan(
 # (capture, deinterlaced, tone-mapped, GPU-decoded on an h264-only NVDEC, 5.1 audio).
 _PROBED_SOURCES = [
     ("ota_1080i_mpeg2", True, False, False, True),
+    # The startup sample was progressive, but the channel switches to 60i content.
+    ("ota_1080_mpeg2_progressive_segment", True, False, False, True),
     ("ota_480i_mpeg2", True, False, False, False),
     ("ota_720p_mpeg2", False, False, False, True),
     ("ota_720p_h264", False, False, True, False),
-    ("iptv_1080p_h264_aac", False, False, True, False),
+    # 1080 H.264 may carry fields later; frames marked progressive pass untouched.
+    ("iptv_1080p_h264_aac", True, False, True, False),
     ("iptv_2160p_hevc_hdr", False, True, False, True),
 ]
 

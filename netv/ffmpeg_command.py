@@ -855,7 +855,14 @@ def build_hls_ffmpeg_cmd(
     # (fallback defaults to True for live, False for VOD when not explicitly set)
     fallback = deinterlace_fallback if deinterlace_fallback is not None else (not is_vod)
     # If probe failed (height=0), don't trust interlaced flag - use fallback.
-    deinterlace = probed.interlaced if probed and probed.height > 0 else fallback
+    # A live sample shows only the moment it was taken: a channel airing a progressive
+    # segment switches to 60i shows later, so a raster that can carry fields keeps the
+    # deinterlacer, which passes frames marked progressive through untouched.
+    deinterlace = (
+        (probed.interlaced or (probed is source and _can_carry_fields(probed)))
+        if probed and probed.height > 0
+        else fallback
+    )
 
     # Build component arg lists.
     video_pre, video_post = _build_video_args(
@@ -1345,7 +1352,9 @@ def _build_video_args(
                 "3",
             ]
             scale = f"scale_cuda=-2:{h}:format=nv12" if h else "scale_cuda=format=nv12"
-            deint = "yadif_cuda=0," if deinterlace else ""  # mode=0 keeps original framerate.
+            deint = (
+                "yadif_cuda=0:-1:1," if deinterlace else ""
+            )  # One frame per frame; frames marked progressive pass.
             # HDR tone mapping: prefer libplacebo (Vulkan GPU), fall back to CPU zscale+tonemap.
             if is_hdr:
                 if _has_libplacebo_filter():
@@ -1367,7 +1376,7 @@ def _build_video_args(
             ]
             scale = f"scale_vaapi=w=-2:h={h}:format=nv12" if h else "scale_vaapi=format=nv12"
             tonemap = "tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709," if is_hdr else ""
-            deint = "deinterlace_vaapi," if deinterlace else ""
+            deint = "deinterlace_vaapi=auto=1," if deinterlace else ""
             vf = f"{deint}{tonemap}{scale},hwdownload,format=nv12,hwupload_cuda"
         else:
             # Software decode, upload to GPU for scaling/encoding.
@@ -1387,17 +1396,17 @@ def _build_video_args(
                     "-filter_threads",
                     str(sr_filter_threads),
                 ]
-                deint = "yadif=0," if deinterlace else ""
+                deint = "yadif=0:-1:1," if deinterlace else ""
                 vf = f"{deint}{sr_filter}"
             elif is_hdr:
-                deint = "yadif=0," if deinterlace else ""  # CPU deinterlace before tonemap.
+                deint = "yadif=0:-1:1," if deinterlace else ""  # CPU deinterlace before tonemap.
                 if _has_libplacebo_filter():
                     tonemap = "libplacebo=tonemapping=hable:colorspace=bt709:color_primaries=bt709:color_trc=bt709,format=nv12,hwupload_cuda,"
                 else:
                     tonemap = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=nv12,hwupload_cuda,"
                 vf = f"{deint}{tonemap}{scale}"
             else:
-                deint = "yadif_cuda=0," if deinterlace else ""  # GPU deinterlace after upload.
+                deint = "yadif_cuda=0:-1:1," if deinterlace else ""  # GPU deinterlace after upload.
                 tonemap = "format=nv12,hwupload_cuda,"
                 vf = f"{tonemap}{deint}{scale}"
         preset = "p5" if sr_filter else ("p4" if deinterlace else "p2")
@@ -1433,7 +1442,7 @@ def _build_video_args(
             ]
             scale = f"scale_vaapi=w=-2:h={h}:format=nv12" if h else "scale_vaapi=format=nv12"
             tonemap = "tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709," if is_hdr else ""
-            deint = "deinterlace_vaapi," if deinterlace else ""
+            deint = "deinterlace_vaapi=auto=1," if deinterlace else ""
             vf = f"{deint}{tonemap}{scale},hwdownload,format=nv12"
         else:
             # Software decode + software filters.
@@ -1442,7 +1451,7 @@ def _build_video_args(
                 tonemap = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=nv12,"
             else:
                 tonemap = ""
-            deint = "yadif=0," if deinterlace else ""
+            deint = "yadif=0:-1:1," if deinterlace else ""
             scale = f"scale=-2:{h}" if h else ""
             vf = f"{deint}{tonemap}{scale},format=nv12".strip(",").replace(",,", ",")
         encoder = "h264_amf"
@@ -1472,13 +1481,15 @@ def _build_video_args(
             scale = f"scale_vaapi=w=-2:h={h}:format=nv12" if h else "scale_vaapi=format=nv12"
             # HDR tone mapping on VAAPI.
             tonemap = "tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709," if is_hdr else ""
-            vf = f"deinterlace_vaapi,{tonemap}{scale}" if deinterlace else f"{tonemap}{scale}"
+            vf = (
+                f"deinterlace_vaapi=auto=1,{tonemap}{scale}" if deinterlace else f"{tonemap}{scale}"
+            )
         else:
             # Software decode, upload to GPU for scaling/encoding.
             pre = ["-vaapi_device", vaapi_device]
             scale = f"scale_vaapi=w=-2:h={h}:format=nv12" if h else "scale_vaapi=format=nv12"
             tonemap = "tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709," if is_hdr else ""
-            deint = "deinterlace_vaapi," if deinterlace else ""
+            deint = "deinterlace_vaapi=auto=1," if deinterlace else ""
             vf = f"format=nv12,hwupload,{deint}{tonemap}{scale}"
         encoder = "h264_vaapi"
         # Use baseline profile for older GPUs (e.g., AMD GCN 1.0) that don't support High profile.
@@ -1535,7 +1546,9 @@ def _build_video_args(
             tonemap = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,"
         else:
             tonemap = ""
-        deint = "yadif=0," if deinterlace else ""  # mode=0 keeps original framerate.
+        deint = (
+            "yadif=0:-1:1," if deinterlace else ""
+        )  # One frame per frame; frames marked progressive pass.
         if h:
             vf = f"{deint}{tonemap}scale=-2:{h},format=yuv420p"
         else:
@@ -1587,6 +1600,15 @@ def _build_audio_args(*, copy_audio: bool, audio: MediaInfo | None) -> list[str]
             "aac_low",
         ]
     return ["-c:a", "aac", "-ac", "2", "-ar", rate, "-b:a", "192k", "-profile:a", "aac_low"]
+
+
+def _can_carry_fields(media_info: MediaInfo) -> bool:
+    """Whether a broadcast codec and raster can switch to interlaced pictures midstream."""
+    return media_info.video_codec in {"mpeg2video", "h264"} and media_info.height in {
+        480,
+        576,
+        1080,
+    }
 
 
 def _can_copy_video(
