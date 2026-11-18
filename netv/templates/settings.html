@@ -22,7 +22,7 @@
     <p class="text-sm text-gray-400 mb-3">Select and order which channel categories appear in the Live TV guide</p>
     <div class="grid grid-cols-2 gap-2 mb-2">
       <div class="relative">
-        <input type="text" id="cat-search" placeholder="Filter categories..."
+        <input type="text" id="cat-search" autocomplete="off" placeholder="Filter categories..."
                class="w-full px-3 py-1 pr-7 bg-gray-700 rounded text-xs focus:outline-none focus:ring-1 focus:ring-blue-500">
         <button type="button" id="cat-search-clear" class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white text-sm px-1 hidden">✕</button>
       </div>
@@ -58,7 +58,7 @@
     <p class="text-sm text-gray-400 mb-3">Select which movie categories appear on the Movies page</p>
     <div class="grid grid-cols-2 gap-2 mb-2">
       <div class="relative">
-        <input type="text" id="vod-cat-search" placeholder="Filter categories..."
+        <input type="text" id="vod-cat-search" autocomplete="off" placeholder="Filter categories..."
                class="w-full px-3 py-1 pr-7 bg-gray-700 rounded text-xs focus:outline-none focus:ring-1 focus:ring-blue-500">
         <button type="button" id="vod-cat-search-clear" class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white text-sm px-1 hidden">✕</button>
       </div>
@@ -94,7 +94,7 @@
     <p class="text-sm text-gray-400 mb-3">Select which series categories appear on the Series page</p>
     <div class="grid grid-cols-2 gap-2 mb-2">
       <div class="relative">
-        <input type="text" id="series-cat-search" placeholder="Filter categories..."
+        <input type="text" id="series-cat-search" autocomplete="off" placeholder="Filter categories..."
                class="w-full px-3 py-1 pr-7 bg-gray-700 rounded text-xs focus:outline-none focus:ring-1 focus:ring-blue-500">
         <button type="button" id="series-cat-search-clear" class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white text-sm px-1 hidden">✕</button>
       </div>
@@ -143,6 +143,24 @@
       </label>
       <p class="text-xs text-gray-400 mt-1 ml-8">Ordering is personalized from your playback history while category order stays unchanged.</p>
     </div>
+  </div>
+
+  <div id="audio" class="mb-8 p-4 bg-gray-800 rounded">
+    <h3 class="text-xl font-semibold mb-4">Audio</h3>
+    <label class="block text-sm mb-2" for="audio-lang-pref">Preferred Audio Language</label>
+    <select id="audio-lang-pref" class="px-3 py-1.5 bg-gray-700 rounded text-sm">
+      <option value="">Original (file default)</option>
+      <option value="en">English</option>
+      <option value="es">Spanish</option>
+      <option value="fr">French</option>
+      <option value="de">German</option>
+      <option value="it">Italian</option>
+      <option value="pt">Portuguese</option>
+      <option value="ja">Japanese</option>
+      <option value="ko">Korean</option>
+      <option value="zh">Chinese</option>
+    </select>
+    <p class="text-xs text-gray-500 mt-2">Movies and episodes with several audio tracks play this one when present.</p>
   </div>
 
   <!-- Closed Captions settings -->
@@ -276,7 +294,7 @@
           <div>
             <label class="block text-xs text-gray-400 mb-1">New Password</label>
             <div class="relative inline-block">
-              <input type="password" class="password-input w-36 px-2 py-1 pr-8 text-sm bg-gray-600 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none">
+              <input type="password" autocomplete="new-password" class="password-input w-36 px-2 py-1 pr-8 text-sm bg-gray-600 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none">
               <button type="button" onclick="togglePwdVis(this)" class="absolute right-1.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white">
                 <svg class="w-4 h-4 eye-off" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>
                 <svg class="w-4 h-4 eye-on hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
@@ -366,12 +384,12 @@
           <div class="flex gap-4 items-end flex-wrap">
             <div>
               <label class="block text-xs text-gray-400 mb-1">Username <span class="text-red-400">*</span></label>
-              <input type="text" name="username" required class="w-36 px-2 py-1 text-sm bg-gray-600 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none">
+              <input type="text" name="username" autocomplete="off" required class="w-36 px-2 py-1 text-sm bg-gray-600 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none">
             </div>
             <div>
               <label class="block text-xs text-gray-400 mb-1">Password <span class="text-red-400">*</span></label>
               <div class="relative">
-                <input type="password" name="password" required class="w-36 px-2 py-1 pr-8 text-sm bg-gray-600 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none">
+                <input type="password" name="password" autocomplete="new-password" required class="w-36 px-2 py-1 pr-8 text-sm bg-gray-600 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none">
                 <button type="button" onclick="togglePwdVis(this)" class="absolute right-1.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white">
                   <svg class="w-4 h-4 eye-off" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>
                   <svg class="w-4 h-4 eye-on hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
@@ -695,7 +713,7 @@
       </div>
       <p class="text-xs text-gray-400 mt-1">Probing adds a few seconds delay on first play but enables hardware decode pipeline. Results are cached.</p>
     </div>
-    <p class="text-sm text-gray-400 mb-4">Cached probe results avoid re-probing episodes in the same series.</p>
+    <p class="text-sm text-gray-400 mb-4">Cached probe results make movies, episodes, and channels start without re-probing; a stale result is replaced automatically.</p>
     <div id="probe-cache-list" class="space-y-2 max-h-96 overflow-y-auto">
       <div class="text-gray-500 text-sm">Loading...</div>
     </div>
@@ -750,13 +768,13 @@
           <div class="grid grid-cols-2 gap-3 xtream-fields" style="{% if source.type != 'xtream' %}display:none{% endif %}">
             <div>
               <label class="block text-sm font-medium mb-1">Username</label>
-              <input type="text" name="username" value="{{ source.username }}"
+              <input type="text" name="username" autocomplete="off" value="{{ source.username }}"
                      class="w-full px-3 py-1.5 bg-gray-600 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none">
             </div>
             <div>
               <label class="block text-sm font-medium mb-1">Password</label>
               <div class="relative">
-                <input type="password" name="password" value="{{ source.password }}"
+                <input type="password" name="password" autocomplete="new-password" value="{{ source.password }}"
                        class="w-full px-3 py-1.5 pr-9 bg-gray-600 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none">
                 <button type="button" onclick="togglePwdVis(this)" class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white">
                   <svg class="w-5 h-5 eye-off" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>
@@ -915,13 +933,13 @@
       <div id="xtream-fields" class="grid grid-cols-2 gap-3">
         <div>
           <label class="block text-sm font-medium mb-1">Username</label>
-          <input type="text" name="username" placeholder="username"
+          <input type="text" name="username" autocomplete="off" placeholder="username"
                  class="w-full px-3 py-1.5 bg-gray-600 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none">
         </div>
         <div>
           <label class="block text-sm font-medium mb-1">Password</label>
           <div class="relative">
-            <input type="password" name="password" placeholder="password"
+            <input type="password" name="password" autocomplete="new-password" placeholder="password"
                    class="w-full px-3 py-1.5 pr-9 bg-gray-600 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none">
             <button type="button" onclick="togglePwdVis(this)" class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white">
               <svg class="w-5 h-5 eye-off" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>
@@ -961,7 +979,7 @@
     <h3 class="text-lg font-semibold mb-4">Delete Your Account</h3>
     <p class="text-sm text-gray-400 mb-4">Enter your password to confirm account deletion. This cannot be undone.</p>
     <form id="delete-self-form" onsubmit="submitDeleteSelf(event); return false;">
-      <input type="password" id="delete-self-password" placeholder="Password" required
+      <input type="password" id="delete-self-password" autocomplete="current-password" placeholder="Password" required
              class="w-full px-3 py-2 bg-gray-700 rounded mb-2 focus:outline-none focus:ring-1 focus:ring-red-500">
       <div id="delete-self-msg" class="text-red-400 text-sm mb-2"></div>
       <div class="flex gap-3 justify-end">
@@ -993,7 +1011,8 @@ window.SETTINGS_CONFIG = {
     {% endfor %}
   },
   ccStyle: {{ cc_style | tojson | safe }},
-  ccLang: {{ cc_lang | tojson | safe }}
+  ccLang: {{ cc_lang | tojson | safe }},
+  audioLang: {{ audio_lang | tojson | safe }}
 };
 </script>
 <script src="/static/js/settings.js"></script>

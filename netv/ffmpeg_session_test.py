@@ -1415,7 +1415,22 @@ def test_recovery_restores_probe_cache(env: _Env):
         "series_id": 7,
         "episode_id": 8,
         "subtitles": [{"index": 2, "lang": "eng"}, 3],
-        "probe": {"video_codec": "hevc", "height": 2160, "interlaced": True},
+        "probe": {
+            "video_codec": "hevc",
+            "height": 2160,
+            "interlaced": True,
+            "audio_tracks": [
+                {
+                    "index": 1,
+                    "lang": "eng",
+                    "codec": "ac3",
+                    "channels": 6,
+                    "sample_rate": 48_000,
+                    "profile": "",
+                    "default": True,
+                },
+            ],
+        },
     }
     _vod_dir(env.root, "p", info)
     ffmpeg_session.cleanup_and_recover_sessions()
@@ -1428,6 +1443,7 @@ def test_recovery_restores_probe_cache(env: _Env):
         True,
     )
     assert subs == [SubtitleStream(index=2, lang="eng", name="")]
+    assert [t.lang for t in media.audio_tracks] == ["eng"]
     assert ffmpeg_command.probe_media("http://m") == (media, subs)
     assert env.run.calls == []
 
@@ -1741,6 +1757,24 @@ async def test_start_replaces_own_dolby_movie_for_an_aac_client_at_its_position(
 
 
 @pytest.mark.asyncio
+async def test_start_replaces_own_movie_in_another_audio_language_at_its_position(
+    env: _Env,
+    tasks: BackgroundTasks,
+    tmp_path: pathlib.Path,
+):
+    del tasks
+    cache.save_server_settings({**cache.load_server_settings(), "probe_movies": False})
+    _existing(env, tmp_path, "http://movie", username="alice")
+    env.sessions["old"].update(seek_offset=30, audio_lang="fr", is_vod=True)
+    result = await ffmpeg_session.start_transcode("http://movie", "movie", username="alice")
+    sid = result["session_id"]
+    assert set(env.sessions) == {sid}
+    assert env.sessions[sid].get("audio_lang") == "en"
+    (command,) = env.launcher.commands
+    assert _option(command, "-ss") == "30"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "bandwidth_saver,audio_passthrough,fast_start,status,detail",
     [
@@ -1862,6 +1896,7 @@ async def test_start_resumes_a_cached_vod_session(
     probes: int,
 ):
     del tasks
+    cache.save_server_settings({**cache.load_server_settings(), "probe_series": False})
     _existing(env, tmp_path, "http://movie")
     env.sessions["old"].update(process=FakeProcess(exited=True), is_vod=True, seek_offset=0)
     (tmp_path / "old" / "seg000.ts").write_bytes(b"x" * 2000)
@@ -1926,6 +1961,40 @@ async def test_start_fast_live_without_dvr(
 
 
 @pytest.mark.asyncio
+async def test_start_retries_movie_with_a_stale_cached_probe(
+    env: _Env,
+    tasks: BackgroundTasks,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    del tasks
+    env.run.program("ffprobe", Program(stdout=_DOLBY_PROBE))
+    stale = MediaInfo(video_codec="h264", audio_codec="aac", pix_fmt="yuv420p", height=720)
+    ffmpeg_command.remember_probe("http://movie", stale)
+    launcher = _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
+    result = await ffmpeg_session.start_transcode(
+        "http://movie",
+        "movie",
+        username="alice",
+        audio_passthrough=True,
+    )
+    assert env.sessions[result["session_id"]].get("audio_passthrough") is True
+    assert len(launcher.commands) == 2
+    assert ffmpeg_command.probe_media("http://movie")[0] != stale
+
+
+@pytest.mark.asyncio
+async def test_start_does_not_retry_a_freshly_probed_movie(
+    env: _Env,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    env.run.program("ffprobe", Program(stdout=_DOLBY_PROBE))
+    launcher = _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
+    with pytest.raises(HTTPException):
+        await ffmpeg_session.start_transcode("http://movie", "movie", username="alice")
+    assert len(launcher.commands) == 1
+
+
+@pytest.mark.asyncio
 async def test_start_retries_series_after_clearing_probe_cache(
     env: _Env,
     tasks: BackgroundTasks,
@@ -1978,6 +2047,13 @@ async def test_retry_keeps_the_requested_deinterlacing(
 ):
     del tasks
     cache.save_server_settings({**cache.load_server_settings(), "transcode_hw": "software"})
+    ffmpeg_command.restore_probe_cache_entry(
+        "http://other",
+        MediaInfo(video_codec="h264", audio_codec="aac", pix_fmt="yuv420p"),
+        [],
+        3,
+        1,
+    )
     launcher = _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
     result = await ffmpeg_session.start_transcode(
         "http://ep",
@@ -2003,6 +2079,13 @@ async def test_retry_still_honours_a_disconnected_archive_client(
     async def disconnected() -> bool:
         return next(answers)
 
+    ffmpeg_command.restore_probe_cache_entry(
+        "http://other",
+        MediaInfo(video_codec="h264", audio_codec="aac", pix_fmt="yuv420p"),
+        [],
+        3,
+        1,
+    )
     launcher = _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
     with pytest.raises(HTTPException) as error:
         await ffmpeg_session.start_transcode(
@@ -2288,6 +2371,7 @@ async def test_do_start_records_the_probed_session(
         "username": "alice",
         "source_id": "src",
         "audio_passthrough": True,
+        "audio_lang": "en",
         "caption_timestamp_origin": 10.0,
     }
     assert result == {
@@ -2827,7 +2911,9 @@ async def test_try_reuse_vod_defaults_without_quality_settings(
     tmp_path: pathlib.Path,
 ):
     del tasks
-    cache.save_server_settings({**cache.load_server_settings(), "transcode_hw": "software"})
+    cache.save_server_settings(
+        {**cache.load_server_settings(), "transcode_hw": "software", "probe_series": False},
+    )
     (tmp_path / "seg000.ts").write_bytes(b"x" * 2000)
     env.sessions["s"] = ffmpeg_session.TranscodeSession(
         dir=str(tmp_path),
@@ -2923,6 +3009,7 @@ async def test_seek_timeout_without_probe_tolerates_bad_session_json(
     env: _Env,
     seek_dir: pathlib.Path,
 ):
+    cache.save_server_settings({**cache.load_server_settings(), "probe_series": False})
     env.sessions["v"].update(series_id=5, subtitles=[])
     (seek_dir / "session.json").write_text("{bad")
     env.launcher.on_launch = None
@@ -4227,6 +4314,7 @@ async def test_do_start_vod_with_seek_offset_persists_probe(env: _Env):
         "username": "alice",
         "source_id": "src",
         "audio_passthrough": False,
+        "audio_lang": "en",
         "probe": {
             "video_codec": "h264",
             "audio_codec": "aac",
@@ -4237,6 +4325,17 @@ async def test_do_start_vod_with_seek_offset_persists_probe(env: _Env):
             "height": 1080,
             "video_bitrate": 8_000_000,
             "interlaced": True,
+            "audio_tracks": [
+                {
+                    "index": 1,
+                    "lang": "und",
+                    "codec": "aac",
+                    "channels": 2,
+                    "sample_rate": 48_000,
+                    "profile": "",
+                    "default": False,
+                },
+            ],
         },
     }
     assert result.get("caption_playlist", "").endswith("/captions.m3u8")

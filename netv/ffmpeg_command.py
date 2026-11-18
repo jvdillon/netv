@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Final, NotRequired, TypedDict
 from urllib import request
 from urllib.parse import urljoin
@@ -21,6 +21,7 @@ from treekle import json_loads
 
 from netv import cache
 from netv.cache import HwAccel, ServerSettings, get_user_agent
+from netv.util import atomic_write_json
 
 
 log = logging.getLogger(__name__)
@@ -52,6 +53,17 @@ class SubtitleStream:
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
+class AudioTrack:
+    index: int | None  # Input stream index; None when ffprobe omits it.
+    lang: str  # Lowercase ISO 639-2 tag as muxed; "und" when untagged.
+    codec: str
+    channels: int = 0
+    sample_rate: int = 0
+    profile: str = ""
+    default: bool = False
+
+
+@dataclass(kw_only=True, slots=True, frozen=True)
 class MediaInfo:
     video_codec: str
     audio_codec: str
@@ -59,6 +71,8 @@ class MediaInfo:
     audio_channels: int = 0
     audio_sample_rate: int = 0
     audio_profile: str = ""  # e.g. "LC", "HE-AAC", "HE-AACv2"
+    audio_index: int | None = None  # Input stream index of a non-first chosen audio track.
+    audio_tracks: tuple[AudioTrack, ...] = ()
     subtitle_codecs: list[str] | None = None
     duration: float = 0.0
     height: int = 0
@@ -70,6 +84,16 @@ class MediaInfo:
 
 
 _ProbeEntry = tuple[float, MediaInfo | None, list[SubtitleStream]]
+
+
+class CachedAudioTrack(TypedDict):
+    index: int | None
+    lang: str
+    codec: str
+    channels: int
+    sample_rate: int
+    profile: str
+    default: bool
 
 
 class _CachedSubtitle(TypedDict):
@@ -85,6 +109,8 @@ class _CachedEpisode(TypedDict, total=False):
     pix_fmt: str
     audio_channels: int
     audio_sample_rate: int
+    audio_index: int | None
+    audio_tracks: list[CachedAudioTrack]
     subtitle_codecs: list[str] | None
     duration: float
     height: int
@@ -100,6 +126,10 @@ class _ProbeTags(TypedDict, total=False):
     language: str
     name: str
     title: str
+
+
+class _ProbeDisposition(TypedDict, total=False):
+    default: int
 
 
 # Numeric fields accept every shape ffprobe versions emit, which the conversions tolerate.
@@ -119,6 +149,7 @@ class _ProbeStream(TypedDict, total=False):
     sample_rate: _ProbeNumber
     profile: str
     tags: _ProbeTags
+    disposition: _ProbeDisposition
 
 
 class _ProbeFormat(TypedDict, total=False):
@@ -131,6 +162,17 @@ class EpisodeProbeStats(TypedDict):
     episode_id: int
     duration: float
     subtitle_count: int
+
+
+class UrlProbeStats(TypedDict):
+    url: str  # Carries provider credentials: never send it to a client.
+    probed_at: float
+    video_codec: str
+    audio_codec: str
+    audio_langs: list[str]
+    subtitle_count: int
+    duration: float
+    height: int
 
 
 class SeriesProbeStats(TypedDict):
@@ -159,6 +201,7 @@ def init(
     _load_settings = load_settings
     _sr_engine_dir = sr_engine_dir or None
     _load_series_probe_cache()
+    _load_url_probe_cache()
     if _sr_engine_dir is not None:
         log.info("AI Upscale enabled: engine_dir=%s", _sr_engine_dir)
 
@@ -209,6 +252,45 @@ def get_transcode_dir() -> pathlib.Path:
 # ===========================================================================
 # Probe Cache Management
 # ===========================================================================
+
+
+def get_url_probe_cache_stats() -> list[UrlProbeStats]:
+    """Probes cached by URL (movies and live channels), most recent first.
+
+    Returns:
+        stats: One summary per cached URL with probe results.
+    """
+    with _probe_lock:
+        entries = sorted(_probe_cache.items(), key=lambda item: item[1][0], reverse=True)
+    return [
+        {
+            "url": url,
+            "probed_at": probed_at,
+            "video_codec": media_info.video_codec,
+            "audio_codec": media_info.audio_codec,
+            "audio_langs": [t.lang for t in media_info.audio_tracks],
+            "subtitle_count": len(subs),
+            "duration": media_info.duration,
+            "height": media_info.height,
+        }
+        for url, (probed_at, media_info, subs) in entries
+        if media_info is not None
+    ]
+
+
+def invalidate_url_probe_cache(urls: list[str]) -> int:
+    """Forget the cached probes of ``urls``.
+
+    Args:
+        urls: Probed URLs.
+
+    Returns:
+        removed: Number of cached URLs dropped.
+    """
+    with _probe_lock:
+        removed = sum(_probe_cache.pop(url, None) is not None for url in urls)
+    _save_url_probe_cache()
+    return removed
 
 
 def get_series_probe_cache_stats() -> list[SeriesProbeStats]:
@@ -271,6 +353,7 @@ def clear_all_probe_cache() -> int:
         _probe_cache.clear()
         _series_probe_cache.clear()
     _save_series_probe_cache()
+    _save_url_probe_cache()
     log.info("Cleared probe cache: %d URL entries, %d series entries", url_count, series_count)
     return url_count + series_count
 
@@ -314,6 +397,51 @@ def clear_series_mru(series_id: int) -> None:
             del _series_probe_cache[series_id]["mru"]
             log.info("Cleared MRU for series=%d", series_id)
     _save_series_probe_cache()
+
+
+def has_cached_probe(url: str, series_id: int | None = None) -> bool:
+    """Whether ``probe_media`` would answer from cache rather than open ``url``.
+
+    Args:
+        url: Media URL.
+        series_id: Series whose episodes share probes.
+
+    Returns:
+        cached: True when a URL or series probe is stored.
+    """
+    with _probe_lock:
+        return url in _probe_cache or bool(
+            series_id is not None and _series_probe_cache.get(series_id, {}).get("episodes"),
+        )
+
+
+def invalidate_probe(url: str, series_id: int | None = None, episode_id: int | None = None) -> None:
+    """Forget ``url``'s cached probe, and its episode's, so the next play re-probes.
+
+    Args:
+        url: Media URL.
+        series_id: Series of the episode, if any.
+        episode_id: Episode whose probe to drop with the series MRU.
+    """
+    with _probe_lock:
+        _probe_cache.pop(url, None)
+    if series_id is not None:
+        invalidate_series_probe_cache(series_id, episode_id)
+    _save_url_probe_cache()
+
+
+def remember_probe(url: str, media_info: MediaInfo | None) -> None:
+    """Record ``media_info`` as ``url``'s latest probe, replacing any older one.
+
+    Args:
+        url: Probed stream URL, such as a live channel's.
+        media_info: Probe result; None records nothing.
+    """
+    if media_info is None:
+        return
+    with _probe_lock:
+        _probe_cache[url] = (time.time(), media_info, [])
+    _save_url_probe_cache()
 
 
 def restore_probe_cache_entry(
@@ -424,19 +552,17 @@ def probe_media(
     episode_id: int | None = None,
     series_name: str = "",
     *,
-    probe_cache_ttl_sec: float = 3_600,
-    series_probe_cache_ttl_sec: float = 7 * 24 * 3_600,
     probe_timeout_sec: float = 30,
 ) -> tuple[MediaInfo | None, list[SubtitleStream]]:
     """Probe media facts and text subtitle streams, using cached results.
+
+    Cached probes never expire: a start that fails on one re-probes and replaces it.
 
     Args:
         url: Media URL to probe.
         series_id: Series cache key, when the media is an episode.
         episode_id: Episode cache key.
         series_name: Display name stored with new series entries.
-        probe_cache_ttl_sec: Lifetime of URL cache entries.
-        series_probe_cache_ttl_sec: Lifetime of series episode cache entries.
         probe_timeout_sec: Deadline for each ffprobe attempt.
 
     Returns:
@@ -454,28 +580,26 @@ def probe_media(
                 mru_eid = series_data.get("mru")
                 # Try exact episode first.
                 if episode_id is not None and episode_id in episodes:
-                    cache_time, media_info, subtitles = episodes[episode_id]
-                    if time.time() - cache_time < series_probe_cache_ttl_sec:
-                        # Update MRU to this episode.
-                        if series_data.get("mru") != episode_id:
-                            series_data["mru"] = episode_id
-                            save_mru = True
-                        log.info(
-                            "Probe cache hit for series=%d episode=%d",
-                            series_id,
-                            episode_id,
-                        )
-                        cache_hit_result = (media_info, subtitles)
+                    _, media_info, subtitles = episodes[episode_id]
+                    # Update MRU to this episode.
+                    if series_data.get("mru") != episode_id:
+                        series_data["mru"] = episode_id
+                        save_mru = True
+                    log.info(
+                        "Probe cache hit for series=%d episode=%d",
+                        series_id,
+                        episode_id,
+                    )
+                    cache_hit_result = (media_info, subtitles)
                 # Fall back to MRU if set.
                 elif mru_eid is not None and mru_eid in episodes:
-                    cache_time, media_info, subtitles = episodes[mru_eid]
-                    if time.time() - cache_time < series_probe_cache_ttl_sec:
-                        log.info(
-                            "Probe cache hit for series=%d (fallback from mru=%d)",
-                            series_id,
-                            mru_eid,
-                        )
-                        cache_hit_result = (media_info, subtitles)
+                    _, media_info, subtitles = episodes[mru_eid]
+                    log.info(
+                        "Probe cache hit for series=%d (fallback from mru=%d)",
+                        series_id,
+                        mru_eid,
+                    )
+                    cache_hit_result = (media_info, subtitles)
         # Save MRU update outside the lock to avoid deadlock.
         if save_mru:
             _save_series_probe_cache()
@@ -486,10 +610,9 @@ def probe_media(
     with _probe_lock:
         cached = _probe_cache.get(url)
         if cached:
-            cache_time, media_info, subtitles = cached
-            if time.time() - cache_time < probe_cache_ttl_sec:
-                log.info("Probe cache hit for %s", url[:50])
-                return media_info, subtitles
+            _, media_info, subtitles = cached
+            log.info("Probe cache hit for %s", url[:50])
+            return media_info, subtitles
     log.info(
         "Probe cache miss for %s (series=%s, episode=%s)",
         url[:50],
@@ -583,6 +706,7 @@ def probe_media(
             )
     if series_id is not None:
         _save_series_probe_cache()
+    _save_url_probe_cache()
     return media_info, subtitles
 
 
@@ -950,7 +1074,8 @@ def build_hls_ffmpeg_cmd(
         cmd.append(f"{output_dir}/sub{i}_%06d.vtt")
 
     # Stream mapping + video + audio.
-    cmd.extend(["-map", "0:v:0", "-map", "0:a:0"])
+    audio_index = media_info.audio_index if media_info else None
+    cmd.extend(["-map", "0:v:0", "-map", "0:a:0" if audio_index is None else f"0:{audio_index}"])
     cmd.extend(video_post)
     cmd.extend(audio_args)
 
@@ -989,6 +1114,136 @@ def build_hls_ffmpeg_cmd(
     if sr_applied and not is_vod:
         limit_live_video_bitrate(cmd, max_resolution)
     return cmd
+
+
+class _ProbeOutput(TypedDict, total=False):
+    """The subset of ffprobe's JSON this module reads; other keys are dropped."""
+
+    streams: list[_ProbeStream]
+    format: _ProbeFormat
+
+
+# ISO 639-1 codes (what settings and browsers use) to the 639-2 B/T tags containers carry.
+_ISO639_2: Final = {
+    "ar": ("ara",),
+    "cs": ("cze", "ces"),
+    "da": ("dan",),
+    "de": ("ger", "deu"),
+    "el": ("gre", "ell"),
+    "en": ("eng",),
+    "es": ("spa",),
+    "fi": ("fin",),
+    "fr": ("fre", "fra"),
+    "he": ("heb",),
+    "hi": ("hin",),
+    "hu": ("hun",),
+    "it": ("ita",),
+    "ja": ("jpn",),
+    "ko": ("kor",),
+    "nl": ("dut", "nld"),
+    "no": ("nor", "nob", "nno"),
+    "pl": ("pol",),
+    "pt": ("por",),
+    "ro": ("rum", "ron"),
+    "ru": ("rus",),
+    "sk": ("slo", "slk"),
+    "sv": ("swe",),
+    "tr": ("tur",),
+    "uk": ("ukr",),
+    "zh": ("chi", "zho"),
+}
+
+
+def with_audio_language(media_info: MediaInfo | None, lang: str) -> MediaInfo | None:
+    """``media_info`` set to play its first audio track in ``lang``, when it has one.
+
+    Args:
+        media_info: Probed source, or None when probing is off.
+        lang: ISO 639-1 or 639-2 code, optionally with a region (``en-US``); empty
+            keeps the probed choice (the track the file marks default).
+
+    Returns:
+        media_info: The input with its audio fields describing the chosen track.
+    """
+    code = lang.split("-")[0].strip().lower()
+    if media_info is None or not code:
+        return media_info
+    tags = _ISO639_2.get(code, (code,))
+    track = next(
+        (t for t in media_info.audio_tracks if t.lang in tags and t.index is not None),
+        None,
+    )
+    return media_info if track is None else with_audio_track(media_info, track)
+
+
+def with_audio_track(media_info: MediaInfo, track: AudioTrack | None) -> MediaInfo:
+    """Point ``media_info``'s audio fields, and its ``-map``, at ``track``.
+
+    Args:
+        media_info: Probed source listing its audio tracks.
+        track: One of its tracks; None keeps ``media_info`` as is.
+
+    Returns:
+        media_info: The input describing ``track``.
+    """
+    if track is None:
+        return media_info
+    first = media_info.audio_tracks[0] if media_info.audio_tracks else None
+    return replace(
+        media_info,
+        audio_codec=track.codec,
+        audio_channels=track.channels,
+        audio_sample_rate=track.sample_rate,
+        audio_profile=track.profile,
+        # The first track keeps the 0:a:0 map, which also holds across HLS variants.
+        audio_index=None if track == first else track.index,
+    )
+
+
+def audio_tracks_to_cache(tracks: tuple[AudioTrack, ...]) -> list[CachedAudioTrack]:
+    """Audio tracks as stored in probe caches and session files.
+
+    Args:
+        tracks: Probed audio tracks.
+
+    Returns:
+        cached: One JSON-ready record per track.
+    """
+    return [
+        {
+            "index": t.index,
+            "lang": t.lang,
+            "codec": t.codec,
+            "channels": t.channels,
+            "sample_rate": t.sample_rate,
+            "profile": t.profile,
+            "default": t.default,
+        }
+        for t in tracks
+    ]
+
+
+def audio_tracks_from_cache(tracks: list[CachedAudioTrack]) -> tuple[AudioTrack, ...]:
+    """Audio tracks read back from ``audio_tracks_to_cache``.
+
+    Args:
+        tracks: Cached records.
+
+    Returns:
+        tracks: The probed tracks.
+    """
+    return tuple(
+        AudioTrack(
+            index=t["index"],
+            lang=t["lang"],
+            codec=t["codec"],
+            channels=t["channels"],
+            sample_rate=t["sample_rate"],
+            profile=t["profile"],
+            default=t["default"],
+        )
+        for t in tracks
+    )
 
 
 def _parse_hw(hw: str) -> tuple[str, str]:
@@ -1168,6 +1423,98 @@ def _has_libplacebo_filter() -> bool:
     return _has_libplacebo
 
 
+def _probe_to_cache(
+    cache_time: float,
+    media_info: MediaInfo,
+    subs: list[SubtitleStream],
+) -> _CachedEpisode:
+    """One probe as stored on disk."""
+    return {
+        "time": cache_time,
+        "video_codec": media_info.video_codec,
+        "audio_codec": media_info.audio_codec,
+        "pix_fmt": media_info.pix_fmt,
+        "audio_channels": media_info.audio_channels,
+        "audio_sample_rate": media_info.audio_sample_rate,
+        "audio_index": media_info.audio_index,
+        "audio_tracks": audio_tracks_to_cache(media_info.audio_tracks),
+        "subtitle_codecs": media_info.subtitle_codecs,
+        "duration": media_info.duration,
+        "height": media_info.height,
+        "video_bitrate": media_info.video_bitrate,
+        "interlaced": media_info.interlaced,
+        "is_10bit": media_info.is_10bit,
+        "is_hdr": media_info.is_hdr,
+        "is_hls": media_info.is_hls,
+        "subtitles": [{"index": s.index, "lang": s.lang, "name": s.name} for s in subs],
+    }
+
+
+def _probe_from_cache(entry: _CachedEpisode) -> _ProbeEntry | None:
+    """One probe read back from disk; None for an entry without video facts."""
+    # Use .get() for all fields to handle corrupt/incomplete cache.
+    video_codec = entry.get("video_codec", "")
+    if not video_codec:
+        return None
+    media_info = MediaInfo(
+        video_codec=video_codec,
+        audio_codec=entry.get("audio_codec", ""),
+        pix_fmt=entry.get("pix_fmt", ""),
+        audio_channels=entry.get("audio_channels", 0),
+        audio_sample_rate=entry.get("audio_sample_rate", 0),
+        audio_index=entry.get("audio_index"),
+        audio_tracks=audio_tracks_from_cache(entry.get("audio_tracks", [])),
+        subtitle_codecs=entry.get("subtitle_codecs"),
+        duration=entry.get("duration", 0),
+        height=entry.get("height", 0),
+        video_bitrate=entry.get("video_bitrate", 0),
+        interlaced=entry.get("interlaced", False),
+        is_10bit=entry.get("is_10bit", False),
+        is_hdr=entry.get("is_hdr", False),
+        is_hls=entry.get("is_hls", False),
+    )
+    subs = [
+        SubtitleStream(
+            index=subtitle["index"],
+            lang=subtitle.get("lang", "und"),
+            name=subtitle.get("name", ""),
+        )
+        for subtitle in entry.get("subtitles", [])
+    ]
+    return entry.get("time", 0), media_info, subs
+
+
+def _load_url_probe_cache() -> None:
+    """Load probes of movies and live channels, cached by URL, from disk."""
+    path = cache.CACHE_DIR / "probe_cache.json"
+    if not path.exists():
+        return
+    try:
+        data = json_loads(path.read_text(), dict[str, _CachedEpisode])
+    except Exception as e:
+        log.warning("Failed to load probe cache: %s", e)
+        return
+    with _probe_lock:
+        for url, entry in data.items():
+            if url not in _probe_cache and (probe := _probe_from_cache(entry)) is not None:
+                _probe_cache[url] = probe
+    log.info("Loaded %d URL probe cache entries", len(data))
+
+
+def _save_url_probe_cache() -> None:
+    """Save probes cached by URL; the file holds provider credentials like the settings."""
+    with _probe_lock:
+        data = {
+            url: _probe_to_cache(cache_time, media_info, subs)
+            for url, (cache_time, media_info, subs) in _probe_cache.items()
+            if media_info is not None
+        }
+    try:
+        atomic_write_json(cache.CACHE_DIR / "probe_cache.json", data)
+    except Exception as e:
+        log.warning("Failed to save probe cache: %s", e)
+
+
 def _load_series_probe_cache() -> None:
     """Load series probe cache from disk."""
     path = cache.CACHE_DIR / "series_probe_cache.json"
@@ -1192,39 +1539,9 @@ def _load_series_probe_cache() -> None:
                     eid = int(eid_str)
                     if eid in _series_probe_cache[sid]["episodes"]:
                         continue
-                    # Use .get() for all fields to handle corrupt/incomplete cache.
-                    video_codec = entry.get("video_codec", "")
-                    if not video_codec:
-                        continue  # Skip entries without video codec.
-                    media_info = MediaInfo(
-                        video_codec=video_codec,
-                        audio_codec=entry.get("audio_codec", ""),
-                        pix_fmt=entry.get("pix_fmt", ""),
-                        audio_channels=entry.get("audio_channels", 0),
-                        audio_sample_rate=entry.get("audio_sample_rate", 0),
-                        subtitle_codecs=entry.get("subtitle_codecs"),
-                        duration=entry.get("duration", 0),
-                        height=entry.get("height", 0),
-                        video_bitrate=entry.get("video_bitrate", 0),
-                        interlaced=entry.get("interlaced", False),
-                        is_10bit=entry.get("is_10bit", False),
-                        is_hdr=entry.get("is_hdr", False),
-                        is_hls=entry.get("is_hls", False),
-                    )
-                    subs = [
-                        SubtitleStream(
-                            index=subtitle["index"],
-                            lang=subtitle.get("lang", "und"),
-                            name=subtitle.get("name", ""),
-                        )
-                        for subtitle in entry.get("subtitles", [])
-                    ]
-                    _series_probe_cache[sid]["episodes"][eid] = (
-                        entry.get("time", 0),
-                        media_info,
-                        subs,
-                    )
-                    count += 1
+                    if (probe := _probe_from_cache(entry)) is not None:
+                        _series_probe_cache[sid]["episodes"][eid] = probe
+                        count += 1
         log.info("Loaded %d series probe cache entries", count)
     except Exception as e:
         log.warning("Failed to load series probe cache: %s", e)
@@ -1242,24 +1559,8 @@ def _save_series_probe_cache() -> None:
                 "episodes": cached_episodes,
             }
             for eid, (cache_time, media_info, subs) in series_data["episodes"].items():
-                if media_info is None:
-                    continue
-                cached_episodes[str(eid)] = {
-                    "time": cache_time,
-                    "video_codec": media_info.video_codec,
-                    "audio_codec": media_info.audio_codec,
-                    "pix_fmt": media_info.pix_fmt,
-                    "audio_channels": media_info.audio_channels,
-                    "audio_sample_rate": media_info.audio_sample_rate,
-                    "subtitle_codecs": media_info.subtitle_codecs,
-                    "duration": media_info.duration,
-                    "height": media_info.height,
-                    "video_bitrate": media_info.video_bitrate,
-                    "interlaced": media_info.interlaced,
-                    "is_10bit": media_info.is_10bit,
-                    "is_hdr": media_info.is_hdr,
-                    "subtitles": [{"index": s.index, "lang": s.lang, "name": s.name} for s in subs],
-                }
+                if media_info is not None:
+                    cached_episodes[str(eid)] = _probe_to_cache(cache_time, media_info, subs)
     try:
         path = cache.CACHE_DIR / "series_probe_cache.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1670,23 +1971,16 @@ class _CachedSeries(TypedDict, total=False):
     episodes: dict[str, _CachedEpisode]
 
 
-class _ProbeOutput(TypedDict, total=False):
-    """The subset of ffprobe's JSON this module reads; other keys are dropped."""
-
-    streams: list[_ProbeStream]
-    format: _ProbeFormat
-
-
 def _media_info_from_probe(
     data: _ProbeOutput,
     *,
     is_hls: bool,
 ) -> tuple[MediaInfo | None, list[SubtitleStream]]:
     """Parse ffprobe stream and format output into source facts and text subtitles."""
-    video_codec = audio_codec = pix_fmt = audio_profile = ""
-    audio_channels = audio_sample_rate = 0
+    video_codec = pix_fmt = ""
     subtitle_codecs: list[str] = []
     subtitles: list[SubtitleStream] = []
+    audio_tracks: list[AudioTrack] = []
 
     height = 0
     video_bitrate = 0
@@ -1713,11 +2007,18 @@ def _media_info_from_probe(
             # Try to get bitrate from stream, fall back to format.
             with suppress(ValueError):
                 video_bitrate = _probe_int(stream.get("bit_rate"))
-        elif codec_type == "audio" and not audio_codec:
-            audio_codec = codec
-            audio_channels = _probe_int(stream.get("channels"))
-            audio_sample_rate = _probe_int(stream.get("sample_rate"))
-            audio_profile = stream.get("profile", "")
+        elif codec_type == "audio":
+            audio_tracks.append(
+                AudioTrack(
+                    index=stream.get("index"),
+                    lang=stream.get("tags", {}).get("language", "und").lower(),
+                    codec=codec,
+                    channels=_probe_int(stream.get("channels")),
+                    sample_rate=_probe_int(stream.get("sample_rate")),
+                    profile=stream.get("profile", ""),
+                    default=stream.get("disposition", {}).get("default") == 1,
+                ),
+            )
         elif codec_type == "subtitle":
             subtitle_codecs.append(codec)
             if codec in {"subrip", "ass", "ssa", "mov_text", "webvtt", "srt"}:
@@ -1750,11 +2051,8 @@ def _media_info_from_probe(
 
     media_info = MediaInfo(
         video_codec=video_codec,
-        audio_codec=audio_codec,
+        audio_codec="",
         pix_fmt=pix_fmt,
-        audio_channels=audio_channels,
-        audio_sample_rate=audio_sample_rate,
-        audio_profile=audio_profile,
         subtitle_codecs=subtitle_codecs or None,
         duration=duration,
         height=height,
@@ -1763,5 +2061,10 @@ def _media_info_from_probe(
         is_10bit=is_10bit,
         is_hdr=is_hdr,
         is_hls=is_hls,
+        audio_tracks=tuple(audio_tracks),
     )
-    return media_info, subtitles
+    default = next((t for t in audio_tracks if t.default), None)
+    return with_audio_track(
+        media_info,
+        default or (audio_tracks[0] if audio_tracks else None),
+    ), subtitles

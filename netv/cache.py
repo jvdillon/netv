@@ -100,6 +100,7 @@ class UserSettings(TypedDict):
     # The browser defines favorite entries; the server stores them verbatim.
     favorites: dict[str, dict[str, MutablePlainTree]]
     cc_lang: str
+    audio_lang: NotRequired[str]  # ISO 639-1; "" plays the track the file marks default.
     cc_style: dict[str, MutablePlainTree]
     cast_host: str
     vod_filter: NotRequired[list[str]]
@@ -626,7 +627,7 @@ def load_server_settings() -> ServerSettings:
             "transcode_dir": "",  # Empty = system temp dir.
             "probe_live": True,
             "probe_movies": True,
-            "probe_series": False,
+            "probe_series": True,
             "sources": [],
             "user_agent_preset": "tivimate",
             "user_agent_custom": "",

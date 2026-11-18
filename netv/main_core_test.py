@@ -589,6 +589,75 @@ def test_vod_page_applies_filter_and_sorts(api: TestClient) -> None:
     assert newest.index("MovieBeta") < newest.index("MovieAlpha")
 
 
+def test_vod_browse_defers_rows_past_the_first_few(api: TestClient) -> None:
+    cats: list[ProviderRecord] = [
+        {"category_id": str(i), "category_name": f"Cat{i}"} for i in range(6)
+    ]
+    films: list[ProviderRecord] = [
+        {"stream_id": i, "name": f"Film{i}", "category_id": str(i)} for i in range(6)
+    ]
+    cache.get_cache().update(vod_categories=cats, vod_streams=films)
+    page = api.get("/vod?sort=alpha").text
+    assert all(f"Film{i}" in page for i in range(4))
+    assert "Film4" not in page
+    assert "Cat5" in page
+    assert "/api/vod/cards?category=5&sort=alpha&limit=20" in page
+
+
+def test_vod_browse_row_links_to_full_category(api: TestClient) -> None:
+    films: list[ProviderRecord] = [
+        {"stream_id": i, "name": f"F{i:02}", "category_id": "1"} for i in range(21)
+    ]
+    cache.get_cache().update(
+        vod_categories=[{"category_id": "1", "category_name": "Big"}],
+        vod_streams=films,
+    )
+    page = api.get("/vod?sort=alpha").text
+    assert "F19" in page
+    assert "F20" not in page
+    assert 'href="/vod?category=1&sort=alpha"' in page
+    full = api.get("/vod?category=1&sort=alpha").text
+    assert "F20" in full
+    assert 'data-total="21"' in full
+
+
+def test_vod_cards_returns_a_slice_of_one_category(api: TestClient) -> None:
+    cache.get_cache().update(vod_categories=[], vod_streams=_vod_streams())
+    resp = api.get("/api/vod/cards?category=1&sort=alpha&offset=1&limit=1")
+    assert resp.status_code == 200
+    assert "MovieBeta" in resp.text
+    assert "MovieAlpha" not in resp.text
+    assert "MovieGamma" not in resp.text
+    assert api.get("/api/vod/cards?category=1&limit=999").status_code == 422
+
+
+def test_cards_load_file_caches(api: TestClient) -> None:
+    cats = [{"category_id": "1", "category_name": "Films"}]
+    cache.save_file_cache("vod_data", {"cats": cats, "streams": _vod_streams()})
+    cache.save_file_cache("series_data", {"cats": cats, "series": _series_list()})
+    movies = api.get("/api/vod/cards?category=1&sort=unknown")
+    series = api.get("/api/series/cards?category=1&sort=alpha")
+    # An unknown sort keeps provider order.
+    assert movies.text.index("MovieAlpha") < movies.text.index("MovieBeta")
+    assert series.text.index("ShowA") < series.text.index("ShowB")
+    assert "ShowC" not in series.text
+
+
+def test_browsable_drops_unavailable_groups_and_filtered_categories() -> None:
+    record: ProviderRecord = {"source_id": "s1", "category_id": "7"}
+    assert main._browsable(record, "movies", set(), [])
+    assert main._browsable(record, "movies", {"series:s1"}, ["7"])
+    assert not main._browsable(record, "movies", {"movies:s1"}, [])
+    assert not main._browsable(record, "movies", set(), ["8"])
+
+
+def test_series_cards_restricted(api: TestClient) -> None:
+    _set_sources(_XTREAM)
+    auth.set_user_limits("testuser", None, ["series:s1"])
+    cache.get_cache().update(series_categories=[], series=[])
+    assert api.get("/api/series/cards?category=1").status_code == 403
+
+
 def _series_list() -> list[ProviderRecord]:
     return [
         {

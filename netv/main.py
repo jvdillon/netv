@@ -22,7 +22,16 @@ from concurrent import futures
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Annotated, Literal, NotRequired, Protocol, TypedDict, cast
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Literal,
+    NotRequired,
+    Protocol,
+    TypedDict,
+    cast,
+    override,
+)
 from urllib import error, parse
 from xml.sax.saxutils import escape as xml_escape
 
@@ -46,6 +55,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
+from starlette.types import Scope
 from treekle import MutablePlainTree, ReadError, from_plain, json_loads
 
 from netv import (
@@ -396,9 +406,32 @@ def _preload_epg() -> None:
         log.error("EPG load error: %s", e)
 
 
+class _RevalidatedStaticFiles(StaticFiles):
+    """Static files browsers must revalidate, so an upgrade never runs stale scripts.
+
+    Unversioned URLs otherwise get heuristic freshness of days; revalidation is a 304.
+    """
+
+    @override
+    def file_response(
+        self,
+        full_path: str | os.PathLike[str],
+        stat_result: os.stat_result,
+        scope: Scope,
+        status_code: int = 200,
+    ) -> Response:
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 def _create_app() -> FastAPI:
     application = FastAPI(title="neTV", lifespan=lifespan)
-    application.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
+    application.mount(
+        "/static",
+        _RevalidatedStaticFiles(directory=APP_DIR / "static"),
+        name="static",
+    )
     return application
 
 
@@ -882,6 +915,40 @@ async def guide_rows_api(
     return JSONResponse(page, headers={"Cache-Control": "no-store"})
 
 
+@dataclass(kw_only=True, slots=True, frozen=True)
+class _Catalog:
+    """One browsable catalog: where it is cached and how it renders."""
+
+    group: Literal["movies", "series"]
+    newest_field: str
+    template: str
+    cards_template: str
+    cards_url: str
+
+
+_MOVIES = _Catalog(
+    group="movies",
+    newest_field="added",
+    template="vod.html",
+    cards_template="_movie_cards.html",
+    cards_url="/api/vod/cards",
+)
+_SERIES = _Catalog(
+    group="series",
+    newest_field="last_modified",
+    template="series.html",
+    cards_template="_series_cards.html",
+    cards_url="/api/series/cards",
+)
+
+
+class _BrowseRow(TypedDict):
+    category_id: str
+    name: str
+    total: int
+    records: list[ProviderRecord] | None
+
+
 @app.get("/vod", response_class=HTMLResponse)
 async def vod_page(
     request: Request,
@@ -895,75 +962,26 @@ async def vod_page(
     ) and not await asyncio.to_thread(_store_cached_vod_data):
         # No cache - start background load and show loading page.
         _start_vod_background_load()
-        username = user["sub"]
-        user_settings = load_user_settings(username)
         return TEMPLATES.TemplateResponse(
             request,
             "vod.html",
-            {
-                "categories": [],
-                "streams": [],
-                "current_category": category,
-                "current_sort": sort,
-                "loading": True,
-                "favorites": _page_favorites(user_settings),
-            },
+            {"loading": True, "favorites": _page_favorites(load_user_settings(user["sub"]))},
         )
+    return _browse_page(request, user.get("sub", ""), _MOVIES, category, sort)
 
-    username = user.get("sub", "")
-    user_settings = load_user_settings(username)
 
-    # Check if user has access to any movies.
-    content_access = _get_content_access(username)
-    if not content_access["movies"]:
-        raise HTTPException(403, "Access to movies is restricted")
-
-    # Get user's unavailable groups for filtering.
-    unavailable_groups = _unavailable_groups(username)
-
-    # Filter by group access (movies:{source_id})
-    streams = [
-        s
-        for s in get_cache().get("vod_streams", [])
-        if f"movies:{text_field(s, 'source_id')}" not in unavailable_groups
-    ]
-    categories = [
-        c
-        for c in get_cache().get("vod_categories", [])
-        if f"movies:{text_field(c, 'source_id')}" not in unavailable_groups
-    ]
-
-    # Apply user's VOD category filter (if set)
-    vod_filter = user_settings.get("vod_filter", [])
-    if vod_filter:
-        vod_filter_set = set(vod_filter)
-        categories = [c for c in categories if str(c.get("category_id")) in vod_filter_set]
-        streams = [s for s in streams if str(s.get("category_id")) in vod_filter_set]
-
-    # Filter by category if specified.
-    if category is not None and category != 0:
-        streams = [s for s in streams if str(s.get("category_id")) == str(category)]
-
-    # Sort.
-    if sort == "alpha":
-        streams.sort(key=lambda s: text_field(s, "name").lower())
-    elif sort == "rating":
-        streams.sort(key=lambda s: _safe_float(s.get("rating")), reverse=True)
-    elif sort == "newest":
-        streams.sort(key=lambda s: _int_value(s.get("added")), reverse=True)
-
-    return TEMPLATES.TemplateResponse(
-        request,
-        "vod.html",
-        {
-            "categories": categories,
-            "streams": streams,
-            "current_category": category,
-            "current_sort": sort,
-            "favorites": _page_favorites(user_settings),
-            "content_access": _get_content_access(username),
-        },
-    )
+@app.get("/api/vod/cards", response_class=HTMLResponse)
+async def vod_cards(
+    request: Request,
+    user: Annotated[TokenClaims, Depends(require_auth)],
+    category: int,
+    sort: str | None = None,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=120)] = 120,
+):
+    if "vod_streams" not in get_cache():
+        await asyncio.to_thread(_store_cached_vod_data)
+    return _browse_cards(request, user.get("sub", ""), _MOVIES, category, sort, offset, limit)
 
 
 @app.get("/series", response_class=HTMLResponse)
@@ -979,75 +997,26 @@ async def series_page(
     ) and not await asyncio.to_thread(_store_cached_series_data):
         # No cache - start background load and show loading page.
         _start_series_background_load()
-        username = user["sub"]
-        user_settings = load_user_settings(username)
         return TEMPLATES.TemplateResponse(
             request,
             "series.html",
-            {
-                "categories": [],
-                "series": [],
-                "current_category": category,
-                "current_sort": sort,
-                "loading": True,
-                "favorites": _page_favorites(user_settings),
-            },
+            {"loading": True, "favorites": _page_favorites(load_user_settings(user["sub"]))},
         )
+    return _browse_page(request, user.get("sub", ""), _SERIES, category, sort)
 
-    username = user.get("sub", "")
-    user_settings = load_user_settings(username)
 
-    # Check if user has access to any series.
-    content_access = _get_content_access(username)
-    if not content_access["series"]:
-        raise HTTPException(403, "Access to series is restricted")
-
-    # Get user's unavailable groups for filtering.
-    unavailable_groups = _unavailable_groups(username)
-
-    # Filter by group access (series:{source_id})
-    series = [
-        s
-        for s in get_cache().get("series", [])
-        if f"series:{text_field(s, 'source_id')}" not in unavailable_groups
-    ]
-    categories = [
-        c
-        for c in get_cache().get("series_categories", [])
-        if f"series:{text_field(c, 'source_id')}" not in unavailable_groups
-    ]
-
-    # Apply user's series category filter (if set)
-    series_filter = user_settings.get("series_filter", [])
-    if series_filter:
-        series_filter_set = set(series_filter)
-        categories = [c for c in categories if str(c.get("category_id")) in series_filter_set]
-        series = [s for s in series if str(s.get("category_id")) in series_filter_set]
-
-    # Filter by category if specified.
-    if category is not None and category != 0:
-        series = [s for s in series if str(s.get("category_id")) == str(category)]
-
-    # Sort.
-    if sort == "alpha":
-        series.sort(key=lambda s: text_field(s, "name").lower())
-    elif sort == "rating":
-        series.sort(key=lambda s: _safe_float(s.get("rating")), reverse=True)
-    elif sort == "newest":
-        series.sort(key=lambda s: _int_value(s.get("last_modified")), reverse=True)
-
-    return TEMPLATES.TemplateResponse(
-        request,
-        "series.html",
-        {
-            "categories": categories,
-            "series": series,
-            "current_category": category,
-            "current_sort": sort,
-            "favorites": _page_favorites(user_settings),
-            "content_access": _get_content_access(username),
-        },
-    )
+@app.get("/api/series/cards", response_class=HTMLResponse)
+async def series_cards(
+    request: Request,
+    user: Annotated[TokenClaims, Depends(require_auth)],
+    category: int,
+    sort: str | None = None,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=120)] = 120,
+):
+    if "series" not in get_cache():
+        await asyncio.to_thread(_store_cached_series_data)
+    return _browse_cards(request, user.get("sub", ""), _SERIES, category, sort, offset, limit)
 
 
 @app.get("/series/{series_id}", response_class=HTMLResponse)
@@ -1432,6 +1401,7 @@ async def player_page(
             "episode_id": episode_id,
             "series_name": series_name,
             "cc_lang": user_settings.get("cc_lang", ""),
+            "audio_lang": user_settings.get("audio_lang", "en"),
             "cc_style": user_settings.get("cc_style", {}),
             "cast_host": user_settings.get("cast_host", ""),
             "next_episode_url": next_episode_url,
@@ -2047,6 +2017,7 @@ async def settings_page(request: Request, user: Annotated[TokenClaims, Depends(r
             "selected_vod_cats": user_settings.get("vod_filter", []),
             "selected_series_cats": user_settings.get("series_filter", []),
             "cc_lang": user_settings.get("cc_lang", ""),
+            "audio_lang": user_settings.get("audio_lang", "en"),
             "cc_style": user_settings.get("cc_style", {}),
             "cast_host": user_settings.get("cast_host", ""),
             "content_access": _get_content_access(username),
@@ -2549,11 +2520,45 @@ async def get_user_prefs(user: Annotated[TokenClaims, Depends(require_auth)]):
     return {
         "favorites": _page_favorites(settings),
         "cc_lang": settings.get("cc_lang", ""),
+        "audio_lang": settings.get("audio_lang", "en"),
         "cc_style": settings.get("cc_style", {}),
         "cast_host": settings.get("cast_host", ""),
         "virtual_scroll": settings.get("virtual_scroll", True),
         "sort_live_by_views": settings.get("sort_live_by_views", True),
     }
+
+
+@app.post("/api/favorites")
+async def set_favorite(
+    request: Request,
+    user: Annotated[TokenClaims, Depends(require_auth)],
+):
+    """Add or remove one favorite, leaving the others as stored.
+
+    Pages send one change rather than their whole list, so a page loaded before another
+    change (another tab, or one restored by Back) cannot overwrite it.
+
+    Args:
+        request: Request carrying the ``_FavoriteUpdate`` body.
+        user: Authenticated viewer claims identifying the favorites owner.
+    """
+    body = await request.body()
+    if len(body) > 64 * 1024:
+        raise HTTPException(400, "Request too large")
+    try:
+        update = from_plain(json_loads(body), _FavoriteUpdate)
+    except ValueError as exc:  # ReadError is a ValueError.
+        raise HTTPException(400, f"Invalid favorite: {exc}") from exc
+    username = user["sub"]
+    settings = load_user_settings(username)
+    entries = settings["favorites"].setdefault(update["kind"], {})
+    entry = update["entry"]
+    if entry is None:
+        entries.pop(update["id"], None)
+    else:
+        entries[update["id"]] = _stored_entry(entry)
+    save_user_settings(username, settings)
+    return {"favorites": _page_favorites(settings)}
 
 
 @app.post("/api/user-prefs")
@@ -2580,10 +2585,10 @@ async def save_user_prefs(
     except ReadError as exc:
         raise HTTPException(400, f"Invalid preferences: {exc}") from exc
     settings = load_user_settings(username)
-    if "favorites" in prefs:
-        settings["favorites"] = _stored_favorites(prefs["favorites"])
     if "cc_lang" in prefs:
         settings["cc_lang"] = prefs["cc_lang"]
+    if "audio_lang" in prefs:
+        settings["audio_lang"] = prefs["audio_lang"]
     if "cc_style" in prefs:
         settings["cc_style"] = prefs["cc_style"]
     if "cast_host" in prefs:
@@ -2858,12 +2863,12 @@ async def get_probe_cache(
     """
     del user
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    probes = await asyncio.to_thread(_labeled_url_probes)
     stats = ffmpeg_command.get_series_probe_cache_stats()
     xtream = get_first_xtream_client()
-    if not xtream:
-        return {"series": stats}
-    stats = await asyncio.to_thread(_enrich_probe_cache_stats, stats, xtream)
-    return {"series": stats}
+    if xtream:
+        stats = await asyncio.to_thread(_enrich_probe_cache_stats, stats, xtream)
+    return {"probes": [probe for _, probe in probes], "series": stats}
 
 
 @app.post("/settings/probe-cache/clear")
@@ -2884,6 +2889,41 @@ async def clear_series_probe_cache(
     del user
     ffmpeg_command.invalidate_series_probe_cache(series_id, episode_id)
     return {"ok": True}
+
+
+@app.post("/settings/probe-cache/clear-url")
+async def clear_url_probe_cache(
+    user: Annotated[TokenClaims, Depends(require_admin)],
+    kind: Literal["movie", "live"],
+    stream_id: str,
+):
+    """Clear the cached probe of one movie or live channel.
+
+    Args:
+        user: Authenticated admin claims.
+        kind: Whether ``stream_id`` names a movie or a live channel.
+        stream_id: The provider's stream id.
+    """
+    del user
+    urls = [
+        url
+        for url, probe in await asyncio.to_thread(_labeled_url_probes)
+        if (probe["kind"], probe["stream_id"]) == (kind, stream_id)
+    ]
+    return {"ok": True, "cleared": ffmpeg_command.invalidate_url_probe_cache(urls)}
+
+
+class _UrlProbe(TypedDict):
+    kind: Literal["movie", "live", "other"]
+    stream_id: str
+    name: str
+    probed_at: float
+    video_codec: str
+    audio_codec: str
+    audio_langs: list[str]
+    subtitle_count: int
+    duration: float
+    height: int
 
 
 @app.post("/settings/probe-cache/clear-mru/{series_id}")
@@ -4620,8 +4660,8 @@ class _ApiSettingsUpdate(TypedDict, total=False):
 class _UserPrefsUpdate(TypedDict, total=False):
     """Preferences a client may change through ``/api/user-prefs``."""
 
-    favorites: dict[str, dict[str, MutablePlainTree]]
     cc_lang: str
+    audio_lang: str
     cc_style: dict[str, MutablePlainTree]
     cast_host: str
     virtual_scroll: bool
@@ -4645,18 +4685,8 @@ def _with_cover(entry: MutablePlainTree, cover: str) -> MutablePlainTree:
 
 # Pages post back the covers they were given, which are signed ``/api/logo`` links.
 # Storing the raw URL keeps saved favorites valid if ``secret_key`` changes.
-def _stored_favorites(favorites: Favorites) -> Favorites:
-    """Favorites as saved: covers hold the provider URL, never a signed proxy link."""
-    return {
-        kind: {fid: _stored_entry(entry) for fid, entry in entries.items()}
-        for kind, entries in favorites.items()
-    }
-
-
-def _stored_entry(entry: MutablePlainTree) -> MutablePlainTree:
+def _stored_entry(entry: dict[str, MutablePlainTree]) -> MutablePlainTree:
     """One saved favorite: a text cover is unwrapped to the provider URL."""
-    if not isinstance(entry, dict):
-        return entry
     cover = entry.get("cover")
     return _with_cover(entry, _raw_logo_url(cover)) if isinstance(cover, str) else entry
 
@@ -4701,6 +4731,213 @@ def _stream_limits(username: str, source_id: str) -> tuple[int, int]:
     )
     source_max = 0 if source is None else source.get("max_streams", 0)
     return user_max_streams.get(source_id, 0), source_max
+
+
+def _catalog_records(
+    catalog: _Catalog,
+    username: str,
+    settings: UserSettings,
+) -> tuple[list[ProviderRecord], list[ProviderRecord]]:
+    """Categories and items the user may browse, after group access and their filter."""
+    store = get_cache()
+    if catalog.group == "movies":
+        cats, items = store.get("vod_categories", []), store.get("vod_streams", [])
+        wanted = settings.get("vod_filter", [])
+    else:
+        cats, items = store.get("series_categories", []), store.get("series", [])
+        wanted = settings.get("series_filter", [])
+    unavailable = _unavailable_groups(username)
+    return (
+        [c for c in cats if _browsable(c, catalog.group, unavailable, wanted)],
+        [i for i in items if _browsable(i, catalog.group, unavailable, wanted)],
+    )
+
+
+def _browsable(
+    record: ProviderRecord,
+    group: str,
+    unavailable: set[str],
+    wanted: list[str],
+) -> bool:
+    """Whether the user's group access and category filter admit ``record``."""
+    if f"{group}:{text_field(record, 'source_id')}" in unavailable:
+        return False
+    return not wanted or str(record.get("category_id")) in wanted
+
+
+def _sorted_records(
+    records: list[ProviderRecord],
+    sort: str | None,
+    newest_field: str,
+) -> list[ProviderRecord]:
+    """``records`` in browse order; an unknown sort keeps provider order."""
+    if sort == "alpha":
+        return sorted(records, key=lambda r: text_field(r, "name").lower())
+    if sort == "rating":
+        return sorted(records, key=lambda r: _safe_float(r.get("rating")), reverse=True)
+    if sort == "newest":
+        return sorted(records, key=lambda r: _int_value(r.get(newest_field)), reverse=True)
+    return records
+
+
+def _in_category(records: list[ProviderRecord], category: int) -> list[ProviderRecord]:
+    return [r for r in records if str(r.get("category_id")) == str(category)]
+
+
+# Only the first ``eager_rows`` carry their items.
+#
+# Later rows load on scroll, so a large catalog never renders in one page.
+def _browse_rows(
+    cats: list[ProviderRecord],
+    items: list[ProviderRecord],
+    sort: str | None,
+    newest_field: str,
+    *,
+    row_size: int = 20,
+    eager_rows: int = 4,
+) -> list[_BrowseRow]:
+    """One row per non-empty category."""
+    by_category: dict[str, list[ProviderRecord]] = {}
+    for item in items:
+        by_category.setdefault(str(item.get("category_id")), []).append(item)
+    rows: list[_BrowseRow] = []
+    for cat in cats:
+        category_id = str(cat.get("category_id"))
+        members = by_category.pop(category_id, [])
+        if members:
+            row: _BrowseRow = {
+                "category_id": category_id,
+                "name": text_field(cat, "category_name"),
+                "total": len(members),
+                "records": None,
+            }
+            if len(rows) < eager_rows:
+                row["records"] = _sorted_records(members, sort, newest_field)[:row_size]
+            rows.append(row)
+    # Items whose category is unknown cannot be fetched by category, so they render now.
+    orphans = [item for members in by_category.values() for item in members]
+    if orphans:
+        rows.append(
+            {
+                "category_id": "",
+                "name": "Other",
+                "total": len(orphans),
+                "records": _sorted_records(orphans, sort, newest_field)[:row_size],
+            },
+        )
+    return rows
+
+
+def _browse_page(
+    request: Request,
+    username: str,
+    catalog: _Catalog,
+    category: int | None,
+    sort: str | None,
+    *,
+    row_size: int = 20,
+    page_size: int = 120,
+) -> HTMLResponse:
+    """The catalog page: favorites, category rows, or one category's first page."""
+    user_settings = load_user_settings(username)
+    content_access = _get_content_access(username)
+    if not content_access[catalog.group]:
+        raise HTTPException(403, f"Access to {catalog.group} is restricted")
+    cats, items = _catalog_records(catalog, username, user_settings)
+    context: dict[str, object] = {
+        "categories": cats,
+        "current_category": category,
+        "current_sort": sort,
+        "favorites": _page_favorites(user_settings),
+        "content_access": content_access,
+        "cards_url": catalog.cards_url,
+        "row_size": row_size,
+        "page_size": page_size,
+        "rows": None,
+        "items": [],
+        "total": 0,
+    }
+    if sort is not None and category is not None:
+        members = _sorted_records(_in_category(items, category), sort, catalog.newest_field)
+        context.update(items=members[:page_size], total=len(members))
+    elif sort is not None:
+        context["rows"] = _browse_rows(cats, items, sort, catalog.newest_field, row_size=row_size)
+    return TEMPLATES.TemplateResponse(request, catalog.template, context)
+
+
+def _browse_cards(
+    request: Request,
+    username: str,
+    catalog: _Catalog,
+    category: int,
+    sort: str | None,
+    offset: int,
+    limit: int,
+) -> HTMLResponse:
+    """A slice of one category's cards, for rows and pages that load on scroll."""
+    if not _get_content_access(username)[catalog.group]:
+        raise HTTPException(403, f"Access to {catalog.group} is restricted")
+    _, items = _catalog_records(catalog, username, load_user_settings(username))
+    members = _sorted_records(_in_category(items, category), sort, catalog.newest_field)
+    return TEMPLATES.TemplateResponse(
+        request,
+        catalog.cards_template,
+        {"items": members[offset : offset + limit]},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+# URLs embed provider credentials, so callers send only the labels to clients.
+def _labeled_url_probes() -> list[tuple[str, _UrlProbe]]:
+    """URL-keyed probes named by the movie or channel they belong to."""
+    store = get_cache()
+    movies = {str(m.get("stream_id")): text_field(m, "name") for m in store.get("vod_streams", [])}
+    channels = store.get("live_streams", [])
+    by_url = {text_field(c, "direct_url"): c for c in channels if c.get("direct_url") is not None}
+    by_id = {str(c.get("stream_id")): c for c in channels}
+    labeled: list[tuple[str, _UrlProbe]] = []
+    for stats in ffmpeg_command.get_url_probe_cache_stats():
+        url = stats["url"]
+        parts = parse.urlparse(url).path.split("/")
+        stem = parts[-1].split(".")[0]
+        kind: Literal["movie", "live", "other"] = "other"
+        stream_id = name = ""
+        if (channel := by_url.get(url)) is not None:
+            kind, stream_id, name = (
+                "live",
+                str(channel.get("stream_id")),
+                text_field(channel, "name"),
+            )
+        elif len(parts) >= 5 and parts[-4] in ("movie", "live"):
+            kind = "movie" if parts[-4] == "movie" else "live"
+            stream_id = stem
+            name = (
+                movies.get(stem, "") if kind == "movie" else text_field(by_id.get(stem, {}), "name")
+            )
+        labeled.append(
+            (
+                url,
+                {
+                    "kind": kind,
+                    "stream_id": stream_id,
+                    "name": name,
+                    "probed_at": stats["probed_at"],
+                    "video_codec": stats["video_codec"],
+                    "audio_codec": stats["audio_codec"],
+                    "audio_langs": stats["audio_langs"],
+                    "subtitle_count": stats["subtitle_count"],
+                    "duration": stats["duration"],
+                    "height": stats["height"],
+                },
+            ),
+        )
+    return labeled
+
+
+class _FavoriteUpdate(TypedDict):
+    kind: Literal["movies", "series"]
+    id: str
+    entry: dict[str, MutablePlainTree] | None  # None removes the favorite.
 
 
 if __name__ == "__main__":

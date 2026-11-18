@@ -33,50 +33,7 @@
   </div>
 
   {% if current_sort %}
-  <!-- Browse view -->
-  <div class="flex-1 min-h-0 overflow-auto scroll-ring-safe">
-    <div class="mb-4 flex gap-2">
-      <select id="category-select" class="bg-gray-700 text-white px-4 py-2 rounded">
-        <option value="">All Categories</option>
-        {% for cat in categories %}
-        <option value="{{ cat.category_id }}" {% if current_category|string == cat.category_id|string %}selected{% endif %}>
-          {{ cat.category_name }}
-        </option>
-        {% endfor %}
-      </select>
-      <select id="sort-select" class="bg-gray-700 text-white px-4 py-2 rounded">
-        <option value="alpha" {% if current_sort == 'alpha' %}selected{% endif %}>A-Z</option>
-        <option value="rating" {% if current_sort == 'rating' %}selected{% endif %}>Rating</option>
-        <option value="newest" {% if current_sort == 'newest' %}selected{% endif %}>Newest</option>
-      </select>
-    </div>
-    <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-7 gap-2 sm:gap-3 pb-4">
-      {% for s in series %}
-      <div class="series-card relative group" data-series-id="{{ s.series_id }}" data-series-name="{{ s.name }}" data-series-cover="{{ (s.cover or '') | logo_url }}">
-        <a href="/series/{{ s.series_id }}"
-           class="block bg-gray-800 rounded-lg overflow-hidden hover:ring-2 hover:ring-blue-500 focus:ring-2 focus:ring-blue-500 focusable transition-all"
-           tabindex="0" data-nav="grid" title="{{ s.name }}{% if s.rating %}&#10;★ {{ s.rating }}{% endif %}">
-          <div class="aspect-[2/3] bg-gray-700">
-            {% if s.cover %}
-            <img src="{{ s.cover | logo_url }}" alt="" class="w-full h-full object-cover" loading="lazy"
-                 onerror="this.style.display='none'">
-            {% endif %}
-          </div>
-          <div class="p-2">
-            <div class="text-sm line-clamp-2 leading-tight">{{ s.name }}</div>
-            {% if s.rating %}
-            <div class="text-xs text-yellow-400 mt-1">★ {{ s.rating }}</div>
-            {% endif %}
-          </div>
-        </a>
-        <button type="button" class="fav-btn absolute top-2 right-2 w-8 h-8 rounded-full bg-black/50 text-xl opacity-0 group-hover:opacity-100 transition-opacity z-10"
-                onclick='toggleFavorite({{ s.series_id | tojson }}, {{ s.name | tojson }}, {{ (s.cover or "") | logo_url | tojson }})'>
-          ☆
-        </button>
-      </div>
-      {% endfor %}
-    </div>
-  </div>
+  {% with base_url = "/series", cards_template = "_series_cards.html" %}{% include "_browse.html" %}{% endwith %}
   {% else %}
   <!-- Favorites view -->
   <div id="favorites-section" class="flex-1 min-h-0 overflow-auto scroll-ring-safe">

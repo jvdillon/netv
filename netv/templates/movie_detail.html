@@ -61,28 +61,20 @@
 {% block scripts %}
 <script>
 let favorites = {{ favorites | tojson }};
-const MOVIE_ID = '{{ movie.stream_id if movie else "" }}';
-const MOVIE_NAME = '{{ movie.name | e if movie else "" }}';
+const MOVIE_ID = {{ (movie.stream_id | string if movie else "") | tojson }};
+const MOVIE_NAME = {{ (movie.name if movie else "") | tojson }};
 const MOVIE_COVER = document.getElementById('cover')?.getAttribute('src') ?? "";
-const MOVIE_EXT = '{{ movie.container_extension or "mkv" if movie else "mkv" }}';
+const MOVIE_EXT = {{ ((movie.container_extension or "mkv") if movie else "mkv") | tojson }};
 
-function saveFavorites() {
-  fetch('/api/user-prefs', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({favorites})
-  });
-}
-
-function toggleFavorite() {
-  if (!MOVIE_ID) return;
-  if (favorites.movies[MOVIE_ID]) {
-    delete favorites.movies[MOVIE_ID];
-  } else {
-    favorites.movies[MOVIE_ID] = { name: MOVIE_NAME, cover: MOVIE_COVER, ext: MOVIE_EXT };
-  }
-  saveFavorites();
+window.onFavoritesChanged = function(changed) {
+  favorites = changed;
   updateButton();
+};
+
+async function toggleFavorite() {
+  if (!MOVIE_ID) return;
+  const entry = favorites.movies[MOVIE_ID] ? null : { name: MOVIE_NAME, cover: MOVIE_COVER, ext: MOVIE_EXT };
+  window.onFavoritesChanged(await setFavorite('movies', MOVIE_ID, entry));
 }
 
 function updateButton() {

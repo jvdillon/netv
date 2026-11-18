@@ -1,5 +1,6 @@
 """Tests for ffmpeg command generation and media probing."""
 
+from dataclasses import replace
 from pathlib import Path
 
 import json
@@ -12,6 +13,7 @@ import pytest
 from netv import cache, ffmpeg_command
 from netv.cache import HwAccel, ServerSettings, get_user_agent
 from netv.ffmpeg_command import (
+    AudioTrack,
     MediaInfo,
     SubtitleStream,
     _build_audio_args,
@@ -19,6 +21,8 @@ from netv.ffmpeg_command import (
     _build_video_args,
     _find_sr_engine,
     _get_gpu_nvdec_codecs,
+    audio_tracks_from_cache,
+    audio_tracks_to_cache,
     build_hls_ffmpeg_cmd,
     can_remux_live,
     clear_all_probe_cache,
@@ -26,14 +30,19 @@ from netv.ffmpeg_command import (
     get_live_hls_list_size,
     get_series_probe_cache_stats,
     get_transcode_dir,
+    get_url_probe_cache_stats,
+    has_cached_probe,
     http_reconnect_args,
+    invalidate_probe,
     invalidate_series_probe_cache,
+    invalidate_url_probe_cache,
     limit_live_video_bitrate,
     probe_closed_captions,
     probe_media,
     probe_segment,
     resolve_hls_master_playlist,
     restore_probe_cache_entry,
+    with_audio_language,
 )
 from netv.testing import FakeResponse, FakeRun, FakeWeb, Program, install_subprocess, install_web
 
@@ -1930,6 +1939,16 @@ def test_probe_segment_parses_video_and_audio(fake_run: FakeRun):
         height=1080,
         video_bitrate=5_000_000,
         interlaced=True,
+        audio_tracks=(
+            AudioTrack(
+                index=None,
+                lang="und",
+                codec="aac",
+                channels=6,
+                sample_rate=48_000,
+                profile="LC",
+            ),
+        ),
     )
     assert fake_run.calls == [
         ["ffprobe", "-v", "error", "-of", "json", "-show_streams", "-show_format", "input_0.ts"],
@@ -1937,6 +1956,52 @@ def test_probe_segment_parses_video_and_audio(fake_run: FakeRun):
     assert fake_run.options == [
         {"capture_output": True, "text": True, "timeout": 5, "check": False},
     ]
+
+
+def _multi_audio_probe() -> dict[str, object]:
+    return {
+        "streams": [
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"},
+            {
+                "index": 1,
+                "codec_type": "audio",
+                "codec_name": "eac3",
+                "channels": 6,
+                "tags": {"language": "chi"},
+                "disposition": {"default": 1},
+            },
+            {"index": 2, "codec_type": "audio", "codec_name": "ac3", "tags": {"language": "cze"}},
+            {
+                "index": 3,
+                "codec_type": "audio",
+                "codec_name": "aac",
+                "channels": 2,
+                "tags": {"language": "eng"},
+            },
+        ],
+        "format": {"duration": "60"},
+    }
+
+
+def test_audio_language_selects_matching_track(fake_run: FakeRun):
+    _ffprobe(fake_run, _multi_audio_probe())
+    info = probe_segment("x.mkv")
+    assert info is not None
+    assert (info.audio_codec, info.audio_index) == ("eac3", None)
+    english = with_audio_language(info, "en-US")
+    assert english is not None
+    assert (english.audio_codec, english.audio_channels, english.audio_index) == ("aac", 2, 3)
+    cmd = build_hls_ffmpeg_cmd("http://x/m.mkv", "software", "/tmp/o", True, None, english)
+    assert cmd[cmd.index("0:v:0") + 2] == "0:3"
+    assert with_audio_language(info, "cs") == replace(
+        info,
+        audio_codec="ac3",
+        audio_channels=0,
+        audio_index=2,
+    )
+    assert with_audio_language(info, "ja") == info
+    assert with_audio_language(info, "") == info
+    assert audio_tracks_from_cache(audio_tracks_to_cache(info.audio_tracks)) == info.audio_tracks
 
 
 @pytest.mark.parametrize(
@@ -2114,24 +2179,39 @@ class TestProbeMediaSeriesCache:
         assert fake_run.calls == []
 
     @pytest.mark.parametrize("episode_id", [1, 99])
-    def test_expired_series_entries_fall_through_to_probe(
+    def test_old_series_entries_still_hit(
         self,
         fake_run: FakeRun,
         probe_state: Path,
         episode_id: int,
     ):
+        old = _media_info(video_codec="old")
         ffmpeg_command._series_probe_cache[7] = {
             "mru": 1,
-            "episodes": {1: (0, _media_info(video_codec="old"), list[SubtitleStream]())},
+            "episodes": {1: (0, old, list[SubtitleStream]())},
+        }
+        ffmpeg_command._probe_cache["http://y"] = (0, old, list[SubtitleStream]())
+        assert probe_media("http://x", series_id=7, episode_id=episode_id) == (old, [])
+        assert probe_media("http://y") == (old, [])
+        assert fake_run.calls == []
+
+    def test_a_series_without_cached_episodes_is_probed(
+        self,
+        fake_run: FakeRun,
+        probe_state: Path,
+    ):
+        ffmpeg_command._series_probe_cache[7] = {
+            "mru": 3,
+            "episodes": dict[int, ffmpeg_command._ProbeEntry](),
         }
         _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}})
-        info, _ = probe_media("http://x", series_id=7, episode_id=episode_id, series_name="N")
+        info, _ = probe_media("http://x", series_id=7, episode_id=2, series_name="N")
         assert info is not None and info.video_codec == "h264"
         series = ffmpeg_command._series_probe_cache[7]
         assert "name" in series
         assert series["name"] == "N"
-        assert series["mru"] == episode_id
-        assert series["episodes"][episode_id][1] is info
+        assert series["mru"] == 2
+        assert series["episodes"][2][1] is info
 
     def test_new_series_is_cached_and_persisted(self, fake_run: FakeRun, probe_state: Path):
         _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}})
@@ -2357,6 +2437,112 @@ class TestHardwareProbes:
     def test_libplacebo_probe_failure(self, fake_run: FakeRun):
         fake_run.program("ffmpeg", Program(error=OSError("no ffmpeg")))
         assert ffmpeg_command._has_libplacebo_filter() is False
+
+
+class TestUrlProbeCachePersistence:
+    def test_probes_survive_a_restart(self, probe_state: Path):
+        track = AudioTrack(index=3, lang="eng", codec="ac3", channels=6, default=True)
+        info = MediaInfo(
+            video_codec="h264",
+            audio_codec="ac3",
+            pix_fmt="yuv420p",
+            height=1080,
+            duration=90.0,
+            is_hls=True,
+            audio_tracks=(track,),
+        )
+        ffmpeg_command.remember_probe("http://h/movie/u/p/1.mkv", info)
+        ffmpeg_command.remember_probe("http://h/movie/u/p/2.mkv", None)
+        saved = json.loads((probe_state / "probe_cache.json").read_text())
+        assert list(saved) == ["http://h/movie/u/p/1.mkv"]
+        assert saved["http://h/movie/u/p/1.mkv"]["time"] > 0
+        assert saved["http://h/movie/u/p/1.mkv"]["is_hls"] is True
+        saved["http://h/movie/u/p/3.mkv"] = {"audio_codec": "aac"}
+        (probe_state / "probe_cache.json").write_text(json.dumps(saved))
+
+        ffmpeg_command._probe_cache.clear()
+        ffmpeg_command._load_url_probe_cache()
+        assert set(ffmpeg_command._probe_cache) == {"http://h/movie/u/p/1.mkv"}
+        assert probe_media("http://h/movie/u/p/1.mkv") == (info, [])
+        assert has_cached_probe("http://h/movie/u/p/1.mkv")
+        assert not has_cached_probe("http://h/movie/u/p/2.mkv")
+
+    def test_load_missing_or_corrupt_file(
+        self,
+        probe_state: Path,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        ffmpeg_command._load_url_probe_cache()
+        assert ffmpeg_command._probe_cache == {}
+        (probe_state / "probe_cache.json").write_text("{not json")
+        ffmpeg_command._load_url_probe_cache()
+        assert ffmpeg_command._probe_cache == {}
+        assert "Failed to load probe cache" in caplog.text
+
+    def test_save_failure_is_logged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        blocker = tmp_path / "file"
+        blocker.write_text("")
+        monkeypatch.setattr(cache, "CACHE_DIR", blocker / "sub")
+        ffmpeg_command.remember_probe("http://h/x", _media_info())
+        assert "Failed to save probe cache" in caplog.text
+
+    def test_invalidation_rewrites_the_file(self, probe_state: Path):
+        info = _media_info()
+        ffmpeg_command.remember_probe("http://a", info)
+        ffmpeg_command.remember_probe("http://b", info)
+        assert invalidate_url_probe_cache(["http://a", "http://missing"]) == 1
+        assert list(json.loads((probe_state / "probe_cache.json").read_text())) == ["http://b"]
+        ffmpeg_command._series_probe_cache[7] = {
+            "episodes": {2: (1.0, info, list[SubtitleStream]())},
+            "mru": 2,
+        }
+        assert has_cached_probe("http://other", series_id=7)
+        invalidate_probe("http://b", series_id=7, episode_id=2)
+        assert json.loads((probe_state / "probe_cache.json").read_text()) == {}
+        assert not has_cached_probe("http://b", series_id=7)
+        invalidate_probe("http://gone")
+        assert ffmpeg_command._probe_cache == {}
+
+
+def test_url_probe_stats_list_recent_probes_first():
+    track = AudioTrack(index=1, lang="eng", codec="ac3")
+    old = MediaInfo(video_codec="h264", audio_codec="ac3", pix_fmt="yuv420p", audio_tracks=(track,))
+    new = MediaInfo(video_codec="hevc", audio_codec="aac", pix_fmt="yuv420p", height=2160)
+    subs = [SubtitleStream(index=2, lang="eng", name="English")]
+    ffmpeg_command._probe_cache.update(
+        {
+            "http://old": (1.0, old, subs),
+            "http://new": (2.0, new, []),
+            "http://none": (3.0, None, []),
+        },
+    )
+    assert get_url_probe_cache_stats() == [
+        {
+            "url": "http://new",
+            "probed_at": 2.0,
+            "video_codec": "hevc",
+            "audio_codec": "aac",
+            "audio_langs": [],
+            "subtitle_count": 0,
+            "duration": 0.0,
+            "height": 2160,
+        },
+        {
+            "url": "http://old",
+            "probed_at": 1.0,
+            "video_codec": "h264",
+            "audio_codec": "ac3",
+            "audio_langs": ["eng"],
+            "subtitle_count": 1,
+            "duration": 0.0,
+            "height": 0,
+        },
+    ]
 
 
 class TestSeriesProbeCachePersistence:

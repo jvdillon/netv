@@ -426,6 +426,18 @@
 
     updatePreview();
 
+    const audioSelect = document.getElementById('audio-lang-pref');
+    if (audioSelect) {
+      audioSelect.value = cfg.audioLang ?? 'en';
+      audioSelect.addEventListener('change', async function() {
+        await saveWithFeedback(
+          '/api/user-prefs',
+          { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({audio_lang: this.value}) },
+          this
+        );
+      });
+    }
+
     if (langSelect) {
       if (cfg.ccLang) langSelect.value = cfg.ccLang;
       langSelect.addEventListener('change', async function() {
@@ -617,11 +629,26 @@
         .then(r => r.json())
         .then(data => {
           const series = data.series || [];
-          if (series.length === 0) {
+          const probes = (data.probes || []).filter(p => p.kind !== 'other');
+          if (series.length === 0 && probes.length === 0) {
             listEl.innerHTML = '<div class="text-gray-500 text-sm">No cached probes</div>';
             return;
           }
-          listEl.innerHTML = series.map(s => {
+          const kindLabel = {movie: 'Movie', live: 'Channel'};
+          const movieRows = probes.map(m => `
+              <div class="flex items-center justify-between p-2 bg-gray-700 rounded text-sm">
+                <div class="flex-1 min-w-0">
+                  <span class="text-xs text-gray-400 mr-1">${kindLabel[m.kind]}</span>
+                  <span class="font-medium truncate">${escapeHtml(m.name) || escapeHtml(m.stream_id)}</span>
+                  <span class="text-gray-400 ml-2">${m.kind === 'movie' ? formatDuration(m.duration) : (m.height ? m.height + 'p' : '')}</span>
+                  <span class="text-gray-500 ml-2">${escapeHtml(m.video_codec || '')}/${escapeHtml(m.audio_codec || '')}</span>
+                  ${m.audio_langs.length > 1 ? `<span class="text-gray-500 ml-1">audio: ${escapeHtml(m.audio_langs.join(', '))}</span>` : ''}
+                  ${m.subtitle_count > 0 ? `<span class="text-gray-500 ml-1">+${m.subtitle_count} subs</span>` : ''}
+                </div>
+                <button class="clear-movie px-2 py-1 text-xs bg-gray-600 hover:bg-red-600 rounded ml-2" data-kind="${m.kind}" data-stream="${escapeHtml(m.stream_id)}">Clear</button>
+              </div>
+            `).join('');
+          listEl.innerHTML = movieRows + series.map(s => {
             const name = escapeHtml(s.name) || `Series ${s.series_id}`;
             const episodes = s.episodes || [];
             const mruEp = s.mru != null ? episodes.find(ep => ep.episode_id === s.mru) : null;
@@ -670,7 +697,9 @@
       if (!btn) return;
       e.stopPropagation();
 
-      if (btn.classList.contains('clear-series')) {
+      if (btn.classList.contains('clear-movie')) {
+        fetch(`/settings/probe-cache/clear-url?kind=${btn.dataset.kind}&stream_id=${encodeURIComponent(btn.dataset.stream)}`, { method: 'POST' }).then(() => loadCache());
+      } else if (btn.classList.contains('clear-series')) {
         fetch(`/settings/probe-cache/clear/${btn.dataset.series}`, { method: 'POST' }).then(() => loadCache());
       } else if (btn.classList.contains('clear-mru')) {
         fetch(`/settings/probe-cache/clear-mru/${btn.dataset.series}`, { method: 'POST' }).then(() => loadCache());

@@ -991,7 +991,6 @@ def test_vod_details_without_info_keeps_movie(web: FakeWeb):
 
 def test_user_prefs_saves_each_field(auth_client: TestClient):
     prefs: dict[str, MutablePlainTree] = {
-        "favorites": {"movies": {"1": {"name": "Film"}}},
         "cc_lang": "eng",
         "cc_style": {"size": "large"},
         "cast_host": "192.168.1.5",
@@ -1022,14 +1021,26 @@ def _favorite_covers(auth_client: TestClient) -> dict[str, dict[str, str]]:
     }
 
 
+def _set_favorite(
+    auth_client: TestClient,
+    kind: str,
+    fid: str,
+    entry: dict[str, str] | None,
+) -> dict[str, dict[str, MutablePlainTree]]:
+    response = auth_client.post("/api/favorites", json={"kind": kind, "id": fid, "entry": entry})
+    assert response.status_code == 200
+    return main_test._body(response, _PageFavorites)["favorites"]
+
+
+class _PageFavorites(TypedDict):
+    favorites: dict[str, dict[str, MutablePlainTree]]
+
+
 def test_favorite_covers_are_saved_as_provider_urls(auth_client: TestClient):
     raw = "https://img.example/film.jpg"
     legacy = "/api/logo?" + parse.urlencode({"source": "img.example", "url": raw})
-    favorites = {
-        "movies": {"1": {"name": "Film", "cover": _logo(raw), "ext": "mkv"}},
-        "series": {"2": {"name": "Show", "cover": legacy}},
-    }
-    assert auth_client.post("/api/user-prefs", json={"favorites": favorites}).json() == {"ok": True}
+    _set_favorite(auth_client, "movies", "1", {"name": "Film", "cover": _logo(raw), "ext": "mkv"})
+    _set_favorite(auth_client, "series", "2", {"name": "Show", "cover": legacy})
     saved = cache_module.load_user_settings("testuser")["favorites"]
     assert saved == {
         "movies": {"1": {"name": "Film", "cover": raw, "ext": "mkv"}},
@@ -1037,11 +1048,48 @@ def test_favorite_covers_are_saved_as_provider_urls(auth_client: TestClient):
     }
 
 
-def test_favorites_of_other_shapes_are_saved_as_they_are(auth_client: TestClient):
+def test_favorites_without_a_text_cover_are_saved_as_sent(auth_client: TestClient):
+    _set_favorite(auth_client, "movies", "1", {"name": "No cover"})
+    auth_client.post(
+        "/api/favorites",
+        json={"kind": "series", "id": "2", "entry": {"name": "Odd", "cover": 5}},
+    )
+    saved = cache_module.load_user_settings("testuser")["favorites"]
+    assert saved["movies"]["1"] == {"name": "No cover"}
+    assert saved["series"]["2"] == {"name": "Odd", "cover": 5}
+
+
+def test_each_favorite_change_keeps_the_others(auth_client: TestClient):
+    stale_page = _set_favorite(auth_client, "movies", "1", {"name": "One", "cover": ""})
+    # Another tab adds a favorite this page never saw.
+    _set_favorite(auth_client, "movies", "2", {"name": "Two", "cover": ""})
+    assert set(stale_page["movies"]) == {"1"}
+    page = _set_favorite(auth_client, "series", "3", {"name": "Three", "cover": ""})
+    assert (set(page["movies"]), set(page["series"])) == ({"1", "2"}, {"3"})
+    page = _set_favorite(auth_client, "movies", "1", None)
+    assert set(page["movies"]) == {"2"}
+    assert _set_favorite(auth_client, "movies", "missing", None)["movies"].keys() == {"2"}
+    saved = cache_module.load_user_settings("testuser")["favorites"]
+    assert (set(saved["movies"]), set(saved["series"])) == ({"2"}, {"3"})
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"{bad", b'{"kind": "live", "id": "1", "entry": null}', b"x" * (64 * 1024 + 1)],
+)
+def test_favorite_update_rejects_bad_bodies(auth_client: TestClient, body: bytes):
+    assert auth_client.post("/api/favorites", content=body).status_code == 400
+
+
+def test_favorites_of_other_shapes_are_shown_as_they_are(auth_client: TestClient):
     raw = "https://img.example/film.jpg"
-    favorites = {"movies": {"1": {"name": "Film", "cover": raw}, "2": "Film"}, "series": {"3": 3}}
-    assert auth_client.post("/api/user-prefs", json={"favorites": favorites}).json() == {"ok": True}
-    assert cache_module.load_user_settings("testuser")["favorites"] == favorites
+    favorites: dict[str, dict[str, MutablePlainTree]] = {
+        "movies": {"1": {"name": "Film", "cover": raw}, "2": "Film"},
+        "series": {"3": 3},
+    }
+    settings = cache_module.load_user_settings("testuser")
+    settings["favorites"] = favorites
+    cache_module.save_user_settings("testuser", settings)
     cache_module.get_cache()["vod_streams"] = [{"stream_id": 2, "stream_icon": raw}]
     page = main_test._fields(auth_client.get("/api/user-prefs"))["favorites"]
     assert page == {
@@ -1948,6 +1996,22 @@ def test_script_guard_exits_with_main_status(monkeypatch: pytest.MonkeyPatch, ro
     assert exit_info.value.code == 0
     [run] = server.runs
     assert run.options["port"] == 8000
+
+
+def test_created_app_serves_static_files_that_browsers_revalidate() -> None:
+    application = main._create_app()
+    assert application.title == "neTV"
+    assert application.router.lifespan_context is main.lifespan
+    # Without a context manager the client skips the lifespan's preloads.
+    client = TestClient(application)
+    first = client.get("/static/js/app.js")
+    assert first.status_code == 200
+    assert first.headers["cache-control"] == "no-cache"
+    assert first.content == (main.APP_DIR / "static" / "js" / "app.js").read_bytes()
+    again = client.get("/static/js/app.js", headers={"if-none-match": first.headers["etag"]})
+    assert again.status_code == 304
+    assert again.headers["cache-control"] == "no-cache"
+    assert application.url_path_for("static", path="/js/app.js") == "/static/js/app.js"
 
 
 if __name__ == "__main__":

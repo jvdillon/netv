@@ -23,24 +23,20 @@
     return window.favorites[cfg.type] || {};
   }
 
-  function saveFavorites() {
-    fetch('/api/user-prefs', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({favorites: window.favorites})
-    });
-  }
-
-  window.toggleFavorite = function(id, name, cover, ext) {
-    const favs = window.favorites[cfg.type];
-    if (favs[id]) {
-      delete favs[id];
-    } else {
-      favs[id] = cfg.type === 'movies' ? { name, cover, ext } : { name, cover };
-    }
-    saveFavorites();
+  function showFavorites() {
     updateFavoriteButtons();
     if (typeof window.renderFavorites === 'function') window.renderFavorites();
+  }
+
+  window.onFavoritesChanged = function(favorites) {
+    window.favorites = favorites;
+    showFavorites();
+  };
+
+  window.toggleFavorite = async function(id, name, cover, ext) {
+    id = String(id);
+    const entry = getFavorites()[id] ? null : (cfg.type === 'movies' ? { name, cover, ext } : { name, cover });
+    window.onFavoritesChanged(await setFavorite(cfg.type, id, entry));
   };
 
   window.updateFavoriteButtons = function() {
@@ -69,6 +65,55 @@
     if (catSel) catSel.addEventListener('change', updateBrowseUrl);
     if (sortSel) sortSel.addEventListener('change', updateBrowseUrl);
     updateFavoriteButtons();
+
+    const browse = document.getElementById('browse');
+
+    // Fetches cards from `url` into `container` ahead of `before`; returns how many arrived.
+    async function loadCards(url, container, before) {
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) return 0;
+        const tpl = document.createElement('template');
+        tpl.innerHTML = await resp.text();
+        const count = tpl.content.querySelectorAll('.' + cfg.cardClass).length;
+        container.insertBefore(tpl.content, before || null);
+        updateFavoriteButtons();
+        return count;
+      } catch (e) {
+        console.error('Failed to load cards:', e);
+        return 0;
+      }
+    }
+
+    const rowObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const row = entry.target;
+        rowObserver.unobserve(row);
+        const grid = row.querySelector('.grid');
+        loadCards(row.dataset.src, grid, grid.querySelector('.see-all'));
+      }
+    }, {root: browse, rootMargin: '600px 0px'});
+    document.querySelectorAll('.browse-row[data-src]').forEach(row => rowObserver.observe(row));
+
+    const pageGrid = document.getElementById('browse-grid');
+    const sentinel = document.getElementById('browse-more');
+    if (pageGrid && sentinel) {
+      let offset = Number(pageGrid.dataset.offset);
+      const total = Number(pageGrid.dataset.total);
+      let busy = false;
+      const pageObserver = new IntersectionObserver(async (entries) => {
+        if (busy || !entries.some(e => e.isIntersecting)) return;
+        busy = true;
+        const count = await loadCards(pageGrid.dataset.src + '&offset=' + offset, pageGrid);
+        offset += count;
+        busy = false;
+        pageObserver.unobserve(sentinel);
+        // Re-observing reports the sentinel again, so a still-visible one loads the next page.
+        if (count && offset < total) pageObserver.observe(sentinel);
+      }, {root: browse, rootMargin: '800px 0px'});
+      if (offset < total) pageObserver.observe(sentinel);
+    }
   }
 
   // Favorites view handlers

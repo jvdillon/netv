@@ -72,27 +72,19 @@
 {% block scripts %}
 <script>
 let favorites = {{ favorites | tojson }};
-const SERIES_ID = '{{ series_id }}';
-const SERIES_NAME = '{{ series.info.name | e if series.info else "" }}';
+const SERIES_ID = {{ series_id | string | tojson }};
+const SERIES_NAME = {{ (series.info.name if series.info else "") | tojson }};
 const SERIES_COVER = document.getElementById('cover')?.getAttribute('src') ?? "";
 
-function saveFavorites() {
-  fetch('/api/user-prefs', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({favorites})
-  });
-}
-
-function toggleFavorite() {
-  if (!SERIES_ID) return;
-  if (favorites.series[SERIES_ID]) {
-    delete favorites.series[SERIES_ID];
-  } else {
-    favorites.series[SERIES_ID] = { name: SERIES_NAME, cover: SERIES_COVER };
-  }
-  saveFavorites();
+window.onFavoritesChanged = function(changed) {
+  favorites = changed;
   updateButton();
+};
+
+async function toggleFavorite() {
+  if (!SERIES_ID) return;
+  const entry = favorites.series[SERIES_ID] ? null : { name: SERIES_NAME, cover: SERIES_COVER };
+  window.onFavoritesChanged(await setFavorite('series', SERIES_ID, entry));
 }
 
 function updateButton() {

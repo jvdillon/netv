@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import NotRequired, TypedDict
+from pathlib import Path
+from typing import Final, NotRequired, TypedDict
 
 import hashlib
 import hmac
 import json
-import pathlib
 import re
 import secrets
 import time
@@ -15,6 +15,9 @@ import time
 from treekle import MutablePlainTree, from_plain, json_loads, mutable, to_plain
 
 from netv.util import atomic_write_json, data_dir, merge_unknown, read_json_object
+
+
+_CWD: Final = Path(__file__).resolve().parent
 
 
 class UserRecord(TypedDict):
@@ -47,7 +50,7 @@ class TokenClaims(TypedDict):
     exp: NotRequired[int]
 
 
-APP_DIR = pathlib.Path(__file__).parent
+APP_DIR = _CWD
 CACHE_DIR = APP_DIR / ".cache"
 SERVER_SETTINGS_FILE = CACHE_DIR / "server_settings.json"
 USERS_DIR = CACHE_DIR / "users"
@@ -377,7 +380,7 @@ def verify_stream_url_token(username: str, url: str, token: str) -> bool:
     return hmac.compare_digest(token, stream_url_token(username, url))
 
 
-def _get_settings_file() -> pathlib.Path:
+def _get_settings_file() -> Path:
     """Resolve legacy storage without replacing caller-supplied paths."""
     global CACHE_DIR, SERVER_SETTINGS_FILE, USERS_DIR
     default_dir = APP_DIR / ".cache"
@@ -390,16 +393,23 @@ def _get_settings_file() -> pathlib.Path:
     return SERVER_SETTINGS_FILE
 
 
+_secret_key_cache: tuple[Path, str] | None = None
+
+
 def _get_secret_key() -> str:
     """Get or generate secret key (persisted in settings)."""
+    global _secret_key_cache
     settings_file = _get_settings_file()
+    # Pages sign every poster URL, so reading the settings file per call stalls renders.
+    if _secret_key_cache is not None and _secret_key_cache[0] == settings_file:
+        return _secret_key_cache[1]
     settings = read_json_object(settings_file)
     key = settings.get("secret_key")
-    if isinstance(key, str):
-        return key
-    key = secrets.token_hex(32)
-    settings["secret_key"] = key
-    atomic_write_json(settings_file, settings)
+    if not isinstance(key, str):
+        key = secrets.token_hex(32)
+        settings["secret_key"] = key
+        atomic_write_json(settings_file, settings)
+    _secret_key_cache = (settings_file, key)
     return key
 
 

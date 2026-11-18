@@ -1,0 +1,26 @@
+{% for movie in items %}
+{% set cover = (movie.stream_icon or '') | logo_url %}
+<div class="movie-card relative group" data-movie-id="{{ movie.stream_id }}" data-movie-name="{{ movie.name }}"
+     data-movie-cover="{{ cover }}" data-movie-ext="{{ movie.container_extension or 'mkv' }}">
+  <a href="/movie/{{ movie.stream_id }}"
+     class="block bg-gray-800 rounded-lg overflow-hidden hover:ring-2 hover:ring-blue-500 focus:ring-2 focus:ring-blue-500 focusable transition-all"
+     tabindex="0" data-nav="grid" title="{{ movie.name }}{% if movie.rating %}&#10;★ {{ movie.rating }}{% endif %}">
+    <div class="aspect-[2/3] bg-gray-700">
+      {% if movie.stream_icon %}
+      <img src="{{ cover }}" alt="" class="w-full h-full object-cover" loading="lazy"
+           onerror="this.style.display='none'">
+      {% endif %}
+    </div>
+    <div class="p-2">
+      <div class="text-sm line-clamp-2 leading-tight">{{ movie.name }}</div>
+      {% if movie.rating %}
+      <div class="text-xs text-yellow-400 mt-1">★ {{ movie.rating }}</div>
+      {% endif %}
+    </div>
+  </a>
+  <button type="button" class="fav-btn absolute top-2 right-2 w-8 h-8 rounded-full bg-black/50 text-xl opacity-0 group-hover:opacity-100 transition-opacity z-10"
+          onclick='toggleFavorite({{ movie.stream_id | tojson }}, {{ movie.name | tojson }}, {{ cover | tojson }}, {{ (movie.container_extension or "mkv") | tojson }})'>
+    ☆
+  </button>
+</div>
+{% endfor %}

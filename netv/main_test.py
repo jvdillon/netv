@@ -1656,6 +1656,11 @@ class TestUserPrefs:
         assert _fields(resp)["ok"] is True
         assert _fields(auth_client.get("/api/user-prefs"))["sort_live_by_views"] is False
 
+    def test_audio_language_defaults_to_english_and_saves(self, auth_client: TestClient):
+        assert _fields(auth_client.get("/api/user-prefs"))["audio_lang"] == "en"
+        auth_client.post("/api/user-prefs", json={"audio_lang": "fr"})
+        assert _fields(auth_client.get("/api/user-prefs"))["audio_lang"] == "fr"
+
     def test_view_sorting_preference_requires_boolean(self, auth_client: TestClient):
         resp = auth_client.post(
             "/api/user-prefs",
@@ -2217,6 +2222,37 @@ class TestProbeCache:
         resp = auth_client.post("/settings/probe-cache/clear/123")
         assert resp.status_code == 200
         assert _body(auth_client.get("/settings/probe-cache"), _ProbeCache)["series"] == []
+
+    def test_url_probes_are_listed_by_movie_and_channel_name_and_cleared(
+        self,
+        auth_client: TestClient,
+        probe_cache: None,
+    ):
+        del probe_cache
+        media = MediaInfo(video_codec="h264", audio_codec="ac3", pix_fmt="yuv420p", duration=60)
+        ffmpeg_command.remember_probe("http://h/movie/u/p/42.mkv", media)
+        ffmpeg_command.remember_probe("http://h/live/u/p/9.ts", media)
+        ffmpeg_command.remember_probe("http://hdhr/auto/v2.1", media)
+        ffmpeg_command.remember_probe("http://h/movie/u/p/43.mkv", None)
+        store = cache_module.get_cache()
+        store["vod_streams"] = [{"stream_id": 42, "name": "Answer"}]
+        store["live_streams"] = [
+            {"stream_id": 9, "name": "News"},
+            {"stream_id": "ota_2", "name": "KTVU", "direct_url": "http://hdhr/auto/v2.1"},
+        ]
+        probes = _body(auth_client.get("/settings/probe-cache"), _ProbeCache)["probes"]
+        labels = {(p["kind"], p["stream_id"], p["name"]) for p in probes}
+        assert labels == {
+            ("movie", "42", "Answer"),
+            ("live", "9", "News"),
+            ("live", "ota_2", "KTVU"),
+            ("other", "", ""),
+        }
+        assert all("url" not in p for p in probes)
+        resp = auth_client.post("/settings/probe-cache/clear-url?kind=live&stream_id=ota_2")
+        assert _fields(resp)["cleared"] == 1
+        probes = _body(auth_client.get("/settings/probe-cache"), _ProbeCache)["probes"]
+        assert ("live", "ota_2") not in {(p["kind"], p["stream_id"]) for p in probes}
 
 
 class TestRefreshStatus:
@@ -3232,6 +3268,7 @@ class _ProbeSeries(TypedDict):
 
 
 class _ProbeCache(TypedDict):
+    probes: list[dict[str, str | float | list[str]]]
     series: list[_ProbeSeries]
 
 

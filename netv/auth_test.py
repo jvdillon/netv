@@ -322,6 +322,11 @@ class TestSecretKey:
         settings = json.loads(settings_file.read_text())
         assert settings["secret_key"] == key1
 
+    def test_get_secret_key_reads_settings_once(self):
+        key = auth._get_secret_key()
+        auth._get_settings_file().write_text("{}")
+        assert auth._get_secret_key() == key
+
 
 @pytest.mark.usefixtures("auth_module")
 def test_user_writes_keep_unrelated_settings():

@@ -40,6 +40,24 @@
     return { items, index, cols };
   }
 
+  function focusAdjacentGrid(current, direction) {
+    const grids = Array.from(document.querySelectorAll('main .grid'))
+      .filter(g => g.querySelector('[data-nav="grid"]'));
+    const index = grids.indexOf(current.closest('.grid'));
+    const target = grids[direction === 'down' ? index + 1 : index - 1];
+    if (index === -1 || !target) return false;
+    const x = current.getBoundingClientRect().left;
+    let best = null;
+    let bestDist = Infinity;
+    for (const item of target.querySelectorAll('[data-nav="grid"]')) {
+      const dist = Math.abs(item.getBoundingClientRect().left - x);
+      if (dist < bestDist) { best = item; bestDist = dist; }
+    }
+    best.focus();
+    best.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
+    return true;
+  }
+
   function moveFocus(direction) {
     const current = document.activeElement;
     const focusables = getFocusables();
@@ -63,8 +81,10 @@
         items[nextIndex].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
         return true;
       }
-      // At grid edge - don't wrap for up/down
-      if (direction === 'up' || direction === 'down') return false;
+      // At grid edge: step into the neighboring grid (browse rows), never wrap.
+      if (direction === 'up' || direction === 'down') {
+        return focusAdjacentGrid(current, direction);
+      }
     }
 
     // Linear navigation fallback
@@ -233,6 +253,30 @@
         }
         break;
     }
+  });
+
+  // ============================================================
+  // Favorites
+  // ============================================================
+
+  // One change per request, so a page loaded before another change cannot undo it.
+  window.setFavorite = async function(kind, id, entry) {
+    const resp = await fetch('/api/favorites', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({kind, id: String(id), entry}),
+    });
+    if (!resp.ok) throw new Error('Saving favorite failed: ' + resp.status);
+    return (await resp.json()).favorites;
+  };
+
+  // Back/Forward shows the page as first loaded; give pages the current favorites.
+  window.addEventListener('pageshow', async (e) => {
+    if (typeof window.onFavoritesChanged !== 'function') return;
+    const nav = performance.getEntriesByType('navigation')[0];
+    if (!e.persisted && nav?.type !== 'back_forward') return;
+    const resp = await fetch('/api/user-prefs');
+    if (resp.ok) window.onFavoritesChanged((await resp.json()).favorites);
   });
 
   // Set initial focus after page load

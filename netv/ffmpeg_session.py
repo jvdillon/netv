@@ -39,6 +39,7 @@ from netv.cache import (
     HwAccel,
     ServerSettings,
     get_user_agent,
+    load_user_settings,
     relay_hints,
     remember_burst_gap,
 )
@@ -64,22 +65,28 @@ from netv.fast_start import (
 )
 from netv.ffmpeg_command import (
     SEG_PREFIX,
+    CachedAudioTrack,
     MediaInfo,
     SubtitleStream,
+    audio_tracks_from_cache,
+    audio_tracks_to_cache,
     build_hls_ffmpeg_cmd,
     can_remux_live,
     get_hls_segment_duration,
     get_live_hls_list_size,
     get_settings,
     get_transcode_dir,
-    invalidate_series_probe_cache,
+    has_cached_probe,
+    invalidate_probe,
     live_video_bitrates,
     probe_closed_captions,
     probe_media,
     probe_segment,
+    remember_probe,
     resolve_hls_master_playlist,
     restore_probe_cache_entry,
     uses_audio_passthrough,
+    with_audio_language,
 )
 from netv.m3u import live_ts_offered
 from netv.playback_policy import LiveRecoveryPolicy, PlaybackHealth, PlaybackPolicy
@@ -158,6 +165,7 @@ class TranscodeSession(TypedDict, total=False):
     series_id: int | None
     episode_id: int | None
     audio_passthrough: bool
+    audio_lang: str  # Preferred audio language the session was started for.
     bandwidth_saver: bool
     recovery_bitrate: float
     caption_timestamp_origin: float
@@ -308,6 +316,7 @@ class SessionProgress(TypedDict):
 
 
 class _SessionProbe(TypedDict, total=False):
+    audio_tracks: list[CachedAudioTrack]
     video_codec: str
     audio_codec: str
     pix_fmt: str
@@ -519,6 +528,7 @@ async def record_live(
         path = pathlib.Path(directory) / "probe.ts"
         await asyncio.to_thread(path.write_bytes, sample)
         source = await asyncio.to_thread(probe_segment, str(path))
+        remember_probe(url, source)
         settings = get_settings()
         cmd = recorder_command(
             directory,
@@ -732,6 +742,7 @@ def cleanup_and_recover_sessions() -> None:
                     "username": info.get("username", ""),
                     "source_id": info.get("source_id", ""),
                     "audio_passthrough": info.get("audio_passthrough", False),
+                    "audio_lang": info.get("audio_lang", ""),
                 }
                 # Prefer session with seek_offset or more recent mtime.
                 existing_id = _url_to_session.get(url)
@@ -747,7 +758,7 @@ def cleanup_and_recover_sessions() -> None:
                         _url_to_session[url] = session_id
 
             # Restore probe cache.
-            if (p := info.get("probe")) is not None and p:
+            if (p := info.get("probe")) is not None and "audio_tracks" in p:
                 media_info = MediaInfo(
                     video_codec=p.get("video_codec", ""),
                     audio_codec=p.get("audio_codec", ""),
@@ -759,6 +770,7 @@ def cleanup_and_recover_sessions() -> None:
                     height=p.get("height", 0),
                     video_bitrate=p.get("video_bitrate", 0),
                     interlaced=p.get("interlaced", False),
+                    audio_tracks=audio_tracks_from_cache(p.get("audio_tracks", [])),
                 )
                 subs = [
                     SubtitleStream(
@@ -876,6 +888,7 @@ class _SessionSnapshot:
     subtitles: list[StoredSubtitle | int]
     duration: float
     audio_passthrough: bool = False
+    username: str = ""
 
 
 # ===========================================================================
@@ -1092,6 +1105,7 @@ class _SeekSessionInfo:
     series_id: int | None
     episode_id: int | None
     audio_passthrough: bool = False
+    username: str = ""
 
 
 async def seek_transcode(
@@ -1167,14 +1181,10 @@ async def seek_transcode(
     else:
         do_probe = settings["probe_movies"]
     if do_probe:
-        media_info = (
-            await asyncio.to_thread(
-                probe_media,
-                url,
-                info.series_id,
-                info.episode_id,
-            )
-        )[0]
+        media_info = _user_audio(
+            (await asyncio.to_thread(probe_media, url, info.series_id, info.episode_id))[0],
+            info.username,
+        )
     else:
         media_info = None
 
@@ -1777,6 +1787,7 @@ def _get_session_snapshot(session_id: str) -> _SessionSnapshot | None:
             subtitles=session.get("subtitles", []),
             duration=session.get("duration", 0),
             audio_passthrough=session.get("audio_passthrough", False),
+            username=session.get("username", ""),
         )
 
 
@@ -1952,7 +1963,9 @@ async def _handle_existing_vod_session(
     url = await asyncio.to_thread(resolve_hls_master_playlist, url)
 
     media_info = (
-        (await asyncio.to_thread(probe_media, url, None, None, ""))[0] if do_probe else None
+        _user_audio((await asyncio.to_thread(probe_media, url, None, None, ""))[0], snap.username)
+        if do_probe
+        else None
     )
     cmd = build_hls_ffmpeg_cmd(
         url,
@@ -2061,6 +2074,7 @@ async def _do_start_transcode(
             episode_id,
             series_name,
         )
+        media_info = _user_audio(media_info, username)
         if media_info is not None:
             codecs = media_info.subtitle_codecs
             # Probing stores None, never [], for a source without subtitles.
@@ -2156,6 +2170,7 @@ async def _do_start_transcode(
             "username": username,
             "source_id": source_id,
             "audio_passthrough": passthrough_used,
+            "audio_lang": _audio_lang(username),
         }
         _url_to_session[url] = session_id
 
@@ -2173,6 +2188,7 @@ async def _do_start_transcode(
             "username": username,
             "source_id": source_id,
             "audio_passthrough": passthrough_used,
+            "audio_lang": _audio_lang(username),
         }
         if media_info is not None:
             session_info["probe"] = {
@@ -2185,6 +2201,7 @@ async def _do_start_transcode(
                 "height": media_info.height,
                 "video_bitrate": media_info.video_bitrate,
                 "interlaced": media_info.interlaced,
+                "audio_tracks": audio_tracks_to_cache(media_info.audio_tracks),
             }
         (pathlib.Path(output_dir) / "session.json").write_text(json.dumps(session_info))
 
@@ -2246,6 +2263,7 @@ def _get_seek_session_info(session_id: str) -> _SeekSessionInfo | None:
             series_id=session.get("series_id"),
             episode_id=session.get("episode_id"),
             audio_passthrough=session.get("audio_passthrough", False),
+            username=session.get("username", ""),
         )
 
 
@@ -2593,7 +2611,17 @@ async def _start_or_reuse(
                 raise fastapi.HTTPException(404, "Session not found")
             touch_session(existing.session_id)
             return _adaptive_session_response(existing.session_id)
-        if content_type != "live":
+        if (
+            content_type != "live"
+            and not _is_archive_url(url)
+            and existing.session.get("username") == username
+            and existing.session.get("audio_lang") != _audio_lang(username)
+        ):
+            # Its segments carry another audio track; restart at the same position.
+            log.info("Restarting session %s for audio language", existing.session_id)
+            await stop_session(existing.session_id, force=True)
+            existing = None
+        elif content_type != "live":
             log.info("Found valid existing VOD session %s", existing.session_id)
             result = await _try_reuse_session(existing.session_id, url, content_type)
             if result:
@@ -2627,7 +2655,9 @@ async def _start_or_reuse(
             min_segments=min_segments,
         )
 
-    # Start fresh transcode (with retry for series probe cache staleness)
+    # A cached probe makes the start fast; if the source changed since, ffmpeg rejects
+    # the stale facts, so re-probe and retry once.
+    probe_was_cached = has_cached_probe(url, series_id)
     try:
         return await _do_start_transcode(
             url,
@@ -2643,10 +2673,10 @@ async def _start_or_reuse(
             is_disconnected=is_disconnected,
         )
     except fastapi.HTTPException:
-        if series_id is None:
+        if not probe_was_cached:
             raise
         log.info("Transcode failed, clearing probe cache and retrying")
-        invalidate_series_probe_cache(series_id, episode_id)
+        invalidate_probe(url, series_id, episode_id)
         return await _do_start_transcode(
             url,
             content_type,
@@ -2701,6 +2731,7 @@ class _SessionInfo(TypedDict, total=False):
     username: str
     source_id: str
     audio_passthrough: bool
+    audio_lang: str
     probe: _SessionProbe
 
 
@@ -2863,6 +2894,7 @@ async def _launch_worker(
     # Captions only shape the master playlist, published once the worker is ready.
     captions = asyncio.ensure_future(asyncio.to_thread(probe_closed_captions, str(path)))
     source = await asyncio.to_thread(probe_segment, str(path))
+    remember_probe(session["url"], source)
     if fresh_relay:
         history = stream.history()
         origin_time = stream.stats.first_byte_at or time.time()
@@ -3063,3 +3095,13 @@ async def _prestart(
     # Not a viewer itself: a page that never asks for the stream lets it stop.
     if "viewer_id" in response:
         await stop_session(response["session_id"], viewer=response["viewer_id"])
+
+
+def _audio_lang(username: str) -> str:
+    """The user's preferred audio language; English when unset."""
+    return load_user_settings(username).get("audio_lang", "en") if username else ""
+
+
+def _user_audio(media_info: MediaInfo | None, username: str) -> MediaInfo | None:
+    """``media_info`` playing the audio track in the user's preferred language."""
+    return with_audio_language(media_info, _audio_lang(username))

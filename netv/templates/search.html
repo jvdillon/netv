@@ -147,28 +147,21 @@
 <script>
 let favorites = {{ favorites | tojson }};
 
-function saveFavorites() {
-  fetch('/api/user-prefs', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({favorites})
-  });
+window.onFavoritesChanged = function(changed) {
+  favorites = changed;
+  updateButtons();
+};
+
+async function toggleSeriesFavorite(id, name, cover) {
+  id = String(id);
+  const entry = favorites.series[id] ? null : { name, cover };
+  window.onFavoritesChanged(await setFavorite('series', id, entry));
 }
 
-function toggleSeriesFavorite(id, name, cover) {
+async function toggleMovieFavorite(id, name, cover, ext) {
   id = String(id);
-  if (favorites.series[id]) delete favorites.series[id];
-  else favorites.series[id] = { name, cover };
-  saveFavorites();
-  updateButtons();
-}
-
-function toggleMovieFavorite(id, name, cover, ext) {
-  id = String(id);
-  if (favorites.movies[id]) delete favorites.movies[id];
-  else favorites.movies[id] = { name, cover, ext };
-  saveFavorites();
-  updateButtons();
+  const entry = favorites.movies[id] ? null : { name, cover, ext };
+  window.onFavoritesChanged(await setFavorite('movies', id, entry));
 }
 
 function updateButtons() {
