@@ -97,9 +97,6 @@ pre-commit = [
     "pytest-xdist>=3.8.0",
     "rekursiv-ai-typings>=0.1.18",
     "ruff>=0.17.4",
-    # netv.upscale imports these; type checkers need their sources, not just stubs.
-    "safetensors>=0.4",
-    "torch>=2.0",
     "treekle>=0.4.4",
     "ty>=0.0.99",
     "wrapt>=2.5.2",
@@ -125,7 +122,7 @@ exclude = ["*_test.py", "/netv/testing.py"]
 
 [tool.uv]
 package = true
-default-groups = ["dev", "cuda"]
+default-groups = ["dev"]
 conflicts = [
     [{extra = "cpu"}, {extra = "cu126"}, {extra = "cu128"}, {extra = "cu130"}, {extra = "cu132"}, {extra = "cu134"}],
     [{group = "cuda"}, {extra = "cpu"}, {extra = "cu128"}, {extra = "cu130"}, {extra = "cu132"}, {extra = "cu134"}],
@@ -247,6 +244,7 @@ pythonPlatform = "All"
 reportCallInDefaultInitializer = false
 reportImplicitStringConcatenation = false
 reportInvalidCast = false
+reportMissingModuleSource = false  # torch and safetensors are typed from stubs only.
 reportMissingSuperCall = false
 reportPrivateUsage = false
 reportUnannotatedClassAttribute = false
