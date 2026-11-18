@@ -344,11 +344,20 @@ test('one showing caption track is the viewer\'s pick and stays', async () => {
   assert.deepEqual(captionModes(p.video), ['showing', 'hidden']);
 });
 
-test('captions turned off hide a track the browser showed', async () => {
+test('a track turned on from the browser menu with CC off stays on', async () => {
+  // The native or fullscreen caption menu sets the mode directly.
   const p = await player({ captionsEnabled: false });
   const tracks = broadcastCaptions();
   tracks[0].mode = 'hidden';
   p.video.textTracks.push(...tracks);
+  await p.video.textTracks.emit('change');
+  assert.deepEqual(captionModes(p.video), ['hidden', 'showing']);
+  assert.equal(p.elements.get('toggle-cc').classList.contains('active'), true);
+});
+
+test('with CC off, two showing tracks are all hidden', async () => {
+  const p = await player({ captionsEnabled: false });
+  p.video.textTracks.push(...broadcastCaptions());
   await p.video.textTracks.emit('change');
   assert.deepEqual(captionModes(p.video), ['hidden', 'hidden']);
 });

@@ -358,11 +358,17 @@
 
   // Chrome can switch a newly added caption channel to showing on its own, so a
   // broadcast with CC1 and CC3 rendered both languages at once. One showing track
-  // (the preferred one, or the viewer's pick) is left alone.
+  // (the preferred one, or the viewer's pick) is left alone; with CC off it is a
+  // pick from the browser's own caption menu, so CC turns on.
   video.textTracks.addEventListener('change', () => {
     const showing = Array.from(video.textTracks).filter(t =>
       (t.kind === 'subtitles' || t.kind === 'captions') && t.mode === 'showing');
-    if (showing.length > (ccEnabled ? 1 : 0)) applyCaptionsSetting();
+    if (showing.length === 1 && !ccEnabled) {
+      ccEnabled = true;
+      updateCcButton();
+    } else if (showing.length > 1) {
+      applyCaptionsSetting();
+    }
   });
 
   function startSubtitlePolling(subtitles, prefIdx) {
