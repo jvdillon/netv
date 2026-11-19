@@ -25,7 +25,7 @@ repos:
     args:
     - --maxkb=5000
     - --enforce-all
-    exclude: "(?x)^(\n  uv\\.lock\n  |typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n  |(.*/)?uv\\.public\\.lock\n  |(.*/)?\\.export/uv\\.lock\n  |\\.(claude|sagent)/sessions/\n)\n"
+    exclude: "(?x)^(\n  uv\\.lock\n  |typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n  |(.*/)?uv\\.public\\.lock\n  |(.*/)?\\.export/uv\\.lock\n  |\\.(claude|sagent)/sessions/\n  |apple/AppStoreScreenshots/\n  |apple/.*\\.xcassets/\n)\n"
   - id: check-merge-conflict
     name: check-merge-conflict
     stages:
