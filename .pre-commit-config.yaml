@@ -23,7 +23,7 @@ repos:
     stages:
     - pre-commit
     args:
-    - --maxkb=5000
+    - --maxkb=800
     - --enforce-all
     exclude: "(?x)^(\n  uv\\.lock\n  |typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n  |(.*/)?uv\\.public\\.lock\n  |(.*/)?\\.export/uv\\.lock\n  |\\.(claude|sagent)/sessions/\n  |apple/AppStoreScreenshots/\n  |apple/.*\\.xcassets/\n)\n"
   - id: check-merge-conflict
@@ -387,18 +387,21 @@ repos:
     - --plugin
     - codedoctor.testing.listing
 - hooks:
-  - additional_dependencies:
+  - id: biome-check
+    name: biome-check
+    language: node
+    additional_dependencies:
     - '@biomejs/biome@2.6.7'
     entry: biome check --write --files-ignore-unknown=true --no-errors-on-unmatched
-    files: \.(tsx?|[cm]ts|jsx?|[cm]js|css)$
-    id: biome-check
-    language: node
-    name: biome-check
+    types:
+    - text
     require_serial: true
     stages:
     - pre-commit
-    types:
-    - text
+    files: \.(tsx?|[cm]ts|jsx?|[cm]js|css)$
+    args:
+    - --reporter=concise
+    - --error-on-warnings
   repo: local
 - hooks:
   - entry: uv --quiet run --frozen --group pre-commit python -m codedoctor cargo fmt
