@@ -69,13 +69,6 @@ def utc() -> Iterator[None]:
     time.tzset()
 
 
-@pytest.fixture
-def no_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    sleeps: list[float] = []
-    monkeypatch.setattr(time, "sleep", sleeps.append)
-    return sleeps
-
-
 class FakeResponse:
     def __init__(self, body: bytes) -> None:
         self.body = body
@@ -101,8 +94,8 @@ def _programme(event: dict[str, Any], *, tvimate: bool) -> xml.Element:
 def test_main_builds_guide_from_api(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    no_sleep: list[float],
 ) -> None:
+    sleeps: list[float] = []
     cache_dir = tmp_path / ".zap2xml"
     cache_dir.mkdir()
     (cache_dir / "1000.json.gz").write_bytes(b"")
@@ -117,12 +110,12 @@ def test_main_builds_guide_from_api(
     monkeypatch.setattr(request, "urlopen", urlopen)
     argv = ["zap2xml.py", "--zip", "90210", "--path", str(tmp_path), "--delay", "0"]
     monkeypatch.setattr(sys, "argv", [*argv, "--days", "0.125"])
-    assert zap2xml.main() == 0
+    assert zap2xml.main(sleep=sleeps.append) == 0
     assert not (cache_dir / "1000.json.gz").exists()
     assert len(urls) == 1
     assert "postalCode=90210" in urls[0]
     assert "lineupId=USA-lineupId-DEFAULT" in urls[0]
-    assert no_sleep == [0]
+    assert sleeps == [0]
 
     tv = xml.parse(tmp_path / "xmltv.xml").getroot()
     assert tv.get("source-info-name") == "zap2it"
@@ -142,7 +135,7 @@ def test_main_builds_guide_from_api(
         "argv",
         [*argv, "--days", "0.25", "--no-tvimate", "--no-is-override"],
     )
-    assert zap2xml.main() == 0
+    assert zap2xml.main(sleep=sleeps.append) == 0
     assert len(urls) == 2
     assert "isOverride=False" in urls[1]
     titles = [p.findtext("sub-title") for p in xml.parse(tmp_path / "xmltv.xml").iter("programme")]
@@ -196,16 +189,16 @@ def test_script_entrypoint(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPat
 def test_get_cached_paths(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    no_sleep: list[float],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    sleeps: list[float] = []
     with gzip.open(tmp_path / "5.json.gz", "wb") as f:
         f.write(b"cached")
-    assert zap2xml.get_cached(tmp_path, 5, 3, "https://x") == b"cached"
+    assert zap2xml.get_cached(tmp_path, 5, 3, "https://x", sleep=sleeps.append) == b"cached"
     assert "Cached: https://x" in capsys.readouterr().out
 
     with pytest.raises(ValueError, match="must start with 'http:' or 'https:'"):
-        zap2xml.get_cached(tmp_path, 6, 3, "ftp://x")
+        zap2xml.get_cached(tmp_path, 6, 3, "ftp://x", sleep=sleeps.append)
 
     with (
         error.HTTPError("https://x/400", 400, "err", message.Message(), None) as bad_request,
@@ -219,18 +212,18 @@ def test_get_cached_paths(
             raise {400: bad_request, 500: server_error}[code]
 
         monkeypatch.setattr(request, "urlopen", urlopen)
-        assert zap2xml.get_cached(tmp_path, 7, 3, "http://x/200") == b"fresh"
+        assert zap2xml.get_cached(tmp_path, 7, 3, "http://x/200", sleep=sleeps.append) == b"fresh"
         with gzip.open(tmp_path / "7.json.gz", "rb") as f:
             assert f.read() == b"fresh"
 
-        result = zap2xml.get_cached(tmp_path, 8, 4, "https://x/400")
+        result = zap2xml.get_cached(tmp_path, 8, 4, "https://x/400", sleep=sleeps.append)
         assert json.loads(result)["channels"] == []
         assert bad_request.closed
         assert "Got a 400 error! Ignoring it." in capsys.readouterr().out
-        assert no_sleep == [3, 4]
+        assert sleeps == [3, 4]
 
         with pytest.raises(error.HTTPError) as exc:
-            zap2xml.get_cached(tmp_path, 9, 3, "https://x/500")
+            zap2xml.get_cached(tmp_path, 9, 3, "https://x/500", sleep=sleeps.append)
         assert exc.value.__notes__ == ['Url is "https://x/500".']
         assert not (tmp_path / "9.json.gz").exists()
 

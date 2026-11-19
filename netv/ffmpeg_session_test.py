@@ -373,6 +373,7 @@ def _fast_session(
         last_access=_NOW,
         url="http://live",
         viewers={},
+        viewer_joined=asyncio.Event(),
         live_recovery=live_recovery or LiveRecoveryPolicy(),
         playback_policy=PlaybackPolicy(),
         plan=plan,
@@ -710,10 +711,39 @@ async def test_the_last_viewer_leaving_stops_the_session_after_a_grace(
 
 
 @pytest.mark.asyncio
-async def test_a_session_gone_before_the_grace_ends_needs_no_stop(env: _Env):
+async def test_a_session_already_gone_is_not_waited_on(env: _Env):
     await ffmpeg_session.stop_when_unwatched("gone")
-    assert env.clock.now == _NOW + 10
+    assert env.clock.now == _NOW
     assert not env.sessions
+
+
+@pytest.mark.asyncio
+async def test_a_session_gone_during_the_grace_needs_no_stop(
+    env: _Env,
+    tmp_path: pathlib.Path,
+):
+    _watched(env, tmp_path, {})
+    grace = asyncio.ensure_future(ffmpeg_session.stop_when_unwatched("s"))
+    asyncio.get_running_loop().call_soon(env.sessions.clear)
+    await grace
+    assert env.clock.now == _NOW + 10
+    assert tmp_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_page_joining_during_the_grace_ends_it_at_once(
+    env: _Env,
+    tmp_path: pathlib.Path,
+):
+    session = _watched(env, tmp_path, {})
+    grace = asyncio.ensure_future(ffmpeg_session.stop_when_unwatched("s"))
+    # The join lands while the grace waits; the wait ends then, not 10 s later.
+    loop = asyncio.get_running_loop()
+    loop.call_soon(ffmpeg_session._adaptive_session_response, "s")
+    await grace
+    assert env.clock.now == _NOW
+    assert env.sessions == {"s": session}
+    assert len(session["viewers"]) == 1
 
 
 @pytest.mark.asyncio
@@ -2484,7 +2514,8 @@ async def test_do_start_applies_the_quality_setting(env: _Env, tasks: Background
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "seek_offset,exit_code,waited,logged_exit",
-    [(0, None, 31.1, -1), (0.5, 0, 40.1, -1), (42.0, 3, 40.1, 3)],
+    # Past the deadline, only a process still running holds the report back (1 s).
+    [(0, None, 31.0, -1), (0.5, 0, 40.0, -1), (42.0, 3, 40.0, 3)],
 )
 async def test_failed_start_reports_the_last_stderr_lines(
     env: _Env,
@@ -2508,7 +2539,7 @@ async def test_failed_start_reports_the_last_stderr_lines(
         500,
         "Transcode failed - check server logs for details",
     )
-    assert sum(env.clock.sleeps) == pytest.approx(waited, abs=0.25)
+    assert sum(env.clock.sleeps) == pytest.approx(waited, abs=0.05)
     (command,) = launcher.commands
     sid = _session_id(command)
     assert ("-ss" in command) is (seek_offset > 0)
@@ -4056,9 +4087,12 @@ async def test_shared_ffmpeg_launcher(env: _Env):
 async def test_monitor_stderr_collects_lines(caplog: pytest.LogCaptureFixture):
     process = FakeProcess(stderr=[b"frame=1\n", b"Fatal error\n", b"Aborting now\n"])
     lines: list[str] = []
+    done = asyncio.Event()
     with caplog.at_level(logging.DEBUG, logger="netv.ffmpeg_session"):
-        await ffmpeg_session._monitor_ffmpeg_stderr(_proc(process), "s", lines)
+        await ffmpeg_session._monitor_ffmpeg_stderr(_proc(process), "s", lines, done)
     assert lines == ["frame=1", "Fatal error", "Aborting now"]
+    # Set only once stderr closed, so a reader of ``lines`` sees the last of them.
+    assert done.is_set()
     assert [
         (r.levelno, r.getMessage()) for r in caplog.records if "ffmpeg:s" in r.getMessage()
     ] == [
@@ -4515,8 +4549,9 @@ async def test_do_start_reports_failed_startup(
         await ffmpeg_session._do_start_transcode("http://movie", "movie", None, None, 42.0)
     assert error.value.status_code == 500
     assert "failed (exit 1): unknown" in caplog.text
-    # A resumed start waits out the longer seek deadline before giving up.
-    assert sum(env.clock.sleeps) == pytest.approx(40.1, abs=0.25)
+    # A resumed start waits out the longer seek deadline, then up to 1 s for stderr
+    # to close: its reader is held here, so it never does.
+    assert sum(env.clock.sleeps) == pytest.approx(41.0, abs=0.05)
     assert not env.sessions
     assert not list(env.root.iterdir())
 

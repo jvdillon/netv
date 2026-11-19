@@ -1154,12 +1154,13 @@ def test_subtitle_file_serves_ready_file(
     assert _subtitle(monkeypatch, sessions, tmp_path) == (body.encode(), [])
 
 
-def test_subtitle_file_missing_returns_empty_vtt(
+def test_subtitle_file_missing_returns_empty_vtt_at_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     sessions: dict[str, TranscodeSession],
 ) -> None:
-    assert _subtitle(monkeypatch, sessions, tmp_path) == (b"WEBVTT\n\n", [0.2] * 15)
+    # The player polls again shortly; holding the request would only delay it.
+    assert _subtitle(monkeypatch, sessions, tmp_path) == (b"WEBVTT\n\n", [])
 
 
 def test_subtitle_file_undecodable_returns_empty_vtt(

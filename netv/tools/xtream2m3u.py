@@ -17,6 +17,7 @@ and series.m3u beside them.
 #   https://github.com/engenex/xtream-codes-api-v2/blob/main/%5BHow-To%5D%20Player%20API%20v2%20-%20Tutorials%20-%20Xtream%20Codes.pdf
 from __future__ import annotations
 
+from collections.abc import Callable
 from concurrent import futures
 from typing import Any, NotRequired, Protocol, TypedDict, cast
 from urllib import error, parse, request
@@ -241,7 +242,7 @@ def fetch_series_info(
 
 
 class RateLimiter(Protocol):
-    def __init__(self, max_calls: int, per_seconds: float = 1): ...
+    def __init__(self, max_calls: int, per_seconds: float): ...
 
     def acquire(self) -> None: ...
 
@@ -404,11 +405,18 @@ def load_list(path: pathlib.Path) -> list[dict[str, Any]]:
 
 
 class SlidingRateLimiter:
-    def __init__(self, max_calls: int, per_seconds: float = 1):
+    def __init__(
+        self,
+        max_calls: int,
+        per_seconds: float,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+    ):
         self.max_calls = max_calls
         self.per_seconds = per_seconds
         self.lock = threading.Lock()
         self.requests = collections.deque()
+        self._sleep = sleep
 
     def acquire(self) -> None:
         while True:
@@ -420,33 +428,7 @@ class SlidingRateLimiter:
                     self.requests.append(time.perf_counter())
                     return
                 sleep_time = max(0, self.requests[0] - cutoff)
-            # Paces requests under the upstream's rate limit.
-            time.sleep(sleep_time)  # house-ignore[sleep] -- See above.
-
-
-class ChunkingRateLimiter:
-    def __init__(self, max_calls: int, per_seconds: float = 1):
-        self.max_calls = max_calls
-        self.per_seconds = per_seconds
-        self.condition = threading.Condition()
-        self.calls = 0
-        self.last_reset = time.perf_counter()
-
-    def acquire(self) -> None:
-        with self.condition:
-            if self.calls >= self.max_calls:
-                now = time.perf_counter()
-                elapsed = now - self.last_reset
-                if elapsed < self.per_seconds:
-                    sleep_time = self.per_seconds - elapsed
-                    self.condition.wait(timeout=sleep_time)
-                    # Basically just,
-                    # self.lock.release()
-                    # time.sleep(sleep_time)
-                    # self.lock.acquire()
-                self.calls = 0
-                self.last_reset = time.perf_counter()
-            self.calls += 1
+            self._sleep(sleep_time)
 
 
 def print_progress_bar(

@@ -686,20 +686,25 @@ async def test_cleanup_upscale_sessions_runs_every_minute(
     expired = _session(tmp_path / "expired", url="http://up/old")
     expired["last_access"] = 0.0
     sessions["expired"] = expired
+    ticks: list[float] = []
+    second_tick, never = asyncio.Event(), asyncio.Event()
 
-    task = asyncio.ensure_future(gateway._cleanup_upscale_sessions())
-    async with asyncio.timeout(5):
-        # Removing the session directory runs on a real worker thread; nothing signals it.
-        while len(clock.sleeps) < 2:
-            await asyncio.sleep(0.001)  # house-ignore[sleep] -- See above.
+    async def tick(seconds: float) -> None:
+        ticks.append(seconds)
+        if len(ticks) == 2:
+            second_tick.set()
+            await never.wait()
+
+    task = asyncio.ensure_future(gateway._cleanup_upscale_sessions(sleep=tick))
+    # The second tick follows the first pass, which removes the directory on a thread.
+    await asyncio.wait_for(second_tick.wait(), timeout=5)
     task.cancel()
     with suppress(asyncio.CancelledError):
         await task
 
     assert sessions == {}
     assert not (tmp_path / "expired").exists()
-    assert len(clock.sleeps) >= 2
-    assert set(clock.sleeps) == {60}
+    assert ticks == [60, 60]
 
 
 @pytest.mark.parametrize(

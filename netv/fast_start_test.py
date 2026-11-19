@@ -838,6 +838,7 @@ def fast_session(
         username="u",
         fast_start=True,
         viewers={},
+        viewer_joined=asyncio.Event(),
         process=FakeProcess(exit_code=None),
         playback_policy=PlaybackPolicy(bandwidth_saver=bandwidth_saver),
         live_recovery=LiveRecoveryPolicy(),

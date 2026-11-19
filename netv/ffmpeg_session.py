@@ -268,6 +268,7 @@ class FastLiveSession(TranscodeSession):
     # Player page loads sharing the session -> when each last reported. A reloaded
     # page joins before its old page's stop arrives, so stops count viewers.
     viewers: dict[str, float]
+    viewer_joined: asyncio.Event  # Set when a page becomes a viewer.
     live_recovery: LiveRecoveryPolicy
     playback_policy: PlaybackPolicy
     plan: _FastLivePlan
@@ -972,8 +973,14 @@ async def stop_when_unwatched(session_id: str, *, grace_sec: float = 10.0) -> No
         session_id: Live session whose last viewer left, or that no page joined yet.
         grace_sec: How long a page has to join before the stream stops.
     """
-    # The grace period is the schedule; nothing else ends it.
-    await asyncio.sleep(grace_sec)  # house-ignore[sleep] -- See above.
+    with _transcode_lock:
+        session = _transcode_sessions.get(session_id)
+        if session is None or not _is_fast_live(session) or session["viewers"]:
+            return
+        joined = session["viewer_joined"]
+        joined.clear()
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(joined.wait(), grace_sec)
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
         if session is None or not _is_fast_live(session) or session["viewers"]:
@@ -1565,9 +1572,12 @@ async def _monitor_ffmpeg_stderr(
     process: asyncio.subprocess.Process,
     session_id: str,
     stderr_lines: list[str] | None = None,
+    done: asyncio.Event | None = None,
 ) -> None:
     if process.stderr is None:
-        raise ValueError("Expected process.stderr is not None.")
+        raise ValueError(
+            "Expected process.stderr is not None.",  # pragma: no mutate[diagnostic-text]
+        )
     while True:
         line = await process.stderr.readline()
         if not line:
@@ -1578,6 +1588,8 @@ async def _monitor_ffmpeg_stderr(
         is_fatal = "fatal" in text.lower() or "aborting" in text.lower()
         level = logging.WARNING if is_fatal else logging.DEBUG
         log.log(level, "ffmpeg:%s %s", session_id, text)
+    if done is not None:
+        done.set()
 
 
 async def _monitor_resume_ffmpeg(
@@ -1636,6 +1648,7 @@ async def _wait_for_playlist(
     *,
     poll_interval_sec: float = 0.2,
     min_segment_size_bytes: int = 1_000,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
 ) -> bool:
     """Wait for playlist with min_segments, checking process health."""
     output_dir = playlist_path.parent
@@ -1656,8 +1669,7 @@ async def _wait_for_playlist(
                         process,
                     ):
                         return True
-        # The ffmpeg process writes the playlist and segments; nothing signals a write.
-        await asyncio.sleep(poll_interval_sec)  # house-ignore[sleep] -- See above.
+        await sleep(poll_interval_sec)
     return False
 
 
@@ -1924,6 +1936,7 @@ def _adaptive_session_response(
             if _is_fast_live(session):
                 viewer_id = uuid.uuid4().hex
                 session["viewers"][viewer_id] = time.time()
+                session["viewer_joined"].set()
     response: TranscodeResponse = {
         "session_id": session_id,
         "playlist": _fast_playlist_url(session_id, "low.m3u8", generation),
@@ -1982,6 +1995,7 @@ async def _handle_existing_vod_session(
     resume_wait_timeout_sec: float = 10.0,
     resume_segment_wait_timeout_sec: float = 5.0,
     poll_interval_sec: float = 0.2,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
 ) -> TranscodeResponse | None:
     """Handle existing VOD session: reuse active, return cached, or append."""
     snap = _get_session_snapshot(existing_id)
@@ -1999,6 +2013,7 @@ async def _handle_existing_vod_session(
             snap.process,
             min_segments=1,
             timeout_sec=reuse_wait_timeout_sec,
+            sleep=sleep,
         )
         return _build_session_response(existing_id, snap, playlist_path)
 
@@ -2071,14 +2086,14 @@ async def _handle_existing_vod_session(
             return None
         if (pathlib.Path(snap.output_dir) / next_seg).exists():
             break
-        # The ffmpeg process writes the segment; nothing signals the write.
-        await asyncio.sleep(poll_interval_sec)  # house-ignore[sleep] -- See above.
+        await sleep(poll_interval_sec)
 
     await _wait_for_playlist(
         playlist_path,
         process,
         min_segments=1,
         timeout_sec=resume_wait_timeout_sec,
+        sleep=sleep,
     )
     return _build_session_response(existing_id, snap, playlist_path)
 
@@ -2219,7 +2234,8 @@ async def _do_start_transcode(
         raise
 
     stderr_lines: list[str] = []
-    _spawn_background_task(_monitor_ffmpeg_stderr(process, session_id, stderr_lines))
+    stderr_done = asyncio.Event()
+    _spawn_background_task(_monitor_ffmpeg_stderr(process, session_id, stderr_lines, stderr_done))
 
     with _transcode_lock:
         _transcode_sessions[session_id] = {
@@ -2287,12 +2303,11 @@ async def _do_start_transcode(
         await stop_session(session_id, force=True)
         raise
     if not ready:
-        # Wait for process to fully exit and stderr to be captured.
-        # asyncio.TimeoutError is distinct from the builtin before Python 3.11.
-        with contextlib.suppress(asyncio.TimeoutError):
+        # The exit code and the last stderr lines name the failure; both arrive as ffmpeg exits.
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(process.wait(), timeout=1.0)
-        # The stderr monitor is a detached task; nothing signals its last line.
-        await asyncio.sleep(0.1)  # house-ignore[sleep] -- See above.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stderr_done.wait(), timeout=1.0)
         error_msg = "\n".join(stderr_lines[-10:]) if stderr_lines else "unknown"
         log.error(
             "ffmpeg:%s failed (exit %d): %s",
@@ -2377,6 +2392,7 @@ async def _wait_for_fresh_fast_playlist(
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
     timeout_sec: float = 30.0,
     poll_interval_sec: float = 0.05,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
 ) -> bool:
     path = pathlib.Path(directory) / name
     deadline = time.monotonic() + timeout_sec
@@ -2398,8 +2414,7 @@ async def _wait_for_fresh_fast_playlist(
             >= minimum_seconds
         ):
             return True
-        # The ffmpeg process writes the playlist; nothing signals a write.
-        await asyncio.sleep(poll_interval_sec)  # house-ignore[sleep] -- See above.
+        await sleep(poll_interval_sec)
     return False
 
 
@@ -2607,10 +2622,10 @@ async def _watch_fast_live(
     *,
     watchdog_interval_sec: float = 2.0,
     heartbeat_timeout_sec: float = 30.0,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
 ) -> None:
     while True:
-        # A periodic pass; the interval is the schedule.
-        await asyncio.sleep(watchdog_interval_sec)  # house-ignore[sleep] -- See above.
+        await sleep(watchdog_interval_sec)
         with _transcode_lock:
             session = _transcode_sessions.get(session_id)
             if session is None:
@@ -2869,6 +2884,7 @@ async def _start_fast_live(
             * 1.1,
             "fast_start": True,
             "viewers": {},
+            "viewer_joined": asyncio.Event(),
             "playlist_generation": 0,
             "playback_buffer_seconds": 12.0,
             "closed_captions": False,
@@ -3126,6 +3142,7 @@ async def _caught_up(
     *,
     timeout_sec: float = 30.0,
     poll_interval_sec: float = 0.2,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
 ) -> bool:
     """Wait until the upscaled rendition reaches where the plain one has got to."""
     deadline = time.monotonic() + timeout_sec
@@ -3137,8 +3154,7 @@ async def _caught_up(
         low_end, up_end = (playlist_end_pts(directory, text) for text in texts)
         if low_end is not None and up_end is not None and up_end >= low_end:
             return True
-        # The ffmpeg process writes the playlist; nothing signals a write.
-        await asyncio.sleep(poll_interval_sec)  # house-ignore[sleep] -- See above.
+        await sleep(poll_interval_sec)
     return False
 
 

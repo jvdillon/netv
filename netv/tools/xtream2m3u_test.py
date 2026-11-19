@@ -269,7 +269,8 @@ def _series(last_modified: int) -> Any:
 
 
 class _UnlimitedRateLimiter:
-    def __init__(self, max_calls: int, per_seconds: float = 1) -> None:
+    def __init__(self, max_calls: int, per_seconds: float) -> None:
+        del per_seconds
         self.max_calls = max_calls
 
     def acquire(self) -> None:
@@ -451,25 +452,13 @@ def test_sliding_rate_limiter_waits_until_the_oldest_call_leaves_the_window(
     monkeypatch.setattr(
         xtream2m3u,
         "time",
-        testing.ModuleView(time, {"perf_counter": clock.monotonic, "sleep": sleep}),
+        testing.ModuleView(time, {"perf_counter": clock.monotonic}),
     )
-    limiter = xtream2m3u.SlidingRateLimiter(max_calls=1, per_seconds=0.5)
+    limiter = xtream2m3u.SlidingRateLimiter(max_calls=1, per_seconds=0.5, sleep=sleep)
     limiter.acquire()
     limiter.acquire()
     assert clock.sleeps == [0.5]
     assert list(limiter.requests) == [clock.now]
-
-
-def test_chunking_rate_limiter_resets() -> None:
-    limiter = xtream2m3u.ChunkingRateLimiter(max_calls=1, per_seconds=0.05)
-    t0 = time.perf_counter()
-    limiter.acquire()
-    limiter.acquire()
-    assert time.perf_counter() - t0 >= 0.04
-    assert limiter.calls == 1
-    limiter.per_seconds = 0
-    limiter.acquire()
-    assert limiter.calls == 1
 
 
 def test_print_progress_bar(capsys: pytest.CaptureFixture[str]) -> None:

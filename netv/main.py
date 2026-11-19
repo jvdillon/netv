@@ -1860,12 +1860,7 @@ async def subtitle_file(session_id: str, filename: str):
     if session is None:
         raise HTTPException(404, "Session not found")
     file_path = pathlib.Path(session["dir"]) / safe_filename
-    # Wait briefly for file, return empty VTT if not ready (client will poll again)
-    for _ in range(15):  # 3 seconds.
-        if file_path.exists() and file_path.stat().st_size > 20:
-            break
-        # The ffmpeg process writes the subtitle file; nothing signals the write.
-        await asyncio.sleep(0.2)  # house-ignore[sleep] -- See above.
+    # A file without cues yet is served empty at once: the player polls every 0.5 s.
     try:
         content = file_path.read_text() if file_path.exists() else "WEBVTT\n\n"
     except (UnicodeDecodeError, OSError):

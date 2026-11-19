@@ -24,7 +24,7 @@ Cron example:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, Protocol, TypedDict, cast
 from urllib import error, parse, request
 
@@ -44,7 +44,7 @@ import xml.etree.ElementTree as xml
 _CALLSIGN_REGEX = re.compile(r"^([A-Z]+?)(LD|DT|CD|CA|LP|TV|FM|D)(\d*)$")
 
 
-def main() -> int:
+def main(*, sleep: Callable[[float], object] = time.sleep) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n", 2)[2] if __doc__ else None,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -99,7 +99,7 @@ def main() -> int:
         url = f"https://{flags.base_url}/api/grid?"
         url += parse.urlencode({**url_flags, "time": i_time})
 
-        result = get_cached(cache_dir, i_time, flags.delay, url)
+        result = get_cached(cache_dir, i_time, flags.delay, url, sleep=sleep)
         json_result = json.loads(result)
 
         if not done_channels:
@@ -161,6 +161,8 @@ def get_cached(
     timestamp: int,
     delay: int,
     url: str,
+    *,
+    sleep: Callable[[float], object] = time.sleep,
 ) -> bytes:
     cache_path = (cache_dir / str(timestamp)).with_suffix(".json.gz")
     if cache_path.is_file():
@@ -201,8 +203,7 @@ def get_cached(
             result = b'{"note": "Got a 400 error at this time, skipping.","channels": []}'
     with gzip.open(cache_path, "wb") as f:
         f.write(result)
-    # Paces requests under the upstream's rate limit.
-    time.sleep(delay)  # house-ignore[sleep] -- See above.
+    sleep(delay)
     return result
 
 

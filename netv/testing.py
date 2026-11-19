@@ -21,7 +21,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping, S
 from dataclasses import dataclass, field
 from datetime import datetime, tzinfo
 from email.message import Message
-from types import ModuleType, TracebackType
+from types import FunctionType, ModuleType, TracebackType
 from typing import ClassVar, Self, TypeVar, override
 from urllib import error, request
 
@@ -1130,6 +1130,7 @@ def install_clock(monkeypatch: pytest.MonkeyPatch, clock: FakeClock, *modules: M
             _override(monkeypatch, module, "threading", threading, Event=clock.make_event)
         if getattr(module, "datetime", None) is datetime:
             monkeypatch.setattr(module, "datetime", clock.datetime_class())
+        _route_injected_sleeps(monkeypatch, clock, module)
 
 
 def install_signals(
@@ -1583,3 +1584,28 @@ def _override(
     current = getattr(module, name)
     kept = current._overrides if isinstance(current, ModuleView) else {}
     monkeypatch.setattr(module, name, ModuleView(real, {**kept, **overrides}))
+
+
+# A default binds when its function is defined, so replacing the module's ``asyncio`` or
+# ``time`` afterwards does not reach it.
+def _route_injected_sleeps(
+    monkeypatch: pytest.MonkeyPatch,
+    clock: FakeClock,
+    module: ModuleType,
+) -> None:
+    """Point every real-sleep default a module's functions take as ``sleep=`` at ``clock``."""
+    fakes: dict[object, object] = {asyncio.sleep: clock.async_sleep, time.sleep: clock.sleep}
+    for value in list(vars(module).values()):
+        for function in _functions(value):
+            defaults = function.__kwdefaults__
+            if defaults is not None and defaults.get("sleep") in fakes:
+                monkeypatch.setitem(defaults, "sleep", fakes[defaults["sleep"]])
+
+
+def _functions(value: object) -> list[FunctionType]:
+    """``value`` if it is a function; a class's own functions; else nothing."""
+    if isinstance(value, FunctionType):
+        return [value]
+    if isinstance(value, type):
+        return [member for member in vars(value).values() if isinstance(member, FunctionType)]
+    return []

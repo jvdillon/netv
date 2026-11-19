@@ -16,7 +16,7 @@ Examples:
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -93,10 +93,13 @@ def _upscale_settings(model_name: str = "2x-nomosuni-compact") -> ServerSettings
     }
 
 
-async def _cleanup_upscale_sessions() -> None:
+async def _cleanup_upscale_sessions(
+    *,
+    interval_sec: float = 60,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+) -> None:
     while True:
-        # A periodic pass; the interval is the schedule.
-        await asyncio.sleep(60)  # house-ignore[sleep] -- See above.
+        await sleep(interval_sec)
         await ffmpeg_session.cleanup_expired_sessions()
 
 

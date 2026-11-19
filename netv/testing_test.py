@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from email.message import Message
 from types import ModuleType
@@ -491,6 +492,11 @@ async def test_installers_replace_only_the_modules_globals(monkeypatch: pytest.M
     assert module.time.perf_counter is time.perf_counter
     await module.asyncio.sleep(10)
     assert module.time.time() == 15
+    module.time.sleep(5)
+    assert (module.time.time(), clock.sleeps) == (20, [10, 5])
+    with pytest.raises(TimeoutError):
+        await module.asyncio.wait_for(asyncio.Event().wait(), 3)
+    assert module.time.time() == 23
     await module.asyncio.create_subprocess_exec("ffmpeg")
     assert launcher.commands == [["ffmpeg"]]
     assert module.asyncio.Event is asyncio.Event
@@ -512,6 +518,39 @@ def test_server_recorder_replaces_uvicorn_run(monkeypatch: pytest.MonkeyPatch):
     app = object()
     module.uvicorn.run(app, port=8000)
     assert recorder.runs == [testing.ServerRun(app=app, options={"port": 8000})]
+
+
+async def _waits(*, sleep: Callable[[float], Awaitable[object]] = asyncio.sleep) -> None:
+    await sleep(10)
+
+
+class _Paced:
+    def __init__(self, *, sleep: Callable[[float], object] = time.sleep, limit: int = 3) -> None:
+        sleep(limit)
+
+
+async def _own_sleep(seconds: float) -> None:
+    del seconds
+
+
+async def _other(*, sleep: Callable[[float], Awaitable[object]] = _own_sleep) -> None:
+    await sleep(1)
+
+
+@pytest.mark.asyncio
+async def test_install_clock_routes_injected_sleeps_to_the_clock(monkeypatch: pytest.MonkeyPatch):
+    module = _module_using_stdlib()
+    module.__dict__.update(waits=_waits, Paced=_Paced, other=_other)
+    clock = testing.FakeClock(now=0)
+    testing.install_clock(monkeypatch, clock, module)
+    await _waits()
+    _Paced()
+    assert clock.sleeps == [10, 3]
+    # A default that is not a real sleep stays.
+    assert _other.__kwdefaults__ == {"sleep": _own_sleep}
+    monkeypatch.undo()
+    assert _waits.__kwdefaults__ == {"sleep": asyncio.sleep}
+    assert _Paced.__init__.__kwdefaults__ == {"sleep": time.sleep, "limit": 3}
 
 
 def test_clock_event_waits_pass_on_the_clock(monkeypatch: pytest.MonkeyPatch):
