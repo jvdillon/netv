@@ -5,33 +5,37 @@
 
 // Configuration constants
 const VIRTUAL_GUIDE_DEFAULTS = {
-  ROW_HEIGHT_DESKTOP: 64,       // 4rem in pixels
-  ROW_HEIGHT_MOBILE: 40,        // 2.5rem in pixels
-  SECTION_HEIGHT_DESKTOP: 32,   // Must match .guide-section in guide.html
+  ROW_HEIGHT_DESKTOP: 64, // 4rem in pixels
+  ROW_HEIGHT_MOBILE: 40, // 2.5rem in pixels
+  SECTION_HEIGHT_DESKTOP: 32, // Must match .guide-section in guide.html
   SECTION_HEIGHT_MOBILE: 24,
-  BUFFER_SIZE: 50,              // Rows to load above/below viewport
-  MAX_CACHE_SIZE: 500,          // Evict cache beyond this
-  MAX_RETRIES: 3,               // Retry failed fetches this many times
-  MOBILE_BREAKPOINT: 512,       // Width below which is considered mobile
+  BUFFER_SIZE: 50, // Rows to load above/below viewport
+  MAX_CACHE_SIZE: 500, // Evict cache beyond this
+  MAX_RETRIES: 3, // Retry failed fetches this many times
+  MOBILE_BREAKPOINT: 512, // Width below which is considered mobile
   SCROLL_DIRECTION_THRESHOLD: 5, // Min scroll delta to register direction
-  RENDER_DEBOUNCE_MS: 16,       // ~60fps for smooth visual update
-  FETCH_DEBOUNCE_MS: 150,       // Wait for scroll to settle before fetching
-  RESIZE_DEBOUNCE_MS: 100,      // Debounce window resize handler
+  RENDER_DEBOUNCE_MS: 16, // ~60fps for smooth visual update
+  FETCH_DEBOUNCE_MS: 150, // Wait for scroll to settle before fetching
+  RESIZE_DEBOUNCE_MS: 100, // Debounce window resize handler
 };
 
 function escapeGuideHtml(str) {
-  if (!str) return '';
-  return String(str).replace(/&/g, '&amp;')
-                    .replace(/</g, '&lt;')
-                    .replace(/>/g, '&gt;')
-                    .replace(/"/g, '&quot;')
-                    .replace(/'/g, '&#39;');
+  if (!str) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 // Times come from the server as Unix timestamps; show them in the viewer's zone.
 function guideClock(timestamp, fallback) {
-  if (!timestamp) return fallback || '';
-  return new Date(timestamp * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+  if (!timestamp) return fallback || "";
+  return new Date(timestamp * 1000).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function programTimes(prog) {
@@ -40,20 +44,23 @@ function programTimes(prog) {
 
 // Server-rendered markup carries server-local clock labels; rewrite them.
 function localizeGuideTimes(root) {
-  root.querySelectorAll('[data-clock]').forEach((el) => {
+  root.querySelectorAll("[data-clock]").forEach((el) => {
     el.textContent = guideClock(Number(el.dataset.clock), el.textContent.trim());
   });
-  root.querySelectorAll('[data-start][data-end]').forEach((el) => {
-    const lines = (el.getAttribute('title') || '').split('\n');
+  root.querySelectorAll("[data-start][data-end]").forEach((el) => {
+    const lines = (el.getAttribute("title") || "").split("\n");
     if (lines.length < 2) return;
-    lines[1] = programTimes({start_timestamp: Number(el.dataset.start), end_timestamp: Number(el.dataset.end)});
-    el.setAttribute('title', lines.join('\n'));
+    lines[1] = programTimes({
+      start_timestamp: Number(el.dataset.start),
+      end_timestamp: Number(el.dataset.end),
+    });
+    el.setAttribute("title", lines.join("\n"));
   });
 }
 
 // Programs still in the upstream archive open from their start.
 function programHref(ch, prog) {
-  if (prog.unavailable) return '';
+  if (prog.unavailable) return "";
   const base = `/play/live/${ch.stream_id}`;
   return prog.catchup ? `${base}?start=${Math.floor(prog.start_timestamp)}` : base;
 }
@@ -66,7 +73,9 @@ function programLinkAttributes(ch, prog, row, col) {
 }
 
 function catchupMark(prog) {
-  return prog.catchup ? '<span class="text-blue-300" title="Watch from the start">&#8634;</span> ' : '';
+  return prog.catchup
+    ? '<span class="text-blue-300" title="Watch from the start">&#8634;</span> '
+    : "";
 }
 
 class VirtualGuide {
@@ -81,13 +90,13 @@ class VirtualGuide {
     this.maxCacheSize = options.maxCacheSize || D.MAX_CACHE_SIZE;
     this.initialRows = options.initialRows || [];
     this.offset = options.offset || 0;
-    this.cats = options.cats || '';
+    this.cats = options.cats || "";
     // Section headings sit above the row where each category starts.
     this.sectionHeight = options.sectionHeight || D.SECTION_HEIGHT_DESKTOP;
     this.sectionHeightMobile = options.sectionHeightMobile || D.SECTION_HEIGHT_MOBILE;
-    this.sections = new Map((options.sections || []).map(s => [s.start, s]));
+    this.sections = new Map((options.sections || []).map((s) => [s.start, s]));
     this.sectionStarts = [...this.sections.keys()].sort((a, b) => a - b);
-    this.logoUrlFilter = options.logoUrlFilter || (url => url);
+    this.logoUrlFilter = options.logoUrlFilter || ((url) => url);
 
     // State
     this.cache = new Map(); // row index -> row data
@@ -103,7 +112,7 @@ class VirtualGuide {
     this.recheckTimeout = null;
     this.isMobile = window.innerWidth < D.MOBILE_BREAKPOINT;
     this.lastScrollTop = 0;
-    this.scrollDirection = 'down';
+    this.scrollDirection = "down";
 
     // DOM elements
     this.viewport = null;
@@ -122,30 +131,40 @@ class VirtualGuide {
   }
 
   get totalHeight() {
-    return this.totalRows * this.currentRowHeight + this.sectionStarts.length * this.currentSectionHeight;
+    return (
+      this.totalRows * this.currentRowHeight +
+      this.sectionStarts.length * this.currentSectionHeight
+    );
   }
 
   /** Number of section headings at or above the given row. */
   sectionsThrough(index) {
-    let lo = 0, hi = this.sectionStarts.length;
+    let lo = 0,
+      hi = this.sectionStarts.length;
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
-      if (this.sectionStarts[mid] <= index) lo = mid + 1; else hi = mid;
+      if (this.sectionStarts[mid] <= index) lo = mid + 1;
+      else hi = mid;
     }
     return lo;
   }
 
   /** Pixel offset of a row's top edge (below its section heading, if any). */
   rowTop(index) {
-    return index * this.currentRowHeight + this.sectionsThrough(index) * this.currentSectionHeight;
+    return (
+      index * this.currentRowHeight +
+      this.sectionsThrough(index) * this.currentSectionHeight
+    );
   }
 
   /** Row at a pixel offset. */
   rowAt(offset) {
-    let lo = 0, hi = Math.max(0, this.totalRows - 1);
+    let lo = 0,
+      hi = Math.max(0, this.totalRows - 1);
     while (lo < hi) {
       const mid = (lo + hi + 1) >> 1;
-      if (this.rowTop(mid) <= offset) lo = mid; else hi = mid - 1;
+      if (this.rowTop(mid) <= offset) lo = mid;
+      else hi = mid - 1;
     }
     return lo;
   }
@@ -167,7 +186,7 @@ class VirtualGuide {
 
     // Handle scroll position restoration
     // Check if there's a saved scroll position that's beyond initial rows
-    const scrollKey = 'guide_scroll:' + this.cats;
+    const scrollKey = "guide_scroll:" + this.cats;
     const savedScroll = sessionStorage.getItem(scrollKey);
 
     if (savedScroll && this.viewport) {
@@ -178,7 +197,10 @@ class VirtualGuide {
       if (firstVisible >= this.initialRows.length) {
         // Fetch data for the saved position, then restore scroll
         const start = Math.max(0, firstVisible - this.bufferSize);
-        const end = Math.min(this.totalRows, firstVisible + this.visibleCount + this.bufferSize);
+        const end = Math.min(
+          this.totalRows,
+          firstVisible + this.visibleCount + this.bufferSize,
+        );
 
         this.fetchMissingRanges([{ start, end }]).then(() => {
           this.viewport.scrollTop = scrollTop;
@@ -197,31 +219,33 @@ class VirtualGuide {
 
   setupDOM() {
     // Find the scroll container (the overflow-y-auto div)
-    this.viewport = this.container.querySelector('.overflow-y-auto');
+    this.viewport = this.container.querySelector(".overflow-y-auto");
     if (!this.viewport) return;
 
     // Create spacer for full height scrollbar
-    this.spacer = document.createElement('div');
-    this.spacer.className = 'virtual-spacer';
+    this.spacer = document.createElement("div");
+    this.spacer.className = "virtual-spacer";
     this.spacer.style.height = `${this.totalHeight}px`;
-    this.spacer.style.position = 'absolute';
-    this.spacer.style.top = '0';
-    this.spacer.style.left = '0';
-    this.spacer.style.right = '0';
-    this.spacer.style.pointerEvents = 'none';
+    this.spacer.style.position = "absolute";
+    this.spacer.style.top = "0";
+    this.spacer.style.left = "0";
+    this.spacer.style.right = "0";
+    this.spacer.style.pointerEvents = "none";
 
     // Create content container
-    this.content = document.createElement('div');
-    this.content.className = 'virtual-content';
-    this.content.style.position = 'relative';
-    this.content.style.zIndex = '1';
+    this.content = document.createElement("div");
+    this.content.className = "virtual-content";
+    this.content.style.position = "relative";
+    this.content.style.zIndex = "1";
 
     // Move existing rows into content container
-    const existingRows = this.viewport.querySelectorAll('.guide-row, .guide-section');
-    existingRows.forEach(row => this.content.appendChild(row));
+    const existingRows = this.viewport.querySelectorAll(".guide-row, .guide-section");
+    existingRows.forEach((row) => {
+      this.content.appendChild(row);
+    });
 
     // Set viewport to relative positioning
-    this.viewport.style.position = 'relative';
+    this.viewport.style.position = "relative";
 
     // Add spacer and content to viewport
     this.viewport.appendChild(this.spacer);
@@ -236,20 +260,24 @@ class VirtualGuide {
 
     // Scroll handler with RAF for smooth updates
     let ticking = false;
-    this.viewport.addEventListener('scroll', () => {
-      if (!ticking) {
-        requestAnimationFrame(() => {
-          this.onScroll();
-          ticking = false;
-        });
-        ticking = true;
-      }
-    }, { passive: true });
+    this.viewport.addEventListener(
+      "scroll",
+      () => {
+        if (!ticking) {
+          requestAnimationFrame(() => {
+            this.onScroll();
+            ticking = false;
+          });
+          ticking = true;
+        }
+      },
+      { passive: true },
+    );
 
     // Handle resize
     const D = VIRTUAL_GUIDE_DEFAULTS;
     let resizeTimer;
-    window.addEventListener('resize', () => {
+    window.addEventListener("resize", () => {
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {
         const wasMobile = this.isMobile;
@@ -278,7 +306,7 @@ class VirtualGuide {
     const scrollDelta = scrollTop - (this.lastScrollTop || 0);
     this.lastScrollTop = scrollTop;
     if (Math.abs(scrollDelta) > D.SCROLL_DIRECTION_THRESHOLD) {
-      this.scrollDirection = scrollDelta > 0 ? 'down' : 'up';
+      this.scrollDirection = scrollDelta > 0 ? "down" : "up";
     }
 
     // Calculate desired range with buffer
@@ -286,8 +314,8 @@ class VirtualGuide {
     const desiredEnd = Math.min(this.totalRows, lastVisible + this.bufferSize);
 
     // Check if we need to update rendered range
-    const needsRender = desiredStart < this.renderedRange.start ||
-                        desiredEnd > this.renderedRange.end;
+    const needsRender =
+      desiredStart < this.renderedRange.start || desiredEnd > this.renderedRange.end;
 
     if (needsRender) {
       // Render immediately with whatever we have (placeholders for missing)
@@ -321,21 +349,25 @@ class VirtualGuide {
     // 1. Always fetch visible rows first
     const visibleMissing = this.findMissingRanges(visibleStart, visibleEnd);
     if (visibleMissing.length > 0) {
-      fetchOrder.push({ ranges: visibleMissing, priority: 'visible' });
+      fetchOrder.push({ ranges: visibleMissing, priority: "visible" });
     }
 
     // 2. Fetch buffer in scroll direction
     // 3. Fetch buffer in opposite direction
-    if (this.scrollDirection === 'down') {
+    if (this.scrollDirection === "down") {
       const forwardMissing = this.findMissingRanges(visibleEnd, bufferEnd);
       const backwardMissing = this.findMissingRanges(bufferStart, visibleStart);
-      if (forwardMissing.length > 0) fetchOrder.push({ ranges: forwardMissing, priority: 'forward' });
-      if (backwardMissing.length > 0) fetchOrder.push({ ranges: backwardMissing, priority: 'backward' });
+      if (forwardMissing.length > 0)
+        fetchOrder.push({ ranges: forwardMissing, priority: "forward" });
+      if (backwardMissing.length > 0)
+        fetchOrder.push({ ranges: backwardMissing, priority: "backward" });
     } else {
       const backwardMissing = this.findMissingRanges(bufferStart, visibleStart);
       const forwardMissing = this.findMissingRanges(visibleEnd, bufferEnd);
-      if (backwardMissing.length > 0) fetchOrder.push({ ranges: backwardMissing, priority: 'backward' });
-      if (forwardMissing.length > 0) fetchOrder.push({ ranges: forwardMissing, priority: 'forward' });
+      if (backwardMissing.length > 0)
+        fetchOrder.push({ ranges: backwardMissing, priority: "backward" });
+      if (forwardMissing.length > 0)
+        fetchOrder.push({ ranges: forwardMissing, priority: "forward" });
     }
 
     // Fetch in priority order, re-rendering after each batch
@@ -390,8 +422,8 @@ class VirtualGuide {
     }
 
     // Merge into a single request for simplicity
-    const overallStart = Math.min(...ranges.map(r => r.start));
-    const overallEnd = Math.max(...ranges.map(r => r.end));
+    const overallStart = Math.min(...ranges.map((r) => r.start));
+    const overallEnd = Math.max(...ranges.map((r) => r.end));
 
     // If there's a pending fetch, check if it's for a relevant range
     if (this.pendingFetch) {
@@ -431,16 +463,16 @@ class VirtualGuide {
       const params = new URLSearchParams({
         start: overallStart,
         count: overallEnd - overallStart,
-        offset: this.offset
+        offset: this.offset,
       });
       // Pass the selected category (or the All Channels list) as-is
       if (this.cats) {
-        params.set('cats', this.cats);
-        params.set('exact', '1');
+        params.set("cats", this.cats);
+        params.set("exact", "1");
       }
 
       const resp = await fetch(`/api/guide/rows?${params}`, {
-        signal: controller.signal
+        signal: controller.signal,
       });
 
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -459,8 +491,8 @@ class VirtualGuide {
       // Evict old cache entries to prevent memory growth
       this.pruneCache();
     } catch (e) {
-      if (e.name !== 'AbortError') {
-        console.error('Failed to fetch guide rows:', e);
+      if (e.name !== "AbortError") {
+        console.error("Failed to fetch guide rows:", e);
 
         // Track failed range for retry
         const rangeKey = `${overallStart}-${overallEnd}`;
@@ -476,7 +508,9 @@ class VirtualGuide {
         } else {
           // Max retries reached - clear tracking
           this.failedRanges.delete(rangeKey);
-          console.error(`Failed to fetch rows ${overallStart}-${overallEnd} after ${this.maxRetries} retries`);
+          console.error(
+            `Failed to fetch rows ${overallStart}-${overallEnd} after ${this.maxRetries} retries`,
+          );
         }
       }
     } finally {
@@ -514,9 +548,10 @@ class VirtualGuide {
 
     // Position content at the right scroll offset
     const start = this.renderedRange.start;
-    const top = this.rowTop(start) - (this.sections.has(start) ? this.currentSectionHeight : 0);
+    const top =
+      this.rowTop(start) - (this.sections.has(start) ? this.currentSectionHeight : 0);
     this.content.style.transform = `translateY(${top}px)`;
-    this.content.innerHTML = html.join('');
+    this.content.innerHTML = html.join("");
   }
 
   /**
@@ -589,26 +624,30 @@ class VirtualGuide {
   renderRow(row, index) {
     const ch = row.channel;
     // The server signs proxy URLs (icon_proxy); /api/logo refuses unsigned ones.
-    const iconUrl = ch.icon_proxy !== undefined
-      ? ch.icon_proxy
-      : (ch.icon ? this.logoUrlFilter(ch.icon) : '');
-    const height = this.currentRowHeight;
-
-    const escapeHtml = escapeGuideHtml;
+    const iconUrl =
+      ch.icon_proxy !== undefined
+        ? ch.icon_proxy
+        : ch.icon
+          ? this.logoUrlFilter(ch.icon)
+          : "";
 
     // Desktop programs
-    let programsDesktop = '';
+    let programsDesktop = "";
     if (row.programs && row.programs.length > 0) {
-      programsDesktop = row.programs.map((prog, pIdx) => `
+      programsDesktop = row.programs
+        .map(
+          (prog, pIdx) => `
         <a ${programLinkAttributes(ch, prog, index, pIdx)}
            class="absolute top-1 bottom-1 bg-gray-700 hover:bg-gray-600 rounded px-2 py-1 overflow-hidden
-                  ${prog.unavailable ? 'opacity-50 cursor-not-allowed' : 'focusable'} border-2 border-transparent focus:border-blue-500 focus:bg-blue-900/50"
+                  ${prog.unavailable ? "opacity-50 cursor-not-allowed" : "focusable"} border-2 border-transparent focus:border-blue-500 focus:bg-blue-900/50"
            style="left: ${prog.left_pct}%; width: calc(${prog.width_pct}% - 4px);"
-           title="${escapeHtml(prog.title)}&#10;${programTimes(prog)}&#10;${escapeHtml(prog.desc)}${prog.unavailable ? '&#10;Not available in the upstream archive' : ''}">
-          <div class="text-sm font-medium truncate">${catchupMark(prog)}${escapeHtml(prog.title)}</div>
-          <div class="text-xs text-gray-400 truncate">${escapeHtml(prog.desc)}</div>
+           title="${escapeGuideHtml(prog.title)}&#10;${programTimes(prog)}&#10;${escapeGuideHtml(prog.desc)}${prog.unavailable ? "&#10;Not available in the upstream archive" : ""}">
+          <div class="text-sm font-medium truncate">${catchupMark(prog)}${escapeGuideHtml(prog.title)}</div>
+          <div class="text-xs text-gray-400 truncate">${escapeGuideHtml(prog.desc)}</div>
         </a>
-      `).join('');
+      `,
+        )
+        .join("");
     } else {
       programsDesktop = `
         <div class="absolute inset-1 flex items-center px-2 text-gray-500 text-sm">
@@ -618,17 +657,21 @@ class VirtualGuide {
     }
 
     // Mobile programs
-    let programsMobile = '';
+    let programsMobile = "";
     if (row.programs_mobile && row.programs_mobile.length > 0) {
-      programsMobile = row.programs_mobile.map((prog, pIdx) => `
+      programsMobile = row.programs_mobile
+        .map(
+          (prog, pIdx) => `
         <a ${programLinkAttributes(ch, prog, index, pIdx)}
            class="absolute top-0.5 bottom-0.5 bg-gray-700 hover:bg-gray-600 rounded px-1 overflow-hidden
-                  ${prog.unavailable ? 'opacity-50 cursor-not-allowed' : 'focusable'} border border-gray-600 focus:ring-2 focus:ring-blue-500 focus:ring-offset-1 focus:ring-offset-gray-800"
+                  ${prog.unavailable ? "opacity-50 cursor-not-allowed" : "focusable"} border border-gray-600 focus:ring-2 focus:ring-blue-500 focus:ring-offset-1 focus:ring-offset-gray-800"
            style="left: ${prog.left_pct}%; width: calc(${prog.width_pct}% - 4px);"
-           title="${escapeHtml(prog.title)}&#10;${programTimes(prog)}&#10;${escapeHtml(prog.desc)}${prog.unavailable ? '&#10;Not available in the upstream archive' : ''}">
-          <div class="text-[10px] font-medium truncate">${catchupMark(prog)}${escapeHtml(prog.title)}</div>
+           title="${escapeGuideHtml(prog.title)}&#10;${programTimes(prog)}&#10;${escapeGuideHtml(prog.desc)}${prog.unavailable ? "&#10;Not available in the upstream archive" : ""}">
+          <div class="text-[10px] font-medium truncate">${catchupMark(prog)}${escapeGuideHtml(prog.title)}</div>
         </a>
-      `).join('');
+      `,
+        )
+        .join("");
     } else {
       programsMobile = `
         <div class="absolute inset-0.5 flex items-center px-1 text-gray-500 text-[10px]">
@@ -644,19 +687,19 @@ class VirtualGuide {
           <a href="/play/live/${ch.stream_id}"
              class="text-xs line-clamp-2 hover:text-blue-400 focus:text-blue-400 focus:outline focus:outline-2 focus:outline-blue-500 focusable"
              tabindex="0" data-nav="epg" data-row="${index}" data-col="-1"
-             title="${escapeHtml(ch.name)}">
-            ${escapeHtml(ch.name)}
+             title="${escapeGuideHtml(ch.name)}">
+            ${escapeGuideHtml(ch.name)}
           </a>
         </div>
 
         <!-- Desktop Channel Info -->
         <div class="desktop-only w-36 lg:w-48 flex-shrink-0 p-1 items-center gap-1 bg-gray-800 sticky left-0 z-10 border-r border-gray-700">
-          ${iconUrl ? `<img src="${iconUrl}" alt="" class="w-10 h-10 object-contain" loading="lazy" onerror="this.style.display='none'">` : ''}
+          ${iconUrl ? `<img src="${iconUrl}" alt="" class="w-10 h-10 object-contain" loading="lazy" onerror="this.style.display='none'">` : ""}
           <a href="/play/live/${ch.stream_id}"
              class="text-sm line-clamp-3 hover:text-blue-400 focus:text-blue-400 focus:outline focus:outline-2 focus:outline-blue-500 focusable"
              tabindex="0" data-nav="epg" data-row="${index}" data-col="-1"
-             title="${escapeHtml(ch.name)}">
-            ${escapeHtml(ch.name)}
+             title="${escapeGuideHtml(ch.name)}">
+            ${escapeGuideHtml(ch.name)}
           </a>
         </div>
 
@@ -697,7 +740,7 @@ class VirtualGuide {
 
     // Clear DOM references
     if (this.content) {
-      this.content.innerHTML = '';
+      this.content.innerHTML = "";
     }
     this.viewport = null;
     this.content = null;
@@ -712,3 +755,4 @@ class VirtualGuide {
 
 // Export for use
 window.VirtualGuide = VirtualGuide;
+window.localizeGuideTimes = localizeGuideTimes;

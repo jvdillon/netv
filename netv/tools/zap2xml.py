@@ -201,7 +201,8 @@ def get_cached(
             result = b'{"note": "Got a 400 error at this time, skipping.","channels": []}'
     with gzip.open(cache_path, "wb") as f:
         f.write(result)
-    time.sleep(delay)
+    # Paces requests under the upstream's rate limit.
+    time.sleep(delay)  # house-ignore[sleep] -- See above.
     return result
 
 

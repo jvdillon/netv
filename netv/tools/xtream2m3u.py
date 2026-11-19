@@ -420,7 +420,8 @@ class SlidingRateLimiter:
                     self.requests.append(time.perf_counter())
                     return
                 sleep_time = max(0, self.requests[0] - cutoff)
-            time.sleep(sleep_time)
+            # Paces requests under the upstream's rate limit.
+            time.sleep(sleep_time)  # house-ignore[sleep] -- See above.
 
 
 class ChunkingRateLimiter:

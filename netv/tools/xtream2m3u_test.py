@@ -16,6 +16,7 @@ import time
 
 import pytest
 
+from netv import testing
 from netv.tools import xtream2m3u
 
 
@@ -437,13 +438,26 @@ def test_load_config_creates_template(workdir: pathlib.Path) -> None:
     )
 
 
-def test_sliding_rate_limiter_waits_when_full() -> None:
-    limiter = xtream2m3u.SlidingRateLimiter(max_calls=1, per_seconds=0.05)
-    t0 = time.perf_counter()
+def test_sliding_rate_limiter_waits_until_the_oldest_call_leaves_the_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = testing.FakeClock()
+
+    def sleep(seconds: float) -> None:
+        clock.sleep(seconds)
+        if len(clock.sleeps) > 1:
+            raise RuntimeError("The limiter never admitted the call.")
+
+    monkeypatch.setattr(
+        xtream2m3u,
+        "time",
+        testing.ModuleView(time, {"perf_counter": clock.monotonic, "sleep": sleep}),
+    )
+    limiter = xtream2m3u.SlidingRateLimiter(max_calls=1, per_seconds=0.5)
     limiter.acquire()
     limiter.acquire()
-    assert time.perf_counter() - t0 >= 0.05
-    assert len(limiter.requests) == 1
+    assert clock.sleeps == [0.5]
+    assert list(limiter.requests) == [clock.now]
 
 
 def test_chunking_rate_limiter_resets() -> None:

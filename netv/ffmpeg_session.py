@@ -972,7 +972,8 @@ async def stop_when_unwatched(session_id: str, *, grace_sec: float = 10.0) -> No
         session_id: Live session whose last viewer left, or that no page joined yet.
         grace_sec: How long a page has to join before the stream stops.
     """
-    await asyncio.sleep(grace_sec)
+    # The grace period is the schedule; nothing else ends it.
+    await asyncio.sleep(grace_sec)  # house-ignore[sleep] -- See above.
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
         if session is None or not _is_fast_live(session) or session["viewers"]:
@@ -1655,7 +1656,8 @@ async def _wait_for_playlist(
                         process,
                     ):
                         return True
-        await asyncio.sleep(poll_interval_sec)
+        # The ffmpeg process writes the playlist and segments; nothing signals a write.
+        await asyncio.sleep(poll_interval_sec)  # house-ignore[sleep] -- See above.
     return False
 
 
@@ -2069,7 +2071,8 @@ async def _handle_existing_vod_session(
             return None
         if (pathlib.Path(snap.output_dir) / next_seg).exists():
             break
-        await asyncio.sleep(poll_interval_sec)
+        # The ffmpeg process writes the segment; nothing signals the write.
+        await asyncio.sleep(poll_interval_sec)  # house-ignore[sleep] -- See above.
 
     await _wait_for_playlist(
         playlist_path,
@@ -2288,8 +2291,8 @@ async def _do_start_transcode(
         # asyncio.TimeoutError is distinct from the builtin before Python 3.11.
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(process.wait(), timeout=1.0)
-        # Give stderr monitor time to process final output.
-        await asyncio.sleep(0.1)
+        # The stderr monitor is a detached task; nothing signals its last line.
+        await asyncio.sleep(0.1)  # house-ignore[sleep] -- See above.
         error_msg = "\n".join(stderr_lines[-10:]) if stderr_lines else "unknown"
         log.error(
             "ffmpeg:%s failed (exit %d): %s",
@@ -2395,7 +2398,8 @@ async def _wait_for_fresh_fast_playlist(
             >= minimum_seconds
         ):
             return True
-        await asyncio.sleep(poll_interval_sec)
+        # The ffmpeg process writes the playlist; nothing signals a write.
+        await asyncio.sleep(poll_interval_sec)  # house-ignore[sleep] -- See above.
     return False
 
 
@@ -2605,7 +2609,8 @@ async def _watch_fast_live(
     heartbeat_timeout_sec: float = 30.0,
 ) -> None:
     while True:
-        await asyncio.sleep(watchdog_interval_sec)
+        # A periodic pass; the interval is the schedule.
+        await asyncio.sleep(watchdog_interval_sec)  # house-ignore[sleep] -- See above.
         with _transcode_lock:
             session = _transcode_sessions.get(session_id)
             if session is None:
@@ -3132,7 +3137,8 @@ async def _caught_up(
         low_end, up_end = (playlist_end_pts(directory, text) for text in texts)
         if low_end is not None and up_end is not None and up_end >= low_end:
             return True
-        await asyncio.sleep(poll_interval_sec)
+        # The ffmpeg process writes the playlist; nothing signals a write.
+        await asyncio.sleep(poll_interval_sec)  # house-ignore[sleep] -- See above.
     return False
 
 

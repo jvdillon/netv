@@ -1,6 +1,4 @@
-(function() {
-  'use strict';
-
+(() => {
   function playbackBufferSeconds(value) {
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) return 12;
@@ -26,7 +24,9 @@
     }
 
     stopQuery() {
-      const viewer = this.viewerId ? `&viewer=${encodeURIComponent(this.viewerId)}` : '';
+      const viewer = this.viewerId
+        ? `&viewer=${encodeURIComponent(this.viewerId)}`
+        : "";
       return `?force=${!this.isVod}${viewer}`;
     }
 
@@ -34,7 +34,7 @@
       if (!this.sessionId) return;
       const response = await fetch(
         `/transcode/${encodeURIComponent(this.sessionId)}${this.stopQuery()}`,
-        { method: 'DELETE', keepalive: this.closed }
+        { method: "DELETE", keepalive: this.closed },
       );
       if (!response.ok) throw new Error(`Transcode stop failed: ${response.status}`);
       this.sessionId = null;
@@ -49,7 +49,7 @@
         const response = await fetch(url);
         if (!response.ok) throw new Error(`Transcode start failed: ${response.status}`);
         const data = await response.json();
-        if (!data.session_id) throw new Error('Transcode response has no session ID');
+        if (!data.session_id) throw new Error("Transcode response has no session ID");
         this.sessionId = data.session_id;
         this.viewerId = data.viewer_id || null;
         if (this.closed || generation !== this.generation) {
@@ -81,10 +81,13 @@
       ++this.generation;
       if (!this.sessionId) return;
       const url = `/transcode/${encodeURIComponent(this.sessionId)}/stop${this.stopQuery()}`;
-      if (!navigator.sendBeacon(url, new Blob([], { type: 'application/json' }))) {
-        fetch(url, { method: 'POST', keepalive: true }).then(response => {
-          if (!response.ok) throw new Error(`Transcode stop failed: ${response.status}`);
-        }).catch(error => console.warn('[TC] Page-close cleanup failed:', error));
+      if (!navigator.sendBeacon(url, new Blob([], { type: "application/json" }))) {
+        fetch(url, { method: "POST", keepalive: true })
+          .then((response) => {
+            if (!response.ok)
+              throw new Error(`Transcode stop failed: ${response.status}`);
+          })
+          .catch((error) => console.warn("[TC] Page-close cleanup failed:", error));
       }
     }
   }
@@ -94,8 +97,9 @@
       this.video = video;
       this.hls = hls;
       this.sessionId = sessionId;
-      this.healthUrl = `/transcode/${encodeURIComponent(sessionId)}/health` +
-        (viewerId ? `?viewer=${encodeURIComponent(viewerId)}` : '');
+      this.healthUrl =
+        `/transcode/${encodeURIComponent(sessionId)}/health` +
+        (viewerId ? `?viewer=${encodeURIComponent(viewerId)}` : "");
       this.playlist = new URL(playlist, window.location.href).href;
       this.bytes = 0;
       this.downloadMs = 0;
@@ -107,14 +111,14 @@
       this.requestTimer = null;
       this.lastError = null;
       this.onFragment = (_event, data) => {
-        if (data.frag?.type !== 'main') return;
+        if (data.frag?.type !== "main") return;
         const stats = data.part?.stats || data.frag.stats;
         const elapsed = stats?.loading?.end - stats?.loading?.start;
         if (!(stats?.loaded > 0 && elapsed > 0)) return;
         this.bytes += stats.loaded;
         this.downloadMs += elapsed;
         const duration = data.part?.duration || data.frag.duration;
-        this.requiredBitrate = duration > 0 ? stats.loaded * 8 / duration : 0;
+        this.requiredBitrate = duration > 0 ? (stats.loaded * 8) / duration : 0;
         this.lastDownloadAt = performance.now();
       };
       if (hls) hls.on(Hls.Events.FRAG_LOADED, this.onFragment);
@@ -134,15 +138,19 @@
       const video = this.video;
       let buffer = 0;
       for (let i = 0; i < video.buffered.length; i++) {
-        if (video.buffered.start(i) <= video.currentTime &&
-            video.currentTime <= video.buffered.end(i)) {
+        if (
+          video.buffered.start(i) <= video.currentTime &&
+          video.currentTime <= video.buffered.end(i)
+        ) {
           buffer = Math.max(buffer, video.buffered.end(i) - video.currentTime);
         }
       }
       const paused = video.paused || video.ended;
       const fresh = performance.now() - this.lastDownloadAt <= 10000;
-      const observed = !paused && fresh && this.downloadMs > 0
-        ? this.bytes * 8000 / this.downloadMs : 0;
+      const observed =
+        !paused && fresh && this.downloadMs > 0
+          ? (this.bytes * 8000) / this.downloadMs
+          : 0;
       this.bytes = 0;
       this.downloadMs = 0;
       return {
@@ -158,15 +166,12 @@
       this.abort = new AbortController();
       this.requestTimer = setTimeout(() => this.abort.abort(), 8000);
       try {
-        const response = await fetch(
-          this.healthUrl,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(this.sample()),
-            signal: this.abort.signal,
-          }
-        );
+        const response = await fetch(this.healthUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(this.sample()),
+          signal: this.abort.signal,
+        });
         if (!response.ok) throw new Error(`Playback health failed: ${response.status}`);
         const feedback = await response.json();
         if (this.closed) return;
@@ -176,7 +181,7 @@
         this.lastError = null;
       } catch (error) {
         if (!this.closed && this.lastError !== error.message) {
-          console.warn('[LIVE] Keeping current rendition:', error);
+          console.warn("[LIVE] Keeping current rendition:", error);
           this.lastError = error.message;
         }
       } finally {

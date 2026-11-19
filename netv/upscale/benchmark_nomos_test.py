@@ -11,7 +11,6 @@ import runpy
 import shutil
 import subprocess
 import sys
-import time
 
 from treekle import ReadError
 
@@ -51,6 +50,11 @@ class FakeProcess:
             return None
         return self.returncode
 
+    def wait(self, timeout: float) -> int:
+        if self.polls < 3:
+            raise subprocess.TimeoutExpired(str(self.playlist), timeout)
+        return self.returncode
+
 
 class _Reader:
     def __init__(self, text: str) -> None:
@@ -73,10 +77,6 @@ def _popen_factory(
     return popen
 
 
-def _skip_sleep(seconds: float) -> None:
-    del seconds
-
-
 def _usr_bin(name: str) -> str:
     return f"/usr/bin/{name}"
 
@@ -88,11 +88,6 @@ def _usr_bin_ffprobe(name: str) -> str | None:
 def _probe_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
     del kwargs
     return subprocess.CompletedProcess(command, 0, stdout=_probe_stdout())
-
-
-@pytest.fixture
-def no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(time, "sleep", _skip_sleep)
 
 
 def test_find_binary_prefers_bundled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -226,7 +221,7 @@ def test_ffmpeg_command_duration() -> None:
     assert "-t" not in bench.ffmpeg_command(Path("ff"), Path("s"), Path("e"), Path("/o"), None)
 
 
-def test_run_once_measures_startup(monkeypatch: pytest.MonkeyPatch, no_sleep: None) -> None:
+def test_run_once_measures_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     commands: list[list[str]] = []
     monkeypatch.setattr(subprocess, "Popen", _popen_factory(commands, stderr=None))
     result = bench.run_once(Path("ff"), Path("s"), Path("/m/model.engine"), 30.0, 25.0)
@@ -256,7 +251,7 @@ def test_run_once_without_playlist_uses_end_time(monkeypatch: pytest.MonkeyPatch
     assert result.startup_seconds >= result.elapsed_seconds
 
 
-def test_run_once_reports_failure_tail(monkeypatch: pytest.MonkeyPatch, no_sleep: None) -> None:
+def test_run_once_reports_failure_tail(monkeypatch: pytest.MonkeyPatch) -> None:
     stderr = "\n".join(f"line {i}" for i in range(30)) + "\n"
     monkeypatch.setattr(subprocess, "Popen", _popen_factory([], returncode=1, stderr=stderr))
     with pytest.raises(RuntimeError) as exc:
@@ -277,7 +272,6 @@ def test_main_warms_then_measures(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    no_sleep: None,
     target: str,
     status: str,
 ) -> None:
@@ -327,7 +321,6 @@ def test_script_entrypoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    no_sleep: None,
 ) -> None:
     sample = tmp_path / "clip.mp4"
     sample.write_bytes(b"")

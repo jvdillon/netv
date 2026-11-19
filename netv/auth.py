@@ -17,7 +17,7 @@ from treekle import MutablePlainTree, from_plain, json_loads, mutable, to_plain
 from netv.util import atomic_write_json, data_dir, merge_unknown, read_json_object
 
 
-_CWD: Final = Path(__file__).resolve().parent
+_CWD: Final[Path] = Path(__file__).resolve().parent
 
 
 class UserRecord(TypedDict):

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Final, Protocol, TypedDict, cast
 
 import argparse
+import contextlib
 import shutil
 import subprocess
 import tempfile
@@ -27,7 +28,7 @@ import time
 from treekle import json_loads
 
 
-_CWD: Final = Path(__file__).resolve().parent
+_CWD: Final[Path] = Path(__file__).resolve().parent
 
 ROOT = _CWD.parents[1]
 
@@ -171,7 +172,8 @@ def run_once(
             playlist = output_dir / "stream.m3u8"
             if startup_at is None and playlist.exists() and ".ts" in playlist.read_text():
                 startup_at = time.monotonic()
-            time.sleep(0.02)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=0.02)
         elapsed = time.monotonic() - started
         stderr = process.stderr.read() if process.stderr else ""
         if process.returncode != 0:

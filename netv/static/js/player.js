@@ -1,15 +1,13 @@
 // IPTV Player Module
 // Requires: Hls.js, window.PLAYER_CONFIG
 
-(function() {
-  'use strict';
-
+(() => {
   const cfg = window.PLAYER_CONFIG;
-  const video = document.getElementById('video');
-  const loading = document.getElementById('loading');
-  const error = document.getElementById('error');
-  const ccBtn = document.getElementById('toggle-cc');
-  const settingsMenu = document.getElementById('settings-menu');
+  const video = document.getElementById("video");
+  const loading = document.getElementById("loading");
+  const error = document.getElementById("error");
+  const ccBtn = document.getElementById("toggle-cc");
+  const settingsMenu = document.getElementById("settings-menu");
 
   // State
   let transcodeSessionId = null;
@@ -27,7 +25,9 @@
   let lastSavedPosition = 0;
   let savePositionTimeout = null;
   let autoMutedByPolicy = false;
-  const transcodeSession = new window.NetvPlayback.TranscodeSession(cfg.isVod && !cfg.catchup);
+  const transcodeSession = new window.NetvPlayback.TranscodeSession(
+    cfg.isVod && !cfg.catchup,
+  );
   let adaptiveSession = null;
   let adaptivePlayback = null;
   let transcodePlaylist = null;
@@ -56,15 +56,16 @@
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = Math.floor(seconds % 60);
-    if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-    return `${m}:${s.toString().padStart(2, '0')}`;
+    if (h > 0)
+      return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+    return `${m}:${s.toString().padStart(2, "0")}`;
   }
 
   function parseTime(str) {
     str = str.trim();
     if (!str) return 0;
-    const parts = str.split(':').map(Number);
-    if (parts.some(isNaN)) return 0;
+    const parts = str.split(":").map(Number);
+    if (parts.some(Number.isNaN)) return 0;
     if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
     if (parts.length === 2) return parts[0] * 60 + parts[1];
     const n = parts[0];
@@ -75,30 +76,33 @@
   }
 
   function parseVttTime(str) {
-    const parts = str.split(':');
-    if (parts.length === 3) return parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2]);
+    const parts = str.split(":");
+    if (parts.length === 3)
+      return (
+        parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2])
+      );
     if (parts.length === 2) return parseFloat(parts[0]) * 60 + parseFloat(parts[1]);
     return 0;
   }
 
   function parseVttCues(vttText) {
     const cues = [];
-    const lines = vttText.split('\n');
+    const lines = vttText.split("\n");
     let i = 0;
-    while (i < lines.length && !lines[i].includes('-->')) i++;
+    while (i < lines.length && !lines[i].includes("-->")) i++;
     while (i < lines.length) {
       const line = lines[i];
-      if (line.includes('-->')) {
-        const [startStr, endStr] = line.split('-->').map(s => s.trim().split(' ')[0]);
+      if (line.includes("-->")) {
+        const [startStr, endStr] = line.split("-->").map((s) => s.trim().split(" ")[0]);
         const start = parseVttTime(startStr);
         const end = parseVttTime(endStr);
         i++;
         const textLines = [];
-        while (i < lines.length && lines[i].trim() !== '') {
+        while (i < lines.length && lines[i].trim() !== "") {
           textLines.push(lines[i]);
           i++;
         }
-        if (textLines.length > 0) cues.push({start, end, text: textLines.join('\n')});
+        if (textLines.length > 0) cues.push({ start, end, text: textLines.join("\n") });
       }
       i++;
     }
@@ -110,18 +114,18 @@
   // ============================================================
 
   function hideLoading() {
-    loading.classList.add('hidden');
+    loading.classList.add("hidden");
   }
 
   function showLoading() {
-    loading.classList.remove('hidden');
+    loading.classList.remove("hidden");
   }
 
   function showError() {
     adaptivePlayback?.destroy();
     adaptivePlayback = null;
     hideLoading();
-    error.classList.remove('hidden');
+    error.classList.remove("hidden");
   }
 
   function isLiveStream() {
@@ -153,51 +157,51 @@
     liveReconnectTimer = setTimeout(() => {
       liveReconnectTimer = null;
       if (castController?.active) return;
-      if (isTranscoding || cfg.transcodeMode !== 'never') startTranscode();
+      if (isTranscoding || cfg.transcodeMode !== "never") startTranscode();
       else playWithUrl(cfg.rawUrl);
     }, delay);
   }
 
   function updateTranscodeCheck() {
-    const check = document.getElementById('tc-check');
-    if (check) check.textContent = isTranscoding ? '✓' : '';
+    const check = document.getElementById("tc-check");
+    if (check) check.textContent = isTranscoding ? "✓" : "";
   }
 
   function updateCcButton() {
-    ccBtn.classList.toggle('active', ccEnabled);
+    ccBtn.classList.toggle("active", ccEnabled);
   }
 
   function updatePlayIcon() {
-    const playIcon = document.getElementById('play-icon');
-    const pauseIcon = document.getElementById('pause-icon');
+    const playIcon = document.getElementById("play-icon");
+    const pauseIcon = document.getElementById("pause-icon");
     if (playIcon && pauseIcon) {
-      playIcon.classList.toggle('hidden', !video.paused);
-      pauseIcon.classList.toggle('hidden', video.paused);
+      playIcon.classList.toggle("hidden", !video.paused);
+      pauseIcon.classList.toggle("hidden", video.paused);
     }
   }
 
   function updateMuteIcon() {
-    const volIcon = document.getElementById('vol-icon');
-    const mutedIcon = document.getElementById('muted-icon');
+    const volIcon = document.getElementById("vol-icon");
+    const mutedIcon = document.getElementById("muted-icon");
     if (volIcon && mutedIcon) {
-      volIcon.classList.toggle('hidden', video.muted);
-      mutedIcon.classList.toggle('hidden', !video.muted);
+      volIcon.classList.toggle("hidden", video.muted);
+      mutedIcon.classList.toggle("hidden", !video.muted);
     }
   }
 
   function updateFullscreenIcon() {
-    const fsEnter = document.getElementById('fs-enter');
-    const fsExit = document.getElementById('fs-exit');
+    const fsEnter = document.getElementById("fs-enter");
+    const fsExit = document.getElementById("fs-exit");
     const isFs = !!document.fullscreenElement;
     if (fsEnter && fsExit) {
-      fsEnter.classList.toggle('hidden', isFs);
-      fsExit.classList.toggle('hidden', !isFs);
+      fsEnter.classList.toggle("hidden", isFs);
+      fsExit.classList.toggle("hidden", !isFs);
     }
   }
 
   function disableCcButton() {
     ccBtn.disabled = true;
-    ccBtn.classList.remove('active');
+    ccBtn.classList.remove("active");
   }
 
   function enableCcButton() {
@@ -216,20 +220,20 @@
       const lines = [];
       for (let r = 0; r < 15; r++) {
         const row = captionScreen.rows[r];
-        let text = '';
+        let text = "";
         for (let c = 0; c < 32; c++) {
-          text += row.chars[c]?.uchar || ' ';
+          text += row.chars[c]?.uchar || " ";
         }
         text = text.trim();
         if (text) lines.push(text);
       }
       if (lines.length === 0) return [];
-      const cue = new VTTCue(startTime, endTime, lines.join('\n'));
+      const cue = new VTTCue(startTime, endTime, lines.join("\n"));
       cue.line = -2;
-      cue.align = 'center';
+      cue.align = "center";
       track.addCue(cue);
       return [cue];
-    }
+    },
   };
 
   function createHlsConfig(options = {}) {
@@ -257,7 +261,11 @@
       ...base,
       liveSyncDurationCount: options.isVod ? 0 : 3,
       // A handoff recording is still growing; begin where it was left off.
-      startPosition: cfg.handoffRecording ? cfg.catchupSeek || 0 : options.isVod ? 0 : -1,
+      startPosition: cfg.handoffRecording
+        ? cfg.catchupSeek || 0
+        : options.isVod
+          ? 0
+          : -1,
     };
   }
 
@@ -268,25 +276,25 @@
   function applyCaptionStyles() {
     const s = cfg.ccStyle || {};
     const hexToRgba = (hex, opacity) => {
-      if (hex === 'transparent') return 'transparent';
-      const r = parseInt(hex.slice(1,3), 16);
-      const g = parseInt(hex.slice(3,5), 16);
-      const b = parseInt(hex.slice(5,7), 16);
+      if (hex === "transparent") return "transparent";
+      const r = parseInt(hex.slice(1, 3), 16);
+      const g = parseInt(hex.slice(3, 5), 16);
+      const b = parseInt(hex.slice(5, 7), 16);
       return `rgba(${r},${g},${b},${opacity})`;
     };
-    const color = hexToRgba(s.cc_color || '#ffffff', 1);
-    const shadow = s.cc_shadow || '0 0 4px black, 0 0 4px black';
-    const bg = hexToRgba(s.cc_bg || '#000000', s.cc_bg_opacity || 0.75);
-    const size = s.cc_size || '1em';
-    const font = s.cc_font || 'inherit';
-    let style = document.getElementById('cc-style');
+    const color = hexToRgba(s.cc_color || "#ffffff", 1);
+    const shadow = s.cc_shadow || "0 0 4px black, 0 0 4px black";
+    const bg = hexToRgba(s.cc_bg || "#000000", s.cc_bg_opacity || 0.75);
+    const size = s.cc_size || "1em";
+    const font = s.cc_font || "inherit";
+    let style = document.getElementById("cc-style");
     if (!style) {
-      style = document.createElement('style');
-      style.id = 'cc-style';
+      style = document.createElement("style");
+      style.id = "cc-style";
       document.head.appendChild(style);
     }
     const sizeMultiplier = parseFloat(size) || 1;
-    const infoSize = (2.5 * sizeMultiplier) + 'vh';
+    const infoSize = 2.5 * sizeMultiplier + "vh";
     style.textContent = `
       video::cue {
         color: ${color} !important;
@@ -302,7 +310,7 @@
   // With no language chosen, follow the browser's: broadcasts often carry a second
   // language (CC3), and whichever caption channel arrives first would otherwise win.
   function captionLanguage() {
-    return cfg.ccLang || (navigator.language || 'en').slice(0, 2).toLowerCase();
+    return cfg.ccLang || (navigator.language || "en").slice(0, 2).toLowerCase();
   }
 
   function getPreferredSubtitleTrack(tracks) {
@@ -311,47 +319,81 @@
     // Handle CC1-CC4 (CEA-608 channels)
     if (/^cc[1-4]$/i.test(prefLang)) {
       const ccNum = prefLang.toUpperCase();
-      const idx = tracks.findIndex(t => (t.name || t.label || '').toUpperCase().includes(ccNum));
+      const idx = tracks.findIndex((t) =>
+        (t.name || t.label || "").toUpperCase().includes(ccNum),
+      );
       if (idx >= 0) return idx;
       // Fallback: CC1 is usually index 0, CC2 is index 1, etc.
       const num = parseInt(prefLang.slice(2)) - 1;
       return num < tracks.length ? num : 0;
     }
-    const langNames = {en: 'english', es: 'spanish', fr: 'french', de: 'german', it: 'italian', pt: 'portuguese', ja: 'japanese', ko: 'korean', zh: 'chinese'};
-    let idx = tracks.findIndex(t => t.lang && t.lang.toLowerCase().startsWith(prefLang));
+    const langNames = {
+      en: "english",
+      es: "spanish",
+      fr: "french",
+      de: "german",
+      it: "italian",
+      pt: "portuguese",
+      ja: "japanese",
+      ko: "korean",
+      zh: "chinese",
+    };
+    let idx = tracks.findIndex(
+      (t) => t.lang && t.lang.toLowerCase().startsWith(prefLang),
+    );
     if (idx >= 0) return idx;
     const prefName = langNames[prefLang];
     if (prefName) {
-      idx = tracks.findIndex(t => (t.name || t.label) && (t.name || t.label).toLowerCase().includes(prefName));
+      idx = tracks.findIndex(
+        (t) =>
+          (t.name || t.label) && (t.name || t.label).toLowerCase().includes(prefName),
+      );
       if (idx >= 0) return idx;
     }
     return 0;
   }
 
   function applyCaptionsSetting() {
-    const tracks = Array.from(video.textTracks).filter(t =>
-      (t.kind === 'subtitles' || t.kind === 'captions') && t.mode !== 'disabled');
+    const tracks = Array.from(video.textTracks).filter(
+      (t) => (t.kind === "subtitles" || t.kind === "captions") && t.mode !== "disabled",
+    );
     if (!ccEnabled) {
-      tracks.forEach(t => t.mode = 'hidden');
+      tracks.forEach((t) => {
+        t.mode = "hidden";
+      });
       return;
     }
     if (tracks.length === 0) return;
     const prefLang = captionLanguage();
-    const langNames = {en: 'english', es: 'spanish', fr: 'french', de: 'german', it: 'italian', pt: 'portuguese', ja: 'japanese', ko: 'korean', zh: 'chinese'};
+    const langNames = {
+      en: "english",
+      es: "spanish",
+      fr: "french",
+      de: "german",
+      it: "italian",
+      pt: "portuguese",
+      ja: "japanese",
+      ko: "korean",
+      zh: "chinese",
+    };
     let preferredIdx = 0;
     if (prefLang) {
-      const idx = tracks.findIndex(t => t.language && t.language.toLowerCase().startsWith(prefLang));
+      const idx = tracks.findIndex(
+        (t) => t.language && t.language.toLowerCase().startsWith(prefLang),
+      );
       if (idx >= 0) preferredIdx = idx;
       else {
         const prefName = langNames[prefLang];
         if (prefName) {
-          const nameIdx = tracks.findIndex(t => t.label && t.label.toLowerCase().includes(prefName));
+          const nameIdx = tracks.findIndex(
+            (t) => t.label && t.label.toLowerCase().includes(prefName),
+          );
           if (nameIdx >= 0) preferredIdx = nameIdx;
         }
       }
     }
     tracks.forEach((t, i) => {
-      const mode = i === preferredIdx ? 'showing' : 'hidden';
+      const mode = i === preferredIdx ? "showing" : "hidden";
       if (t.mode !== mode) t.mode = mode;
     });
   }
@@ -360,9 +402,10 @@
   // broadcast with CC1 and CC3 rendered both languages at once. One showing track
   // (the preferred one, or the viewer's pick) is left alone; with CC off it is a
   // pick from the browser's own caption menu, so CC turns on.
-  video.textTracks.addEventListener('change', () => {
-    const showing = Array.from(video.textTracks).filter(t =>
-      (t.kind === 'subtitles' || t.kind === 'captions') && t.mode === 'showing');
+  video.textTracks.addEventListener("change", () => {
+    const showing = Array.from(video.textTracks).filter(
+      (t) => (t.kind === "subtitles" || t.kind === "captions") && t.mode === "showing",
+    );
     if (showing.length === 1 && !ccEnabled) {
       ccEnabled = true;
       updateCcButton();
@@ -379,7 +422,7 @@
     }
     if (activeTrackStates && activeTrackStates.length === subtitles.length) {
       for (const ts of activeTrackStates) {
-        if (ts.track.mode === 'disabled') ts.track.mode = 'hidden';
+        if (ts.track.mode === "disabled") ts.track.mode = "hidden";
         const cues = ts.track.cues;
         if (cues) while (cues.length > 0) ts.track.removeCue(cues[0]);
         ts.addedCues.clear();
@@ -387,17 +430,17 @@
       }
     } else {
       for (let i = 0; i < video.textTracks.length; i++) {
-        video.textTracks[i].mode = 'disabled';
+        video.textTracks[i].mode = "disabled";
       }
       activeTrackStates = subtitles.map((sub) => ({
         url: sub.url,
-        track: video.addTextTrack('subtitles', sub.label, sub.lang),
+        track: video.addTextTrack("subtitles", sub.label, sub.lang),
         addedCues: new Set(),
         retryCount: 0,
       }));
     }
     activeTrackStates.forEach((ts, i) => {
-      ts.track.mode = (ccEnabled && i === prefIdx) ? 'showing' : 'hidden';
+      ts.track.mode = ccEnabled && i === prefIdx ? "showing" : "hidden";
     });
 
     const poll = async () => {
@@ -405,8 +448,11 @@
         const ts = activeTrackStates[i];
         if (ts.retryCount > 120) continue;
         try {
-          const resp = await fetch(ts.url + '?t=' + Date.now());
-          if (!resp.ok) { ts.retryCount++; continue; }
+          const resp = await fetch(ts.url + "?t=" + Date.now());
+          if (!resp.ok) {
+            ts.retryCount++;
+            continue;
+          }
           const vtt = await resp.text();
           const cues = parseVttCues(vtt);
           for (const cue of cues) {
@@ -415,11 +461,13 @@
               try {
                 ts.track.addCue(new VTTCue(cue.start, cue.end, cue.text));
                 ts.addedCues.add(key);
-              } catch (e) {}
+              } catch {}
             }
           }
           ts.retryCount = 0;
-        } catch (e) { ts.retryCount++; }
+        } catch {
+          ts.retryCount++;
+        }
       }
     };
 
@@ -427,7 +475,8 @@
     const doPoll = async () => {
       await poll();
       pollCount++;
-      subtitlePollTimerId = pollCount < 20 ? setTimeout(doPoll, 500) : setInterval(poll, 5000);
+      subtitlePollTimerId =
+        pollCount < 20 ? setTimeout(doPoll, 500) : setInterval(poll, 5000);
     };
     doPoll();
   }
@@ -443,11 +492,22 @@
     if (video.currentTime < 1 && seekOffset > 0) return;
     if (Math.abs(actualTime - lastSavedPosition) < 5) return;
     lastSavedPosition = actualTime;
-    const data = JSON.stringify({ url: cfg.rawUrl, position: actualTime, duration: totalDuration });
-    if (document.visibilityState === 'hidden') {
-      navigator.sendBeacon('/api/watch-position', new Blob([data], {type: 'application/json'}));
+    const data = JSON.stringify({
+      url: cfg.rawUrl,
+      position: actualTime,
+      duration: totalDuration,
+    });
+    if (document.visibilityState === "hidden") {
+      navigator.sendBeacon(
+        "/api/watch-position",
+        new Blob([data], { type: "application/json" }),
+      );
     } else {
-      fetch('/api/watch-position', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: data });
+      fetch("/api/watch-position", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: data,
+      });
     }
   }
 
@@ -465,20 +525,21 @@
 
   function setupPositionTracking() {
     if (!cfg.isVod) return;
-    video.addEventListener('timeupdate', () => {
+    video.addEventListener("timeupdate", () => {
       if (savePositionTimeout) return;
       savePositionTimeout = setTimeout(() => {
         savePosition();
         savePositionTimeout = null;
       }, 10000);
     });
-    video.addEventListener('pause', savePosition);
-    video.addEventListener('ended', savePosition);
-    video.addEventListener('ended', () => {
-      if (autoNextEnabled && cfg.nextEpisodeUrl) window.location.href = cfg.nextEpisodeUrl;
+    video.addEventListener("pause", savePosition);
+    video.addEventListener("ended", savePosition);
+    video.addEventListener("ended", () => {
+      if (autoNextEnabled && cfg.nextEpisodeUrl)
+        window.location.href = cfg.nextEpisodeUrl;
     });
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'hidden') savePosition();
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") savePosition();
     });
   }
 
@@ -492,7 +553,8 @@
   function liveWindowStart() {
     if (currentHls) {
       const levels = currentHls.levels || [];
-      const level = levels[currentHls.currentLevel] || levels[currentHls.loadLevel] || levels[0];
+      const level =
+        levels[currentHls.currentLevel] || levels[currentHls.loadLevel] || levels[0];
       const fragments = level && level.details && level.details.fragments;
       if (fragments && fragments.length && Number.isFinite(fragments[0].start)) {
         return fragments[0].start;
@@ -505,7 +567,9 @@
   // Playback position of the live edge: what plays when fully caught up.
   function liveEdge() {
     if (currentHls) {
-      return Number.isFinite(currentHls.liveSyncPosition) ? currentHls.liveSyncPosition : null;
+      return Number.isFinite(currentHls.liveSyncPosition)
+        ? currentHls.liveSyncPosition
+        : null;
     }
     return video.seekable.length ? video.seekable.end(video.seekable.length - 1) : null;
   }
@@ -518,8 +582,10 @@
     if (cfg.isVod || !cfg.liveDvrMins) return;
 
     let pausedDuringSession = false;
-    video.addEventListener('pause', () => { pausedDuringSession = true; });
-    video.addEventListener('play', () => {
+    video.addEventListener("pause", () => {
+      pausedDuringSession = true;
+    });
+    video.addEventListener("play", () => {
       if (!pausedDuringSession) return;
       const start = liveWindowStart();
       if (start === null || video.currentTime >= start) return;
@@ -586,15 +652,16 @@
     try {
       // Release the upstream connection before the next page starts probing.
       await cleanupTranscode();
-      const base = '/play/live/' + encodeURIComponent(cfg.streamId);
+      const base = "/play/live/" + encodeURIComponent(cfg.streamId);
       // A handoff recording's channel has no archive: anything past it is live.
-      const live = target >= Date.now() / 1000 - 30 || (cfg.handoffRecording && !cfg.catchupDays);
+      const live =
+        target >= Date.now() / 1000 - 30 || (cfg.handoffRecording && !cfg.catchupDays);
       window.location.href = live
         ? base
-        : base + '?start=' + Math.floor(Math.max(target, archiveStart()));
+        : base + "?start=" + Math.floor(Math.max(target, archiveStart()));
     } catch (e) {
       archiveNavigationInProgress = false;
-      console.error('[CATCHUP] Could not release the previous stream:', e);
+      console.error("[CATCHUP] Could not release the previous stream:", e);
       showError();
     }
   }
@@ -610,9 +677,12 @@
 
   function seekCatchup(target) {
     pendingCatchupSeek = 0;
-    const loadedEnd = cfg.catchupStart + seekOffset + Math.max(0, transcodedDuration - 2);
+    const loadedEnd =
+      cfg.catchupStart + seekOffset + Math.max(0, transcodedDuration - 2);
     // A handoff recording holds nothing before its start, so earlier seeks stop there.
-    const loadedStart = cfg.handoffRecording ? -Infinity : cfg.catchupStart + seekOffset;
+    const loadedStart = cfg.handoffRecording
+      ? -Infinity
+      : cfg.catchupStart + seekOffset;
     if (target >= loadedStart && target <= loadedEnd) {
       video.currentTime = Math.max(0, target - cfg.catchupStart - seekOffset);
       return;
@@ -634,12 +704,14 @@
 
   function setupCatchup() {
     if (!cfg.catchup) return;
-    document.getElementById('go-live-btn')?.addEventListener('click', e => {
+    document.getElementById("go-live-btn")?.addEventListener("click", (e) => {
       e.preventDefault();
       openArchiveAt(Date.now() / 1000);
     });
     // Carry on with whatever aired next, or rejoin live once caught up.
-    video.addEventListener('ended', () => openArchiveAt(Math.max(programEnd, catchupClock())));
+    video.addEventListener("ended", () =>
+      openArchiveAt(Math.max(programEnd, catchupClock())),
+    );
   }
 
   // ============================================================
@@ -649,8 +721,9 @@
   // Recordings are played directly, so how much is seekable comes from the
   // growing playlist rather than transcode progress.
   function recordingDuration() {
-    const details = currentHls?.levels?.[currentHls.currentLevel]?.details
-      || currentHls?.levels?.[0]?.details;
+    const details =
+      currentHls?.levels?.[currentHls.currentLevel]?.details ||
+      currentHls?.levels?.[0]?.details;
     if (details && Number.isFinite(details.totalduration)) return details.totalduration;
     return video.seekable.length ? video.seekable.end(video.seekable.length - 1) : 0;
   }
@@ -661,7 +734,12 @@
       transcodedDuration = recordingDuration();
       applyPendingCatchupSeek();
     };
-    for (const event of ['loadedmetadata', 'durationchange', 'progress', 'timeupdate']) {
+    for (const event of [
+      "loadedmetadata",
+      "durationchange",
+      "progress",
+      "timeupdate",
+    ]) {
       video.addEventListener(event, update);
     }
   }
@@ -669,39 +747,44 @@
   // Broadcast moment on screen, including a catchup seek still waiting to apply.
   function handoffPosition() {
     if (!cfg.catchup) return playbackWallClock();
-    return pendingCatchupSeek > 0 ? cfg.catchupStart + pendingCatchupSeek : catchupClock();
+    return pendingCatchupSeek > 0
+      ? cfg.catchupStart + pendingCatchupSeek
+      : catchupClock();
   }
 
   function handoffReport() {
     return JSON.stringify({
       stream_id: cfg.streamId,
       position: handoffPosition(),
-      handoff_id: cfg.handoffId || '',
+      handoff_id: cfg.handoffId || "",
     });
   }
 
   // Tell the server where this channel is playing, and when the page goes
   // away, so another device can offer to pick it up from the same moment.
   function setupHandoff() {
-    if (cfg.streamType !== 'live') return;
+    if (cfg.streamType !== "live") return;
     let started = false;
     const report = () => {
       if (!started || castController?.active) return;
-      fetch('/api/handoff/watch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+      fetch("/api/handoff/watch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: handoffReport(),
       }).catch(() => {});
     };
-    video.addEventListener('playing', () => {
+    video.addEventListener("playing", () => {
       if (started) return;
       started = true;
       report();
     });
     setInterval(report, 15000);
-    window.addEventListener('pagehide', () => {
+    window.addEventListener("pagehide", () => {
       if (!started || castController?.active) return;
-      navigator.sendBeacon('/api/handoff/stop', new Blob([handoffReport()], { type: 'application/json' }));
+      navigator.sendBeacon(
+        "/api/handoff/stop",
+        new Blob([handoffReport()], { type: "application/json" }),
+      );
     });
   }
 
@@ -714,21 +797,21 @@
     programRefreshInFlight = true;
     programRetryAt = now + 30;
     try {
-      const resp = await fetch('/api/live/program/' + encodeURIComponent(cfg.streamId));
+      const resp = await fetch("/api/live/program/" + encodeURIComponent(cfg.streamId));
       if (!resp.ok) return;
       const data = await resp.json();
       if (!data.end || data.end <= Date.now() / 1000) return;
       programStart = data.start;
       programEnd = data.end;
-      const title = document.getElementById('program-title');
-      if (title) title.textContent = data.title ? ' \u2014 ' + data.title : '';
-      const desc = document.getElementById('program-desc');
+      const title = document.getElementById("program-title");
+      if (title) title.textContent = data.title ? " \u2014 " + data.title : "";
+      const desc = document.getElementById("program-desc");
       if (desc) {
-        desc.textContent = data.desc || '';
-        desc.classList.toggle('hidden', !data.desc);
+        desc.textContent = data.desc || "";
+        desc.classList.toggle("hidden", !data.desc);
       }
       updateProgress();
-    } catch (e) {
+    } catch {
       // Keep the current listing and try again on a later tick.
     } finally {
       programRefreshInFlight = false;
@@ -737,20 +820,23 @@
 
   function setupLiveProgram() {
     if (cfg.isVod) return;
-    const container = document.getElementById('progress-container');
-    const startOver = document.getElementById('start-over-btn');
-    startOver?.addEventListener('click', () => {
+    const container = document.getElementById("progress-container");
+    const startOver = document.getElementById("start-over-btn");
+    startOver?.addEventListener("click", () => {
       openArchiveAt(programStart);
     });
     // Wall-clock driven, so the bar keeps up while paused or stalled.
     const tick = () => {
       // Channels the guide knows nothing about stay off the timeline.
       if (programEnd && Date.now() / 1000 >= programEnd) refreshProgram();
-      container?.classList.toggle('hidden', !hasLiveProgram());
+      container?.classList.toggle("hidden", !hasLiveProgram());
       if (hasLiveProgram()) updateProgress();
       // The upstream archive only reaches back catchupDays
       const archiveStart = Date.now() / 1000 - cfg.catchupDays * 86400;
-      startOver?.classList.toggle('hidden', !hasLiveProgram() || programStart < archiveStart);
+      startOver?.classList.toggle(
+        "hidden",
+        !hasLiveProgram() || programStart < archiveStart,
+      );
     };
     tick();
     setInterval(tick, 1000);
@@ -761,18 +847,18 @@
   // ============================================================
 
   function renderProgress(pct, currentText, rightText) {
-    const played = document.getElementById('progress-played');
-    const handle = document.getElementById('progress-handle');
-    const timeCurrent = document.getElementById('time-current');
-    const timeDuration = document.getElementById('time-duration');
-    if (played) played.style.width = pct + '%';
-    if (handle) handle.style.left = pct + '%';
+    const played = document.getElementById("progress-played");
+    const handle = document.getElementById("progress-handle");
+    const timeCurrent = document.getElementById("time-current");
+    const timeDuration = document.getElementById("time-duration");
+    if (played) played.style.width = pct + "%";
+    if (handle) handle.style.left = pct + "%";
     if (timeCurrent) timeCurrent.textContent = currentText;
     if (timeDuration) timeDuration.textContent = rightText;
-    const slider = document.getElementById('progress-seek');
+    const slider = document.getElementById("progress-seek");
     if (slider) {
       if (scrubPercent === null) slider.value = pct;
-      slider.setAttribute('aria-valuetext', currentText);
+      slider.setAttribute("aria-valuetext", currentText);
     }
   }
 
@@ -784,56 +870,74 @@
 
   // Shade the part of the program the DVR can still seek to.
   function renderDvrWindow(length) {
-    const buffered = document.getElementById('progress-buffered');
+    const buffered = document.getElementById("progress-buffered");
     if (!buffered) return;
     const edge = liveEdge();
     const start = liveWindowStart();
     const now = Date.now() / 1000;
     const live = Math.min(Math.max(now - programStart, 0), length);
-    const oldest = edge === null || start === null
-      ? live
-      : Math.min(Math.max(now - (edge - start) - programStart, 0), length);
-    buffered.style.left = (oldest / length) * 100 + '%';
-    buffered.style.width = ((live - oldest) / length) * 100 + '%';
+    const oldest =
+      edge === null || start === null
+        ? live
+        : Math.min(Math.max(now - (edge - start) - programStart, 0), length);
+    buffered.style.left = (oldest / length) * 100 + "%";
+    buffered.style.width = ((live - oldest) / length) * 100 + "%";
   }
 
   // Shade the part of an archived program that's transcoded and seekable.
   function renderArchiveWindow(length) {
-    const buffered = document.getElementById('progress-buffered');
+    const buffered = document.getElementById("progress-buffered");
     if (!buffered) return;
     const clamp = (t) => Math.min(Math.max(t - programStart, 0), length);
     const from = clamp(cfg.catchupStart + seekOffset);
     const to = clamp(cfg.catchupStart + seekOffset + transcodedDuration);
-    buffered.style.left = (from / length) * 100 + '%';
-    buffered.style.width = ((to - from) / length) * 100 + '%';
+    buffered.style.left = (from / length) * 100 + "%";
+    buffered.style.width = ((to - from) / length) * 100 + "%";
   }
 
   function updateProgress() {
     if (scrubPercent !== null) {
       const length = timelineDuration();
-      const elapsed = length * scrubPercent / 100;
-      renderProgress(scrubPercent, formatTime(elapsed),
-        hasCatchupProgram() || hasLiveProgram() ? '-' + formatTime(length - elapsed) : formatTime(length));
+      const elapsed = (length * scrubPercent) / 100;
+      renderProgress(
+        scrubPercent,
+        formatTime(elapsed),
+        hasCatchupProgram() || hasLiveProgram()
+          ? "-" + formatTime(length - elapsed)
+          : formatTime(length),
+      );
       return;
     }
     if (hasCatchupProgram()) {
       const length = programEnd - programStart;
       const elapsed = Math.min(Math.max(catchupClock() - programStart, 0), length);
-      renderProgress((elapsed / length) * 100, formatTime(elapsed), '-' + formatTime(length - elapsed));
+      renderProgress(
+        (elapsed / length) * 100,
+        formatTime(elapsed),
+        "-" + formatTime(length - elapsed),
+      );
       renderArchiveWindow(length);
       return;
     }
     if (hasLiveProgram()) {
       const length = programEnd - programStart;
       const elapsed = Math.min(Math.max(playbackWallClock() - programStart, 0), length);
-      renderProgress((elapsed / length) * 100, formatTime(elapsed), '-' + formatTime(length - elapsed));
+      renderProgress(
+        (elapsed / length) * 100,
+        formatTime(elapsed),
+        "-" + formatTime(length - elapsed),
+      );
       renderDvrWindow(length);
       return;
     }
     const duration = totalDuration || video.duration || 0;
     if (!duration) return;
     const currentTime = video.currentTime + seekOffset;
-    renderProgress((currentTime / duration) * 100, formatTime(currentTime), formatTime(duration));
+    renderProgress(
+      (currentTime / duration) * 100,
+      formatTime(currentTime),
+      formatTime(duration),
+    );
   }
 
   // ============================================================
@@ -845,13 +949,13 @@
     const poll = async () => {
       if (!transcodeSessionId) return;
       try {
-        const resp = await fetch('/transcode/progress/' + transcodeSessionId);
+        const resp = await fetch("/transcode/progress/" + transcodeSessionId);
         if (resp.ok) {
           const data = await resp.json();
           transcodedDuration = data.duration || 0;
           applyPendingCatchupSeek();
         }
-      } catch (e) {}
+      } catch {}
     };
     poll();
     progressPollTimerId = setInterval(poll, 2000);
@@ -889,14 +993,15 @@
     seekOffset = 0;
     currentSubtitles = null;
     activeTrackStates = null;
-    document.getElementById('menu-jump')?.classList.add('hidden');
-    document.getElementById('seek-container').classList.add('hidden');
+    document.getElementById("menu-jump")?.classList.add("hidden");
+    document.getElementById("seek-container").classList.add("hidden");
     await transcodeSession.stop();
     transcodeSessionId = null;
   }
 
   function cleanupTranscodeSync() {
-    if (document.pictureInPictureElement === video || castController?.browserActive) return;
+    if (document.pictureInPictureElement === video || castController?.browserActive)
+      return;
     adaptivePlayback?.destroy();
     adaptivePlayback = null;
     stopProgressPolling();
@@ -917,14 +1022,14 @@
   let vodRecoveries = [];
   function recoverVod() {
     const now = Date.now();
-    vodRecoveries = vodRecoveries.filter(t => now - t < 60000);
+    vodRecoveries = vodRecoveries.filter((t) => now - t < 60000);
     if (!transcodeSessionId || vodRecoveries.length >= 2) {
       showError();
       return;
     }
     vodRecoveries.push(now);
     const position = seekOffset + (video.currentTime || 0);
-    console.warn('[VOD] Stream stopped; restarting at', position);
+    console.warn("[VOD] Stream stopped; restarting at", position);
     seekInProgress = false;
     handleSeekToPosition(position);
   }
@@ -939,9 +1044,9 @@
     if (!transcodeSessionId || seekInProgress) return false;
     seekInProgress = true;
     showLoading();
-    error.classList.add('hidden');
+    error.classList.add("hidden");
     video.pause();
-    video.src = '';
+    video.src = "";
     if (subtitlePollTimerId) {
       clearInterval(subtitlePollTimerId);
       clearTimeout(subtitlePollTimerId);
@@ -952,55 +1057,67 @@
       currentHls = null;
     }
     try {
-      const resp = await fetch('/transcode/seek/' + transcodeSessionId + '?time=' + targetTime);
-      if (!resp.ok) throw new Error('Seek failed: ' + resp.status);
+      const resp = await fetch(
+        "/transcode/seek/" + transcodeSessionId + "?time=" + targetTime,
+      );
+      if (!resp.ok) throw new Error("Seek failed: " + resp.status);
       transcodedDuration = 0;
       seekOffset = targetTime;
       if (nativeHls) {
         video.disableRemotePlayback = false;
-        video.src = '/transcode/' + transcodeSessionId + '/stream.m3u8';
-        video.addEventListener('loadedmetadata', () => {
-          hideLoading();
-          seekInProgress = false;
-          savePosition();
-          video.play().catch(() => {});
-        }, { once: true });
+        video.src = "/transcode/" + transcodeSessionId + "/stream.m3u8";
+        video.addEventListener(
+          "loadedmetadata",
+          () => {
+            hideLoading();
+            seekInProgress = false;
+            savePosition();
+            video.play().catch(() => {});
+          },
+          { once: true },
+        );
         return true;
       }
-      const hls = new Hls(createHlsConfig({forSeek: true}));
+      const hls = new Hls(createHlsConfig({ forSeek: true }));
       currentHls = hls;
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         hideLoading();
-        error.classList.add('hidden');
+        error.classList.add("hidden");
         seekInProgress = false;
         savePosition();
         if (currentSubtitles && currentSubtitles.length > 0) {
-          startSubtitlePolling(currentSubtitles, getPreferredSubtitleTrack(currentSubtitles));
+          startSubtitlePolling(
+            currentSubtitles,
+            getPreferredSubtitleTrack(currentSubtitles),
+          );
         }
         video.play().catch(() => {});
       });
 
       let recoveryAttempts = 0;
-      hls.on(Hls.Events.ERROR, (event, data) => {
+      hls.on(Hls.Events.ERROR, (_event, data) => {
         if (data.fatal) {
           recoveryAttempts++;
           if (recoveryAttempts <= 3 && data.type === Hls.ErrorTypes.NETWORK_ERROR) {
             hls.startLoad();
-          } else if (recoveryAttempts <= 3 && data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          } else if (
+            recoveryAttempts <= 3 &&
+            data.type === Hls.ErrorTypes.MEDIA_ERROR
+          ) {
             hls.recoverMediaError();
           } else {
-            console.error('[SEEK] HLS error:', data);
+            console.error("[SEEK] HLS error:", data);
             recoverVod();
           }
         }
       });
 
-      hls.loadSource('/transcode/' + transcodeSessionId + '/stream.m3u8');
+      hls.loadSource("/transcode/" + transcodeSessionId + "/stream.m3u8");
       hls.attachMedia(video);
       return true;
     } catch (e) {
-      console.error('[SEEK] Error:', e);
+      console.error("[SEEK] Error:", e);
       seekInProgress = false;
       showError();
       return false;
@@ -1013,22 +1130,28 @@
       await cleanupTranscode();
       if (castController?.active) return;
       // Archived programs are finite and seekable, so they play like a movie
-      const contentType = cfg.catchup ? 'movie' : cfg.streamType;
-      let url = '/transcode/start?url=' + encodeURIComponent(cfg.rawUrl) +
-        '&url_token=' + encodeURIComponent(cfg.rawUrlToken || '') + '&content_type=' + contentType;
-      if (cfg.seriesId) url += '&series_id=' + cfg.seriesId;
-      if (cfg.episodeId) url += '&episode_id=' + cfg.episodeId;
-      if (cfg.seriesName) url += '&series_name=' + encodeURIComponent(cfg.seriesName);
-      if (cfg.deinterlaceFallback !== undefined) url += '&deinterlace_fallback=' + (cfg.deinterlaceFallback ? '1' : '0');
-      if (cfg.sourceId) url += '&source_id=' + encodeURIComponent(cfg.sourceId);
+      const contentType = cfg.catchup ? "movie" : cfg.streamType;
+      let url =
+        "/transcode/start?url=" +
+        encodeURIComponent(cfg.rawUrl) +
+        "&url_token=" +
+        encodeURIComponent(cfg.rawUrlToken || "") +
+        "&content_type=" +
+        contentType;
+      if (cfg.seriesId) url += "&series_id=" + cfg.seriesId;
+      if (cfg.episodeId) url += "&episode_id=" + cfg.episodeId;
+      if (cfg.seriesName) url += "&series_name=" + encodeURIComponent(cfg.seriesName);
+      if (cfg.deinterlaceFallback !== undefined)
+        url += "&deinterlace_fallback=" + (cfg.deinterlaceFallback ? "1" : "0");
+      if (cfg.sourceId) url += "&source_id=" + encodeURIComponent(cfg.sourceId);
       // This player holds live playback for its own lead (playWhenBuffered).
-      if (!cfg.isVod) url += '&min_segments=1';
+      if (!cfg.isVod) url += "&min_segments=1";
       const data = await transcodeSession.start(url);
       if (!data) return;
       transcodeSessionId = data.session_id;
       transcodePlaylist = data.playlist;
       const playlistPath = new URL(data.playlist, window.location.href).pathname;
-      adaptiveSession = !cfg.isVod && playlistPath.endsWith('/low.m3u8') ? data : null;
+      adaptiveSession = !cfg.isVod && playlistPath.endsWith("/low.m3u8") ? data : null;
       isTranscoding = true;
       updateTranscodeCheck();
       totalDuration = data.duration || 0;
@@ -1036,18 +1159,19 @@
       transcodedDuration = data.transcoded_duration || 0;
       currentSubtitles = data.subtitles || null;
       if (cfg.isVod) {
-        document.getElementById('menu-jump')?.classList.remove('hidden');
-        document.getElementById('progress-container')?.classList.remove('hidden');
+        document.getElementById("menu-jump")?.classList.remove("hidden");
+        document.getElementById("progress-container")?.classList.remove("hidden");
         const duration = timelineDuration();
         if (duration > 0) {
-          document.getElementById('seek-duration').textContent = '/ ' + formatTime(duration);
-          document.getElementById('time-duration').textContent = formatTime(duration);
+          document.getElementById("seek-duration").textContent =
+            "/ " + formatTime(duration);
+          document.getElementById("time-duration").textContent = formatTime(duration);
         }
         enableCcButton();
       }
       playWithUrl(data.master_playlist || data.playlist, onError, data.subtitles);
     } catch (e) {
-      console.error('[TC] Error:', e);
+      console.error("[TC] Error:", e);
       if (onError) onError();
       else if (isLiveStream()) reconnectLive();
       else showError();
@@ -1062,48 +1186,61 @@
     showLoading();
     adaptivePlayback?.destroy();
     adaptivePlayback = null;
-    const useHls = !nativeHls && Hls.isSupported() && (
-      url.includes('.m3u8') || url.includes('/live/') || url.includes('/transcode')
-    );
+    const useHls =
+      !nativeHls &&
+      Hls.isSupported() &&
+      (url.includes(".m3u8") || url.includes("/live/") || url.includes("/transcode"));
     if (!useHls) {
       video.disableRemotePlayback = false;
       // Native HLS without download telemetry stays on the safe initial rendition.
       video.src = adaptiveSession ? adaptiveSession.playlist : url;
       if (adaptiveSession) startAdaptivePlayback(null);
-      video.addEventListener('loadedmetadata', function() {
-        endLiveOutage();
-        hideLoading();
-        error.classList.add('hidden');
-        if (video.textTracks.length === 0) disableCcButton();
-        applyCaptionsSetting();
-        restorePosition();
-        if (transcodeSessionId && !adaptiveSession) startProgressPolling();
-        startPlayback();
-      }, { once: true });
-      video.addEventListener('error', function() {
-        if (onError) onError();
-        else if (isLiveStream()) reconnectLive();
-        else showError();
-      }, { once: true });
+      video.addEventListener(
+        "loadedmetadata",
+        () => {
+          endLiveOutage();
+          hideLoading();
+          error.classList.add("hidden");
+          if (video.textTracks.length === 0) disableCcButton();
+          applyCaptionsSetting();
+          restorePosition();
+          if (transcodeSessionId && !adaptiveSession) startProgressPolling();
+          startPlayback();
+        },
+        { once: true },
+      );
+      video.addEventListener(
+        "error",
+        () => {
+          if (onError) onError();
+          else if (isLiveStream()) reconnectLive();
+          else showError();
+        },
+        { once: true },
+      );
       return;
     }
 
     const adaptiveBufferSeconds = window.NetvPlayback.playbackBufferSeconds(
-      adaptiveSession?.playback_buffer_seconds
+      adaptiveSession?.playback_buffer_seconds,
     );
     const hls = new Hls({
-      ...createHlsConfig({isVod: cfg.isVod}),
-      ...(adaptiveSession ? {
-        liveSyncDuration: adaptiveBufferSeconds,
-        liveSyncDurationCount: undefined,
-        maxBufferLength: Math.max(30, adaptiveBufferSeconds),
-        // Request each next segment by blocking reload (?blocking=1 below) instead of
-        // polling, so it arrives as soon as the server lists it.
-        lowLatencyMode: true,
-      } : {}),
+      ...createHlsConfig({ isVod: cfg.isVod }),
+      ...(adaptiveSession
+        ? {
+            liveSyncDuration: adaptiveBufferSeconds,
+            liveSyncDurationCount: undefined,
+            maxBufferLength: Math.max(30, adaptiveBufferSeconds),
+            // Request each next segment by blocking reload (?blocking=1 below) instead of
+            // polling, so it arrives as soon as the server lists it.
+            lowLatencyMode: true,
+          }
+        : {}),
     });
-    const source = adaptiveSession && url === adaptiveSession.master_playlist
-      ? url + '?blocking=1' : url;
+    const source =
+      adaptiveSession && url === adaptiveSession.master_playlist
+        ? url + "?blocking=1"
+        : url;
     currentHls = hls;
     let recoveryAttempts = 0;
     let hasLoaded = false;
@@ -1119,7 +1256,7 @@
     if (onError) {
       loadTimeout = setTimeout(() => {
         if (!hasLoaded) {
-          console.log('[AUTO] Load timeout, triggering transcode');
+          console.log("[AUTO] Load timeout, triggering transcode");
           hls.destroy();
           currentHls = null;
           onError();
@@ -1130,21 +1267,26 @@
     // Check for missing audio (Auto mode only)
     if (onError) {
       let audioChecked = false;
-      video.addEventListener('timeupdate', function checkAudio() {
+      video.addEventListener("timeupdate", function checkAudio() {
         if (audioChecked || video.currentTime < 1) return;
         audioChecked = true;
-        video.removeEventListener('timeupdate', checkAudio);
+        video.removeEventListener("timeupdate", checkAudio);
         let hasAudio = false;
-        if (typeof video.webkitAudioDecodedByteCount !== 'undefined') {
+        if (typeof video.webkitAudioDecodedByteCount !== "undefined") {
           hasAudio = video.webkitAudioDecodedByteCount > 0;
-        } else if (typeof video.mozHasAudio !== 'undefined') {
+        } else if (typeof video.mozHasAudio !== "undefined") {
           hasAudio = video.mozHasAudio;
         } else if (video.audioTracks && video.audioTracks.length > 0) {
           hasAudio = true;
         }
-        console.log('[AUTO] Audio check: hasAudio=' + hasAudio + ', webkitAudioDecodedByteCount=' + video.webkitAudioDecodedByteCount);
+        console.log(
+          "[AUTO] Audio check: hasAudio=" +
+            hasAudio +
+            ", webkitAudioDecodedByteCount=" +
+            video.webkitAudioDecodedByteCount,
+        );
         if (!hasAudio) {
-          console.log('[AUTO] No audio detected, triggering transcode');
+          console.log("[AUTO] No audio detected, triggering transcode");
           hls.destroy();
           currentHls = null;
           onError();
@@ -1155,7 +1297,7 @@
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       if (loadTimeout) clearTimeout(loadTimeout);
       hideLoading();
-      error.classList.add('hidden');
+      error.classList.add("hidden");
       hasLoaded = true;
       recoveryAttempts = 0;
       if (subtitles && subtitles.length > 0) {
@@ -1175,20 +1317,23 @@
 
     // The server reports embedded (CEA-608) captions at startup, but hls.js creates
     // their track only when it decodes the first cue, which can be many seconds in.
-    const hasCaptions = () => !!adaptiveSession?.caption_playlist ||
-      hls.subtitleTracks.length > 0 || video.textTracks.length > 0;
+    const hasCaptions = () =>
+      !!adaptiveSession?.caption_playlist ||
+      hls.subtitleTracks.length > 0 ||
+      video.textTracks.length > 0;
 
     hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, () => {
       if (hls.subtitleTracks.length > 0 && ccBtn.disabled) {
         enableCcButton();
-        if (cfg.captionsEnabled) hls.subtitleTrack = getPreferredSubtitleTrack(hls.subtitleTracks);
+        if (cfg.captionsEnabled)
+          hls.subtitleTrack = getPreferredSubtitleTrack(hls.subtitleTracks);
       } else if (!hasCaptions() && !ccBtn.disabled) {
         disableCcButton();
       }
     });
 
-    video.textTracks.addEventListener('addtrack', (e) => {
-      if (e.track.kind === 'captions' || e.track.kind === 'subtitles') {
+    video.textTracks.addEventListener("addtrack", (e) => {
+      if (e.track.kind === "captions" || e.track.kind === "subtitles") {
         applyCaptionsSetting();
         if (ccBtn.disabled) enableCcButton();
       }
@@ -1199,7 +1344,7 @@
       if (currentHls === hls) endLiveOutage();
     });
 
-    hls.on(Hls.Events.ERROR, (event, data) => {
+    hls.on(Hls.Events.ERROR, (_event, data) => {
       if (!data.fatal) return;
       const status = data.response?.code || 0;
       // A source refused before playing anything is not an outage.
@@ -1226,7 +1371,12 @@
       }
       recoveryAttempts++;
       if (recoveryAttempts <= 3 && data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-        setTimeout(() => { if (currentHls === hls) hls.startLoad(); }, 1000 * 2 ** recoveryAttempts);
+        setTimeout(
+          () => {
+            if (currentHls === hls) hls.startLoad();
+          },
+          1000 * 2 ** recoveryAttempts,
+        );
       } else if (recoveryAttempts <= 3 && data.type === Hls.ErrorTypes.MEDIA_ERROR) {
         hls.recoverMediaError();
       } else {
@@ -1242,7 +1392,13 @@
   }
 
   function startPlayback() {
-    video.play().catch(() => { if (!video.muted) { autoMutedByPolicy = true; video.muted = true; } video.play(); });
+    video.play().catch(() => {
+      if (!video.muted) {
+        autoMutedByPolicy = true;
+        video.muted = true;
+      }
+      video.play();
+    });
   }
 
   // A live session is produced in real time, so playing from its first fragment
@@ -1260,15 +1416,19 @@
       if (video.currentTime < ranges.start(0)) video.currentTime = ranges.start(0);
       return ranges.end(ranges.length - 1) - video.currentTime;
     };
-    const listed = details => details
-      ? details.edge - Math.max(video.currentTime, details.fragmentStart) : 0;
+    const listed = (details) =>
+      details ? details.edge - Math.max(video.currentTime, details.fragmentStart) : 0;
     const start = () => {
       hls.off(Hls.Events.FRAG_BUFFERED, onBuffered);
       hls.off(Hls.Events.LEVEL_LOADED, onListed);
       startPlayback();
     };
-    const onBuffered = () => { if (buffered() >= leadSeconds) start(); };
-    const onListed = (_event, data) => { if (listed(data.details) >= listedSeconds) start(); };
+    const onBuffered = () => {
+      if (buffered() >= leadSeconds) start();
+    };
+    const onListed = (_event, data) => {
+      if (listed(data.details) >= listedSeconds) start();
+    };
     if (buffered() >= leadSeconds || listed(hls.levels[0]?.details) >= listedSeconds) {
       startPlayback();
       return;
@@ -1292,13 +1452,26 @@
   // ============================================================
 
   function setupKeyboardControls() {
-    document.addEventListener('keydown', (e) => {
-      if (castController?.active || document.getElementById('cast-dialog')?.open) return;
+    document.addEventListener("keydown", (e) => {
+      if (castController?.active || document.getElementById("cast-dialog")?.open)
+        return;
       // In seek input: allow player hotkeys, block other non-time chars
-      if (e.target.id === 'seek-input') {
-        const passthrough = ['j', 'm', 'f', ' ', 'k', 'c', 'i', 'Escape'];
-        if (!passthrough.includes(e.key) && !/^[0-9:]$/.test(e.key) &&
-            !['Backspace', 'Delete', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'Tab', 'Enter'].includes(e.key)) {
+      if (e.target.id === "seek-input") {
+        const passthrough = ["j", "m", "f", " ", "k", "c", "i", "Escape"];
+        if (
+          !passthrough.includes(e.key) &&
+          !/^[0-9:]$/.test(e.key) &&
+          ![
+            "Backspace",
+            "Delete",
+            "ArrowLeft",
+            "ArrowRight",
+            "Home",
+            "End",
+            "Tab",
+            "Enter",
+          ].includes(e.key)
+        ) {
           e.preventDefault();
           return;
         }
@@ -1306,71 +1479,101 @@
         if (!passthrough.includes(e.key)) return;
       }
       // Skip other input fields entirely
-      else if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
-        if (e.key === 'Escape') e.target.blur();
+      else if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") {
+        if (e.key === "Escape") e.target.blur();
         return;
       }
-      switch(e.key) {
-        case ' ':
-        case 'k':
-          if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+      switch (e.key) {
+        case " ":
+        case "k":
+          if (e.target.tagName === "BUTTON" || e.target.tagName === "A") return;
           e.preventDefault();
           video.paused ? video.play() : video.pause();
           break;
-        case 'ArrowLeft': e.preventDefault(); skip(-10); break;
-        case 'ArrowRight': e.preventDefault(); skip(10); break;
-        case 'ArrowUp': e.preventDefault(); video.volume = Math.min(1, video.volume + 0.1); break;
-        case 'ArrowDown': e.preventDefault(); video.volume = Math.max(0, video.volume - 0.1); break;
-        case 'f':
+        case "ArrowLeft":
+          e.preventDefault();
+          skip(-10);
+          break;
+        case "ArrowRight":
+          e.preventDefault();
+          skip(10);
+          break;
+        case "ArrowUp":
+          e.preventDefault();
+          video.volume = Math.min(1, video.volume + 0.1);
+          break;
+        case "ArrowDown":
+          e.preventDefault();
+          video.volume = Math.max(0, video.volume - 0.1);
+          break;
+        case "f":
           e.preventDefault();
           suppressShowControls = true;
-          setTimeout(() => suppressShowControls = false, 150);
+          setTimeout(() => (suppressShowControls = false), 150);
           if (document.fullscreenElement) document.exitFullscreen();
-          else document.getElementById('player-container').requestFullscreen();
+          else document.getElementById("player-container").requestFullscreen();
           break;
-        case 'm': video.muted = !video.muted; updateMuteIcon(); break;
-        case 't': document.getElementById('menu-transcode')?.click(); break;
-        case 'c': ccBtn.click(); break;
-        case 'i': document.getElementById('info-btn')?.click(); break;
-        case 'a': document.getElementById('cast-btn')?.click(); break;
-        case 'x': document.getElementById('menu-restart')?.click(); break;
-        case 'j':
+        case "m":
+          video.muted = !video.muted;
+          updateMuteIcon();
+          break;
+        case "t":
+          document.getElementById("menu-transcode")?.click();
+          break;
+        case "c":
+          ccBtn.click();
+          break;
+        case "i":
+          document.getElementById("info-btn")?.click();
+          break;
+        case "a":
+          document.getElementById("cast-btn")?.click();
+          break;
+        case "x":
+          document.getElementById("menu-restart")?.click();
+          break;
+        case "j":
           e.preventDefault();
-          if (cfg.isVod) document.getElementById('jump-btn')?.click();
+          if (cfg.isVod) document.getElementById("jump-btn")?.click();
           break;
-        case 'n': document.getElementById('autonext-btn')?.click(); break;
-        case 'p': document.getElementById('pip-btn')?.click(); break;
-        case 'h':
-          const container = document.getElementById('player-container');
-          if (container.classList.contains('controls-visible')) {
-            container.classList.remove('controls-visible');
+        case "n":
+          document.getElementById("autonext-btn")?.click();
+          break;
+        case "p":
+          document.getElementById("pip-btn")?.click();
+          break;
+        case "h": {
+          const container = document.getElementById("player-container");
+          if (container.classList.contains("controls-visible")) {
+            container.classList.remove("controls-visible");
             clearTimeout(activityTimeoutId);
             activityTimeoutId = null;
           } else {
-            container.classList.add('controls-visible');
+            container.classList.add("controls-visible");
             clearTimeout(activityTimeoutId);
             activityTimeoutId = setTimeout(() => {
-              if (!settingsMenu.classList.contains('open')) {
-                container.classList.remove('controls-visible');
+              if (!settingsMenu.classList.contains("open")) {
+                container.classList.remove("controls-visible");
                 activityTimeoutId = null;
               }
             }, 3000);
           }
           break;
-        case 'Escape': {
-          const seekContainer = document.getElementById('seek-container');
-          const infoOverlay = document.getElementById('info-overlay');
-          if (seekContainer && !seekContainer.classList.contains('hidden')) {
-            seekContainer.classList.add('hidden');
-          } else if (infoOverlay?.classList.contains('pinned')) {
-            infoOverlay.classList.remove('pinned');
-            document.getElementById('info-btn')?.classList.remove('active');
+        }
+        case "Escape": {
+          const seekContainer = document.getElementById("seek-container");
+          const infoOverlay = document.getElementById("info-overlay");
+          if (seekContainer && !seekContainer.classList.contains("hidden")) {
+            seekContainer.classList.add("hidden");
+          } else if (infoOverlay?.classList.contains("pinned")) {
+            infoOverlay.classList.remove("pinned");
+            document.getElementById("info-btn")?.classList.remove("active");
             saveSettings({ infoPinned: false });
-          } else if (settingsMenu.classList.contains('open')) {
-            settingsMenu.classList.remove('open');
+          } else if (settingsMenu.classList.contains("open")) {
+            settingsMenu.classList.remove("open");
           } else if (!document.fullscreenElement) {
             if (history.length > 1) history.back();
-            else window.location.href = '/guide';
+            else window.location.href = "/guide";
           }
           break;
         }
@@ -1383,11 +1586,13 @@
   let suppressShowControls = false;
 
   // Persistent settings
-  const STORAGE_KEY = 'playerSettings';
+  const STORAGE_KEY = "playerSettings";
   function loadSettings() {
     try {
       return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
-    } catch { return {}; }
+    } catch {
+      return {};
+    }
   }
   function saveSettings(updates) {
     const settings = { ...loadSettings(), ...updates };
@@ -1395,28 +1600,32 @@
   }
 
   function setupActivityTracking() {
-    const container = document.getElementById('player-container');
+    const container = document.getElementById("player-container");
     const HIDE_DELAY = 3000;
 
     function showControls() {
       if (suppressShowControls) return;
-      container.classList.add('controls-visible');
+      container.classList.add("controls-visible");
       clearTimeout(activityTimeoutId);
       activityTimeoutId = setTimeout(hideControls, HIDE_DELAY);
     }
 
     function hideControls() {
       if (scrubPercent !== null) return;
-      if (settingsMenu.classList.contains('open')) return;
-      if (document.getElementById('seek-container')?.classList.contains('hidden') === false) return;
-      container.classList.remove('controls-visible');
+      if (settingsMenu.classList.contains("open")) return;
+      if (
+        document.getElementById("seek-container")?.classList.contains("hidden") ===
+        false
+      )
+        return;
+      container.classList.remove("controls-visible");
       activityTimeoutId = null;
     }
 
-    container.addEventListener('mousemove', showControls);
-    container.addEventListener('mouseenter', showControls);
-    container.addEventListener('click', showControls);
-    container.addEventListener('mouseleave', () => {
+    container.addEventListener("mousemove", showControls);
+    container.addEventListener("mouseenter", showControls);
+    container.addEventListener("click", showControls);
+    container.addEventListener("mouseleave", () => {
       clearTimeout(activityTimeoutId);
       activityTimeoutId = null;
       hideControls();
@@ -1425,100 +1634,122 @@
   }
 
   function setupButtonHandlers() {
-    const seekContainer = document.getElementById('seek-container');
-    const seekInput = document.getElementById('seek-input');
+    const seekContainer = document.getElementById("seek-container");
+    const seekInput = document.getElementById("seek-input");
 
     // Play/Pause button
-    document.getElementById('play-btn')?.addEventListener('click', () => {
+    document.getElementById("play-btn")?.addEventListener("click", () => {
       video.paused ? video.play() : video.pause();
     });
 
     // Click video to toggle play/pause and show controls
-    video.addEventListener('click', (e) => {
+    video.addEventListener("click", (e) => {
       if (e.target !== video) return;
       video.paused ? video.play() : video.pause();
-      const container = document.getElementById('player-container');
-      container.classList.add('controls-visible');
+      const container = document.getElementById("player-container");
+      container.classList.add("controls-visible");
       clearTimeout(activityTimeoutId);
       activityTimeoutId = setTimeout(() => {
-        if (scrubPercent === null && !settingsMenu.classList.contains('open') && seekContainer.classList.contains('hidden')) {
-          container.classList.remove('controls-visible');
+        if (
+          scrubPercent === null &&
+          !settingsMenu.classList.contains("open") &&
+          seekContainer.classList.contains("hidden")
+        ) {
+          container.classList.remove("controls-visible");
           activityTimeoutId = null;
         }
       }, 3000);
     });
 
     // Mute button
-    document.getElementById('mute-btn')?.addEventListener('click', () => {
+    document.getElementById("mute-btn")?.addEventListener("click", () => {
       video.muted = !video.muted;
       updateMuteIcon();
       saveSettings({ muted: video.muted });
     });
 
     // Volume slider
-    const volSlider = document.getElementById('volume-slider');
-    volSlider?.addEventListener('input', () => {
+    const volSlider = document.getElementById("volume-slider");
+    volSlider?.addEventListener("input", () => {
       video.volume = parseFloat(volSlider.value);
       video.muted = false;
       updateMuteIcon();
       saveSettings({ volume: video.volume, muted: false });
     });
-    video.addEventListener('volumechange', () => {
+    video.addEventListener("volumechange", () => {
       if (volSlider) volSlider.value = video.muted ? 0 : video.volume;
     });
 
     // Jump button
-    document.getElementById('jump-btn')?.addEventListener('click', (e) => {
+    document.getElementById("jump-btn")?.addEventListener("click", (e) => {
       e.stopPropagation();
-      seekContainer.classList.toggle('hidden');
-      if (!seekContainer.classList.contains('hidden')) {
+      seekContainer.classList.toggle("hidden");
+      if (!seekContainer.classList.contains("hidden")) {
         // Show controls and prevent auto-hide while jump input is active
-        document.getElementById('player-container').classList.add('controls-visible');
+        document.getElementById("player-container").classList.add("controls-visible");
         clearTimeout(activityTimeoutId);
         activityTimeoutId = null;
-        seekInput.value = '';
+        seekInput.value = "";
         seekInput.focus();
       }
     });
 
     // Auto-next button
-    const autoNextBtn = document.getElementById('autonext-btn');
-    autoNextBtn?.addEventListener('click', (e) => {
+    const autoNextBtn = document.getElementById("autonext-btn");
+    autoNextBtn?.addEventListener("click", (e) => {
       e.stopPropagation();
       autoNextEnabled = !autoNextEnabled;
-      autoNextBtn.classList.toggle('active', autoNextEnabled);
+      autoNextBtn.classList.toggle("active", autoNextEnabled);
     });
 
     // Info button
-    const infoOverlay = document.getElementById('info-overlay');
-    const infoBtn = document.getElementById('info-btn');
-    infoBtn?.addEventListener('click', (e) => {
+    const infoOverlay = document.getElementById("info-overlay");
+    const infoBtn = document.getElementById("info-btn");
+    infoBtn?.addEventListener("click", (e) => {
       e.stopPropagation();
-      const wasPinned = infoOverlay.classList.contains('pinned');
-      infoOverlay.classList.toggle('pinned');
-      infoBtn.classList.toggle('active', !wasPinned);
+      const wasPinned = infoOverlay.classList.contains("pinned");
+      infoOverlay.classList.toggle("pinned");
+      infoBtn.classList.toggle("active", !wasPinned);
       saveSettings({ infoPinned: !wasPinned });
       if (wasPinned && !activityTimeoutId) {
-        document.getElementById('player-container').classList.remove('controls-visible');
+        document
+          .getElementById("player-container")
+          .classList.remove("controls-visible");
       }
     });
 
     // CC button
-    ccBtn.addEventListener('click', function(e) {
+    ccBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       ccEnabled = !ccEnabled;
       if (activeTrackStates && activeTrackStates.length > 0) {
-        const prefIdx = getPreferredSubtitleTrack(activeTrackStates.map(ts => ({lang: ts.track.language, label: ts.track.label})));
-        activeTrackStates.forEach((ts, i) => ts.track.mode = (ccEnabled && i === prefIdx) ? 'showing' : 'hidden');
+        const prefIdx = getPreferredSubtitleTrack(
+          activeTrackStates.map((ts) => ({
+            lang: ts.track.language,
+            label: ts.track.label,
+          })),
+        );
+        activeTrackStates.forEach((ts, i) => {
+          ts.track.mode = ccEnabled && i === prefIdx ? "showing" : "hidden";
+        });
       } else {
-        const tracks = Array.from(video.textTracks).filter(t => (t.kind === 'subtitles' || t.kind === 'captions') && t.mode !== 'disabled');
-        const prefIdx = getPreferredSubtitleTrack(tracks.map(t => ({lang: t.language, label: t.label})));
-        tracks.forEach((t, i) => t.mode = (ccEnabled && i === prefIdx) ? 'showing' : 'hidden');
+        const tracks = Array.from(video.textTracks).filter(
+          (t) =>
+            (t.kind === "subtitles" || t.kind === "captions") && t.mode !== "disabled",
+        );
+        const prefIdx = getPreferredSubtitleTrack(
+          tracks.map((t) => ({ lang: t.language, label: t.label })),
+        );
+        tracks.forEach((t, i) => {
+          t.mode = ccEnabled && i === prefIdx ? "showing" : "hidden";
+        });
       }
       if (currentHls) {
         currentHls.subtitleDisplay = ccEnabled;
         if (ccEnabled && currentHls.subtitleTracks?.length > 0) {
-          currentHls.subtitleTrack = getPreferredSubtitleTrack(currentHls.subtitleTracks);
+          currentHls.subtitleTrack = getPreferredSubtitleTrack(
+            currentHls.subtitleTracks,
+          );
         }
       }
       updateCcButton();
@@ -1526,9 +1757,9 @@
     });
 
     // PiP button
-    const pipBtn = document.getElementById('pip-btn');
+    const pipBtn = document.getElementById("pip-btn");
     if (pipBtn && document.pictureInPictureEnabled) {
-      pipBtn.addEventListener('click', async (e) => {
+      pipBtn.addEventListener("click", async (e) => {
         e.stopPropagation();
         try {
           if (document.pictureInPictureElement) {
@@ -1537,38 +1768,53 @@
             await video.requestPictureInPicture();
           }
         } catch (err) {
-          console.error('[PiP] Error:', err);
+          console.error("[PiP] Error:", err);
         }
       });
     } else if (pipBtn) {
-      pipBtn.style.display = 'none';
+      pipBtn.style.display = "none";
     }
 
     // Settings menu toggle
-    document.getElementById('settings-btn')?.addEventListener('click', () => {
-      settingsMenu.classList.toggle('open');
+    document.getElementById("settings-btn")?.addEventListener("click", () => {
+      settingsMenu.classList.toggle("open");
     });
 
     // Close settings menu when clicking outside
-    document.addEventListener('click', (e) => {
-      if (!e.target.closest('#settings-btn') && !e.target.closest('#settings-menu')) {
-        settingsMenu.classList.remove('open');
+    document.addEventListener("click", (e) => {
+      if (!e.target.closest("#settings-btn") && !e.target.closest("#settings-menu")) {
+        settingsMenu.classList.remove("open");
       }
     });
 
     // CC Track selection
     let selectedCcTrackIdx = 0;
-    const ccTracksMenuItem = document.getElementById('menu-cc-tracks');
+    const ccTracksMenuItem = document.getElementById("menu-cc-tracks");
 
     function getCcTracks() {
       const tracks = [];
       if (activeTrackStates?.length > 0) {
-        activeTrackStates.forEach((ts, i) => tracks.push({ idx: i, label: ts.track.label || `Track ${i + 1}`, lang: ts.track.language }));
+        activeTrackStates.forEach((ts, i) => {
+          tracks.push({
+            idx: i,
+            label: ts.track.label || `Track ${i + 1}`,
+            lang: ts.track.language,
+          });
+        });
       } else if (currentHls?.subtitleTracks?.length > 0) {
-        currentHls.subtitleTracks.forEach((t, i) => tracks.push({ idx: i, label: t.name || `Track ${i + 1}`, lang: t.lang }));
+        currentHls.subtitleTracks.forEach((t, i) => {
+          tracks.push({ idx: i, label: t.name || `Track ${i + 1}`, lang: t.lang });
+        });
       } else {
-        Array.from(video.textTracks).filter(t => t.kind === 'subtitles' || t.kind === 'captions')
-          .forEach((t, i) => tracks.push({ idx: i, label: t.label || `Track ${i + 1}`, lang: t.language }));
+        Array.from(video.textTracks)
+          .filter((t) => t.kind === "subtitles" || t.kind === "captions")
+          .forEach((t, i) => {
+            tracks.push({
+              idx: i,
+              label: t.label || `Track ${i + 1}`,
+              lang: t.language,
+            });
+          });
       }
       return tracks;
     }
@@ -1577,31 +1823,40 @@
       ccEnabled = true;
       updateCcButton();
       if (activeTrackStates?.length > 0) {
-        activeTrackStates.forEach((ts, i) => ts.track.mode = i === idx ? 'showing' : 'hidden');
+        activeTrackStates.forEach((ts, i) => {
+          ts.track.mode = i === idx ? "showing" : "hidden";
+        });
       } else if (currentHls?.subtitleTracks?.length > 0) {
         currentHls.subtitleTrack = idx;
         currentHls.subtitleDisplay = true;
         // iOS: also set TextTrack.mode directly (HLS.js property change doesn't always trigger render)
         const tracks = Array.from(video.textTracks).filter(
-          t => t.kind === 'subtitles' || t.kind === 'captions'
+          (t) => t.kind === "subtitles" || t.kind === "captions",
         );
-        tracks.forEach((t, i) => t.mode = i === idx ? 'showing' : 'hidden');
+        tracks.forEach((t, i) => {
+          t.mode = i === idx ? "showing" : "hidden";
+        });
       } else {
-        const tracks = Array.from(video.textTracks).filter(t => t.kind === 'subtitles' || t.kind === 'captions');
-        tracks.forEach((t, i) => t.mode = i === idx ? 'showing' : 'hidden');
+        const tracks = Array.from(video.textTracks).filter(
+          (t) => t.kind === "subtitles" || t.kind === "captions",
+        );
+        tracks.forEach((t, i) => {
+          t.mode = i === idx ? "showing" : "hidden";
+        });
       }
     }
 
     function updateCcTracksLabel() {
       if (!ccTracksMenuItem) return;
       const tracks = getCcTracks();
-      const label = tracks.length > 0 && tracks[selectedCcTrackIdx]
-        ? `CC: ${tracks[selectedCcTrackIdx].label}`
-        : 'CC Track';
+      const label =
+        tracks.length > 0 && tracks[selectedCcTrackIdx]
+          ? `CC: ${tracks[selectedCcTrackIdx].label}`
+          : "CC Track";
       ccTracksMenuItem.innerHTML = `<span class="settings-check"></span>${label}`;
     }
 
-    ccTracksMenuItem?.addEventListener('click', () => {
+    ccTracksMenuItem?.addEventListener("click", () => {
       const tracks = getCcTracks();
       if (tracks.length === 0) return;
       selectedCcTrackIdx = (selectedCcTrackIdx + 1) % tracks.length;
@@ -1610,11 +1865,11 @@
     });
 
     // Settings menu items
-    document.getElementById('menu-transcode')?.addEventListener('click', async () => {
-      settingsMenu.classList.remove('open');
+    document.getElementById("menu-transcode")?.addEventListener("click", async () => {
+      settingsMenu.classList.remove("open");
       video.pause();
-      video.src = '';
-      error.classList.add('hidden');
+      video.src = "";
+      error.classList.add("hidden");
       if (isTranscoding) {
         try {
           await cleanupTranscode();
@@ -1622,7 +1877,7 @@
           updateTranscodeCheck();
           playWithUrl(cfg.rawUrl);
         } catch (e) {
-          console.error('[TC] Unable to stop transcode:', e);
+          console.error("[TC] Unable to stop transcode:", e);
           showError();
         }
       } else {
@@ -1630,96 +1885,105 @@
       }
     });
 
-    document.getElementById('menu-restart')?.addEventListener('click', async () => {
-      settingsMenu.classList.remove('open');
+    document.getElementById("menu-restart")?.addEventListener("click", async () => {
+      settingsMenu.classList.remove("open");
       video.pause();
-      video.src = '';
-      error.classList.add('hidden');
+      video.src = "";
+      error.classList.add("hidden");
       try {
-        await fetch('/transcode-clear?url=' + encodeURIComponent(cfg.rawUrl), {method: 'DELETE'});
+        await fetch("/transcode-clear?url=" + encodeURIComponent(cfg.rawUrl), {
+          method: "DELETE",
+        });
         await cleanupTranscode();
         isTranscoding = false;
         await startTranscode();
       } catch (e) {
-        console.error('[X] Error:', e);
+        console.error("[X] Error:", e);
         showError();
       }
     });
 
-    document.getElementById('menu-jump')?.addEventListener('click', () => {
-      settingsMenu.classList.remove('open');
-      seekContainer.classList.toggle('hidden');
-      if (!seekContainer.classList.contains('hidden')) {
+    document.getElementById("menu-jump")?.addEventListener("click", () => {
+      settingsMenu.classList.remove("open");
+      seekContainer.classList.toggle("hidden");
+      if (!seekContainer.classList.contains("hidden")) {
         // Show controls and prevent auto-hide while jump input is active
-        document.getElementById('player-container').classList.add('controls-visible');
+        document.getElementById("player-container").classList.add("controls-visible");
         clearTimeout(activityTimeoutId);
         activityTimeoutId = null;
-        seekInput.value = '';
+        seekInput.value = "";
         seekInput.focus();
       }
     });
 
-    document.getElementById('menu-url')?.addEventListener('click', () => {
-      settingsMenu.classList.remove('open');
+    document.getElementById("menu-url")?.addEventListener("click", () => {
+      settingsMenu.classList.remove("open");
       if (navigator.clipboard) {
         navigator.clipboard.writeText(cfg.rawUrl).catch(fallback);
       } else {
         fallback();
       }
       function fallback() {
-        const ta = document.createElement('textarea');
+        const ta = document.createElement("textarea");
         ta.value = cfg.rawUrl;
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
         document.body.appendChild(ta);
         ta.select();
-        document.execCommand('copy');
+        document.execCommand("copy");
         document.body.removeChild(ta);
       }
     });
 
-    document.getElementById('menu-external')?.addEventListener('click', () => {
-      settingsMenu.classList.remove('open');
+    document.getElementById("menu-external")?.addEventListener("click", () => {
+      settingsMenu.classList.remove("open");
       video.pause();
-      video.src = '';
-      window.location.href = '/playlist.xspf?url=' + encodeURIComponent(cfg.rawUrl);
+      video.src = "";
+      window.location.href = "/playlist.xspf?url=" + encodeURIComponent(cfg.rawUrl);
     });
 
     // Fullscreen button
-    document.getElementById('fullscreen-btn')?.addEventListener('click', () => {
+    document.getElementById("fullscreen-btn")?.addEventListener("click", () => {
       if (document.fullscreenElement) document.exitFullscreen();
-      else document.getElementById('player-container').requestFullscreen();
+      else document.getElementById("player-container").requestFullscreen();
     });
 
     // Fullscreen change listener
-    document.addEventListener('fullscreenchange', updateFullscreenIcon);
+    document.addEventListener("fullscreenchange", updateFullscreenIcon);
 
     // Video state listeners
-    video.addEventListener('play', updatePlayIcon);
-    video.addEventListener('pause', updatePlayIcon);
-    video.addEventListener('volumechange', updateMuteIcon);
+    video.addEventListener("play", updatePlayIcon);
+    video.addEventListener("pause", updatePlayIcon);
+    video.addEventListener("volumechange", updateMuteIcon);
 
     // Prevent video element's native spacebar handling
-    video.addEventListener('keydown', (e) => {
-      if (e.key === ' ') e.preventDefault();
+    video.addEventListener("keydown", (e) => {
+      if (e.key === " ") e.preventDefault();
     });
 
     // Mousewheel volume control
-    document.getElementById('player-container')?.addEventListener('wheel', (e) => {
-      e.preventDefault();
-      video.volume = Math.max(0, Math.min(1, video.volume + (e.deltaY < 0 ? 0.05 : -0.05)));
-      saveSettings({ volume: video.volume });
-    }, { passive: false });
+    document.getElementById("player-container")?.addEventListener(
+      "wheel",
+      (e) => {
+        e.preventDefault();
+        video.volume = Math.max(
+          0,
+          Math.min(1, video.volume + (e.deltaY < 0 ? 0.05 : -0.05)),
+        );
+        saveSettings({ volume: video.volume });
+      },
+      { passive: false },
+    );
 
     // Progress bar
-    const progressBar = document.getElementById('progress-bar');
-    const progressSeek = document.getElementById('progress-seek');
+    const progressBar = document.getElementById("progress-bar");
+    const progressSeek = document.getElementById("progress-seek");
 
-    video.addEventListener('timeupdate', updateProgress);
-    video.addEventListener('loadedmetadata', () => {
+    video.addEventListener("timeupdate", updateProgress);
+    video.addEventListener("loadedmetadata", () => {
       if (cfg.isVod && !transcodeSessionId) {
-        document.getElementById('progress-container')?.classList.remove('hidden');
-        document.getElementById('menu-jump')?.classList.remove('hidden');
+        document.getElementById("progress-container")?.classList.remove("hidden");
+        document.getElementById("menu-jump")?.classList.remove("hidden");
       }
       updateProgress();
     });
@@ -1752,19 +2016,19 @@
       }
     }
 
-    progressBar?.addEventListener('click', async (e) => {
+    progressBar?.addEventListener("click", async (e) => {
       const rect = progressBar.getBoundingClientRect();
       if (rect.width > 0) await seekToProgress((e.clientX - rect.left) / rect.width);
     });
     // The native range handles mouse, touch and keyboard dragging. Preview
     // while moving; open at most one archive request when the seek is committed.
-    progressSeek?.addEventListener('click', e => e.stopPropagation());
-    progressSeek?.addEventListener('input', () => {
+    progressSeek?.addEventListener("click", (e) => e.stopPropagation());
+    progressSeek?.addEventListener("input", () => {
       scrubPercent = Number(progressSeek.value);
-      document.getElementById('player-container').classList.add('controls-visible');
+      document.getElementById("player-container").classList.add("controls-visible");
       updateProgress();
     });
-    progressSeek?.addEventListener('change', async () => {
+    progressSeek?.addEventListener("change", async () => {
       const pct = Number(progressSeek.value) / 100;
       scrubPercent = null;
       await seekToProgress(pct);
@@ -1774,25 +2038,34 @@
       scrubPercent = null;
       updateProgress();
     };
-    progressSeek?.addEventListener('pointercancel', cancelScrub);
-    progressSeek?.addEventListener('blur', cancelScrub);
+    progressSeek?.addEventListener("pointercancel", cancelScrub);
+    progressSeek?.addEventListener("blur", cancelScrub);
 
     // Seek input handler - filter chars here (must be at input level to block typing)
-    seekInput?.addEventListener('keydown', async function(e) {
+    seekInput?.addEventListener("keydown", async (e) => {
       // Only allow: digits, colon, navigation keys, Enter
       // Hotkeys and other chars: preventDefault (hotkeys will still bubble to global handler)
-      const typeable = /^[0-9:]$/.test(e.key) ||
-        ['Backspace', 'Delete', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'Tab'].includes(e.key);
+      const typeable =
+        /^[0-9:]$/.test(e.key) ||
+        [
+          "Backspace",
+          "Delete",
+          "ArrowLeft",
+          "ArrowRight",
+          "Home",
+          "End",
+          "Tab",
+        ].includes(e.key);
       if (!typeable) e.preventDefault();
-      if (e.key !== 'Enter') return;
+      if (e.key !== "Enter") return;
       e.preventDefault();
       const targetTime = parseTime(seekInput.value);
       if (targetTime < 0 || targetTime > timelineDuration()) {
-        seekInput.classList.add('ring-2', 'ring-red-500');
-        setTimeout(() => seekInput.classList.remove('ring-2', 'ring-red-500'), 500);
+        seekInput.classList.add("ring-2", "ring-red-500");
+        setTimeout(() => seekInput.classList.remove("ring-2", "ring-red-500"), 500);
         return;
       }
-      seekContainer.classList.add('hidden');
+      seekContainer.classList.add("hidden");
       if (cfg.catchup) {
         await seekCatchup(programStart + targetTime);
         updateProgress();
@@ -1818,13 +2091,16 @@
         const position = video.currentTime + seekOffset;
         if (!transcodeSessionId) {
           await startTranscode();
-          if (!transcodeSessionId) throw new Error('Could not prepare an HLS stream for the TV.');
+          if (!transcodeSessionId)
+            throw new Error("Could not prepare an HLS stream for the TV.");
           if (cfg.isVod && position > 0) {
-            if (!await handleSeekToPosition(position)) throw new Error('Could not prepare the current movie position.');
+            if (!(await handleSeekToPosition(position)))
+              throw new Error("Could not prepare the current movie position.");
           }
         }
         return {
-          session_id: transcodeSessionId, title: cfg.mediaTitle,
+          session_id: transcodeSessionId,
+          title: cfg.mediaTitle,
           current_time: Math.max(0, position - seekOffset),
         };
       },
@@ -1832,43 +2108,56 @@
         const position = video.currentTime + seekOffset;
         if (!transcodeSessionId) {
           await startTranscode();
-          if (!transcodeSessionId) throw new Error('Could not prepare an HLS stream for the TV.');
-          if (cfg.isVod && position > 0 && !await handleSeekToPosition(position)) {
-            throw new Error('Could not prepare the current movie position.');
+          if (!transcodeSessionId)
+            throw new Error("Could not prepare an HLS stream for the TV.");
+          if (cfg.isVod && position > 0 && !(await handleSeekToPosition(position))) {
+            throw new Error("Could not prepare the current movie position.");
           }
         }
         const playlist = adaptiveSession?.master_playlist || transcodePlaylist;
         return {
           url: new URL(playlist, window.location.origin).href,
-          title: cfg.mediaTitle, isVod: cfg.isVod,
+          title: cfg.mediaTitle,
+          isVod: cfg.isVod,
           current_time: Math.max(0, position - seekOffset),
         };
       },
       onBrowserStarted: async () => {
         video.pause();
         if (document.pictureInPictureElement === video) {
-          await document.exitPictureInPicture().catch(e => console.warn('[CAST] Could not close picture-in-picture:', e));
+          await document
+            .exitPictureInPicture()
+            .catch((e) =>
+              console.warn("[CAST] Could not close picture-in-picture:", e),
+            );
         }
         adaptivePlayback?.destroy();
         adaptivePlayback = null;
-        if (currentHls) { currentHls.destroy(); currentHls = null; }
+        if (currentHls) {
+          currentHls.destroy();
+          currentHls = null;
+        }
         stopProgressPolling();
-        video.removeAttribute('src');
+        video.removeAttribute("src");
         video.load();
         hideLoading();
-        error.classList.add('hidden');
+        error.classList.add("hidden");
       },
-      onStarted: async status => {
+      onStarted: async (status) => {
         video.pause();
         if (document.pictureInPictureElement === video) {
-          await document.exitPictureInPicture().catch(e => console.warn('[CAST] Could not close picture-in-picture:', e));
+          await document
+            .exitPictureInPicture()
+            .catch((e) =>
+              console.warn("[CAST] Could not close picture-in-picture:", e),
+            );
         }
         if (status.session_id === transcodeSessionId) transcodeSession.detach();
         await cleanupTranscode();
-        video.removeAttribute('src');
+        video.removeAttribute("src");
         video.load();
         hideLoading();
-        error.classList.add('hidden');
+        error.classList.add("hidden");
       },
     });
   }
@@ -1878,61 +2167,79 @@
   // ============================================================
 
   function setupAirPlay() {
-    const btn = document.getElementById('airplay-btn');
-    const status = document.getElementById('airplay-status');
-    if (!btn || !window.WebKitPlaybackTargetAvailabilityEvent || !video.webkitShowPlaybackTargetPicker) return;
-    btn.classList.remove('hidden');
+    const btn = document.getElementById("airplay-btn");
+    const status = document.getElementById("airplay-status");
+    if (
+      !btn ||
+      !window.WebKitPlaybackTargetAvailabilityEvent ||
+      !video.webkitShowPlaybackTargetPicker
+    )
+      return;
+    btn.classList.remove("hidden");
     let statusTimer = null;
     let preparing = false;
 
     function notify(text) {
       status.textContent = text;
-      status.classList.remove('hidden');
+      status.classList.remove("hidden");
       clearTimeout(statusTimer);
-      statusTimer = setTimeout(() => status.classList.add('hidden'), 8000);
+      statusTimer = setTimeout(() => status.classList.add("hidden"), 8000);
     }
 
-    video.addEventListener('webkitcurrentplaybacktargetiswirelesschanged', () => {
+    video.addEventListener("webkitcurrentplaybacktargetiswirelesschanged", () => {
       const wireless = !!video.webkitCurrentPlaybackTargetIsWireless;
-      btn.classList.toggle('active', wireless);
-      notify(wireless ? 'Playing on AirPlay.' : 'AirPlay ended. Playing here.');
+      btn.classList.toggle("active", wireless);
+      notify(wireless ? "Playing on AirPlay." : "AirPlay ended. Playing here.");
     });
 
-    btn.addEventListener('click', async e => {
+    btn.addEventListener("click", async (e) => {
       e.stopPropagation();
       if (preparing) return;
-      if (castController?.active) return notify('Stop casting to Chromecast before using AirPlay.');
-      if (['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname)) {
-        return notify('Open neTV using its LAN address (not localhost) so the TV can reach it.');
+      if (castController?.active)
+        return notify("Stop casting to Chromecast before using AirPlay.");
+      if (["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname)) {
+        return notify(
+          "Open neTV using its LAN address (not localhost) so the TV can reach it.",
+        );
       }
-      if (nativeHls && transcodeSessionId) return video.webkitShowPlaybackTargetPicker();
+      if (nativeHls && transcodeSessionId)
+        return video.webkitShowPlaybackTargetPicker();
       if (transcodeSessionId) {
         // The picker needs this click's user gesture, so switch players synchronously.
         const position = cfg.isVod ? video.currentTime : 0;
         nativeHls = true;
-        if (currentHls) { currentHls.destroy(); currentHls = null; }
+        if (currentHls) {
+          currentHls.destroy();
+          currentHls = null;
+        }
         playWithUrl(transcodePlaylist, null, currentSubtitles);
         if (position > 0) {
-          video.addEventListener('loadedmetadata', () => { video.currentTime = position; }, { once: true });
+          video.addEventListener(
+            "loadedmetadata",
+            () => {
+              video.currentTime = position;
+            },
+            { once: true },
+          );
         }
         return video.webkitShowPlaybackTargetPicker();
       }
       // Direct playback must first move to a neTV HLS stream the TV can fetch.
       preparing = true;
       btn.disabled = true;
-      notify('Preparing the stream for AirPlay...');
+      notify("Preparing the stream for AirPlay...");
       try {
         const position = video.currentTime + seekOffset;
         nativeHls = true;
         await startTranscode();
-        if (!transcodeSessionId) throw new Error('no transcode session');
-        if (cfg.isVod && position > 0 && !await handleSeekToPosition(position)) {
-          throw new Error('could not restore position');
+        if (!transcodeSessionId) throw new Error("no transcode session");
+        if (cfg.isVod && position > 0 && !(await handleSeekToPosition(position))) {
+          throw new Error("could not restore position");
         }
-        notify('AirPlay is ready. Tap AirPlay again to choose a TV.');
+        notify("AirPlay is ready. Tap AirPlay again to choose a TV.");
       } catch (err) {
-        console.warn('[AIRPLAY]', err);
-        notify('Could not prepare the stream for AirPlay.');
+        console.warn("[AIRPLAY]", err);
+        notify("Could not prepare the stream for AirPlay.");
       } finally {
         preparing = false;
         btn.disabled = false;
@@ -1966,7 +2273,7 @@
     updateTranscodeCheck();
     updateCcButton();
     updateMuteIcon();
-    document.getElementById('volume-slider').value = video.muted ? 0 : video.volume;
+    document.getElementById("volume-slider").value = video.muted ? 0 : video.volume;
 
     // Restore volume on first user interaction if auto-muted by browser policy
     function restoreVolumeOnInteraction() {
@@ -1976,19 +2283,18 @@
         autoMutedByPolicy = false;
       }
     }
-    document.addEventListener('click', restoreVolumeOnInteraction, { once: true });
-    document.addEventListener('keydown', restoreVolumeOnInteraction, { once: true });
+    document.addEventListener("click", restoreVolumeOnInteraction, { once: true });
+    document.addEventListener("keydown", restoreVolumeOnInteraction, { once: true });
 
     // Restore info pinned state
     if (settings.infoPinned) {
-      document.getElementById('info-overlay')?.classList.add('pinned');
-      document.getElementById('info-btn')?.classList.add('active');
+      document.getElementById("info-overlay")?.classList.add("pinned");
+      document.getElementById("info-btn")?.classList.add("active");
     }
 
-
-    window.addEventListener('beforeunload', cleanupTranscodeSync);
-    window.addEventListener('pagehide', cleanupTranscodeSync);
-    window.addEventListener('pageshow', event => {
+    window.addEventListener("beforeunload", cleanupTranscodeSync);
+    window.addEventListener("pagehide", cleanupTranscodeSync);
+    window.addEventListener("pageshow", (event) => {
       if (event.persisted && transcodeSession.closed && !castController?.active) {
         transcodeSession.reopen();
         if (isTranscoding) startTranscode();
@@ -1999,13 +2305,13 @@
     // Do not open a second provider connection when returning to an active cast.
     castController.ready.then(() => {
       if (castController.active) return;
-      if (cfg.transcodeMode === 'always') {
+      if (cfg.transcodeMode === "always") {
         startTranscode();
-      } else if (cfg.transcodeMode === 'never') {
+      } else if (cfg.transcodeMode === "never") {
         playWithUrl(cfg.rawUrl);
       } else {
         playWithUrl(cfg.rawUrl, () => {
-          error.classList.add('hidden');
+          error.classList.add("hidden");
           startTranscode();
         });
       }

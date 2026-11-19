@@ -1864,7 +1864,8 @@ async def subtitle_file(session_id: str, filename: str):
     for _ in range(15):  # 3 seconds.
         if file_path.exists() and file_path.stat().st_size > 20:
             break
-        await asyncio.sleep(0.2)
+        # The ffmpeg process writes the subtitle file; nothing signals the write.
+        await asyncio.sleep(0.2)  # house-ignore[sleep] -- See above.
     try:
         content = file_path.read_text() if file_path.exists() else "WEBVTT\n\n"
     except (UnicodeDecodeError, OSError):

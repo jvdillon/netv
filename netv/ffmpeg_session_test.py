@@ -3718,6 +3718,10 @@ async def test_switch_waits_until_the_upscaled_rendition_catches_up(
     # A playlist without a dated segment has no end yet.
     (tmp_path / "up.m3u8").write_text("#EXTM3U\n")
     assert not await ffmpeg_session._caught_up(directory, running, timeout_sec=0.1)
+    env.clock.sleeps.clear()
+    # Quarter-second polls land exactly on the 30 s deadline, which ends the wait.
+    assert not await ffmpeg_session._caught_up(directory, running, poll_interval_sec=0.25)
+    assert len(env.clock.sleeps) == 120
 
 
 def test_live_playlist_continues_the_plain_rendition_across_the_switch(
@@ -4427,6 +4431,35 @@ async def test_do_start_vod_with_seek_offset_persists_probe(env: _Env):
     }
     assert result.get("caption_playlist", "").endswith("/captions.m3u8")
     assert session.get("caption_timestamp_origin") == 10.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("do_env")
+async def test_do_start_plays_the_users_audio_language(env: _Env):
+    probe = json.loads(_MOVIE_PROBE)
+    probe["streams"].append(
+        {
+            "index": 3,
+            "codec_type": "audio",
+            "codec_name": "ac3",
+            "channels": 6,
+            "sample_rate": "48000",
+            "tags": {"language": "fre"},
+        },
+    )
+    env.run.program("ffprobe", Program(stdout=json.dumps(probe)))
+    cache.save_user_settings("alice", {**cache.load_user_settings("alice"), "audio_lang": "fr"})
+    result = await ffmpeg_session._do_start_transcode(
+        "http://movie",
+        "movie",
+        None,
+        None,
+        0,
+        username="alice",
+    )
+    session = env.sessions[result["session_id"]]
+    info = json.loads((pathlib.Path(session["dir"]) / "session.json").read_text())
+    assert (info["probe"]["audio_codec"], info["probe"]["audio_channels"]) == ("ac3", 6)
 
 
 @pytest.mark.asyncio

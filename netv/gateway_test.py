@@ -689,9 +689,9 @@ async def test_cleanup_upscale_sessions_runs_every_minute(
 
     task = asyncio.ensure_future(gateway._cleanup_upscale_sessions())
     async with asyncio.timeout(5):
-        # Removing the session directory runs on a real worker thread.
+        # Removing the session directory runs on a real worker thread; nothing signals it.
         while len(clock.sleeps) < 2:
-            await asyncio.sleep(0.001)
+            await asyncio.sleep(0.001)  # house-ignore[sleep] -- See above.
     task.cancel()
     with suppress(asyncio.CancelledError):
         await task

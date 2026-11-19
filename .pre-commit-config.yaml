@@ -25,10 +25,7 @@ repos:
     args:
     - --maxkb=5000
     - --enforce-all
-    exclude: "(?x)^(\n  uv\\.lock\n  |typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\\
-      .export/typings/\n  |(.*/)?chrome/chrome_(desktop|android)_useragents\\.txt\n\
-      \  |(.*/)?uv\\.public\\.lock\n  |(.*/)?\\.export/uv\\.lock\n  |\\.(claude|sagent)/sessions/\n\
-      )\n"
+    exclude: "(?x)^(\n  uv\\.lock\n  |typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n  |(.*/)?uv\\.public\\.lock\n  |(.*/)?\\.export/uv\\.lock\n  |\\.(claude|sagent)/sessions/\n)\n"
   - id: check-merge-conflict
     name: check-merge-conflict
     stages:
@@ -66,7 +63,7 @@ repos:
 - repo: local
   hooks:
   - id: codedoctor-lint
-    name: codedoctor lint
+    name: codedoctor-lint
     language: system
     stages:
     - pre-commit
@@ -88,9 +85,7 @@ repos:
     entry: uv --quiet run --frozen --group pre-commit codespell
     args:
     - -w
-    exclude: "(?x)^(\n  typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n\
-      \  |(.*/)?third_party/\n  |\\.(claude|sagent)/sessions/\n  |docs/symbols\\.md\n\
-      )\n"
+    exclude: "(?x)^(\n  typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n  |(.*/)?third_party/\n  |\\.(claude|sagent)/sessions/\n)\n"
 - repo: https://github.com/astral-sh/ruff-pre-commit
   rev: v0.17.4
   hooks:
@@ -211,8 +206,7 @@ repos:
     - pyi
     entry: uv --quiet run --frozen --group pre-commit python -m codedoctor gate spool
       basedpyright
-    exclude: "(?x)^(\n  typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n\
-      \  |(.*/)?third_party/\n  |website/rekursiv-ai\\.github\\.io/_site/\n)\n"
+    exclude: "(?x)^(\n  typings/\n  |(.*/)?typings/stubs/\n  |(.*/)?\\.export/typings/\n  |(.*/)?third_party/\n)\n"
   - id: basedpyright
     name: basedpyright
     language: system
@@ -392,3 +386,36 @@ repos:
     args:
     - --plugin
     - codedoctor.testing.listing
+- hooks:
+  - additional_dependencies:
+    - '@biomejs/biome@2.6.7'
+    entry: biome check --write --files-ignore-unknown=true --no-errors-on-unmatched
+    files: \.(tsx?|[cm]ts|jsx?|[cm]js|css)$
+    id: biome-check
+    language: node
+    name: biome-check
+    require_serial: true
+    stages:
+    - pre-commit
+    types:
+    - text
+  repo: local
+- hooks:
+  - entry: uv --quiet run --frozen --group pre-commit python -m codedoctor cargo fmt
+    files: (\.rs|(^|/)Cargo\.toml)$
+    id: cargo-fmt
+    language: system
+    name: cargo-fmt
+    require_serial: true
+    stages:
+    - pre-commit
+  - entry: nice -n 19 uv --quiet run --frozen --group pre-commit python -m codedoctor
+      cargo clippy
+    files: (\.rs|(^|/)Cargo\.(toml|lock))$
+    id: cargo-clippy
+    language: system
+    name: cargo-clippy
+    require_serial: true
+    stages:
+    - pre-commit
+  repo: local

@@ -95,7 +95,8 @@ def _upscale_settings(model_name: str = "2x-nomosuni-compact") -> ServerSettings
 
 async def _cleanup_upscale_sessions() -> None:
     while True:
-        await asyncio.sleep(60)
+        # A periodic pass; the interval is the schedule.
+        await asyncio.sleep(60)  # house-ignore[sleep] -- See above.
         await ffmpeg_session.cleanup_expired_sessions()
 
 
