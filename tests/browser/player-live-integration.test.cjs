@@ -303,6 +303,11 @@ async function player({
     window,
     document,
     Hls,
+    VTTCue: class {
+      constructor(startTime, endTime, text) {
+        Object.assign(this, { startTime, endTime, text });
+      }
+    },
     URL,
     Blob,
     AbortController,
@@ -1388,4 +1393,59 @@ test("VOD network errors retry in place with backoff", async () => {
   await p.fireTimer(2000);
   assert.equal(p.engines[0].loads, 1);
   assert.equal(isHidden(p, "error"), true);
+});
+
+// A CEA-608 screen as hls.js hands it to the cue handler: 15 rows of 32 cells.
+function captionScreen(...lines) {
+  const rows = Array.from({ length: 15 }, () => ({ chars: [] }));
+  lines.forEach((line, i) => {
+    rows[13 - lines.length + 1 + i].chars = [...line].map((uchar) => ({ uchar }));
+  });
+  return { rows };
+}
+
+function captionTrack() {
+  const cues = [];
+  return {
+    cues,
+    addCue: (cue) => cues.push(cue),
+    removeCue: (cue) => cues.splice(cues.indexOf(cue), 1),
+    shownAt: (t) =>
+      cues
+        .filter((cue) => cue.startTime <= t && t < cue.endTime)
+        .map((cue) => cue.text),
+  };
+}
+
+test("roll-up captions show as held two-line pages without gaps", async () => {
+  const p = await player();
+  const { cueHandler } = p.engines[0].config;
+  const track = captionTrack();
+  // hls.js emits one cue per line, each screen the previous line plus the new one.
+  const screens = [["A"], ["A", "B"], ["B", "C"], ["C", "D"], ["D", "E"]];
+  for (const [i, lines] of screens.entries()) {
+    cueHandler.newCue(track, i, i + 1, captionScreen(...lines));
+  }
+  const shown = (t) => track.shownAt(t);
+  assert.deepEqual(shown(0.5), ["A"]);
+  assert.deepEqual(shown(1.5), ["A\nB"]);
+  // C waits for its partner while A B stays up.
+  assert.deepEqual(shown(2.5), ["A\nB"]);
+  assert.deepEqual(shown(3.5), ["C\nD"]);
+  // No caption follows E: C D holds 6 s past its end, then E shows alone.
+  assert.deepEqual(shown(9.5), ["C\nD"]);
+  assert.deepEqual(shown(10.5), ["E"]);
+  assert.deepEqual(shown(11.5), []);
+  for (let t = 0; t < 11; t += 0.1) assert.equal(shown(t).length, 1, `t=${t}`);
+});
+
+test("captions cached before their track exists keep broadcast timing", async () => {
+  const p = await player();
+  const [cue] = p.engines[0].config.cueHandler.newCue(
+    null,
+    2,
+    3,
+    captionScreen("HELLO"),
+  );
+  assert.deepEqual([cue.startTime, cue.endTime, cue.text], [2, 3, "HELLO"]);
 });

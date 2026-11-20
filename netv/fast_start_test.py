@@ -648,7 +648,7 @@ def test_encoder_command_for_an_interlaced_surround_broadcast(
         "-map",
         "0:a:0",
         "-vf",
-        "yadif_cuda=0:-1:1,scale_cuda=-2:min(ih\\,1080):format=nv12",
+        "fps=source_fps,yadif_cuda=0:-1:1,scale_cuda=-2:min(ih\\,1080):format=nv12",
         "-c:v",
         "h264_nvenc",
         "-preset",

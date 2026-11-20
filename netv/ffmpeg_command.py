@@ -1629,32 +1629,30 @@ def _build_video_args(
 
     max_h = _max_resolution_height(max_resolution)
 
-    # Check if SR should be applied (discrete GPUs only)
-    sr_filter = ""
-    sr_model = _load_settings().get("sr_model", "")
-    if allow_upscale and sr_model and enc_type in ("nvenc", "amf") and _sr_engine_dir is not None:
-        sr_filter = _build_sr_filter(source_height, 0 if max_h is None else max_h)
-        # SR requires CPU frames, so disable hw pipeline when SR active.
-        if sr_filter:
-            use_hw_pipeline = False
+    # AI Upscale runs on NVENC only; it needs CPU frames, so it turns off the hw pipeline.
+    sr_filter = (
+        _build_sr_filter(source_height, max_h or 0) if allow_upscale and enc_type == "nvenc" else ""
+    )
+    use_hw_pipeline = use_hw_pipeline and not sr_filter
 
     # Fall back gracefully if VAAPI is needed but no device was detected.
     vaapi_device = cache.VAAPI_DEVICE or ""
-    needs_vaapi = enc_type == "vaapi" or fallback == "vaapi"
-    if needs_vaapi and not vaapi_device:
+    vaapi_decode = fallback == "vaapi" and bool(vaapi_device)
+    if not vaapi_device:
         if enc_type == "vaapi":
-            # Pure VAAPI encoder requested but not available - fall back to software.
-            log.warning("VAAPI unavailable (no Intel/AMD GPU), falling back to software encoding")
+            log.warning(
+                "VAAPI unavailable (no Intel/AMD GPU), falling back to software encoding",  # pragma: no mutate[diagnostic-text]
+            )
             enc_type = "software"
-        else:
-            # VAAPI fallback requested but not available - use software decode instead.
-            log.warning("VAAPI fallback unavailable (no Intel/AMD GPU), using software decode")
-        fallback = "software"
+        elif fallback == "vaapi":
+            log.warning(
+                "VAAPI fallback unavailable (no Intel/AMD GPU), using software decode",  # pragma: no mutate[diagnostic-text]
+            )
 
     # Height expr for scale filter (scale down only, -2 keeps width divisible by 2)
     h = "" if max_h is None else f"min(ih\\,{max_h})"
     # Lower QP/CRF means higher quality.
-    qp = {"high": 20, "medium": 28, "low": 35}.get(quality, 28)
+    qp = {"high": 20, "low": 35}.get(quality, 28)
     pre: list[str]
 
     if enc_type == "nvenc":
@@ -1681,7 +1679,7 @@ def _build_video_args(
             else:
                 tonemap = ""
             vf = f"{deint}{tonemap}{scale}"
-        elif fallback == "vaapi":
+        elif vaapi_decode:
             # VAAPI decode + VAAPI filters + hwdownload + hwupload_cuda for NVENC.
             pre = [
                 "-hwaccel",
@@ -1747,7 +1745,7 @@ def _build_video_args(
 
     elif enc_type == "amf":
         # AMF has no hardware decode - always uses fallback for decode/filter.
-        if fallback == "vaapi":
+        if vaapi_decode:
             # VAAPI decode + VAAPI filters + hwdownload for AMF encode.
             pre = [
                 "-hwaccel",
@@ -1769,8 +1767,8 @@ def _build_video_args(
             else:
                 tonemap = ""
             deint = "yadif=0:-1:1," if deinterlace else ""
-            scale = f"scale=-2:{h}" if h else ""
-            vf = f"{deint}{tonemap}{scale},format=nv12".strip(",").replace(",,", ",")
+            scale = f"scale=-2:{h}," if h else ""
+            vf = f"{deint}{tonemap}{scale}format=nv12"
         encoder = "h264_amf"
         enc_opts = [
             "-rc",
@@ -1810,7 +1808,7 @@ def _build_video_args(
             vf = f"format=nv12,hwupload,{deint}{tonemap}{scale}"
         encoder = "h264_vaapi"
         # Use baseline profile for older GPUs (e.g., AMD GCN 1.0) that don't support High profile.
-        if cache.AVAILABLE_ENCODERS.get("vaapi_baseline_only", False):
+        if cache.AVAILABLE_ENCODERS.get("vaapi_baseline_only") is True:
             # Baseline doesn't support B-frames.
             enc_opts = ["-rc_mode", "CQP", "-qp", str(qp), "-profile:v", "constrained_baseline"]
         else:
@@ -1869,15 +1867,18 @@ def _build_video_args(
         if h:
             vf = f"{deint}{tonemap}scale=-2:{h},format=yuv420p"
         else:
-            vf = f"{deint}{tonemap}format=yuv420p".rstrip(",")
-        crf = {"high": 20, "medium": 26, "low": 32}.get(quality, 26)
+            vf = f"{deint}{tonemap}format=yuv420p"
+        crf = {"high": 20, "low": 32}.get(quality, 26)
         encoder = "libx264"
         enc_opts = ["-preset", "veryfast", "-crf", str(crf), "-bf", "3"]
 
     else:
         raise ValueError(f"Unrecognized hardware encoder: '{enc_type}'.")
 
-    post = ["-vf", vf, "-c:v", encoder, *enc_opts, "-g", "60"]
+    # Film with pulldown decodes slower than the stream's rate; left to the muxer,
+    # the missing frames are duplicated with their CEA-608 bytes, garbling captions.
+    # The fps filter fills them and re-paces the caption data.
+    post = ["-vf", f"fps=source_fps,{vf}", "-c:v", encoder, *enc_opts, "-g", "60"]
     return pre, post
 
 

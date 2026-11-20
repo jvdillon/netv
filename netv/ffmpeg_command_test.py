@@ -526,8 +526,15 @@ _UNKNOWN_LAYOUT_AAC = [
 ]
 
 
-def _software_video(*, deinterlace: bool, height: int = 1080, crf: str = "20") -> list[str]:
-    vf = f"{'yadif=0:-1:1,' if deinterlace else ''}scale=-2:min(ih\\,{height}),format=yuv420p"
+def _software_video(
+    *,
+    deinterlace: bool,
+    height: int = 1080,
+    crf: str = "20",
+    tonemap: str = "",
+) -> list[str]:
+    deint = "yadif=0:-1:1," if deinterlace else ""
+    vf = f"fps=source_fps,{deint}{tonemap}scale=-2:min(ih\\,{height}),format=yuv420p"
     return [
         "-vf",
         vf,
@@ -592,7 +599,7 @@ class TestHlsAssemblyContract:
             )
             video_post = [
                 "-vf",
-                f"{'yadif=0:-1:1,' if deinterlace else ''}{sr_filter}",
+                f"fps=source_fps,{'yadif=0:-1:1,' if deinterlace else ''}{sr_filter}",
                 "-c:v",
                 "h264_nvenc",
                 "-preset",
@@ -753,8 +760,7 @@ class TestHlsAssemblyContract:
             "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,"
             "zscale=t=bt709:m=bt709:r=tv,format=yuv420p,"
         )
-        video = _software_video(deinterlace=False, height=720, crf="32")
-        video[1] = tonemap + video[1]
+        video = _software_video(deinterlace=False, height=720, crf="32", tonemap=tonemap)
         audio_args = [
             "-c:a",
             "aac",
@@ -835,7 +841,7 @@ class TestHlsAssemblyContract:
             deinterlace_fallback=fallback,
         )
         expected = interlaced if height == 1 else (not is_vod if fallback is None else fallback)
-        assert cmd[cmd.index("-vf") + 1].startswith("yadif=0:-1:1,") is expected
+        assert cmd[cmd.index("-vf") + 1].startswith("fps=source_fps,yadif=0:-1:1,") is expected
 
     @pytest.mark.parametrize(
         ("codec", "height", "live_deinterlaced"),
@@ -857,8 +863,9 @@ class TestHlsAssemblyContract:
         progressive = _media_info(video_codec=codec, height=height, pix_fmt="yuv420p10le")
         live = build_hls_ffmpeg_cmd("input", "software", "/output", source=progressive)
         vod = build_hls_ffmpeg_cmd("input", "software", "/output", media_info=progressive)
-        assert live[live.index("-vf") + 1].startswith("yadif=0:-1:1,") is live_deinterlaced
-        assert not vod[vod.index("-vf") + 1].startswith("yadif")
+        live_vf = live[live.index("-vf") + 1]
+        assert live_vf.startswith("fps=source_fps,yadif=0:-1:1,") is live_deinterlaced
+        assert "yadif" not in vod[vod.index("-vf") + 1]
 
     def test_missing_codec_does_not_probe_gpu(self, fake_run: FakeRun):
         cmd = build_hls_ffmpeg_cmd("input", "nvenc+software", "/output")
@@ -2670,20 +2677,20 @@ class TestVideoArgsRemainingBranches:
 
         pre, post = self._args("nvenc+vaapi")
         assert pre == []
-        assert (
-            self._vf(post) == "format=nv12,hwupload_cuda,scale_cuda=-2:min(ih\\,1080):format=nv12"
+        assert self._vf(post) == (
+            "fps=source_fps,format=nv12,hwupload_cuda,scale_cuda=-2:min(ih\\,1080):format=nv12"
         )
 
     def test_nvenc_software_hdr_zscale_without_libplacebo(self, fake_run: FakeRun):
         _script_libplacebo(fake_run, available=False)
         _, post = self._args("nvenc+software", hdr=True)
-        assert self._vf(post).startswith("zscale=t=linear")
+        assert self._vf(post).startswith("fps=source_fps,zscale=t=linear")
         assert self._vf(post).endswith("hwupload_cuda,scale_cuda=-2:min(ih\\,1080):format=nv12")
 
     def test_amf_software_hdr(self):
         _, post = self._args("amf+software", hdr=True, deinterlace=True)
         vf = self._vf(post)
-        assert vf.startswith("yadif=0:-1:1,zscale=t=linear")
+        assert vf.startswith("fps=source_fps,yadif=0:-1:1,zscale=t=linear")
         assert vf.endswith("format=nv12,scale=-2:min(ih\\,1080),format=nv12")
 
     def test_vaapi_baseline_only(self, monkeypatch: pytest.MonkeyPatch):
@@ -2705,13 +2712,25 @@ class TestVideoArgsRemainingBranches:
         _, post = self._args("qsv", hw_pipeline=hw_pipeline, deinterlace=deinterlace, hdr=hdr)
         vf = self._vf(post)
         assert expected in vf
-        assert vf.startswith("vpp_qsv" if hw_pipeline else "format=nv12,hwupload")
+        assert vf.startswith(
+            "fps=source_fps," + ("vpp_qsv" if hw_pipeline else "format=nv12,hwupload"),
+        )
 
     def test_software_hdr_and_unbounded_resolution(self):
         _, post = self._args("software", hdr=True)
-        assert self._vf(post).startswith("zscale=t=linear")
+        assert self._vf(post).startswith("fps=source_fps,zscale=t=linear")
         _, post = self._args("software", res="original")
-        assert self._vf(post) == "format=yuv420p"
+        assert self._vf(post) == "fps=source_fps,format=yuv420p"
+
+    @pytest.mark.parametrize(
+        "hw",
+        ["nvenc+software", "nvenc+vaapi", "vaapi", "qsv", "amf+software", "software"],
+    )
+    @pytest.mark.parametrize("hw_pipeline", [False, True])
+    def test_every_encoder_paces_frames_before_its_filters(self, hw: HwAccel, hw_pipeline: bool):
+        """Film with pulldown otherwise gets muxer-duplicated frames that garble CEA-608."""
+        _, post = self._args(hw, hw_pipeline=hw_pipeline, deinterlace=True)
+        assert self._vf(post).startswith("fps=source_fps,")
 
 
 def _media_info(
@@ -2741,6 +2760,540 @@ def _media_info(
         is_hdr=is_hdr,
         is_hls=is_hls,
     )
+
+
+_VIDEO_ARGS_CASES = [
+    pytest.param(
+        "nvenc+software",
+        {"hw_pipeline": True, "deinterlace": True, "hdr": False},
+        ("1080p", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "-hwaccel cuda -hwaccel_output_format cuda -extra_hw_frames 3",
+        (
+            "-vf fps=source_fps,yadif_cuda=0:-1:1,scale_cuda=-2:min(ih\\,"
+            "1080):format=nv12 -c:v h264_nvenc -preset p4 -rc constqp -qp 20 "
+            "-rc-lookahead 32 -bf 3 -spatial-aq 1 -temporal-aq 1 -g 60"
+        ),
+        id="cuda-deint",
+    ),
+    pytest.param(
+        "nvenc+software",
+        {"hw_pipeline": True, "deinterlace": False, "hdr": True},
+        ("original", "medium"),
+        {"libplacebo": True, "vaapi_baseline_only": False},
+        "-hwaccel cuda -hwaccel_output_format cuda -extra_hw_frames 3",
+        (
+            "-vf fps=source_fps,hwdownload,format=p010le,"
+            "libplacebo=tonemapping=hable:colorspace=bt709:color_primaries=bt709:co"
+            "lor_trc=bt709,format=nv12,hwupload_cuda,scale_cuda=format=nv12 -c:v "
+            "h264_nvenc -preset p2 -rc constqp -qp 28 -rc-lookahead 32 -bf 3 "
+            "-spatial-aq 1 -temporal-aq 1 -g 60"
+        ),
+        id="cuda-hdr-placebo-orig",
+    ),
+    pytest.param(
+        "nvenc+software",
+        {"hw_pipeline": True, "deinterlace": False, "hdr": True},
+        ("1080p", "low"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "-hwaccel cuda -hwaccel_output_format cuda -extra_hw_frames 3",
+        (
+            "-vf fps=source_fps,hwdownload,format=p010le,zscale=t=linear:npl=100,"
+            "format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,"
+            "zscale=t=bt709:m=bt709:r=tv,format=nv12,hwupload_cuda,"
+            "scale_cuda=-2:min(ih\\,1080):format=nv12 -c:v h264_nvenc -preset p2 "
+            "-rc constqp -qp 35 -rc-lookahead 32 -bf 3 -spatial-aq 1 -temporal-aq "
+            "1 -g 60"
+        ),
+        id="cuda-hdr-zscale",
+    ),
+    pytest.param(
+        "nvenc+software",
+        {"hw_pipeline": False, "deinterlace": True, "hdr": True},
+        ("1080p", "high"),
+        {"libplacebo": True, "vaapi_baseline_only": False},
+        "",
+        (
+            "-vf fps=source_fps,yadif=0:-1:1,"
+            "libplacebo=tonemapping=hable:colorspace=bt709:color_primaries=bt709:co"
+            "lor_trc=bt709,format=nv12,hwupload_cuda,scale_cuda=-2:min(ih\\,"
+            "1080):format=nv12 -c:v h264_nvenc -preset p4 -rc constqp -qp 20 "
+            "-rc-lookahead 32 -bf 3 -spatial-aq 1 -temporal-aq 1 -g 60"
+        ),
+        id="nvsw-deint-hdr-placebo",
+    ),
+    pytest.param(
+        "nvenc+software",
+        {"hw_pipeline": False, "deinterlace": False, "hdr": True},
+        ("original", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "",
+        (
+            "-vf fps=source_fps,zscale=t=linear:npl=100,format=gbrpf32le,"
+            "zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,"
+            "format=nv12,hwupload_cuda,scale_cuda=format=nv12 -c:v h264_nvenc "
+            "-preset p2 -rc constqp -qp 20 -rc-lookahead 32 -bf 3 -spatial-aq 1 "
+            "-temporal-aq 1 -g 60"
+        ),
+        id="nvsw-hdr-zscale-orig",
+    ),
+    pytest.param(
+        "nvenc+software",
+        {"hw_pipeline": False, "deinterlace": True, "hdr": False},
+        ("original", "unknown"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "",
+        (
+            "-vf fps=source_fps,format=nv12,hwupload_cuda,yadif_cuda=0:-1:1,"
+            "scale_cuda=format=nv12 -c:v h264_nvenc -preset p4 -rc constqp -qp 28 "
+            "-rc-lookahead 32 -bf 3 -spatial-aq 1 -temporal-aq 1 -g 60"
+        ),
+        id="nvsw-deint-orig-default-q",
+    ),
+    pytest.param(
+        "nvenc+software",
+        {"hw_pipeline": False, "deinterlace": False, "hdr": False},
+        ("1080p", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "",
+        (
+            "-vf fps=source_fps,format=nv12,hwupload_cuda,scale_cuda=-2:min(ih\\,"
+            "1080):format=nv12 -c:v h264_nvenc -preset p2 -rc constqp -qp 20 "
+            "-rc-lookahead 32 -bf 3 -spatial-aq 1 -temporal-aq 1 -g 60"
+        ),
+        id="nvsw-plain",
+    ),
+    pytest.param(
+        "nvenc+vaapi",
+        {"hw_pipeline": False, "deinterlace": True, "hdr": True},
+        ("1080p", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        ("-hwaccel vaapi -hwaccel_output_format vaapi -hwaccel_device /dev/dri/renderD128"),
+        (
+            "-vf fps=source_fps,deinterlace_vaapi=auto=1,"
+            "tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,"
+            "scale_vaapi=w=-2:h=min(ih\\,1080):format=nv12,hwdownload,format=nv12,"
+            "hwupload_cuda -c:v h264_nvenc -preset p4 -rc constqp -qp 20 "
+            "-rc-lookahead 32 -bf 3 -spatial-aq 1 -temporal-aq 1 -g 60"
+        ),
+        id="nv-vaapi-deint-hdr",
+    ),
+    pytest.param(
+        "nvenc+vaapi",
+        {"hw_pipeline": False, "deinterlace": False, "hdr": False},
+        ("original", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        ("-hwaccel vaapi -hwaccel_output_format vaapi -hwaccel_device /dev/dri/renderD128"),
+        (
+            "-vf fps=source_fps,scale_vaapi=format=nv12,hwdownload,format=nv12,"
+            "hwupload_cuda -c:v h264_nvenc -preset p2 -rc constqp -qp 20 "
+            "-rc-lookahead 32 -bf 3 -spatial-aq 1 -temporal-aq 1 -g 60"
+        ),
+        id="nv-vaapi-plain-orig",
+    ),
+    pytest.param(
+        "amf+vaapi",
+        {"hw_pipeline": False, "deinterlace": True, "hdr": True},
+        ("1080p", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        ("-hwaccel vaapi -hwaccel_output_format vaapi -hwaccel_device /dev/dri/renderD128"),
+        (
+            "-vf fps=source_fps,deinterlace_vaapi=auto=1,"
+            "tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,"
+            "scale_vaapi=w=-2:h=min(ih\\,1080):format=nv12,hwdownload,format=nv12 "
+            "-c:v h264_amf -rc cqp -qp_i 20 -qp_p 20 -quality balanced -g 60"
+        ),
+        id="amf-vaapi-deint-hdr",
+    ),
+    pytest.param(
+        "amf+vaapi",
+        {"hw_pipeline": False, "deinterlace": False, "hdr": False},
+        ("original", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        ("-hwaccel vaapi -hwaccel_output_format vaapi -hwaccel_device /dev/dri/renderD128"),
+        (
+            "-vf fps=source_fps,scale_vaapi=format=nv12,hwdownload,format=nv12 "
+            "-c:v h264_amf -rc cqp -qp_i 20 -qp_p 20 -quality balanced -g 60"
+        ),
+        id="amf-vaapi-plain-orig",
+    ),
+    pytest.param(
+        "amf+software",
+        {"hw_pipeline": False, "deinterlace": True, "hdr": False},
+        ("original", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "",
+        (
+            "-vf fps=source_fps,yadif=0:-1:1,format=nv12 -c:v h264_amf -rc cqp "
+            "-qp_i 20 -qp_p 20 -quality balanced -g 60"
+        ),
+        id="amf-sw-deint-orig",
+    ),
+    pytest.param(
+        "amf+software",
+        {"hw_pipeline": False, "deinterlace": False, "hdr": True},
+        ("1080p", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "",
+        (
+            "-vf fps=source_fps,zscale=t=linear:npl=100,format=gbrpf32le,"
+            "zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,"
+            "format=nv12,scale=-2:min(ih\\,1080),format=nv12 -c:v h264_amf -rc cqp "
+            "-qp_i 20 -qp_p 20 -quality balanced -g 60"
+        ),
+        id="amf-sw-hdr",
+    ),
+    pytest.param(
+        "amf+software",
+        {"hw_pipeline": False, "deinterlace": False, "hdr": False},
+        ("original", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "",
+        (
+            "-vf fps=source_fps,format=nv12 -c:v h264_amf -rc cqp -qp_i 20 -qp_p "
+            "20 -quality balanced -g 60"
+        ),
+        id="amf-sw-plain-orig",
+    ),
+    pytest.param(
+        "vaapi",
+        {"hw_pipeline": True, "deinterlace": True, "hdr": True},
+        ("1080p", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        (
+            "-hwaccel vaapi -hwaccel_output_format vaapi -hwaccel_device "
+            "/dev/dri/renderD128 -extra_hw_frames 3"
+        ),
+        (
+            "-vf fps=source_fps,deinterlace_vaapi=auto=1,"
+            "tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,"
+            "scale_vaapi=w=-2:h=min(ih\\,1080):format=nv12 -c:v h264_vaapi -rc_mode "
+            "CQP -qp 20 -bf 3 -g 60"
+        ),
+        id="vaapi-hw-deint-hdr",
+    ),
+    pytest.param(
+        "vaapi",
+        {"hw_pipeline": True, "deinterlace": False, "hdr": False},
+        ("original", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        (
+            "-hwaccel vaapi -hwaccel_output_format vaapi -hwaccel_device "
+            "/dev/dri/renderD128 -extra_hw_frames 3"
+        ),
+        (
+            "-vf fps=source_fps,scale_vaapi=format=nv12 -c:v h264_vaapi -rc_mode "
+            "CQP -qp 20 -bf 3 -g 60"
+        ),
+        id="vaapi-hw-plain-orig",
+    ),
+    pytest.param(
+        "vaapi",
+        {"hw_pipeline": False, "deinterlace": True, "hdr": True},
+        ("1080p", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "-vaapi_device /dev/dri/renderD128",
+        (
+            "-vf fps=source_fps,format=nv12,hwupload,deinterlace_vaapi=auto=1,"
+            "tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,"
+            "scale_vaapi=w=-2:h=min(ih\\,1080):format=nv12 -c:v h264_vaapi -rc_mode "
+            "CQP -qp 20 -bf 3 -g 60"
+        ),
+        id="vaapi-sw-deint-hdr",
+    ),
+    pytest.param(
+        "vaapi",
+        {"hw_pipeline": False, "deinterlace": False, "hdr": False},
+        ("original", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "-vaapi_device /dev/dri/renderD128",
+        (
+            "-vf fps=source_fps,format=nv12,hwupload,scale_vaapi=format=nv12 -c:v "
+            "h264_vaapi -rc_mode CQP -qp 20 -bf 3 -g 60"
+        ),
+        id="vaapi-sw-plain-orig",
+    ),
+    pytest.param(
+        "vaapi",
+        {"hw_pipeline": False, "deinterlace": False, "hdr": False},
+        ("1080p", "low"),
+        {"libplacebo": False, "vaapi_baseline_only": True},
+        "-vaapi_device /dev/dri/renderD128",
+        (
+            "-vf fps=source_fps,format=nv12,hwupload,scale_vaapi=w=-2:h=min(ih\\,"
+            "1080):format=nv12 -c:v h264_vaapi -rc_mode CQP -qp 35 -profile:v "
+            "constrained_baseline -g 60"
+        ),
+        id="vaapi-baseline",
+    ),
+    pytest.param(
+        "qsv",
+        {"hw_pipeline": True, "deinterlace": True, "hdr": True},
+        ("1080p", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "-hwaccel qsv -hwaccel_output_format qsv",
+        (
+            "-vf fps=source_fps,vpp_qsv=deinterlace=2:tonemap=1:format=nv12,"
+            "scale_qsv=w=-2:h=min(ih\\,1080):format=nv12 -c:v h264_qsv "
+            "-global_quality 20 -bf 3 -look_ahead 1 -look_ahead_depth 40 -g 60"
+        ),
+        id="qsv-hw-deint-hdr",
+    ),
+    pytest.param(
+        "qsv",
+        {"hw_pipeline": True, "deinterlace": True, "hdr": False},
+        ("1080p", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "-hwaccel qsv -hwaccel_output_format qsv",
+        (
+            "-vf fps=source_fps,vpp_qsv=deinterlace=2,scale_qsv=w=-2:h=min(ih\\,"
+            "1080):format=nv12 -c:v h264_qsv -global_quality 20 -bf 3 -look_ahead "
+            "1 -look_ahead_depth 40 -g 60"
+        ),
+        id="qsv-hw-deint",
+    ),
+    pytest.param(
+        "qsv",
+        {"hw_pipeline": True, "deinterlace": False, "hdr": True},
+        ("1080p", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "-hwaccel qsv -hwaccel_output_format qsv",
+        (
+            "-vf fps=source_fps,vpp_qsv=tonemap=1:format=nv12,"
+            "scale_qsv=w=-2:h=min(ih\\,1080):format=nv12 -c:v h264_qsv "
+            "-global_quality 20 -bf 3 -look_ahead 1 -look_ahead_depth 40 -g 60"
+        ),
+        id="qsv-hw-hdr",
+    ),
+    pytest.param(
+        "qsv",
+        {"hw_pipeline": True, "deinterlace": False, "hdr": False},
+        ("original", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "-hwaccel qsv -hwaccel_output_format qsv",
+        (
+            "-vf fps=source_fps,scale_qsv=format=nv12 -c:v h264_qsv "
+            "-global_quality 20 -bf 3 -look_ahead 1 -look_ahead_depth 40 -g 60"
+        ),
+        id="qsv-hw-plain-orig",
+    ),
+    pytest.param(
+        "qsv",
+        {"hw_pipeline": False, "deinterlace": True, "hdr": True},
+        ("1080p", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "-init_hw_device qsv=hw -filter_hw_device hw",
+        (
+            "-vf fps=source_fps,format=nv12,hwupload=extra_hw_frames=64,"
+            "vpp_qsv=deinterlace=2:tonemap=1:format=nv12,scale_qsv=w=-2:h=min(ih\\,"
+            "1080):format=nv12 -c:v h264_qsv -global_quality 20 -bf 3 -look_ahead "
+            "1 -look_ahead_depth 40 -g 60"
+        ),
+        id="qsv-sw-deint-hdr",
+    ),
+    pytest.param(
+        "qsv",
+        {"hw_pipeline": False, "deinterlace": True, "hdr": False},
+        ("1080p", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "-init_hw_device qsv=hw -filter_hw_device hw",
+        (
+            "-vf fps=source_fps,format=nv12,hwupload=extra_hw_frames=64,"
+            "vpp_qsv=deinterlace=2,scale_qsv=w=-2:h=min(ih\\,1080):format=nv12 -c:v "
+            "h264_qsv -global_quality 20 -bf 3 -look_ahead 1 -look_ahead_depth 40 "
+            "-g 60"
+        ),
+        id="qsv-sw-deint",
+    ),
+    pytest.param(
+        "qsv",
+        {"hw_pipeline": False, "deinterlace": False, "hdr": True},
+        ("original", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "-init_hw_device qsv=hw -filter_hw_device hw",
+        (
+            "-vf fps=source_fps,format=nv12,hwupload=extra_hw_frames=64,"
+            "vpp_qsv=tonemap=1:format=nv12,scale_qsv=format=nv12 -c:v h264_qsv "
+            "-global_quality 20 -bf 3 -look_ahead 1 -look_ahead_depth 40 -g 60"
+        ),
+        id="qsv-sw-hdr-orig",
+    ),
+    pytest.param(
+        "qsv",
+        {"hw_pipeline": False, "deinterlace": False, "hdr": False},
+        ("original", "high"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "-init_hw_device qsv=hw -filter_hw_device hw",
+        (
+            "-vf fps=source_fps,format=nv12,hwupload=extra_hw_frames=64,"
+            "scale_qsv=format=nv12 -c:v h264_qsv -global_quality 20 -bf 3 "
+            "-look_ahead 1 -look_ahead_depth 40 -g 60"
+        ),
+        id="qsv-sw-plain-orig",
+    ),
+    pytest.param(
+        "software",
+        {"hw_pipeline": False, "deinterlace": True, "hdr": True},
+        ("1080p", "unknown"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "",
+        (
+            "-vf fps=source_fps,yadif=0:-1:1,zscale=t=linear:npl=100,"
+            "format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,"
+            "zscale=t=bt709:m=bt709:r=tv,format=yuv420p,scale=-2:min(ih\\,1080),"
+            "format=yuv420p -c:v libx264 -preset veryfast -crf 26 -bf 3 -g 60"
+        ),
+        id="x264-deint-hdr-default-q",
+    ),
+    pytest.param(
+        "software",
+        {"hw_pipeline": False, "deinterlace": False, "hdr": False},
+        ("original", "medium"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "",
+        ("-vf fps=source_fps,format=yuv420p -c:v libx264 -preset veryfast -crf 26 -bf 3 -g 60"),
+        id="x264-plain-orig",
+    ),
+    pytest.param(
+        "software",
+        {"hw_pipeline": False, "deinterlace": False, "hdr": False},
+        ("1080p", "low"),
+        {"libplacebo": False, "vaapi_baseline_only": False},
+        "",
+        (
+            "-vf fps=source_fps,scale=-2:min(ih\\,1080),format=yuv420p -c:v libx264 "
+            "-preset veryfast -crf 32 -bf 3 -g 60"
+        ),
+        id="x264-low",
+    ),
+]
+
+
+@pytest.mark.parametrize(("hw", "flags", "target", "env", "pre", "post"), _VIDEO_ARGS_CASES)
+def test_video_args_per_encoder_branch(
+    monkeypatch: pytest.MonkeyPatch,
+    hw: HwAccel,
+    flags: dict[str, bool],
+    target: tuple[str, str],
+    env: dict[str, bool],
+    pre: str,
+    post: str,
+):
+    monkeypatch.setattr(ffmpeg_command, "_has_libplacebo", env["libplacebo"])
+    monkeypatch.setitem(cache.AVAILABLE_ENCODERS, "vaapi_baseline_only", env["vaapi_baseline_only"])
+    resolution, quality = target
+    actual_pre, actual_post = _build_video_args(
+        copy_video=False,
+        hw=hw,
+        deinterlace=flags["deinterlace"],
+        use_hw_pipeline=flags["hw_pipeline"],
+        max_resolution=resolution,
+        quality=quality,
+        is_hdr=flags["hdr"],
+    )
+    assert (" ".join(actual_pre), " ".join(actual_post)) == (pre, post)
+
+
+class TestVideoArgsUpscale:
+    def _args(
+        self,
+        hw: str,
+        *,
+        resolution: str = "1080p",
+        allow_upscale: bool = True,
+    ) -> tuple[list[str], str]:
+        pre, post = _build_video_args(
+            copy_video=False,
+            hw=hw,
+            deinterlace=False,
+            use_hw_pipeline=True,
+            max_resolution=resolution,
+            quality="high",
+            allow_upscale=allow_upscale,
+        )
+        return pre, post[1]
+
+    def test_unprobed_source_uses_the_largest_engine(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        engine = _enable_sr(monkeypatch, tmp_path)
+        (tmp_path / "2x-nomosuni-compact_480p_fp16.engine").write_bytes(b"engine")
+        pre, vf = self._args("nvenc+software")
+        assert "-hwaccel" not in pre
+        assert vf.endswith(f"model={engine},scale_cuda=w=-2:h=1080")
+
+    def test_unbounded_resolution_keeps_the_engine_output(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        engine = _enable_sr(monkeypatch, tmp_path)
+        _, vf = self._args("nvenc+software", resolution="original")
+        assert vf.endswith(f"model={engine}")
+
+    def test_amf_never_upscales(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        _enable_sr(monkeypatch, tmp_path)
+        _, vf = self._args("amf+software")
+        assert "dnn_processing" not in vf
+
+    def test_disallowed_upscale_keeps_the_cuda_pipeline(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        _enable_sr(monkeypatch, tmp_path)
+        pre, vf = self._args("nvenc+software", allow_upscale=False)
+        assert "-hwaccel" in pre
+        assert "dnn_processing" not in vf
+
+
+@pytest.mark.parametrize("hw", ["vaapi", "nvenc+vaapi", "amf+vaapi"])
+def test_missing_vaapi_device_warns(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    hw: str,
+):
+    monkeypatch.setattr(cache, "VAAPI_DEVICE", None)
+    pre, _ = _build_video_args(
+        copy_video=False,
+        hw=hw,
+        deinterlace=False,
+        use_hw_pipeline=False,
+        max_resolution="1080p",
+        quality="high",
+    )
+    assert "-hwaccel" not in pre
+    assert [r.levelname for r in caplog.records] == ["WARNING"]
+    assert "VAAPI" in caplog.records[0].getMessage()
+
+
+def test_audio_tracks_round_trip_through_the_cache():
+    tracks = (
+        AudioTrack(
+            index=2,
+            lang="spa",
+            codec="aac",
+            channels=6,
+            sample_rate=44_100,
+            profile="HE-AAC",
+            default=True,
+        ),
+    )
+    assert audio_tracks_from_cache(audio_tracks_to_cache(tracks)) == tracks
+
+
+@pytest.mark.parametrize(
+    ("url", "paced"),
+    [
+        ("http://host/movie.mkv", True),
+        ("https://host/movie.mkv", True),
+        ("/media/movie.mkv", False),
+    ],
+)
+def test_vod_read_pacing_applies_to_network_sources(url: str, paced: bool):
+    assert ("-readrate" in build_hls_ffmpeg_cmd(url, "software", "/output", True)) is paced
 
 
 if __name__ == "__main__":
