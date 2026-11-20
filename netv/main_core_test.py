@@ -181,12 +181,10 @@ def _session(
 def test_lifespan_runs_workers_and_shuts_down(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    guide_db: None,
     web: testing.FakeWeb,
     sessions: dict[str, TranscodeSession],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    del guide_db
     noon = datetime(2026, 1, 1, 12, 0)
     # The scheduler polls every 30 s, so its first two passes land at 12:00:00 and 12:00:30.
     clock = testing.FakeClock(now=noon.timestamp() - 30)

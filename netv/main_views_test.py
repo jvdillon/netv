@@ -62,6 +62,7 @@ from netv.xtream import ProviderRecord, XtreamClient
 mock_deps = main_test.mock_deps
 auth_client = main_test.auth_client
 clean_handoff = main_test.clean_handoff
+transcode_dir = main_test.transcode_dir
 
 
 @pytest.fixture(autouse=True)

@@ -53,18 +53,24 @@ SERVER_INFO_URL = "http://upstream.test/player_api.php?username=user&password=pa
 
 
 @pytest.fixture
-def mock_deps(monkeypatch: pytest.MonkeyPatch, guide_db: None) -> None:
-    """Give each test an empty guide database and fresh session, cast and login state."""
-    del guide_db
-    settings = cache_module.load_server_settings()
-    settings["transcode_dir"] = str(cache_module.CACHE_DIR / "transcode")
-    cache_module.save_server_settings(settings)
+def mock_deps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each test fresh session, cast and login state."""
     monkeypatch.setattr(ffmpeg_session, "_transcode_sessions", {})
     monkeypatch.setattr(ffmpeg_session, "_url_to_session", {})
     monkeypatch.setattr(chromecast, "manager", chromecast.CastManager())
     monkeypatch.setattr(m3u_module, "_refresh_in_progress", set())
     monkeypatch.setattr(main, "_login_attempts", {})
     monkeypatch.setattr(catchup, "_tz_cache", {})
+
+
+@pytest.fixture
+def transcode_dir(tmp_path: Path) -> Path:
+    """Keep transcodes and handoff recordings out of the system temp dir."""
+    path = tmp_path / "transcode"
+    cache_module.save_server_settings(
+        {**cache_module.load_server_settings(), "transcode_dir": str(path)},
+    )
+    return path
 
 
 @pytest.fixture
@@ -90,6 +96,7 @@ def threads(monkeypatch: pytest.MonkeyPatch) -> testing.ThreadRecorder:
     return recorder
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_web_player_includes_resolution_badge(auth_client: TestClient):
     _set_live({"stream_id": "test", "name": "Test channel", "direct_url": "https://e.test/l.m3u8"})
     response = auth_client.get("/play/live/test")
@@ -137,6 +144,7 @@ def test_web_player_includes_resolution_badge(auth_client: TestClient):
     }
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_live_player_records_view(auth_client: TestClient):
     _set_live(
         {"stream_id": "7", "name": "Test", "direct_url": "https://e.test/l.m3u8", "source_id": "a"},
@@ -319,6 +327,7 @@ def test_receiver_hls_request_keeps_session_alive_without_cookie(
     assert session.get("last_access", 0) >= before
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_live_dvr_routes_auto_mode_through_server(auth_client: TestClient):
     _set_live(_archive_stream(stream_id="test", tv_archive=0))
     response = auth_client.get("/play/live/test")
@@ -327,6 +336,7 @@ def test_live_dvr_routes_auto_mode_through_server(auth_client: TestClient):
     assert "liveDvrMins: 120" in response.text
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_live_dvr_disabled_keeps_direct_auto_mode(auth_client: TestClient):
     settings = cache_module.load_server_settings()
     settings["live_dvr_mins"] = 0
@@ -338,6 +348,7 @@ def test_live_dvr_disabled_keeps_direct_auto_mode(auth_client: TestClient):
     assert "liveDvrMins: 0" in response.text
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_live_player_passes_program_window_from_epg(auth_client: TestClient):
     start = _now() - timedelta(minutes=30)
     stop = start + timedelta(hours=1)
@@ -358,6 +369,7 @@ def test_live_player_passes_program_window_from_epg(auth_client: TestClient):
     assert 'id="program-remaining"' not in response.text
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_live_player_info_reads_program_window_from_epg(mock_deps: None):
     start = _now() - timedelta(minutes=30)
     stop = _now() + timedelta(minutes=30)
@@ -385,6 +397,7 @@ def test_live_player_info_reads_program_window_from_epg(mock_deps: None):
     assert info.category_ids is None
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_live_program_api_returns_current_program(auth_client: TestClient):
     start = _now() - timedelta(minutes=10)
     stop = start + timedelta(minutes=45)
@@ -400,6 +413,7 @@ def test_live_program_api_returns_current_program(auth_client: TestClient):
     }
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_live_program_api_without_guide_data_returns_empty_program(auth_client: TestClient):
     _set_live({"stream_id": "1", "name": "Channel"})
     response = auth_client.get("/api/live/program/1")
@@ -407,6 +421,7 @@ def test_live_program_api_without_guide_data_returns_empty_program(auth_client: 
     assert response.json() == {"title": "", "desc": "", "start": 0.0, "end": 0.0}
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_live_program_api_unknown_stream_is_not_found(auth_client: TestClient):
     _set_live()
     response = auth_client.get("/api/live/program/missing")
@@ -449,6 +464,7 @@ def _hours_ago(hours: int) -> datetime:
     return (datetime.now(timezone.utc) - timedelta(hours=hours)).replace(second=0, microsecond=0)
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_catchup_player_info_builds_timeshift_url(catchup_world: _CatchupWorld):
     start = _hours_ago(3)
     program = _air("ch1", "Earlier news", start, start + timedelta(minutes=30), desc="Headlines")
@@ -469,6 +485,7 @@ def test_catchup_player_info_builds_timeshift_url(catchup_world: _CatchupWorld):
     assert catchup_world.web.urls == [SERVER_INFO_URL]
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_catchup_player_info_starts_mid_program(catchup_world: _CatchupWorld):
     program_start = _hours_ago(3)
     program = _air("ch1", "Earlier news", program_start, program_start + timedelta(minutes=30))
@@ -485,6 +502,7 @@ def test_catchup_player_info_starts_mid_program(catchup_world: _CatchupWorld):
     assert catchup_world.web.urls == []
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_catchup_player_info_without_guide_plays_one_hour(catchup_world: _CatchupWorld):
     del catchup_world
     start = _hours_ago(3) + timedelta(seconds=40)
@@ -501,11 +519,13 @@ def test_catchup_player_info_without_guide_plays_one_hour(catchup_world: _Catchu
     assert info.program_end == (start + timedelta(hours=1)).timestamp()
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_catchup_player_info_needs_a_live_url(catchup_world: _CatchupWorld):
     catchup_world.stream["source_type"] = "m3u"
     assert main._get_catchup_player_info("src1_42", _hours_ago(3).timestamp()) == PlayerInfo()
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_catchup_player_info_rejects_programs_outside_archive(catchup_world: _CatchupWorld):
     del catchup_world
     too_old = datetime.now(timezone.utc) - timedelta(days=3)
@@ -515,6 +535,7 @@ def test_catchup_player_info_rejects_programs_outside_archive(catchup_world: _Ca
     assert excinfo.value.detail == "This program is not available to watch from the start"
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_catchup_player_page_plays_archive_as_vod(auth_client: TestClient):
     _set_live(_archive_stream())
     begin = _hours_ago(3)
@@ -530,6 +551,7 @@ def test_catchup_player_page_plays_archive_as_vod(auth_client: TestClient):
     assert 'id="start-over-btn"' not in response.text
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_live_player_offers_start_over_with_archive(auth_client: TestClient):
     _set_live(
         _archive_stream(stream_id="test", direct_url="https://e.test/l.ts", tv_archive_duration=1),
@@ -540,6 +562,7 @@ def test_live_player_offers_start_over_with_archive(auth_client: TestClient):
     assert 'id="start-over-btn"' in response.text
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_catchup_api_lists_archived_programs_newest_first(auth_client: TestClient):
     now = _now()
     _air("ch1", "Too old", now - timedelta(days=2, hours=1), now - timedelta(days=2, minutes=-1))
@@ -554,12 +577,14 @@ def test_catchup_api_lists_archived_programs_newest_first(auth_client: TestClien
     assert payload["programs"][1]["start_timestamp"] == morning.start.timestamp()
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_catchup_api_without_archive_is_empty(auth_client: TestClient):
     _set_live(_archive_stream(tv_archive=0))
     response = auth_client.get("/api/live/catchup/src1_42")
     assert response.json() == {"days": 0, "programs": []}
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_catchup_api_uses_playlist_guide_assignment(auth_client: TestClient):
     now = _now()
     _air("assigned", "Morning", now - timedelta(hours=5), now - timedelta(hours=4))
@@ -583,11 +608,13 @@ def test_catchup_api_uses_playlist_guide_assignment(auth_client: TestClient):
     assert [p["title"] for p in _body(response, CatchupListing)["programs"]] == ["Morning"]
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_catchup_player_page_rejects_invalid_start(auth_client: TestClient):
     _set_live(_archive_stream())
     assert auth_client.get("/play/live/src1_42?start=1e300").status_code == 404
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_catchup_api_unknown_stream_is_not_found(auth_client: TestClient):
     _set_live()
     assert auth_client.get("/api/live/catchup/missing").status_code == 404
@@ -639,6 +666,7 @@ def prestarts(monkeypatch: pytest.MonkeyPatch) -> _Prestarts:
 _OTA = "http://tuner.test:5004/auto/v9.1"
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_a_live_page_starts_its_stream_while_its_scripts_load(
     auth_client: TestClient,
     prestarts: _Prestarts,
@@ -659,6 +687,7 @@ def test_a_live_page_starts_its_stream_while_its_scripts_load(
     ]
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_a_page_that_will_not_transcode_starts_nothing(
     auth_client: TestClient,
     prestarts: _Prestarts,
@@ -671,6 +700,7 @@ def test_a_page_that_will_not_transcode_starts_nothing(
     assert prestarts.calls == []
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_a_stream_playing_on_a_tv_is_not_started_again(
     auth_client: TestClient,
     prestarts: _Prestarts,
@@ -708,6 +738,7 @@ def test_transcode_start_refuses_urls_the_server_did_not_issue(
     assert start_recorder.urls == []
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_player_page_token_starts_that_stream_for_that_user(
     auth_client: TestClient,
     start_recorder: _StartRecorder,
@@ -846,6 +877,7 @@ XMLTV_URL = "http://epg.test/guide.xml"
 
 
 class TestLoadAllEpg:
+    @pytest.mark.usefixtures("guide_db")
     def test_refetches_when_listings_ran_out(
         self,
         mock_deps: None,
@@ -862,6 +894,7 @@ class TestLoadAllEpg:
         assert web.fetches[0].timeout == 30
         assert epg.has_programs_after(now + timedelta(hours=6))
 
+    @pytest.mark.usefixtures("guide_db")
     def test_skips_fetch_when_listings_are_current(
         self,
         mock_deps: None,
@@ -1007,6 +1040,7 @@ class TestFavicon:
 class TestGuide:
     """Tests for guide page."""
 
+    @pytest.mark.usefixtures("guide_db")
     @pytest.mark.parametrize("guide_db_open", [True, False])
     def test_guide_shows_loading_when_no_cache(
         self,
@@ -1030,6 +1064,7 @@ class TestGuide:
         assert ("epg_error" in cache_module.get_cache()) is not guide_db_open
         assert "guide_load" not in m3u_module.get_refresh_in_progress()
 
+    @pytest.mark.usefixtures("guide_db")
     def test_guide_shows_channels_from_cache(self, auth_client: TestClient):
         cache_module.get_cache()["live_categories"] = [
             {"category_id": "1", "category_name": "News"},
@@ -1042,6 +1077,7 @@ class TestGuide:
         assert resp.status_code == 200
         assert "CNN" in resp.text
 
+    @pytest.mark.usefixtures("guide_db")
     def test_guide_limits_initial_virtual_rows(self, auth_client: TestClient):
         cache_module.get_cache()["live_categories"] = [
             {"category_id": "1", "category_name": "News"},
@@ -1153,6 +1189,7 @@ class TestGuide:
         )
         assert (past_end["rows"], past_end["total"]) == ([], 3)
 
+    @pytest.mark.usefixtures("guide_db")
     def test_guide_rows_timestamps_anchor_local_timeline(
         self,
         auth_client: TestClient,
@@ -1181,6 +1218,7 @@ class TestGuide:
         assert listing["left_pct"] == 0
         assert listing["width_pct"] == pytest.approx(100 / 3)
 
+    @pytest.mark.usefixtures("guide_db")
     def test_guide_rows_flag_archived_programs(self, auth_client: TestClient):
         now = _now()
         cache_module.get_cache()["live_streams"] = [
@@ -1213,6 +1251,7 @@ class TestGuide:
         assert mobile["Earlier"]["start_timestamp"] == past.start.timestamp()
         assert mobile["Earlier"]["end_timestamp"] == past.stop.timestamp()
 
+    @pytest.mark.usefixtures("guide_db")
     @pytest.mark.parametrize("archive_days", [0, 1, 3])
     def test_guide_disables_unavailable_past_listings(
         self,
@@ -1269,6 +1308,7 @@ class TestGuide:
         for programs in (rows[0]["programs"], rows[0]["programs_mobile"]):
             assert programs[0].get("unavailable") is (archive_days != 3)
 
+    @pytest.mark.usefixtures("guide_db")
     def test_guide_page_exposes_timestamps_for_local_times(self, auth_client: TestClient):
         now = datetime.now(timezone.utc)
         cache_module.get_cache()["live_categories"] = [
@@ -1290,6 +1330,7 @@ class TestGuide:
         assert f'data-end="{program.stop.timestamp()}"' in html
         assert "localizeGuideTimes(document)" in html
 
+    @pytest.mark.usefixtures("guide_db")
     def test_guide_uses_saved_filter(self, auth_client: TestClient):
         _save_guide_filter(["2"])
         cache_module.get_cache()["live_categories"] = [
@@ -1370,12 +1411,14 @@ class TestVod:
         cache_module.get_cache()["vod_categories"] = []
         cache_module.get_cache()["vod_streams"] = [
             {"stream_id": 1, "name": "Zebra", "source_id": "src1"},
-            {"stream_id": 2, "name": "Apple", "source_id": "src1"},
+            {"stream_id": 2, "name": "apple", "source_id": "src1"},
+            # "_" sorts between the upper- and lowercase letters, so case folding shows.
+            {"stream_id": 3, "name": "_Extras", "source_id": "src1"},
         ]
 
         resp = auth_client.get("/vod?sort=alpha")
         assert resp.status_code == 200
-        assert resp.text.index("Apple") < resp.text.index("Zebra")
+        assert resp.text.index("_Extras") < resp.text.index("apple") < resp.text.index("Zebra")
 
     def test_vod_sorts_unrated_movies_last(self, auth_client: TestClient):
         cache_module.get_cache()["vod_categories"] = []
@@ -1615,6 +1658,7 @@ class TestAddSource:
 class TestDeleteSource:
     """Tests for deleting sources."""
 
+    @pytest.mark.usefixtures("guide_db")
     def test_delete_source(self, auth_client: TestClient):
         settings = cache_module.load_server_settings()
         settings["sources"] = [
@@ -1932,7 +1976,9 @@ def fast_live(
     mock_deps: None,
     monkeypatch: pytest.MonkeyPatch,
     upstreams: testing.FakeUpstreams,
+    transcode_dir: Path,
 ) -> Iterator[_FastLive]:
+    del transcode_dir
     fake = _FastLive(monkeypatch, upstreams)
     yield fake
     fake.tasks.discard()
@@ -2421,6 +2467,7 @@ class TestPlaylists:
 
         assert [r["channel"]["stream_id"] for r in payload["rows"]] == [2, 3]
 
+    @pytest.mark.usefixtures("guide_db")
     def test_guide_page_defaults_to_playlists_then_filter(self, auth_client: TestClient):
         playlist = self._create(auth_client)
         auth_client.post("/settings/guide-filter", json={"cats": ["1"]})
@@ -2429,6 +2476,7 @@ class TestPlaylists:
         assert "★ Favorites" in resp.text
         assert f'"{playlist["category_id"]},1"' in resp.text
 
+    @pytest.mark.usefixtures("guide_db")
     def test_guide_page_shows_section_headings(self, auth_client: TestClient):
         self._create(auth_client)
         auth_client.post("/settings/guide-filter", json={"cats": ["2"]})
@@ -2465,6 +2513,7 @@ class TestPlaylists:
         rows = re.findall(r'<div class="guide-row[^"]*" data-row="\d+"', text)
         return links, current, len(rows)
 
+    @pytest.mark.usefixtures("guide_db")
     def test_guide_sidebar_lists_playlists_and_categories(self, auth_client: TestClient):
         auth_client.post("/settings/guide-filter", json={"cats": ["1", "2"]})
         auth_client.post("/api/user-prefs", json={"guide_selected_cats": ["2"]})
@@ -2489,6 +2538,7 @@ class TestPlaylists:
         assert "guide_selected_cats" in settings
         assert settings["guide_selected_cats"] is None
 
+    @pytest.mark.usefixtures("guide_db")
     def test_old_multi_category_view_falls_back_to_all(self, auth_client: TestClient):
         auth_client.post("/settings/guide-filter", json={"cats": ["1", "2"]})
         auth_client.post("/api/user-prefs", json={"guide_selected_cats": ["1", "2"]})
@@ -2555,6 +2605,7 @@ class TestPlaylists:
             },
         ]
 
+    @pytest.mark.usefixtures("guide_db")
     def test_assigned_guide_survives_round_trip_and_feeds_guide(self, auth_client: TestClient):
         playlist = self._create(auth_client, ids=(1,))
         channels = _body(auth_client.get(f"/api/playlists/{playlist['id']}"), PlaylistPayload)[
@@ -2576,6 +2627,7 @@ class TestPlaylists:
         assert rows[0]["channel"]["epg_id"] == "guide.one"
         assert [p["title"] for p in rows[0]["programs"]] == ["Assigned show"]
 
+    @pytest.mark.usefixtures("guide_db")
     def test_epg_channel_search(self, auth_client: TestClient):
         epg.insert_channel("alpha.one.hd", "ALPHA ONE HD", "s")
         epg.insert_channel("alpha.one", "Alpha One", "s")
@@ -2683,6 +2735,7 @@ class TestPlaylists:
         )
         assert _body(auth_client.get("/api/playlists"), _PlaylistList)["playlists"] == []
 
+    @pytest.mark.usefixtures("guide_db")
     def test_saved_view_drops_deleted_playlist(self, auth_client: TestClient):
         playlist = self._create(auth_client)
         auth_client.post("/settings/guide-filter", json={"cats": ["1"]})
@@ -2811,7 +2864,8 @@ class TestSourceAssignment:
 
 
 @pytest.fixture
-def clean_handoff(monkeypatch: pytest.MonkeyPatch) -> None:
+def clean_handoff(monkeypatch: pytest.MonkeyPatch, transcode_dir: Path) -> None:
+    del transcode_dir
     monkeypatch.setattr(handoff, "_users_dir", None)
     monkeypatch.setattr(handoff, "_records", {})
     monkeypatch.setattr(handoff, "_watches", {})
@@ -2830,6 +2884,7 @@ def test_handoff_api_offers_the_users_handoff(auth_client: TestClient, clean_han
     assert auth_client.get("/api/handoff").json() == {"handoff": None}
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_handoff_recording_resumes_from_where_it_was_left(
     auth_client: TestClient,
     clean_handoff: None,
@@ -2845,6 +2900,7 @@ def test_handoff_recording_resumes_from_where_it_was_left(
     assert handoff._records["testuser"]["resumed"] is True
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_handoff_catchup_resumes_through_the_archive(auth_client: TestClient, clean_handoff: None):
     position = _hours_ago(3).timestamp()
     handoff._records["testuser"] = _handoff_record(
@@ -2861,6 +2917,7 @@ def test_handoff_catchup_resumes_through_the_archive(auth_client: TestClient, cl
     assert handoff._records["testuser"]["resumed"] is True
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_playing_something_else_cancels_the_handoff(auth_client: TestClient, clean_handoff: None):
     handoff._records["testuser"] = _handoff_record(mode="catchup", recording_id="")
     _set_live({"stream_id": "other", "name": "Other", "direct_url": "https://e.test/l.m3u8"})
@@ -2875,6 +2932,7 @@ def test_stale_handoff_cannot_be_resumed(auth_client: TestClient, clean_handoff:
     assert handoff._records["testuser"]["id"] == "h1", "An old link keeps the newer handoff"
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_handoff_stop_hands_off_the_watched_channel(auth_client: TestClient, clean_handoff: None):
     now = time.time()
     _watching("src1_42", now)
@@ -2888,6 +2946,7 @@ def test_handoff_stop_hands_off_the_watched_channel(auth_client: TestClient, cle
     assert handoff._records["testuser"]["position"] == pytest.approx(now - 5)
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_handoff_stop_rejects_streams_the_user_cannot_see(
     auth_client: TestClient,
     clean_handoff: None,
@@ -2904,6 +2963,7 @@ def test_handoff_stop_rejects_streams_the_user_cannot_see(
     assert handoff._records == {}
 
 
+@pytest.mark.usefixtures("guide_db")
 @pytest.mark.asyncio
 async def test_handoff_recording_takes_over_the_live_session(
     auth_client: TestClient,
@@ -2938,6 +2998,7 @@ async def test_handoff_recording_takes_over_the_live_session(
     assert upstream.closed
 
 
+@pytest.mark.usefixtures("guide_db")
 @pytest.mark.asyncio
 async def test_handoff_recording_without_a_session_reads_the_panels_ts_stream(
     auth_client: TestClient,

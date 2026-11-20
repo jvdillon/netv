@@ -6,31 +6,19 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Final
 
-import shutil
-
 import pytest
 
-from netv import auth, cache, epg, testing, util
+from netv import auth, cache, epg, testing
 
 
 # Each invocation claims its own basetemp, so concurrent runs never delete each other's.
 pytest_plugins: Final = ("codedoctor.lib.testing.basetemp",)
 
 
-@pytest.fixture(scope="session")
-def empty_guide(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Build one empty guide database per worker: building one costs ~70 ms of fsyncs."""
-    path = tmp_path_factory.mktemp("guide")
-    epg.init(path)
-    epg.close()
-    return path / "epg.db"
-
-
 @pytest.fixture
-def guide_db(empty_guide: Path, tmp_path: Path) -> Iterator[None]:
-    """Open a copy of the empty guide database; copying skips the build's fsyncs."""
-    shutil.copyfile(empty_guide, tmp_path / "epg.db")
-    epg.init(tmp_path)
+def guide_db(tmp_path: Path) -> Iterator[None]:
+    """An empty guide database, for the tests that read or write the guide."""
+    epg.init(tmp_path / "epg")
     yield
     epg.close()
 
@@ -42,7 +30,7 @@ def isolated_state(
 ) -> Iterator[None]:
     """Keep settings, users, and file caches in a per-test directory, memory caches empty.
 
-    Password hashing also runs at minimum cost, and settings writes skip fsync.
+    Password hashing also runs at minimum cost.
 
     Without it a test that forgets to redirect storage reads and writes the
     developer's real neTV data directory.
@@ -55,7 +43,6 @@ def isolated_state(
         monkeypatch.setattr(module, "USERS_DIR", state / "users")
     monkeypatch.setattr(cache, "LOGOS_DIR", state / "logos")
     testing.install_cheap_kdf(monkeypatch, auth)
-    testing.install_no_fsync(monkeypatch, util)
     cache.clear_all_caches()
     cache.get_cache().pop("epg", None)
     yield
