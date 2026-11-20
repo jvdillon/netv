@@ -225,6 +225,42 @@ repos:
     - codedoctor.affected
     - --fixer
     - codedoctor.assert_isinstance
+- hooks:
+  - id: biome-check
+    name: biome-check
+    language: node
+    additional_dependencies:
+    - '@biomejs/biome@2.6.7'
+    entry: biome check --write --files-ignore-unknown=true --no-errors-on-unmatched
+    types:
+    - text
+    require_serial: true
+    stages:
+    - pre-commit
+    files: \.(tsx?|[cm]ts|jsx?|[cm]js|css)$
+    args:
+    - --reporter=concise
+    - --error-on-warnings
+  repo: local
+- hooks:
+  - entry: uv --quiet run --frozen --group pre-commit python -m codedoctor cargo fmt
+    files: (\.rs|(^|/)Cargo\.toml)$
+    id: cargo-fmt
+    language: system
+    name: cargo-fmt
+    require_serial: true
+    stages:
+    - pre-commit
+  - entry: nice -n 19 uv --quiet run --frozen --group pre-commit python -m codedoctor
+      cargo clippy
+    files: (\.rs|(^|/)Cargo\.(toml|lock))$
+    id: cargo-clippy
+    language: system
+    name: cargo-clippy
+    require_serial: true
+    stages:
+    - pre-commit
+  repo: local
 - repo: local
   hooks:
   - id: pytest-spool
@@ -386,39 +422,3 @@ repos:
     args:
     - --plugin
     - codedoctor.testing.listing
-- hooks:
-  - id: biome-check
-    name: biome-check
-    language: node
-    additional_dependencies:
-    - '@biomejs/biome@2.6.7'
-    entry: biome check --write --files-ignore-unknown=true --no-errors-on-unmatched
-    types:
-    - text
-    require_serial: true
-    stages:
-    - pre-commit
-    files: \.(tsx?|[cm]ts|jsx?|[cm]js|css)$
-    args:
-    - --reporter=concise
-    - --error-on-warnings
-  repo: local
-- hooks:
-  - entry: uv --quiet run --frozen --group pre-commit python -m codedoctor cargo fmt
-    files: (\.rs|(^|/)Cargo\.toml)$
-    id: cargo-fmt
-    language: system
-    name: cargo-fmt
-    require_serial: true
-    stages:
-    - pre-commit
-  - entry: nice -n 19 uv --quiet run --frozen --group pre-commit python -m codedoctor
-      cargo clippy
-    files: (\.rs|(^|/)Cargo\.(toml|lock))$
-    id: cargo-clippy
-    language: system
-    name: cargo-clippy
-    require_serial: true
-    stages:
-    - pre-commit
-  repo: local

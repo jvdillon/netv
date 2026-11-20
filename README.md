@@ -806,24 +806,19 @@ extra adds only `treekle` and its dependencies, without the server stack.
 For regular use, run `uv tool install 'pynetv[xtream2m3u]'` once, then invoke
 all three tools directly. A `pynetv[server]` installation also supports all
 three tools. From a checkout, use `uv run python -m netv.tools.zap2xml`
-(or `netv.tools.alignm3u` / `netv.tools.xtream2m3u`). Each writes to the
-current directory unless told otherwise:
+(or `netv.tools.alignm3u` / `netv.tools.xtream2m3u`).
 
 - `zap2xml`: Scrape guide data into XML (I `crontab` this at 5am daily).
 - `alignm3u`: Useful for reworking your HDHomeRun m3u to align with guide.
 - `xtream2m3u`: Dump xtream to m3u, useful for making Emby work with IPTV.
 
-For persistent source-checkout files, use `.cache/tools` explicitly with
-`zap2xml --path` or `xtream2m3u --dir`; the defaults remain the current directory:
+`zap2xml` and `xtream2m3u` write to a per-user data directory
+(`~/.local/share/netv/zap2xml` and `~/.local/share/netv/xtream2m3u` on
+Linux; `~/Library/Application Support/netv/...` on macOS). Override it with
+`zap2xml --path` or `xtream2m3u --dir`.
 
-```bash
-mkdir -p .cache/tools
-uv run python -m netv.tools.zap2xml --zip 90210 --path .cache/tools
-uv run python -m netv.tools.xtream2m3u --dir .cache/tools
-```
-
-On its first run, `xtream2m3u` creates `.cache/tools/xtream.json` for your
-provider settings. Edit it, then rerun the command.
+On its first run, `xtream2m3u` creates `xtream.json` there for your provider
+settings. Edit it, then rerun the command.
 
 ## Troubleshooting
 
@@ -893,20 +888,21 @@ packaged commands to fetch guide data and align it:
 
 ```bash
 # 1. Get your HDHomeRun lineup (replace IP with your device's IP)
-mkdir -p .cache/tools
-wget http://192.168.1.87/lineup.m3u -O .cache/tools/lineup.m3u
+guide=~/.local/share/netv/zap2xml
+mkdir -p "$guide"
+wget http://192.168.1.87/lineup.m3u -O "$guide/lineup.m3u"
 
-# 2. Fetch TV guide data for your area
-uv run python -m netv.tools.zap2xml --zip 90210 --path .cache/tools
+# 2. Fetch TV guide data for your area (writes $guide/xmltv.xml)
+uv run python -m netv.tools.zap2xml --zip 90210
 
 # 3. Align the M3U with the guide (adds tvg-id for EPG matching)
-uv run python -m netv.tools.alignm3u --input .cache/tools/lineup.m3u --xmltv .cache/tools/xmltv.xml --output .cache/tools/ota.m3u
+uv run python -m netv.tools.alignm3u --input "$guide/lineup.m3u" --xmltv "$guide/xmltv.xml" --output "$guide/ota.m3u"
 ```
 
 See the [example HDHomeRun playlist](https://raw.githubusercontent.com/jvdillon/netv/main/assets/example.m3u) for guide IDs and
 channel groups. Replace its tuner and XMLTV addresses with your own.
 
-Then add `.cache/tools/ota.m3u` as an M3U source in neTV settings.
+Then add `~/.local/share/netv/zap2xml/ota.m3u` as an M3U source in neTV settings.
 
 And set up a cron job to refresh the guide daily (e.g.,
 `0 5 * * *  /path/to/netv/.venv/bin/python -m netv.tools.zap2xml --zip 90210 --path /var/www/html`).

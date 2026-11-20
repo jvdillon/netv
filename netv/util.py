@@ -110,12 +110,16 @@ def data_dir(app_dir: pathlib.Path) -> pathlib.Path:
     if configured:
         return pathlib.Path(configured).expanduser()
     target = userdirs.data_dir() / "netv"
-    if not target.exists():
+    # The tools keep their own subdirectories here, so a directory without
+    # server settings still lacks the state a checkout may hold.
+    if not (target / "server_settings.json").exists():
         root = app_dir.parent if (app_dir.parent / "pyproject.toml").is_file() else app_dir
         for legacy in (root / "cache", root / ".cache"):
             if (legacy / "server_settings.json").is_file():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(legacy, target)
+                target.mkdir(parents=True, exist_ok=True)
+                for child in legacy.iterdir():
+                    shutil.move(child, target / child.name)
+                legacy.rmdir()
                 break
     return target
 

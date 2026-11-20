@@ -1211,6 +1211,19 @@ def install_cheap_kdf(monkeypatch: pytest.MonkeyPatch, *modules: ModuleType) -> 
         _override(monkeypatch, module, "hashlib", hashlib, pbkdf2_hmac=cheap_pbkdf2_hmac)
 
 
+def install_no_fsync(monkeypatch: pytest.MonkeyPatch, *modules: ModuleType) -> None:
+    """Make each module's ``os.fsync`` a no-op.
+
+    An fsync costs ~6 ms on disk; tests check what is written, not that it survives a crash.
+
+    Args:
+        monkeypatch: The test's monkeypatch.
+        modules: Modules whose ``os`` global to replace.
+    """
+    for module in modules:
+        _override(monkeypatch, module, "os", os, fsync=_no_fsync)
+
+
 def install_subprocess(
     monkeypatch: pytest.MonkeyPatch,
     module: ModuleType,
@@ -1609,3 +1622,7 @@ def _functions(value: object) -> list[FunctionType]:
     if isinstance(value, type):
         return [member for member in vars(value).values() if isinstance(member, FunctionType)]
     return []
+
+
+def _no_fsync(fd: int) -> None:
+    del fd

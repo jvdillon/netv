@@ -198,6 +198,8 @@ def test_main_fetches_and_writes_playlists(
 
     for name in ("live.m3u", "vod.m3u", "series.m3u"):
         (workdir / name).unlink()
+    # A newer series would be refetched, but a cached-only run must not fetch.
+    (workdir / "get_series.json").write_text(json.dumps([{**SERIES[0], "last_modified": "200"}]))
     monkeypatch.setattr(xtream2m3u, "fetch_text", None)
     monkeypatch.setattr(sys, "argv", ["xtream2m3u", "--dir", str(workdir), "--cached-only"])
     assert xtream2m3u.main() == 0
@@ -222,18 +224,38 @@ def test_script_entrypoint_runs_main(
     assert (tmp_path / "live.m3u").read_text() == EXPECTED_LIVE
 
 
-def test_main_defaults_to_cwd_not_script_dir(
+def test_main_defaults_to_user_data_dir(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     script_config = SCRIPT.parent / "xtream.json"
     before = script_config.stat().st_mtime_ns if script_config.exists() else None
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    (tmp_path / "cwd").mkdir()
+    monkeypatch.chdir(tmp_path / "cwd")
     monkeypatch.setattr(sys, "argv", ["xtream2m3u"])
-    with pytest.raises(SystemExit, match="Created xtream.json - edit"):
+    with pytest.raises(SystemExit, match="Created .*xtream.json - edit"):
         xtream2m3u.main()
-    assert [p.name for p in tmp_path.iterdir()] == ["xtream.json"]
+    assert (tmp_path / "data" / "netv" / "xtream2m3u" / "xtream.json").is_file()
+    assert list((tmp_path / "cwd").iterdir()) == []
     assert (script_config.stat().st_mtime_ns if script_config.exists() else None) == before
+
+
+@pytest.mark.parametrize("documented", [True, False])
+def test_help_shows_the_module_description(
+    documented: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    if not documented:
+        monkeypatch.setattr(xtream2m3u, "__doc__", None)
+    monkeypatch.setattr(sys, "argv", ["xtream2m3u", "--help"])
+    with pytest.raises(SystemExit):
+        xtream2m3u.main()
+    out = capsys.readouterr().out
+    assert ("Fetch Xtream catalogs" in out) is documented
+    assert ("Reads provider credentials" in out) is documented
+    assert "exec uv" not in out
 
 
 def test_fetch_text_success_and_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -382,7 +404,7 @@ def test_process_handles_every_stream_type(capsys: pytest.CaptureFixture[str]) -
         "tvg-logo": "c",
         "group-title": ["Drama"],
         "tvg-id": None,
-        "url": None,
+        "url": "s",
         "category_ids": [7],
         "year": None,
         "rating": None,
@@ -478,7 +500,7 @@ def test_write_m3u_series_skips_bad_info(
         1: {"tvg-logo": "a", "group-title": ["G"]},
         2: {"tvg-logo": "b", "group-title": ["G"]},
         3: {"tvg-logo": "c", "group-title": ["G"]},
-        4: {"tvg-logo": "d", "group-title": ["H"]},
+        4: {"tvg-logo": "d", "group-title": ["H"], "url": "s"},
     }
     info: dict[int, Any] = {
         2: {"info": {}},
@@ -486,7 +508,7 @@ def test_write_m3u_series_skips_bad_info(
         4: {"episodes": [{"season": {"id": 9, "title": "E", "container_extension": "ts"}}]},
     }
     auth = {"server_info": {}}
-    xtream2m3u.write_m3u_series(series, info, auth, ["s"], workdir)
+    xtream2m3u.write_m3u_series(series, info, auth, workdir)
     assert "Series 3:" in capsys.readouterr().out
     assert (workdir / "series.m3u").read_text() == (
         '#EXTM3U\n#EXTINF:-1 tvg-name="E" tvg-logo="d" group-title="Series | H",E\ns/9.ts\n'

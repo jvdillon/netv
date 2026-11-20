@@ -12,13 +12,13 @@ tool ignores those and continues fetching available data.
 Written with only standard library dependencies.
 
 Writes xmltv.xml and a .zap2xml/ fetch cache into --path (default: the
-current directory).
+per-user data directory, e.g. ~/.local/share/netv/zap2xml).
 
 Usage:
     zap2xml --zip 90210 --days 7
 
 Cron example:
-    0 0 * * * cd /path/to/guide && /path/to/bin/zap2xml --zip 90210
+    0 0 * * * /path/to/bin/zap2xml --zip 90210 --path /path/to/guide
 '''
 # fmt: on
 
@@ -38,6 +38,8 @@ import re
 import time
 import xml.etree.ElementTree as xml
 
+from netv import userdirs
+
 
 # https://en.wikipedia.org/wiki/Call_signs_in_the_United_States#Suffixes
 # Note: Doesn't correctly handly boosters.
@@ -55,8 +57,7 @@ def main(*, sleep: Callable[[float], object] = time.sleep) -> int:
     working_dir = flags.path
 
     cache_dir = working_dir / ".zap2xml"
-    if not cache_dir.is_dir():
-        cache_dir.mkdir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
     url_flags = {k[len("zap_") :]: v for k, v in vars(flags).items() if k.startswith("zap_")}
     url_flags["lineupId"] = f"{flags.zap_country}-{flags.zap_headendId}-DEFAULT"
@@ -85,9 +86,6 @@ def main(*, sleep: Callable[[float], object] = time.sleep) -> int:
         },
     )
 
-    channel_map = {}  # Only used for debugging.
-    done_channels = False
-
     # Fetch data in `zap_timespan` chunks.
     if flags.days > 15:
         raise ValueError(f"Can only collect at most 15 days; {flags.days} too large.")
@@ -102,8 +100,8 @@ def main(*, sleep: Callable[[float], object] = time.sleep) -> int:
         result = get_cached(cache_dir, i_time, flags.delay, url, sleep=sleep)
         json_result = json.loads(result)
 
-        if not done_channels:
-            done_channels = True
+        # Every chunk lists the same channels; the first one declares them.
+        if i == 0:
             for c_in in json_result["channels"]:
                 # {'affiliateCallSign': 'null',
                 #  'affiliateName': 'AMERICAN BROADCASTING COMPANY',
@@ -122,7 +120,6 @@ def main(*, sleep: Callable[[float], object] = time.sleep) -> int:
                         c_in["channelNo"],  # Eg., "13.5"
                     ],
                 )
-                channel_map[channel_key] = channel_display_name
                 c_out = add_xml_child(
                     parent=out,
                     tag="channel",
@@ -138,7 +135,6 @@ def main(*, sleep: Callable[[float], object] = time.sleep) -> int:
                     tag="icon",
                     src=f"https:{c_in['thumbnail'].split('?')[0]}",
                 )
-            channel_map = dict(sorted(channel_map.items(), key=lambda kv: kv[0]))
 
         f = add_programme_tvimate if flags.tvimate else add_programme
         for c_in in json_result["channels"]:
@@ -148,10 +144,15 @@ def main(*, sleep: Callable[[float], object] = time.sleep) -> int:
 
     # https://docs.python.org/3/library/xml.etree.elementtree.html#xml.etree.ElementTree.indent
     # Note: xml.indent must be done last.
-    xml.indent(out, space="\t", level=0)
+    xml.indent(out, space="\t")
     with pathlib.Path.open((working_dir / "xmltv.xml").resolve(), "wb") as f:
         f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
-        f.write(xml.tostring(out, encoding="UTF-8"))
+        f.write(
+            xml.tostring(
+                out,
+                encoding="UTF-8",  # pragma: no mutate[case-insensitive]
+            ),
+        )
 
     return 0
 
@@ -628,8 +629,8 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "--path",
         dest="path",
         type=pathlib.Path,
-        default=pathlib.Path(),
-        help="Directory for xmltv.xml and the .zap2xml cache (default: cwd).",
+        default=userdirs.data_dir() / "netv" / "zap2xml",
+        help="Directory for xmltv.xml and the .zap2xml cache (default: %(default)s).",
     )
     _ = parser.add_argument(
         "--aid",

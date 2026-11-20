@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from email import message
 from typing import Any
-from urllib import error, request
+from urllib import error, parse, request
 
 import argparse
 import gzip
@@ -94,6 +94,7 @@ def _programme(event: dict[str, Any], *, tvimate: bool) -> xml.Element:
 def test_main_builds_guide_from_api(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     sleeps: list[float] = []
     cache_dir = tmp_path / ".zap2xml"
@@ -104,21 +105,41 @@ def test_main_builds_guide_from_api(
     def urlopen(req: request.Request) -> FakeResponse:
         urls.append(req.full_url)
         assert req.get_header("Accept") == "*/*"
-        body = {"channels": [{**CHANNEL, "events": [_event(flag=[])]}]}
+        # Only the first chunk may declare channels; later ones name another.
+        channel = {**CHANNEL, "callSign": "KXTVDT" if len(urls) == 1 else "KOVRDT5"}
+        event = _event(flag=[], program={"title": "Gämé"})
+        body = {"channels": [{**channel, "events": [event]}]}
         return FakeResponse(json.dumps(body).encode())
 
     monkeypatch.setattr(request, "urlopen", urlopen)
     argv = ["zap2xml.py", "--zip", "90210", "--path", str(tmp_path), "--delay", "0"]
     monkeypatch.setattr(sys, "argv", [*argv, "--days", "0.125"])
+    before = time.time()
     assert zap2xml.main(sleep=sleeps.append) == 0
     assert not (cache_dir / "1000.json.gz").exists()
     assert len(urls) == 1
     assert "postalCode=90210" in urls[0]
     assert "lineupId=USA-lineupId-DEFAULT" in urls[0]
     assert sleeps == [0]
+    out = capsys.readouterr().out
+    assert all(label in out for label in ("Local time:", "First zap time:", "Getting data:"))
+    window = 3 * 3_600
+    times = [int(parse.parse_qs(parse.urlsplit(url).query)["time"][0]) for url in urls]
+    assert times[0] % window == 0
+    assert times[0] <= before < times[0] + window
 
+    raw = (tmp_path / "xmltv.xml").read_bytes()
+    assert raw.startswith(b'<?xml version="1.0" encoding="UTF-8"?>\n<tv ')
+    assert "Gämé".encode() in raw
+    assert b"\n\t<channel " in raw
+    assert b"\n\t\t<channel " not in raw
     tv = xml.parse(tmp_path / "xmltv.xml").getroot()
-    assert tv.get("source-info-name") == "zap2it"
+    assert tv.attrib == {
+        "source-info-url": "https://tvlistings.gracenote.com/grid-affiliates.html?aid=gapzap",
+        "source-info-name": "zap2it",
+        "generator-info-name": "zap2xml.py",
+        "generator-info-url": "https://github.com/jvdillon/netv",
+    }
     channel = tv.find("channel")
     assert channel is not None
     assert channel.get("id") == "KXTVDT"
@@ -126,7 +147,7 @@ def test_main_builds_guide_from_api(
     icon = channel.find("icon")
     assert icon is not None
     assert icon.get("src") == "https://zap2it.tmsimg.com/h3/s28708.png"
-    assert tv.findtext("programme/title") == "Game: Finals"
+    assert tv.findtext("programme/title") == "Gämé: Finals"
 
     assert "isOverride=True" in urls[0]
 
@@ -138,8 +159,43 @@ def test_main_builds_guide_from_api(
     assert zap2xml.main(sleep=sleeps.append) == 0
     assert len(urls) == 2
     assert "isOverride=False" in urls[1]
-    titles = [p.findtext("sub-title") for p in xml.parse(tmp_path / "xmltv.xml").iter("programme")]
+    assert int(parse.parse_qs(parse.urlsplit(urls[1]).query)["time"][0]) == times[0] + window
+    tv = xml.parse(tmp_path / "xmltv.xml").getroot()
+    assert [c.get("id") for c in tv.iter("channel")] == ["KXTVDT"]
+    titles = [p.findtext("sub-title") for p in tv.iter("programme")]
     assert titles == ["Finals", "Finals"]
+
+
+def test_main_accepts_fifteen_days(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def urlopen(req: request.Request) -> FakeResponse:
+        del req
+        return FakeResponse(b'{"channels": []}')
+
+    monkeypatch.setattr(request, "urlopen", urlopen)
+    argv = ["zap2xml", "--zip", "1", "--path", str(tmp_path), "--delay", "0"]
+    monkeypatch.setattr(sys, "argv", [*argv, "--days", "15", "--timespan", "360"])
+    assert zap2xml.main(sleep=lambda _: None) == 0
+
+
+@pytest.mark.parametrize("documented", [True, False])
+def test_help_shows_the_module_description(
+    documented: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    if not documented:
+        monkeypatch.setattr(zap2xml, "__doc__", None)
+    monkeypatch.setattr(sys, "argv", ["zap2xml", "--help"])
+    with pytest.raises(SystemExit):
+        zap2xml.main()
+    out = capsys.readouterr().out
+    assert ("Fetch TV guide data" in out) is documented
+    assert ("Scrapes the internal JSON feed" in out) is documented
+    assert "exec uv" not in out
+    assert out.endswith("\nThis tool is noisy to stdout; with cron use chronic from moreutils.\n")
 
 
 def test_boolean_flags_parse_on_and_off() -> None:
@@ -153,11 +209,18 @@ def test_boolean_flags_parse_on_and_off() -> None:
     assert (on.tvimate, on.zap_isOverride) == (True, True)
 
 
-def test_main_defaults_to_cwd(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.chdir(tmp_path)
+def test_main_defaults_to_user_data_dir(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    (tmp_path / "cwd").mkdir()
+    monkeypatch.chdir(tmp_path / "cwd")
     monkeypatch.setattr(sys, "argv", ["zap2xml", "--zip", "1", "--days", "0"])
     assert zap2xml.main() == 0
-    assert sorted(p.name for p in tmp_path.iterdir()) == [".zap2xml", "xmltv.xml"]
+    written = sorted(p.name for p in (tmp_path / "data" / "netv" / "zap2xml").iterdir())
+    assert written == [".zap2xml", "xmltv.xml"]
+    assert list((tmp_path / "cwd").iterdir()) == []
 
 
 def test_main_rejects_too_many_days(

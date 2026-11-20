@@ -57,7 +57,7 @@ def test_filtered_xmltv_preferred_programme_replaces_all_overlaps(tmp_path: Path
     now = datetime(2026, 8, 29, 18, tzinfo=timezone.utc)
     database = tmp_path / "epg.db"
     _create_epg_database(database, now)
-    connection = sqlite3.connect(database)
+    connection = _connect(database)
     connection.execute(
         "INSERT INTO channels (id, name, source_id) VALUES (?, ?, ?)",
         ("split.channel", "Split Channel", "source-a"),
@@ -145,7 +145,7 @@ def test_filtered_xmltv_uses_database_channel_name_and_icon(tmp_path: Path):
     now = datetime(2026, 8, 29, 18, tzinfo=timezone.utc)
     database = tmp_path / "epg.db"
     _create_epg_database(database, now)
-    connection = sqlite3.connect(database)
+    connection = _connect(database)
     connection.execute(
         "INSERT INTO channels (id, name, source_id) VALUES (?, ?, ?)",
         ("nameless.channel", None, "source-a"),
@@ -197,7 +197,7 @@ def test_filtered_xmltv_omits_empty_icon_and_strips_control_characters(tmp_path:
     now = datetime(2026, 8, 29, 18, tzinfo=timezone.utc)
     database = tmp_path / "epg.db"
     _create_epg_database(database, now)
-    connection = sqlite3.connect(database)
+    connection = _connect(database)
     connection.execute(
         "INSERT INTO programs (channel_id, title, start_ts, stop_ts, desc, source_id) "
         "VALUES (?, ?, ?, ?, ?, ?)",
@@ -239,7 +239,7 @@ def test_filtered_xmltv_omits_empty_icon_and_strips_control_characters(tmp_path:
 def test_filtered_xmltv_ignores_rows_for_unrequested_channel_ids(tmp_path: Path):
     now = datetime(2026, 8, 29, 18, tzinfo=timezone.utc)
     database = tmp_path / "epg.db"
-    connection = sqlite3.connect(database)
+    connection = _connect(database)
     connection.executescript("""
         CREATE TABLE channels (id TEXT PRIMARY KEY, name TEXT);
         CREATE TABLE icons (channel_id TEXT PRIMARY KEY, url TEXT);
@@ -309,7 +309,7 @@ def test_filtered_xmltv_reports_unopenable_database(tmp_path: Path):
 
 def test_filtered_xmltv_reports_missing_schema(tmp_path: Path):
     database = tmp_path / "epg.db"
-    sqlite3.connect(database).close()
+    _connect(database).close()
 
     with pytest.raises(EpgUnavailableError, match="schema is not ready"):
         build_filtered_xmltv(database, [_stream(1, "allowed.channel")])
@@ -350,8 +350,15 @@ def _stream(
     )
 
 
-def _create_epg_database(path: Path, now: datetime) -> None:
+def _connect(path: Path) -> sqlite3.Connection:
+    """Open a fixture database without fsyncs: ~25 ms per commit, and no crash to survive."""
     connection = sqlite3.connect(path)
+    connection.execute("PRAGMA synchronous=OFF")
+    return connection
+
+
+def _create_epg_database(path: Path, now: datetime) -> None:
+    connection = _connect(path)
     connection.executescript("""
         CREATE TABLE channels (id TEXT PRIMARY KEY, name TEXT, source_id TEXT);
         CREATE TABLE icons (channel_id TEXT PRIMARY KEY, url TEXT);

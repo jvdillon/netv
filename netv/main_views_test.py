@@ -95,13 +95,6 @@ def refresh_flags() -> Iterator[set[str]]:
 
 
 @pytest.fixture
-def guide_db(tmp_path: Path) -> Iterator[None]:
-    epg.init(tmp_path / "epg")
-    yield
-    epg.close()
-
-
-@pytest.fixture
 def root_logging(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Let ``configure_logging`` reset a private root handler list, not pytest's."""
     level = logging.root.level

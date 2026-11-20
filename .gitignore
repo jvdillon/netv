@@ -17,12 +17,8 @@ cache/
 *.pem
 /apple/.env
 
-# Tools - user data and generated files
-**/*.gz
-**/*.json
-**/*.m3u
-!assets/example.m3u
-**/*.xml
+# Claude Code personal settings
+**/.claude/settings.local.json
 
 # macOS
 .DS_Store

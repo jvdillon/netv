@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, cast
@@ -76,14 +75,6 @@ def web(monkeypatch: pytest.MonkeyPatch) -> testing.FakeWeb:
     fake = testing.FakeWeb()
     testing.install_web(monkeypatch, fake, util, ffmpeg_command)
     return fake
-
-
-@pytest.fixture
-def guide_db() -> Iterator[None]:
-    """An empty EPG database in the test's state directory."""
-    epg.init(cache.CACHE_DIR)
-    yield
-    epg.close()
 
 
 @pytest.fixture

@@ -5,7 +5,8 @@
 exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P -m netv.tools.xtream2m3u "$@"
 Fetch Xtream catalogs and write M3U playlists.
 
-Reads provider credentials from xtream.json in --dir (a template is created on
+Reads provider credentials from xtream.json in --dir (default: the per-user
+data directory, e.g. ~/.local/share/netv/xtream2m3u; a template is created on
 first run), caches the raw API responses there, and writes live.m3u, vod.m3u,
 and series.m3u beside them.
 '''
@@ -35,6 +36,8 @@ import threading
 import time
 
 from treekle import json_loads
+
+from netv import userdirs
 
 
 class RetryableError(Exception):
@@ -66,6 +69,7 @@ def main() -> int:
     _add_arguments(parser)
     flags = cast(Flags, parser.parse_args())
     data_dir = flags.dir
+    data_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = _load_config(data_dir)
     api_url, _, epg_url = _get_urls(cfg)
@@ -105,7 +109,7 @@ def main() -> int:
     )
     del series_categories
     series_info = fetch_series_info(series, api_url, data_dir, cached_only=flags.cached_only)
-    write_m3u_series(series, series_info, auth, series_url, data_dir)
+    write_m3u_series(series, series_info, auth, data_dir)
     return 0
 
 
@@ -325,7 +329,8 @@ def process(
                 "tvg-logo": s["cover"],
                 "group-title": [categories_dict[c] for c in s["category_ids"]],
                 "tvg-id": None,
-                "url": None,
+                # Each episode's URL is this base plus its id and extension.
+                "url": "/".join(iptv_url),
                 "category_ids": s["category_ids"],
                 "year": toint(s.get("year")),
                 "rating": tofloat(s.get("rating")),
@@ -516,7 +521,6 @@ def write_m3u_series(
     series: dict[int, VideoInfo],
     series_info: dict[int, None | Any],
     auth: dict[str, dict[str, Any]],
-    series_url: list[str],
     data_dir: pathlib.Path,
 ) -> None:
     series_episodes = {}
@@ -540,7 +544,7 @@ def write_m3u_series(
             group_title = "Series | " + v["group-title"][0]
             for e in vv:
                 tvg_name = e["title"]
-                url = "/".join([*series_url, f"{e['id']}.{e['container_extension']}"])
+                url = f"{v['url']}/{e['id']}.{e['container_extension']}"
                 print(
                     f'#EXTINF:-1 tvg-name="{tvg_name}" tvg-logo="{tvg_logo}" '
                     f'group-title="{group_title}",{tvg_name}',
@@ -639,8 +643,8 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dir",
         type=pathlib.Path,
-        default=pathlib.Path(),
-        help="Directory for xtream.json, cached API data, and playlists (default: cwd).",
+        default=userdirs.data_dir() / "netv" / "xtream2m3u",
+        help="Directory for xtream.json, cached API data, and playlists (default: %(default)s).",
     )
     parser.add_argument(
         "--cached-only",

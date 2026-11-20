@@ -93,10 +93,24 @@ class TestDataDir:
 
     def test_keeps_existing_user_data_dir(self, tmp_path: pathlib.Path):
         (tmp_path / "xdg" / "netv").mkdir(parents=True)
+        (tmp_path / "xdg" / "netv" / "server_settings.json").write_text("new")
         (tmp_path / ".cache").mkdir()
         (tmp_path / ".cache" / "server_settings.json").write_text("{}")
         assert util.data_dir(tmp_path) == tmp_path / "xdg" / "netv"
+        assert (tmp_path / "xdg" / "netv" / "server_settings.json").read_text() == "new"
         assert (tmp_path / ".cache" / "server_settings.json").exists()
+
+    def test_moves_legacy_state_beside_tool_dirs(self, tmp_path: pathlib.Path):
+        (tmp_path / "xdg" / "netv" / "zap2xml").mkdir(parents=True)
+        (tmp_path / ".cache" / "users").mkdir(parents=True)
+        (tmp_path / ".cache" / "server_settings.json").write_text("{}")
+        assert util.data_dir(tmp_path) == tmp_path / "xdg" / "netv"
+        assert sorted(p.name for p in (tmp_path / "xdg" / "netv").iterdir()) == [
+            "server_settings.json",
+            "users",
+            "zap2xml",
+        ]
+        assert not (tmp_path / ".cache").exists()
 
     def test_ignores_legacy_dir_without_settings(self, tmp_path: pathlib.Path):
         (tmp_path / ".cache" / "tools").mkdir(parents=True)

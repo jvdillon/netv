@@ -53,9 +53,9 @@ SERVER_INFO_URL = "http://upstream.test/player_api.php?username=user&password=pa
 
 
 @pytest.fixture
-def mock_deps(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def mock_deps(monkeypatch: pytest.MonkeyPatch, guide_db: None) -> None:
     """Give each test an empty guide database and fresh session, cast and login state."""
-    epg.init(cache_module.CACHE_DIR)
+    del guide_db
     settings = cache_module.load_server_settings()
     settings["transcode_dir"] = str(cache_module.CACHE_DIR / "transcode")
     cache_module.save_server_settings(settings)
@@ -65,8 +65,6 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(m3u_module, "_refresh_in_progress", set())
     monkeypatch.setattr(main, "_login_attempts", {})
     monkeypatch.setattr(catchup, "_tz_cache", {})
-    yield
-    epg.close()
 
 
 @pytest.fixture
