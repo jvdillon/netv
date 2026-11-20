@@ -183,12 +183,13 @@ async function player({
     loadSource(url) {
       this.sources.push(url);
       const [path, query] = url.split("?");
-      if (path.endsWith("/master.m3u8")) {
+      const master = path.match(/\/(master|low-captions)\.m3u8$/);
+      if (master) {
         // The server's master lists its single rendition, blocking when asked to.
         this.levels = ["low"].map((name) => ({
           uri:
             "http://netv.test" +
-            path.replace("master.m3u8", `${name}.m3u8`) +
+            path.replace(master[0], `/${name}.m3u8`) +
             (query === "blocking=1" ? "?blocking=1" : ""),
           details: {
             get fragments() {
@@ -554,6 +555,30 @@ test("a stream with embedded captions keeps CC available before the first captio
   await p.fireTimer(1000);
   p.engines[0].emit("subtitles");
   assert.equal(p.elements.get("toggle-cc").disabled, false);
+  assert.deepEqual(p.errors, []);
+});
+
+test("a stream with embedded captions plays the master that declares them", async () => {
+  const p = await player({ embeddedCaptions: true });
+  assert.deepEqual(p.engines[0].sources, [
+    "/transcode/session1/low-captions.m3u8?blocking=1",
+  ]);
+  assert.deepEqual(p.errors, []);
+});
+
+test("native playback of embedded captions keeps CC and turns it on", async () => {
+  const p = await player({
+    native: true,
+    embeddedCaptions: true,
+    captionsEnabled: true,
+  });
+  assert.equal(p.video.src, "/transcode/session1/low-captions.m3u8");
+  await p.video.emit("loadedmetadata");
+  assert.equal(p.elements.get("toggle-cc").disabled, false);
+  const track = { kind: "captions", label: "CC1", language: "en", mode: "hidden" };
+  p.video.textTracks.push(track);
+  await p.video.textTracks.emit("addtrack", { track });
+  assert.equal(track.mode, "showing");
   assert.deepEqual(p.errors, []);
 });
 

@@ -412,6 +412,13 @@
     }
   });
 
+  video.textTracks.addEventListener("addtrack", (e) => {
+    if (e.track.kind === "captions" || e.track.kind === "subtitles") {
+      applyCaptionsSetting();
+      if (ccBtn.disabled) enableCcButton();
+    }
+  });
+
   function startSubtitlePolling(subtitles, prefIdx) {
     if (subtitlePollTimerId) {
       clearInterval(subtitlePollTimerId);
@@ -1167,7 +1174,13 @@
         }
         enableCcButton();
       }
-      playWithUrl(data.master_playlist || data.playlist, onError, data.subtitles);
+      // The caption master declares the embedded CEA-608 channel, so the player
+      // offers CC at load instead of waiting for the first decoded cue.
+      playWithUrl(
+        adaptiveSession?.caption_playlist || data.master_playlist || data.playlist,
+        onError,
+        data.subtitles,
+      );
     } catch (e) {
       console.error("[TC] Error:", e);
       if (onError) onError();
@@ -1191,7 +1204,9 @@
     if (!useHls) {
       video.disableRemotePlayback = false;
       // Native HLS without download telemetry stays on the safe initial rendition.
-      video.src = adaptiveSession ? adaptiveSession.playlist : url;
+      video.src = adaptiveSession
+        ? adaptiveSession.caption_playlist || adaptiveSession.playlist
+        : url;
       if (adaptiveSession) startAdaptivePlayback(null);
       video.addEventListener(
         "loadedmetadata",
@@ -1199,7 +1214,8 @@
           endLiveOutage();
           hideLoading();
           error.classList.add("hidden");
-          if (video.textTracks.length === 0) disableCcButton();
+          if (video.textTracks.length === 0 && !adaptiveSession?.caption_playlist)
+            disableCcButton();
           applyCaptionsSetting();
           restorePosition();
           if (transcodeSessionId && !adaptiveSession) startProgressPolling();
@@ -1236,8 +1252,10 @@
         : {}),
     });
     const source =
-      adaptiveSession && url === adaptiveSession.master_playlist
-        ? `${url}?blocking=1`
+      adaptiveSession &&
+      (url === adaptiveSession.master_playlist ||
+        url === adaptiveSession.caption_playlist)
+        ? `${url}${url.includes("?") ? "&" : "?"}blocking=1`
         : url;
     currentHls = hls;
     let recoveryAttempts = 0;
@@ -1301,7 +1319,7 @@
       if (subtitles && subtitles.length > 0) {
         startSubtitlePolling(subtitles, getPreferredSubtitleTrack(subtitles));
       }
-      if (cfg.captionsEnabled && hls.subtitleTracks.length > 0) {
+      if (ccEnabled && hls.subtitleTracks.length > 0) {
         hls.subtitleTrack = getPreferredSubtitleTrack(hls.subtitleTracks);
       }
       if (transcodeSessionId && !adaptiveSession) startProgressPolling();
@@ -1323,17 +1341,10 @@
     hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, () => {
       if (hls.subtitleTracks.length > 0 && ccBtn.disabled) {
         enableCcButton();
-        if (cfg.captionsEnabled)
+        if (ccEnabled)
           hls.subtitleTrack = getPreferredSubtitleTrack(hls.subtitleTracks);
       } else if (!hasCaptions() && !ccBtn.disabled) {
         disableCcButton();
-      }
-    });
-
-    video.textTracks.addEventListener("addtrack", (e) => {
-      if (e.track.kind === "captions" || e.track.kind === "subtitles") {
-        applyCaptionsSetting();
-        if (ccBtn.disabled) enableCcButton();
       }
     });
 
