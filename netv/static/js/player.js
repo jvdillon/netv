@@ -216,12 +216,12 @@
   // Custom cueHandler for CEA-608 caption positioning
   // See: https://github.com/video-dev/hls.js/issues/654
   // hls.js creates each cue only when the following line begins, so a cue can
-  // arrive after its time has mostly passed. Each caption is held up to
-  // CAPTION_HOLD_SEC past its end, until the next one replaces it.
-  // Roll-up captions are shown as whole two-line pages, each held until the
-  // next page is complete: [A B] then [C D], so no line moves or flashes.
+  // arrive after its time has mostly passed. Each caption shows the screen as
+  // broadcast from its start, held up to CAPTION_HOLD_SEC past its end until
+  // the next one replaces it. Waiting to fill a roll-up page delayed half the
+  // lines by ~2 s, on top of the broadcaster's own live-captioning lag.
   const CAPTION_HOLD_SEC = 6;
-  const captionState = new WeakMap();
+  const shownCue = new WeakMap();
   const captionCue = (startTime, endTime, lines) => {
     const cue = new VTTCue(startTime, endTime, lines.join("\n"));
     cue.line = -2;
@@ -244,34 +244,12 @@
       // Before its track exists hls.js caches cues (track is null); those
       // cannot be held or replaced, so they keep their broadcast timing.
       if (!track) return [captionCue(startTime, endTime, lines)];
-      const prev = captionState.get(track);
-      if (prev?.pending) track.removeCue(prev.pending);
-      const newest = lines[lines.length - 1];
-      const rolled =
-        prev !== undefined &&
-        lines.length >= 2 &&
-        lines[lines.length - 2] === prev.last;
-      if (rolled && prev.page.length === 2) {
-        // The full page stays up; if no second line follows, this line shows
-        // alone once the page's hold runs out.
-        const pending = captionCue(prev.cue.endTime, endTime + CAPTION_HOLD_SEC, [
-          newest,
-        ]);
-        track.addCue(pending);
-        captionState.set(track, {
-          cue: prev.cue,
-          page: [newest],
-          last: newest,
-          pending,
-        });
-        return [pending];
+      const prev = shownCue.get(track);
+      if (prev && prev.startTime < startTime && prev.endTime > startTime) {
+        prev.endTime = startTime;
       }
-      const page = rolled ? [...prev.page, newest] : lines;
-      const cue = captionCue(startTime, endTime + CAPTION_HOLD_SEC, page);
-      if (prev && prev.cue.startTime < startTime && prev.cue.endTime > startTime) {
-        prev.cue.endTime = startTime;
-      }
-      captionState.set(track, { cue, page, last: newest, pending: null });
+      const cue = captionCue(startTime, endTime + CAPTION_HOLD_SEC, lines);
+      shownCue.set(track, cue);
       track.addCue(cue);
       return [cue];
     },

@@ -1417,7 +1417,7 @@ function captionTrack() {
   };
 }
 
-test("roll-up captions show as held two-line pages without gaps", async () => {
+test("roll-up captions show each line at its broadcast time without gaps", async () => {
   const p = await player();
   const { cueHandler } = p.engines[0].config;
   const track = captionTrack();
@@ -1429,12 +1429,12 @@ test("roll-up captions show as held two-line pages without gaps", async () => {
   const shown = (t) => track.shownAt(t);
   assert.deepEqual(shown(0.5), ["A"]);
   assert.deepEqual(shown(1.5), ["A\nB"]);
-  // C waits for its partner while A B stays up.
-  assert.deepEqual(shown(2.5), ["A\nB"]);
+  // A new line shows the moment it is broadcast, not when its page fills.
+  assert.deepEqual(shown(2.5), ["B\nC"]);
   assert.deepEqual(shown(3.5), ["C\nD"]);
-  // No caption follows E: C D holds 6 s past its end, then E shows alone.
-  assert.deepEqual(shown(9.5), ["C\nD"]);
-  assert.deepEqual(shown(10.5), ["E"]);
+  assert.deepEqual(shown(4.5), ["D\nE"]);
+  // No caption follows E: D E holds 6 s past its end.
+  assert.deepEqual(shown(10.5), ["D\nE"]);
   assert.deepEqual(shown(11.5), []);
   for (let t = 0; t < 11; t += 0.1) assert.equal(shown(t).length, 1, `t=${t}`);
 });
