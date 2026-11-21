@@ -483,7 +483,7 @@ def write_m3u_live(
         for v in live.values():
             tvg_name = v["tvg-name"]
             tvg_logo = v["tvg-logo"]
-            group_title = "TV | " + v["group-title"][0]
+            group_title = _group_title("TV", v["group-title"])
             url = v["url"]
             tvg_id = v["tvg-id"]
             print(
@@ -507,7 +507,7 @@ def write_m3u_vod(
         for v in vod.values():
             tvg_name = v["tvg-name"]
             tvg_logo = v["tvg-logo"]
-            group_title = "VOD | " + v["group-title"][0]
+            group_title = _group_title("VOD", v["group-title"])
             url = v["url"]
             print(
                 f'#EXTINF:-1 tvg-name="{tvg_name}" tvg-logo="{tvg_logo}" '
@@ -541,7 +541,7 @@ def write_m3u_series(
         for k, vv in series_episodes.items():
             v = series[k]
             tvg_logo = v["tvg-logo"]
-            group_title = "Series | " + v["group-title"][0]
+            group_title = _group_title("Series", v["group-title"])
             for e in vv:
                 tvg_name = e["title"]
                 url = f"{v['url']}/{e['id']}.{e['container_extension']}"
@@ -551,6 +551,11 @@ def write_m3u_series(
                     file=f,
                 )
                 print(url, file=f)
+
+
+def _group_title(kind: str, groups: list[str]) -> str:
+    """The playlist group: ``kind | first category``, or ``kind`` for none."""
+    return f"{kind} | {groups[0]}" if groups else kind
 
 
 def _descend(x: Any):

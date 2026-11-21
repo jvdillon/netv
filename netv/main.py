@@ -825,6 +825,7 @@ async def guide_page(
             "offset": offset,
             "window_start": window_start.strftime("%Y-%m-%d %H:%M"),
             "epg_error": get_cache().get("epg_error"),
+            "stale_guides": _stale_guides(get_cache().get("epg_urls", []), now.timestamp()),
             "epg_loading": epg_loading,
             "channel_count": len(grid_data),
             "total_count": total_count,  # For virtual scrolling.
@@ -1166,6 +1167,20 @@ async def movie_detail_page(
             "favorites": _page_favorites(user_settings),
         },
     )
+
+
+class GuideHorizon(TypedDict):
+    """Where a source's listings end, and when they last reached further."""
+
+    ends: datetime
+    since: datetime
+
+
+class StaleGuide(TypedDict):
+    """A source whose guide has stopped updating; ``horizon`` None means no listings."""
+
+    name: str
+    horizon: GuideHorizon | None
 
 
 class CurrentProgram(TypedDict):
@@ -3826,6 +3841,20 @@ def _fetch_all_epg(epg_urls: list[tuple[str, int, str]]) -> int:
 
     _prune_epg()
 
+    now = time.time()
+    epg.record_horizons(now=now)
+    for stale in _stale_guides(epg_urls, now):
+        horizon = stale["horizon"]
+        if horizon is None:
+            log.warning("Guide for %s has no listings; is its feed updating?", stale["name"])
+        else:
+            log.warning(
+                "Guide for %s has not reached further since %s (listings end %s); "
+                "is its feed updating?",
+                stale["name"],
+                horizon["since"].astimezone().strftime("%Y-%m-%d %H:%M"),
+                horizon["ends"].astimezone().strftime("%Y-%m-%d %H:%M"),
+            )
     log.info("EPG fetch complete: %d programs total", total)
     return total
 
@@ -3841,6 +3870,36 @@ def _prune_epg() -> None:
 def _epg_is_fresh() -> bool:
     """True if the EPG still has listings a few hours ahead."""
     return epg.has_programs_after(datetime.now(timezone.utc) + _EPG_MIN_LOOKAHEAD)
+
+
+# A feed that stops updating keeps its last listings, so the guide stays full
+# until they run out (13 days, once). How far ahead a feed lists cannot tell:
+# OTA lists 14 days, Streamtopia under 2. A dead feed's listings stop reaching
+# further; 36 h is one missed daily refresh plus slack.
+def _stale_guides(
+    epg_urls: list[tuple[str, int, str]],
+    now: float,
+    *,
+    max_quiet_sec: float = 36 * 3600,
+) -> list[StaleGuide]:
+    """Sources whose guide has not reached further in ``max_quiet_sec``, or is empty."""
+    ends = epg.listings_end_by_source()
+    advanced = epg.horizons_advanced()
+    names = {s.id: s.name for s in get_sources()}
+    stale: list[StaleGuide] = []
+    for source_id in dict.fromkeys(source_id for _, _, source_id in epg_urls):
+        name = names.get(source_id, source_id)
+        end = ends.get(source_id)
+        since = advanced.get(source_id)
+        if end is None:
+            stale.append({"name": name, "horizon": None})
+        elif since is not None and now - since > max_quiet_sec:
+            horizon: GuideHorizon = {
+                "ends": datetime.fromtimestamp(end, timezone.utc),
+                "since": datetime.fromtimestamp(since, timezone.utc),
+            }
+            stale.append({"name": name, "horizon": horizon})
+    return stale
 
 
 def _start_guide_background_load() -> None:

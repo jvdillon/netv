@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from concurrent import futures
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import SupportsIndex, TypedDict, override
@@ -1284,18 +1285,51 @@ def test_fetch_all_epg_sums_successes_and_prunes(
     _add_program("Expired", now - 90_000, now - 88_000)
     _add_program("Expired too", now - 90_000, now - 89_000)
     _add_program("Recent", now - 84_000, now - 82_800)
-    web.routes["http://good"] = _xmltv(
-        *((f"P{i}", now + i * 60, now + i * 60 + 60) for i in range(3)),
+    # URLs past the 80 characters logged, so each message shows where it cuts.
+    good, other, bad, messy = (
+        f"http://{name}/{'x' * 90}" for name in ("good", "other", "bad", "messy")
     )
-    web.routes["http://bad"] = RuntimeError("timeout")
+    web.routes[good] = _xmltv(*((f"P{i}", now + i * 60, now + i * 60 + 60) for i in range(3)))
+    web.routes[other] = _xmltv(("Q", now, now + 120))
+    web.routes[bad] = RuntimeError("timeout")
+    # Junk between programmes makes the feed fetch again, whole, and keep a debug
+    # copy; sanitizing salvages the programme.
+    junk = _xmltv(("M", now, now + 60)).read().replace(b"</tv>", b"<<</tv>")
+    web.routes[messy] = lambda: FakeResponse(junk)
+    # Two days ago this feed already listed further than it does now.
+    quiet = "http://quiet"
+    # Starting before the refetched listing, it is kept, not replaced.
+    _add_program("Long", now - 60, now + 5 * 86_400, source_id="q")
+    epg.record_horizons(now=now - 2 * 86_400)
+    web.routes[quiet] = _xmltv(("R", now, now + 60))
     cache_module.get_cache()["live_streams"] = []
+    feeds = [(good, 5, "a"), (other, 5, "c"), (bad, 5, "b"), (messy, 5, "d"), (quiet, 5, "q")]
     with caplog.at_level(logging.INFO, logger="netv.main"):
-        total = main._fetch_all_epg([("http://good", 5, "a"), ("http://bad", 5, "b")])
-    assert total == 3
-    assert epg.get_program_count() == 4
+        total = main._fetch_all_epg(feeds)
+    assert total == 6
+    assert epg.get_program_count() == 8
+    # Each fetched source's horizon is recorded for the next fetch to compare.
+    assert set(epg.horizons_advanced()) >= {"a", "c", "d", "q"}
     assert {f.headers["User-agent"] for f in web.fetches} == {"UA"}
-    assert "Pruned 2 expired EPG programs" in caplog.text
-    assert "EPG failed" in caplog.text
+    assert list(cache_module.CACHE_DIR.glob("epg_debug_*.xml"))
+
+    def until(stop: float) -> str:
+        return datetime.fromtimestamp(stop, timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+
+    stale = "is its feed updating?"
+    assert {r.getMessage() for r in caplog.records if r.name == "netv.main"} == {
+        *(f"Fetching EPG (timeout=5s): {url[:80]}" for url in (good, other, bad, messy, quiet)),
+        f"EPG done: 3 programs from {good[:50]}",
+        f"EPG done: 1 programs from {other[:50]}",
+        f"EPG done: 1 programs from {messy[:50]}",
+        f"EPG done: 1 programs from {quiet[:50]}",
+        f"EPG failed: {bad[:50]} - timeout",
+        "Pruned 2 expired EPG programs",
+        f"Guide for b has no listings; {stale}",
+        f"Guide for q has not reached further since {until(now - 2 * 86_400)}"
+        f" (listings end {until(now + 5 * 86_400)}); {stale}",
+        "EPG fetch complete: 6 programs total",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1576,6 +1610,68 @@ def test_series_player_info_episodes(
     assert (info.program_title, info.program_desc, found_next) == (title, desc, next_url)
     assert web.urls == [url]
     assert (cache_module.CACHE_DIR / "series_info_s1_1.json").exists()
+
+
+def test_stale_guides_name_sources_whose_feeds_stopped_updating(guide_db: None):
+    del guide_db
+    now = _now()
+    day = 86_400.0
+    _use_sources(_source("ota", "m3u", url="http://ota"))
+    # Two days ago OTA listed two weeks ahead and the daily feed one day back.
+    _add_program("Old OTA", now - 2 * day, now + 12 * day, source_id="ota")
+    _add_program("Old daily", now - 2 * day, now - day, source_id="daily")
+    epg.record_horizons(now=now - 2 * day)
+    # Since then the daily feed reaches further, as a refreshing feed does, and
+    # OTA's has not, as when its generator stopped (Nov 8 to 21).
+    _add_program("New daily", now, now + day, source_id="daily")
+    epg.record_horizons(now=now)
+    # Listings never recorded are not judged yet.
+    _add_program("Unrecorded", now, now + 3600, source_id="new")
+    epg_urls = [
+        ("http://ota/a", 5, "ota"),
+        ("http://ota/b", 5, "ota"),
+        ("http://daily", 5, "daily"),
+        ("http://new", 5, "new"),
+        ("http://empty", 5, "empty"),
+    ]
+    ota: list[main.StaleGuide] = [
+        {
+            "name": "OTA",
+            "horizon": {
+                "ends": datetime.fromtimestamp(now + 12 * day, timezone.utc),
+                "since": datetime.fromtimestamp(now - 2 * day, timezone.utc),
+            },
+        },
+    ]
+
+    # Named once, by its configured name; a source with no listings, by id.
+    assert main._stale_guides(epg_urls, now) == [
+        *ota,
+        {"name": "empty", "horizon": None},
+    ]
+    # One missed daily refresh is not yet a dead feed; 36 h without one is.
+    assert main._stale_guides(epg_urls[:1], now - 2 * day + 36 * 3600) == []
+    assert main._stale_guides(epg_urls[:1], now - 2 * day + 36 * 3600 + 1) == ota
+    assert main._stale_guides([], now) == []
+
+
+def test_fetch_all_epg_caps_its_workers(
+    guide_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    del guide_db
+    workers: list[int | None] = []
+    real_pool = futures.ThreadPoolExecutor
+
+    def pool(max_workers: int | None) -> futures.ThreadPoolExecutor:
+        workers.append(max_workers)
+        return real_pool(max_workers)
+
+    monkeypatch.setattr(main.futures, "ThreadPoolExecutor", pool)
+    cache_module.get_cache()["live_streams"] = []
+    main._fetch_all_epg([(f"http://down{i}", 1, "x") for i in range(9)])
+    main._fetch_all_epg([])
+    assert workers == [8, 1]
 
 
 @pytest.mark.parametrize(

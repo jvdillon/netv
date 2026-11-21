@@ -90,6 +90,13 @@
     <p class="text-xs sm:text-sm text-gray-400 mt-1">Showing channels without program info</p>
   </div>
   {% endif %}
+  {% if stale_guides %}
+  <div class="bg-amber-900/40 border border-amber-500 rounded p-2 sm:p-3 mb-2 sm:mb-4 text-amber-200 text-xs sm:text-sm" role="status">
+    {% for g in stale_guides %}
+    <p>Guide for {{ g.name }} has {% if g.horizon %}not reached further since {{ g.horizon.since.astimezone().strftime('%a %b %-d, %H:%M') }}; its listings end {{ g.horizon.ends.astimezone().strftime('%a %b %-d, %H:%M') }}{% else %}no listings{% endif %}. Is its feed still updating?</p>
+    {% endfor %}
+  </div>
+  {% endif %}
 
   <!-- Handoff: a channel left playing on another device (filled by handoff-card.js) -->
   <div id="handoff-card" class="hidden flex items-center gap-3 bg-gray-900 border border-blue-500/60 rounded-lg p-2 sm:p-3 mb-2 sm:mb-4" role="region" aria-label="Continue watching">

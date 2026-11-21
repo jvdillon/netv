@@ -519,6 +519,33 @@ def test_write_m3u_series_skips_bad_info(
     assert (workdir / "live.m3u").read_text() == '#EXTM3U url-tvg="e" x-tvg-url="e"\n'
 
 
+def test_uncategorized_entries_get_the_bare_group(workdir: pathlib.Path) -> None:
+    # Providers list some streams under no category at all.
+    auth = {"server_info": {}}
+    bare: xtream2m3u.VideoInfo = {
+        "tvg-name": "N",
+        "tvg-logo": "l",
+        "group-title": [],
+        "tvg-id": "i",
+        "url": "u",
+        "category_ids": [],
+        "year": None,
+        "rating": None,
+        "num": 1,
+        "last_modified": None,
+    }
+    xtream2m3u.write_m3u_live({1: bare}, auth, "e", workdir)
+    assert (workdir / "live.m3u").read_text().splitlines()[1:] == [
+        '#EXTINF:-1 tvg-id="i" tvg-name="N" tvg-logo="l" group-title="TV",N',
+        "u",
+    ]
+    xtream2m3u.write_m3u_vod({1: bare}, auth, workdir)
+    assert 'group-title="VOD",N' in (workdir / "vod.m3u").read_text()
+    episode = {"season": {"id": 9, "title": "E", "container_extension": "ts"}}
+    xtream2m3u.write_m3u_series({1: bare}, {1: {"episodes": [episode]}}, auth, workdir)
+    assert 'group-title="Series",E' in (workdir / "series.m3u").read_text()
+
+
 def test_descend_yields_nested_episodes() -> None:
     tree = {"a": [{"id": 1}, {"b": {"id": 2, "x": {"id": 3}}}], "c": 5}
     assert list(xtream2m3u._descend(tree)) == [{"id": 1}, {"id": 2, "x": {"id": 3}}]

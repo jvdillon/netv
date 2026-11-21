@@ -1080,6 +1080,28 @@ class TestGuide:
         assert "CNN" in resp.text
 
     @pytest.mark.usefixtures("guide_db")
+    def test_guide_warns_when_a_source_guide_runs_out(self, auth_client: TestClient):
+        cache_module.get_cache()["live_categories"] = [
+            {"category_id": "1", "category_name": "News"},
+        ]
+        cache_module.get_cache()["live_streams"] = [
+            {"stream_id": 1, "name": "CNN", "category_ids": ["1"], "epg_channel_id": ""},
+        ]
+        cache_module.get_cache()["epg_urls"] = [("http://ota", 5, "ota"), ("http://xt", 5, "xt")]
+        # The xt feed last reached further two days ago.
+        now = time.time()
+        epg.insert_programs([("c", "Show", now, now + 86_400, "", "xt")])
+        epg.commit()
+        epg.record_horizons(now=now - 2 * 86_400)
+
+        resp = auth_client.get("/guide?cats=1")
+
+        assert resp.status_code == 200
+        assert "Guide for ota has no listings" in resp.text
+        since = datetime.fromtimestamp(now - 2 * 86_400).strftime("%a %b %-d, %H:%M")
+        assert f"Guide for xt has not reached further since {since}" in resp.text
+
+    @pytest.mark.usefixtures("guide_db")
     def test_guide_limits_initial_virtual_rows(self, auth_client: TestClient):
         cache_module.get_cache()["live_categories"] = [
             {"category_id": "1", "category_name": "News"},

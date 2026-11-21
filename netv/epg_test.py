@@ -313,6 +313,41 @@ class TestPrune:
         assert epg.has_programs_after(now)
         assert not epg.has_programs_after(now + timedelta(hours=2))
 
+    def test_listings_end_by_source(self, epg_db: None):
+        epg.insert_programs(
+            [
+                ("ch1", "A", 100.0, 200.0, "", "src1"),
+                ("ch2", "B", 150.0, 300.0, "", "src1"),
+                ("ch3", "C", 100.0, 120.0, "", "src2"),
+            ],
+        )
+        epg.commit()
+
+        assert epg.listings_end_by_source() == {"src1": 300.0, "src2": 120.0}
+
+    def test_horizons_record_when_listings_last_reached_further(self, epg_db: None):
+        epg.insert_programs([("ch1", "A", 100.0, 300.0, "", "src1")])
+        epg.commit()
+        epg.record_horizons(now=1000.0)
+        assert epg.horizons_advanced() == {"src1": 1000.0}
+
+        # A refetch of the same listings, or of shorter ones, is no advance.
+        epg.record_horizons(now=2000.0)
+        epg.insert_programs([("ch2", "B", 100.0, 200.0, "", "src2")])
+        epg.commit()
+        epg.record_horizons(now=3000.0)
+        assert epg.horizons_advanced() == {"src1": 1000.0, "src2": 3000.0}
+
+        epg.insert_programs([("ch1", "C", 300.0, 400.0, "", "src1")])
+        epg.commit()
+        epg.record_horizons(now=4000.0)
+        assert epg.horizons_advanced() == {"src1": 4000.0, "src2": 3000.0}
+
+        # Pruning every listing keeps when the horizon last moved.
+        epg.prune_old_programs(datetime.fromtimestamp(1000.0, timezone.utc))
+        epg.record_horizons(now=5000.0)
+        assert epg.horizons_advanced() == {"src1": 4000.0, "src2": 3000.0}
+
     def test_search_channels_ranks_channels_with_listings_first(self, epg_db: None):
         now = datetime.now(timezone.utc)
         epg.insert_channel("alpha.one", "XX| ALPHA ONE", "src1")

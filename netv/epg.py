@@ -83,6 +83,11 @@ def init(cache_dir: Path) -> None:
             ON programs(channel_id, start_ts, stop_ts);
         CREATE INDEX IF NOT EXISTS idx_programs_time
             ON programs(start_ts);
+        CREATE TABLE IF NOT EXISTS horizons (
+            source_id TEXT PRIMARY KEY,
+            ends_ts REAL NOT NULL,
+            advanced_ts REAL NOT NULL
+        );
     """)
     conn.commit()
 
@@ -343,6 +348,41 @@ def has_programs_after(when: datetime) -> bool:
         (when.timestamp(),),
     ).fetchone()
     return row is not None
+
+
+def listings_end_by_source() -> dict[str, float]:
+    """Return each source's latest program end, as a POSIX time."""
+    rows = db.connection().execute(
+        "SELECT source_id, MAX(stop_ts) FROM programs GROUP BY source_id",  # pragma: no mutate[case-insensitive]
+    )
+    return {str(source_id): float(end) for source_id, end in rows}
+
+
+# A feed that stops updating is refetched unchanged, so its newest listing stops
+# moving; that, not how far ahead it lists, tells a dead feed from a short one.
+def record_horizons(*, now: float) -> None:
+    """Record ``now`` for each source whose listings reach further than last recorded.
+
+    Args:
+        now: Current POSIX time.
+    """
+    conn = db.connection()
+    with conn:
+        conn.executemany(
+            "INSERT INTO horizons (source_id, ends_ts, advanced_ts) VALUES (?, ?, ?)"  # pragma: no mutate[case-insensitive]
+            " ON CONFLICT (source_id) DO UPDATE SET"  # pragma: no mutate[case-insensitive]
+            " ends_ts = excluded.ends_ts, advanced_ts = excluded.advanced_ts"  # pragma: no mutate[case-insensitive]
+            " WHERE excluded.ends_ts > horizons.ends_ts",  # pragma: no mutate[case-insensitive]
+            [(source_id, end, now) for source_id, end in listings_end_by_source().items()],
+        )
+
+
+def horizons_advanced() -> dict[str, float]:
+    """Return when each source's listings last reached further, as a POSIX time."""
+    rows = db.connection().execute(
+        "SELECT source_id, advanced_ts FROM horizons",  # pragma: no mutate[case-insensitive]
+    )
+    return {str(source_id): float(advanced) for source_id, advanced in rows}
 
 
 def search_channels(terms: list[str], limit: int = 20) -> list[ChannelMatch]:
