@@ -1,3 +1,16 @@
+# Example Installation:
+#
+# Typical:
+#   uv sync --all-groups --frozen  # cu126 aka "default-cuda"
+#
+# No GPU:
+#   uv sync --all-groups --frozen --no-group default-cuda --extra cpu
+#   export UV_NO_SYNC=1
+#
+# New GPU (eg sm_75+):
+#   uv sync --all-groups --frozen --no-group default-cuda --extra cu132
+#   export UV_NO_SYNC=1
+
 [project]
 name = "pynetv"
 version = "0.5.3"
@@ -26,9 +39,12 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-# One extra per PyTorch build (index in [tool.uv.sources]); the default `cuda` group is cu126.
+# One extra per PyTorch build (index in [tool.uv.sources]); the `default-cuda` group is cu126.
 cpu = ["torch"]
 cu126 = ["torch"]
+# cu128 Not Recommended: download.pytorch.org/whl/cu128 stops at torch 2.11.0, so the
+# extra locked to a stale torch. Its builds also lack sm_5x kernels which is likely the
+# reason you'd want older CUDA; use cu126.
 cu128 = ["torch"]
 cu130 = ["torch"]
 cu132 = ["torch"]
@@ -49,7 +65,7 @@ server = [
 [dependency-groups]
 dev = ["pynetv[server,xtream2m3u]"]
 # Default PyTorch build: cu126 still ships sm_50+ kernels (Maxwell, e.g. GTX TITAN X).
-cuda = ["torch"]
+default-cuda = ["torch"]
 ai_upscale = [
     "torch>=2.0",
     "onnx>=1.14",
@@ -122,11 +138,22 @@ exclude = ["*_test.py", "/netv/testing.py"]
 
 [tool.uv]
 package = true
-default-groups = ["dev"]
-conflicts = [
-    [{extra = "cpu"}, {extra = "cu126"}, {extra = "cu128"}, {extra = "cu130"}, {extra = "cu132"}, {extra = "cu134"}],
-    [{group = "cuda"}, {extra = "cpu"}, {extra = "cu128"}, {extra = "cu130"}, {extra = "cu132"}, {extra = "cu134"}],
-]
+default-groups = ["dev", "default-cuda"]
+conflicts = [[
+    {extra = "cpu"},
+    {extra = "cu126"},
+    {extra = "cu128"},  # Not Recommended; see project.optional-dependencies.
+    {extra = "cu130"},
+    {extra = "cu132"},
+    {extra = "cu134"},
+], [
+    {group = "default-cuda"},
+    {extra = "cpu"},
+    {extra = "cu128"},  # Not Recommended; see project.optional-dependencies.
+    {extra = "cu130"},
+    {extra = "cu132"},
+    {extra = "cu134"},
+]]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
@@ -138,6 +165,7 @@ name = "pytorch-cu126"
 url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
+# Not Recommended; see project.optional-dependencies.
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
@@ -159,8 +187,10 @@ url = "https://download.pytorch.org/whl/cu134"
 explicit = true
 
 [tool.uv.sources]
+# To test that it installed correctly,
+# uv --quiet run python -c "import torch; print(f'PyTorch CUDA: {torch.version.cuda}'); print(f'cuDNN: {torch.backends.cudnn.version()}'); print(f'Device: {torch.cuda.get_device_name(0)}')"
 torch = [
-    {index = "pytorch-cu126", group = "cuda", marker = "sys_platform == 'linux'"},
+    {index = "pytorch-cu126", group = "default-cuda", marker = "sys_platform == 'linux'"},
     {index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux'"},
     {index = "pytorch-cu126", extra = "cu126", marker = "sys_platform == 'linux'"},
     {index = "pytorch-cu128", extra = "cu128", marker = "sys_platform == 'linux'"},

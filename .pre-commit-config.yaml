@@ -1,3 +1,9 @@
+#   Hook entries omit `--no-sync` on purpose: `uv run` re-syncs the venv, so
+#   a tool bumped in uv.lock (ty, ruff, ...) is reinstalled before it runs.
+#   That sync also restores `default-cuda` torch. On a venv synced with
+#   `--extra cpu` or `--extra cu132` (see pyproject.toml), keep it with:
+#
+#     export UV_NO_SYNC=1  # then re-run that sync after each uv.lock change
 
 fail_fast: false
 default_stages:
