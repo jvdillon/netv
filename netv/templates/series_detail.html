@@ -20,7 +20,7 @@
       </div>
       <div class="flex gap-4 text-gray-400 mb-4">
         {% if series.info.year %}<span>{{ series.info.year }}</span>{% endif %}
-        {% if series.info.rating %}<span class="text-yellow-400">★ {{ series.info.rating }}/10</span>{% endif %}
+        {% if series.info.rating %}<span class="text-yellow-400">★ {{ series.info.rating | rating }}/10</span>{% endif %}
         {% if series.info.episode_run_time %}<span>{{ series.info.episode_run_time }} min/ep</span>{% endif %}
       </div>
 
@@ -33,8 +33,8 @@
       {% endif %}
 
       {% from "_people.html" import people %}
-      {% if series.info.director %}{{ people('Director', series.info.director, 'mb-1') }}{% endif %}
-      {% if series.info.cast %}{{ people('Cast', series.info.cast, 'mb-4') }}{% endif %}
+      {{ people('Director', directors, 'mb-1') }}
+      {{ people('Cast', cast, 'mb-4') }}
     </div>
   </div>
   {% endif %}

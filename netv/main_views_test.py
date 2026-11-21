@@ -536,6 +536,14 @@ def test_logo_refuses_unsigned_urls_even_when_cached(auth_client: TestClient):
     assert auth_client.get("/api/logo?url=http://x/logo.png").status_code == 403
 
 
+@pytest.mark.parametrize(
+    ("rating", "shown"),
+    [("8.049", "8.0"), (7.25, "7.2"), (9, "9.0"), ("N/A", "N/A"), ("nan", "nan"), (None, "None")],
+)
+def test_rating_filter_rounds_to_a_tenth(rating: MutablePlainTree, shown: str):
+    assert main._rating_filter(rating) == shown
+
+
 def test_logo_url_filter_signs_proxy_urls():
     url = "http://logos.example:8080/c.png?x=1"
     proxied = main._logo_url_filter(url)
@@ -1571,18 +1579,20 @@ def test_series_player_info_episodes(
 
 
 @pytest.mark.parametrize(
-    ("route", "name"),
+    ("route", "name", "cached"),
     [
-        (error.URLError("down"), ""),
-        (_json({}), ""),
-        (_json({"info": {"name": "Untimed"}}), "Untimed"),
-        (_json({"info": {"plot": "Unnamed"}}), ""),
+        (error.URLError("down"), "", False),
+        # A provider answer without info is used once, never cached.
+        (_json({}), "", False),
+        (_json({"info": {"name": "Untimed"}}), "Untimed", True),
+        (_json({"info": {"plot": "Unnamed"}}), "", True),
     ],
 )
 def test_series_player_info_partial_data(
     web: FakeWeb,
     route: FakeResponse | Exception,
     name: str,
+    cached: bool,
     caplog: pytest.LogCaptureFixture,
 ):
     cache_module.get_cache().pop("series", None)
@@ -1594,8 +1604,8 @@ def test_series_player_info_partial_data(
     assert info == PlayerInfo(url="http://x/series/u/p/1.mkv", channel_name=name)
     assert next_url is None
     assert web.urls == [url]
+    assert (cache_module.CACHE_DIR / "series_info__9.json").exists() is cached
     failed = isinstance(route, Exception)
-    assert (cache_module.CACHE_DIR / "series_info__9.json").exists() is not failed
     warnings = [r.getMessage() for r in caplog.records if r.name == "netv.main"]
     assert warnings == ([f"Failed to fetch series info 9: {route}"] if failed else [])
 

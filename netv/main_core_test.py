@@ -224,7 +224,13 @@ def test_lifespan_runs_workers_and_shuts_down(
         monkeypatch.setattr(handoff, name, value)
     monkeypatch.setattr(main, "_shutdown_event", None)
     # Threads share the test's fake internet; spawned processes would not.
-    monkeypatch.setattr(imdb, "ProcessPoolExecutor", testing.thread_pool)
+    built: list[list[ProviderRecord]] = []
+
+    def failing_build(records: list[ProviderRecord]) -> int:
+        built.append(records)
+        raise OSError("IMDb unreachable")
+
+    monkeypatch.setattr(imdb, "build", failing_build)
     monkeypatch.setattr(chromecast.manager, "_sessions", {})
     monkeypatch.setattr(chromecast.manager, "_stop", threading.Event())
     monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", None)
@@ -324,9 +330,11 @@ def test_lifespan_runs_workers_and_shuts_down(
             clock.deadline = clock.now + 15 + 1
             with caplog.at_level(logging.ERROR, logger="netv.main"):
                 await asyncio.to_thread(handoff_loop.run)
-                # A failed IMDb build is logged; the loop then ends with the server.
+                # Once both catalogs load, a failed IMDb build is logged; the loop then
+                # ends with the server.
                 cache.get_cache()["vod_streams"] = [{"name": "Heat - 1995"}]
                 imdb_loop.run()
+            assert built == [[{"name": "Heat - 1995"}]]
             viewer, recording = launcher.launches
             await recording.process.stdin.wait_for(len(testing.ts_source()))
             # The recording took over before shutdown, which would stop the viewer anyway.
@@ -367,11 +375,7 @@ def test_lifespan_runs_workers_and_shuts_down(
         ["http://bad", "http://e/epg", "http://m/epg", "http://m/list", xtream_epg],
     )
     # The recording reused the viewer's one upstream connection.
-    assert web.urls[6] == stream_url
-    imdb_urls = {f"https://datasets.imdbws.com/title.{n}.tsv.gz" for n in ("basics", "ratings")}
-    # Wikidata is unreachable too; the build falls back to titles, then fails on IMDb.
-    imdb_urls.add(imdb._tmdb_query_url("https://query.wikidata.org/sparql"))
-    assert set(web.urls[7:]) == imdb_urls
+    assert web.urls[6:] == [stream_url]
     assert not flags
     # Shutdown stopped the remaining transcode, the recorder, its upstream and the
     # cast monitor.
@@ -755,9 +759,11 @@ def test_series_detail_provider_error(api: TestClient, web: testing.FakeWeb) -> 
     assert web.urls == [_api_url("http://x", "get_series_info", series_id="5")]
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_series_detail_cleans_episode_metadata(api: TestClient, web: testing.FakeWeb) -> None:
+    imdb.init()
     _set_sources(_XTREAM)
-    cache.get_cache()["series"] = [{"series_id": 5, "source_id": "s1"}]
+    cache.get_cache()["series"] = [{"series_id": 5, "source_id": "s1", "tmdb": "77"}]
     cache.save_file_cache("series_info_s1_5", {"info": {"name": "Stale"}, "episodes": {}})
     series = {
         "info": {
@@ -796,6 +802,8 @@ def test_series_detail_cleans_episode_metadata(api: TestClient, web: testing.Fak
     assert "2019" in resp.text
     people = re.findall(r'<a href="/search\?q=([^"]*)"[^>]*>([^<]*)</a>', resp.text)
     assert people == [("Ann%20Dir", "Ann Dir"), ("Cy%20Star", "Cy Star"), ("Di%20Lead", "Di Lead")]
+    # Every name the page links is in the index search reads.
+    assert imdb.matching_keys(lambda name: name == "Di Lead") == {"series:tmdb:77"}
 
 
 def test_movie_detail_loads_vod_and_restricts(api: TestClient) -> None:
@@ -806,7 +814,9 @@ def test_movie_detail_loads_vod_and_restricts(api: TestClient) -> None:
     assert cache.get_cache().get("vod_streams") == [movie]
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_movie_detail_tolerates_provider_error(api: TestClient, web: testing.FakeWeb) -> None:
+    imdb.init()
     _set_sources({**_XTREAM, "id": "other"})
     url = _api_url("http://x", "get_vod_info", vod_id="7")
     web.routes[url] = TimeoutError()
@@ -817,9 +827,12 @@ def test_movie_detail_tolerates_provider_error(api: TestClient, web: testing.Fak
     assert web.urls == [url]
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_movie_detail_merges_provider_info(api: TestClient, web: testing.FakeWeb) -> None:
+    imdb.init()
     _set_sources(_XTREAM)
-    cache.get_cache()["vod_streams"] = [{"stream_id": 7, "name": "Film", "source_id": "s1"}]
+    movie: ProviderRecord = {"stream_id": 7, "name": "Film", "source_id": "s1", "tmdb": 55}
+    cache.get_cache()["vod_streams"] = [movie]
     info = {
         "info": {
             "plot": "Great plot",
@@ -849,6 +862,7 @@ def test_movie_detail_merges_provider_info(api: TestClient, web: testing.FakeWeb
         ("Actor%20A", "Actor A"),
         ("B%C3%A9%20%26%20Co", "Bé &amp; Co"),
     ]
+    assert imdb.matching_keys(lambda name: name == "Bé & Co") == {"movies:tmdb:55"}
 
 
 # =============================================================================

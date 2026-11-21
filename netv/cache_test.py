@@ -184,27 +184,43 @@ class TestMemoryCache:
 
 class TestCachedInfo:
     def test_get_cached_info_calls_fetch(self):
-        fetch = _Fetch(data={"result": 42})
+        fetch = _Fetch(data={"info": {"result": 42}})
         result = cache.get_cached_info("test_key", fetch)
-        assert result == {"result": 42}
+        assert result == {"info": {"result": 42}}
         assert fetch.calls == 1
 
     def test_get_cached_info_uses_memory_cache(self):
-        fetch = _Fetch(data={"result": 1})
+        fetch = _Fetch(data={"info": {"result": 1}})
         cache.get_cached_info("key1", fetch)
         cache.get_cached_info("key1", fetch)
         # Only called once - second call uses memory cache.
         assert fetch.calls == 1
 
     def test_get_cached_info_force_bypasses_memory(self):
-        fetch = _Fetch(data={"result": 1})
+        fetch = _Fetch(data={"info": {"result": 1}})
         cache.get_cached_info("key2", fetch)
         cache.get_cached_info("key2", fetch, force=True)
         assert fetch.calls == 2
 
     def test_non_object_file_cache_is_refetched(self):
         cache.save_file_cache("key3", [1, 2])
-        assert cache.get_cached_info("key3", lambda: {"fresh": True}) == {"fresh": True}
+        assert cache.get_cached_info("key3", lambda: {"info": {"fresh": True}}) == {
+            "info": {"fresh": True},
+        }
+
+    def test_answer_without_info_is_returned_but_not_cached(self):
+        empty = _Fetch(data={"info": {}})
+        assert cache.get_cached_info("k", empty) == {"info": {}}
+        assert cache.get_cached_info("k", empty) == {"info": {}}
+        assert empty.calls == 2
+        assert cache.load_file_cache("k") is None
+        assert "k" not in cache._info_cache
+
+    def test_file_without_info_counts_as_missing(self):
+        cache.save_file_cache("k", {"info": []})
+        fetch = _Fetch(data={"info": {"name": "Top Gun"}})
+        assert cache.get_cached_info("k", fetch) == {"info": {"name": "Top Gun"}}
+        assert fetch.calls == 1
 
 
 class TestSettings:
@@ -856,55 +872,66 @@ class TestStaleWhileRevalidate:
         self,
         threads: testing.ThreadRecorder,
     ):
-        _backdate("k", {"v": "file"}, 2 * 24 * 3600)
-        cache._info_cache["k"] = {"v": "mem"}
-        fetch = _Fetch(data={"v": "new"})
-        assert cache.get_cached_info("k", fetch) == {"v": "mem"}
+        _backdate("k", {"info": {"v": "file"}}, 2 * 24 * 3600)
+        cache._info_cache["k"] = {"info": {"v": "mem"}}
+        fetch = _Fetch(data={"info": {"v": "new"}})
+        assert cache.get_cached_info("k", fetch) == {"info": {"v": "mem"}}
         assert [(t.args, t.daemon, t.started) for t in threads.threads] == [
             (("k", fetch), True, True),
         ]
         assert fetch.calls == 0
         threads.run_all()
-        assert (fetch.calls, cache._info_cache["k"]) == (1, {"v": "new"})
+        assert (fetch.calls, cache._info_cache["k"]) == (1, {"info": {"v": "new"}})
 
     def test_stale_file_served_and_refreshed(self, threads: testing.ThreadRecorder):
-        _backdate("k", {"v": "file"}, 2 * 24 * 3600)
-        fetch = _Fetch(data={"v": "new"})
-        assert cache.get_cached_info("k", fetch) == {"v": "file"}
-        assert cache._info_cache["k"] == {"v": "file"}
+        _backdate("k", {"info": {"v": "file"}}, 2 * 24 * 3600)
+        fetch = _Fetch(data={"info": {"v": "new"}})
+        assert cache.get_cached_info("k", fetch) == {"info": {"v": "file"}}
+        assert cache._info_cache["k"] == {"info": {"v": "file"}}
         assert [(t.args, t.daemon, t.started) for t in threads.threads] == [
             (("k", fetch), True, True),
         ]
         threads.run_all()
         loaded = cache.load_file_cache("k")
         assert loaded is not None
-        assert loaded[0] == {"v": "new"}
+        assert loaded[0] == {"info": {"v": "new"}}
 
     def test_fresh_file_served_without_refresh(self, threads: testing.ThreadRecorder):
-        _backdate("k", {"v": "file"}, 60)
-        fetch = _Fetch(data={"v": "new"})
-        assert cache.get_cached_info("k", fetch) == {"v": "file"}
+        _backdate("k", {"info": {"v": "file"}}, 60)
+        fetch = _Fetch(data={"info": {"v": "new"}})
+        assert cache.get_cached_info("k", fetch) == {"info": {"v": "file"}}
         assert threads.threads == []
         assert fetch.calls == 0
 
     def test_force_refetches_despite_file(self):
-        _backdate("k", {"v": "file"}, 60)
-        cache._info_cache["k"] = {"v": "mem"}
-        assert cache.get_cached_info("k", _Fetch(data={"v": "new"}), force=True) == {"v": "new"}
+        _backdate("k", {"info": {"v": "file"}}, 60)
+        cache._info_cache["k"] = {"info": {"v": "mem"}}
+        assert cache.get_cached_info("k", _Fetch(data={"info": {"v": "new"}}), force=True) == {
+            "info": {"v": "new"},
+        }
         loaded = cache.load_file_cache("k")
         assert loaded is not None
-        assert loaded[0] == {"v": "new"}
+        assert loaded[0] == {"info": {"v": "new"}}
 
     def test_refresh_success_and_failure(self, caplog: pytest.LogCaptureFixture):
         caplog.set_level("INFO", logger=cache.log.name)
-        cache._refresh_cached_info("k", _Fetch(data={"v": 9}))
-        assert cache._info_cache["k"] == {"v": 9}
+        cache._refresh_cached_info("k", _Fetch(data={"info": {"v": 9}}))
+        assert cache._info_cache["k"] == {"info": {"v": 9}}
         loaded = cache.load_file_cache("k")
         assert loaded is not None
-        assert loaded[0] == {"v": 9}
+        assert loaded[0] == {"info": {"v": 9}}
         cache._refresh_cached_info("k", _failing_fetch)
-        assert cache._info_cache["k"] == {"v": 9}
+        assert cache._info_cache["k"] == {"info": {"v": 9}}
         assert "Background refresh failed for k: boom" in caplog.text
+
+    def test_refresh_without_info_keeps_the_cached_copy(self, caplog: pytest.LogCaptureFixture):
+        _backdate("k", {"info": {"v": "file"}}, 2 * 24 * 3600)
+        cache._info_cache["k"] = {"info": {"v": "file"}}
+        cache._refresh_cached_info("k", _Fetch(data={}))
+        assert cache._info_cache["k"] == {"info": {"v": "file"}}
+        loaded = cache.load_file_cache("k")
+        assert loaded is not None and loaded[0] == {"info": {"v": "file"}}
+        assert "got no info; keeping the cached copy" in caplog.text
 
 
 class TestServerSettingsExtras:

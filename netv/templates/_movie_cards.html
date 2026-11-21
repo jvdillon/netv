@@ -4,7 +4,7 @@
      data-movie-cover="{{ cover }}" data-movie-ext="{{ movie.container_extension or 'mkv' }}">
   <a href="/movie/{{ movie.stream_id }}"
      class="block bg-gray-800 rounded-lg overflow-hidden hover:ring-2 hover:ring-blue-500 focus:ring-2 focus:ring-blue-500 focusable transition-all"
-     tabindex="0" data-nav="grid" title="{{ movie.name }}{% if movie.rating %}&#10;★ {{ movie.rating }}{% endif %}">
+     tabindex="0" data-nav="grid" title="{{ movie.name }}{% if movie.rating %}&#10;★ {{ movie.rating | rating }}{% endif %}">
     <div class="aspect-[2/3] bg-gray-700">
       {% if movie.stream_icon %}
       <img src="{{ cover }}" alt="" class="w-full h-full object-cover" loading="lazy"
@@ -14,7 +14,7 @@
     <div class="p-2">
       <div class="text-sm line-clamp-2 leading-tight">{{ movie.name }}</div>
       {% if movie.rating %}
-      <div class="text-xs text-yellow-400 mt-1">★ {{ movie.rating }}</div>
+      <div class="text-xs text-yellow-400 mt-1">★ {{ movie.rating | rating }}</div>
       {% endif %}
     </div>
   </a>

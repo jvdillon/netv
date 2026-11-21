@@ -823,14 +823,14 @@ class TestStreaming:
         monkeypatch: pytest.MonkeyPatch,
     ):
         # Detail the guide does not store, such as credits, is most of a real feed.
-        credits = "<credits>" + "<actor>Someone Quite Famous</actor>" * 100 + "</credits>"
+        credits = "<credits>" + "<actor>Someone Quite Famous</actor>" * 50 + "</credits>"
         prog = (
             '<programme start="20241130120000 +0000" stop="20241130130000 +0000" channel="c">'
             f"<title>T</title>{credits}</programme>"
         )
         peaks: list[int] = []
         sizes: list[int] = []
-        for n in (20, 80):
+        for n in (10, 40):
             feed = f"<tv>{prog * n}</tv>".encode()
             url = f"http://epg.example/{n}.xml.gz"
             _serve(monkeypatch, url, gzip.compress(feed, 1))

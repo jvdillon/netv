@@ -78,29 +78,8 @@
   {% if results.vod %}
   <div id="vod-results" class="mb-8">
     <h3 class="text-2xl font-semibold mb-4">Movies ({{ results.vod|length }}{% if limit and results.vod|length == limit %}+{% endif %})</h3>
-    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
-      {% for movie in results.vod %}
-      <div class="movie-card relative group" data-movie-id="{{ movie.stream_id }}" data-movie-name="{{ movie.name }}"
-           data-movie-cover="{{ (movie.stream_icon or '') | logo_url }}" data-movie-ext="{{ movie.container_extension or 'mkv' }}">
-        <a href="/movie/{{ movie.stream_id }}"
-           class="block bg-gray-800 rounded-lg overflow-hidden hover:ring-2 hover:ring-blue-500 focus:ring-2 focus:ring-blue-500 focusable transition-all"
-           tabindex="0" data-nav="grid">
-          <div class="aspect-[2/3] bg-gray-700">
-            {% if movie.stream_icon %}
-            <img data-src="{{ movie.stream_icon | logo_url }}" alt="" class="w-full h-full object-cover lazy-img"
-                 onerror="this.style.display='none'">
-            {% endif %}
-          </div>
-          <div class="p-2">
-            <span class="text-sm line-clamp-2">{{ movie.name }}</span>
-          </div>
-        </a>
-        <button type="button" class="fav-btn-movie absolute top-2 right-2 w-8 h-8 rounded-full bg-black/50 text-xl opacity-0 group-hover:opacity-100 transition-opacity z-10"
-                onclick='toggleMovieFavorite({{ movie.stream_id | tojson }}, {{ movie.name | tojson }}, {{ (movie.stream_icon or "") | logo_url | tojson }}, {{ (movie.container_extension or "mkv") | tojson }})'>
-          ☆
-        </button>
-      </div>
-      {% endfor %}
+    <div class="grid grid-cols-[repeat(auto-fill,8rem)] sm:grid-cols-[repeat(auto-fill,10rem)] gap-2 sm:gap-3">
+      {% with items = results.vod %}{% include "_movie_cards.html" %}{% endwith %}
     </div>
   </div>
   {% endif %}
@@ -109,28 +88,8 @@
   {% if results.series %}
   <div id="series-results" class="mb-8">
     <h3 class="text-2xl font-semibold mb-4">Series ({{ results.series|length }}{% if limit and results.series|length == limit %}+{% endif %})</h3>
-    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
-      {% for s in results.series %}
-      <div class="series-card relative group" data-series-id="{{ s.series_id }}" data-series-name="{{ s.name }}" data-series-cover="{{ (s.cover or '') | logo_url }}">
-        <a href="/series/{{ s.series_id }}"
-           class="block bg-gray-800 rounded-lg overflow-hidden hover:ring-2 hover:ring-blue-500 focus:ring-2 focus:ring-blue-500 focusable transition-all"
-           tabindex="0" data-nav="grid">
-          <div class="aspect-[2/3] bg-gray-700">
-            {% if s.cover %}
-            <img data-src="{{ s.cover | logo_url }}" alt="" class="w-full h-full object-cover lazy-img"
-                 onerror="this.style.display='none'">
-            {% endif %}
-          </div>
-          <div class="p-2">
-            <span class="text-sm line-clamp-2">{{ s.name }}</span>
-          </div>
-        </a>
-        <button type="button" class="fav-btn-series absolute top-2 right-2 w-8 h-8 rounded-full bg-black/50 text-xl opacity-0 group-hover:opacity-100 transition-opacity z-10"
-                onclick='toggleSeriesFavorite({{ s.series_id | tojson }}, {{ s.name | tojson }}, {{ (s.cover or "") | logo_url | tojson }})'>
-          ☆
-        </button>
-      </div>
-      {% endfor %}
+    <div class="grid grid-cols-[repeat(auto-fill,8rem)] sm:grid-cols-[repeat(auto-fill,10rem)] gap-2 sm:gap-3">
+      {% with items = results.series %}{% include "_series_cards.html" %}{% endwith %}
     </div>
   </div>
   {% endif %}
@@ -152,31 +111,21 @@ window.onFavoritesChanged = function(changed) {
   updateButtons();
 };
 
-async function toggleSeriesFavorite(id, name, cover) {
+// The shared cards call toggleFavorite: movie cards with an extension, series cards without.
+async function toggleFavorite(id, name, cover, ext) {
+  const kind = ext === undefined ? 'series' : 'movies';
   id = String(id);
-  const entry = favorites.series[id] ? null : { name, cover };
-  window.onFavoritesChanged(await setFavorite('series', id, entry));
-}
-
-async function toggleMovieFavorite(id, name, cover, ext) {
-  id = String(id);
-  const entry = favorites.movies[id] ? null : { name, cover, ext };
-  window.onFavoritesChanged(await setFavorite('movies', id, entry));
+  const entry = favorites[kind][id] ? null : kind === 'movies' ? { name, cover, ext } : { name, cover };
+  window.onFavoritesChanged(await setFavorite(kind, id, entry));
 }
 
 function updateButtons() {
-  document.querySelectorAll('.fav-btn-series').forEach(btn => {
-    const card = btn.closest('.series-card');
-    const id = card?.dataset.seriesId;
-    btn.textContent = favorites.series[id] ? '★' : '☆';
-    btn.classList.toggle('text-yellow-400', !!favorites.series[id]);
-  });
-
-  document.querySelectorAll('.fav-btn-movie').forEach(btn => {
-    const card = btn.closest('.movie-card');
-    const id = card?.dataset.movieId;
-    btn.textContent = favorites.movies[id] ? '★' : '☆';
-    btn.classList.toggle('text-yellow-400', !!favorites.movies[id]);
+  document.querySelectorAll('.fav-btn').forEach(btn => {
+    const card = btn.closest('.movie-card, .series-card');
+    const kind = card?.classList.contains('movie-card') ? 'movies' : 'series';
+    const id = card?.dataset.movieId ?? card?.dataset.seriesId;
+    btn.textContent = favorites[kind][id] ? '★' : '☆';
+    btn.classList.toggle('text-yellow-400', !!favorites[kind][id]);
   });
 }
 

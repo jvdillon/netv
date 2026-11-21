@@ -155,6 +155,7 @@ def _create_templates() -> Jinja2Templates:
     templates = Jinja2Templates(directory=APP_DIR / "templates")
     templates.env.auto_reload = True
     templates.env.filters["logo_url"] = _logo_url_filter
+    templates.env.filters["rating"] = _rating_filter
     templates.env.globals["get_content_access"] = _get_content_access
     templates.env.globals["get_content_access_from_request"] = _get_content_access_from_request
     return templates
@@ -1096,6 +1097,16 @@ async def series_detail_page(
                 if isinstance(ep, dict):
                     _clean_episode(ep)
 
+    record = cached_series if cached_series is not None else {**info, "series_id": series_id}
+    # Off the event loop: saving credits waits on a build's write.
+    directors, cast = await asyncio.to_thread(
+        functools.partial(
+            imdb.credits,
+            record,
+            directors=text_field(info, "director"),
+            cast=text_field(info, "cast"),
+        ),
+    )
     user_settings = load_user_settings(username)
     return TEMPLATES.TemplateResponse(
         request,
@@ -1103,6 +1114,8 @@ async def series_detail_page(
         {
             "series": series_data,
             "series_id": series_id,
+            "directors": directors,
+            "cast": cast,
             "favorites": _page_favorites(user_settings),
         },
     )
@@ -1129,6 +1142,18 @@ async def movie_detail_page(
         if f"movies:{source_id}" in _unavailable_groups(username):
             raise HTTPException(403, "Access to this movie is restricted")
         movie = await _with_vod_details(movie, source_id, stream_id)
+    directors: list[str] = []
+    cast: list[str] = []
+    if movie is not None:
+        # Off the event loop: saving credits waits on a build's write.
+        directors, cast = await asyncio.to_thread(
+            functools.partial(
+                imdb.credits,
+                movie,
+                directors=text_field(movie, "director"),
+                cast=text_field(movie, "cast"),
+            ),
+        )
 
     user_settings = load_user_settings(username)
     return TEMPLATES.TemplateResponse(
@@ -1136,6 +1161,8 @@ async def movie_detail_page(
         "movie_detail.html",
         {
             "movie": movie,
+            "directors": directors,
+            "cast": cast,
             "favorites": _page_favorites(user_settings),
         },
     )
@@ -1557,11 +1584,15 @@ async def search_page(
                 with get_cache_lock():
                     get_cache()["vod_categories"] = vod_cats
                     get_cache()["vod_streams"] = vod_streams
-            results["vod"] = _matching_names(
-                get_cache().get("vod_streams", []),
-                match_fn,
-                limit,
-                imdb_credits=True,
+            # Off the event loop: the credits query reads the database.
+            results["vod"] = await asyncio.to_thread(
+                functools.partial(
+                    _matching_names,
+                    get_cache().get("vod_streams", []),
+                    match_fn,
+                    limit,
+                    imdb_credits=True,
+                ),
             )
 
         # Load series data (run in thread to avoid blocking)
@@ -1571,11 +1602,15 @@ async def search_page(
                 with get_cache_lock():
                     get_cache()["series_categories"] = series_cats
                     get_cache()["series"] = series_list
-            results["series"] = _matching_names(
-                get_cache().get("series", []),
-                match_fn,
-                limit,
-                imdb_credits=True,
+            # Off the event loop: the credits query reads the database.
+            results["series"] = await asyncio.to_thread(
+                functools.partial(
+                    _matching_names,
+                    get_cache().get("series", []),
+                    match_fn,
+                    limit,
+                    imdb_credits=True,
+                ),
             )
 
     username = user["sub"]
@@ -3336,6 +3371,16 @@ def _logo_url_filter(url: str) -> str:
     source = parsed.netloc.split(":")[0] if parsed.netloc else "external"
     sig = auth.logo_url_signature(url)
     return f"/api/logo?source={parse.quote(source)}&url={parse.quote(url)}&sig={sig}"
+
+
+# Text that is not a number shows as sent.
+def _rating_filter(rating: MutablePlainTree) -> str:
+    """A rating to one decimal, as providers send ``8.049`` or ``"8.049"``."""
+    try:
+        value = float(str(rating))
+    except ValueError:
+        return str(rating)
+    return f"{value:.1f}" if math.isfinite(value) else str(rating)
 
 
 Favorites = dict[str, dict[str, MutablePlainTree]]

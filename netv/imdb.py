@@ -10,13 +10,15 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set
 from concurrent.futures import ProcessPoolExecutor
-from typing import TypedDict, cast
+from typing import ParamSpec, TypedDict, TypeVar, cast
 from urllib import parse
 
+import functools
 import gzip
 import logging
 import multiprocessing
 import re
+import sqlite3
 import time
 import unicodedata
 
@@ -28,6 +30,9 @@ from netv.xtream import ProviderRecord, text_field
 
 
 log = logging.getLogger(__name__)
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 
 class Info(TypedDict):
@@ -112,19 +117,19 @@ def is_stale(*, max_age_sec: float) -> bool:
     Returns:
         stale: True when the index needs a rebuild.
     """
-    [built] = (
+    built = _optional_float(
         db.connection()
         .execute(
             "SELECT MAX(built_ts) FROM imdb_builds",  # pragma: no mutate[case-insensitive]
         )
-        .fetchone()
+        .fetchone()[0],
     )
     return built is None or time.time() - built > max_age_sec
 
 
 def resolved_keys(records: Sequence[ProviderRecord]) -> list[str | None]:
     """Return each record's index key: its TMDB id's when indexed, else its title's."""
-    present = {row[0] for row in db.connection().execute("SELECT key FROM imdb_titles")}
+    present = {str(row[0]) for row in db.connection().execute("SELECT key FROM imdb_titles")}
     return [next((k for k in _catalog_keys(r) if k in present), None) for r in records]
 
 
@@ -138,12 +143,27 @@ def matching_keys(match: Callable[[str], bool]) -> set[str]:
         keys: Index keys, as ``resolved_keys`` gives them.
     """
     conn = db.connection()
-    conn.create_function("netv_match", 1, match, deterministic=True)
-    rows = conn.execute(
-        "SELECT DISTINCT c.title_key FROM imdb_names n"
-        " JOIN imdb_credits c ON c.name_id = n.id WHERE netv_match(n.name)",
+    # The file, plus a build's time and the newest saved name, identify the names.
+    file = str(conn.execute("PRAGMA database_list").fetchone()[2])
+    built, max_id = conn.execute(
+        "SELECT (SELECT MAX(built_ts) FROM imdb_builds), (SELECT MAX(id) FROM imdb_names)",  # pragma: no mutate[case-insensitive]
+    ).fetchone()
+    names = _all_names(file, _optional_float(built), None if max_id is None else int(max_id))
+    matched = [(i,) for i, name in names if match(name)]
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS matched_names (id INTEGER PRIMARY KEY)",  # pragma: no mutate[case-insensitive]
     )
-    return {row[0] for row in rows}
+    with conn:
+        conn.execute("DELETE FROM matched_names")  # pragma: no mutate[case-insensitive]
+        conn.executemany(
+            "INSERT INTO matched_names VALUES (?)",  # pragma: no mutate[case-insensitive]
+            matched,
+        )
+        rows = conn.execute(
+            "SELECT DISTINCT title_key FROM imdb_credits"  # pragma: no mutate[case-insensitive]
+            " WHERE name_id IN (SELECT id FROM matched_names)",  # pragma: no mutate[case-insensitive]
+        ).fetchall()
+    return {str(row[0]) for row in rows}
 
 
 def info(record: ProviderRecord) -> Info | None:
@@ -156,37 +176,35 @@ def info(record: ProviderRecord) -> Info | None:
         found: IMDb's facts, or None for a title the index lacks.
     """
     conn = db.connection()
-    for key in filter(None, _catalog_keys(record)):
-        row = conn.execute(
-            "SELECT imdb_id, title, year, genres, runtime_min, rating, votes"  # pragma: no mutate[case-insensitive]
-            " FROM imdb_titles WHERE key = ?",  # pragma: no mutate[case-insensitive]
-            (key,),
-        ).fetchone()
-        if row is not None:
-            break
-    else:
-        return None
-    credits: dict[str, list[str]] = {}
-    for role, name in conn.execute(
-        "SELECT c.role, n.name FROM imdb_credits c JOIN imdb_names n ON n.id = c.name_id"  # pragma: no mutate[case-insensitive]
-        " WHERE c.title_key = ? ORDER BY c.role, c.billing",  # pragma: no mutate[case-insensitive]
-        (key,),
-    ):
-        credits.setdefault(role, []).append(name)
-    imdb_id, title, year, genres, runtime_min, rating, votes = row
-    return Info(
-        imdb_id=imdb_id,
-        title=title,
-        year=year,
-        genres=genres.split(",") if genres else [],
-        runtime_min=runtime_min,
-        rating=rating,
-        votes=votes,
-        directors=credits.pop("director", []),
-        writers=credits.pop("writer", []),
-        cast=credits.pop("cast", []),
-        crew=credits,
+    return next(
+        (found for key in filter(None, _catalog_keys(record)) if (found := _info_at(conn, key))),
+        None,
     )
+
+
+def credits(record: ProviderRecord, *, directors: str, cast: str) -> tuple[list[str], list[str]]:
+    """Return the directors and cast a detail page shows, all of which search finds.
+
+    IMDb's credits when the index has the title. Otherwise the provider's, which
+    are first saved to the index, so that every name a page links finds the title.
+
+    Args:
+        record: Provider movie or series.
+        directors: The provider's comma-separated directors.
+        cast: The provider's comma-separated cast.
+
+    Returns:
+        directors: Names to show as directors.
+        cast: Names to show as cast.
+    """
+    found = info(record)
+    if found is not None:
+        return found["directors"], found["cast"]
+    provided = (_split(directors), _split(cast))
+    key = next(filter(None, _catalog_keys(record)), None)
+    if key is not None and any(provided):
+        _add(key, text_field(record, "name"), *provided)
+    return provided
 
 
 def people(found: Info) -> list[str]:
@@ -247,19 +265,99 @@ def build(
             key
             for by_id, by_title in keys
             for key in ((by_id,) if by_id in chosen else (by_id, by_title))
-            if key in chosen
+            if key is not None and key in chosen
         }
         kept = {chosen[k]: basics[chosen[k]] for k in needed}
         crew = executor.submit(_crew, base_url, kept)
         cast_ids, roles = executor.submit(_billing, base_url, kept).result()
         infos = _infos(base_url, kept, ratings, crew.result(), (cast_ids, roles))
-    _write({key: infos[chosen[key]] for key in needed})
+    # A record IMDb now describes drops the credits its detail page saved.
+    superseded = {k for pair in keys if not needed.isdisjoint(pair) for k in pair if k is not None}
+    _write({key: infos[chosen[key]] for key in needed}, superseded)
     log.info("IMDb index: %d catalog titles", len(needed))
     return len(needed)
 
 
-def _write(index: Mapping[str, Info]) -> None:
+def _info_at(conn: sqlite3.Connection, key: str) -> Info | None:
+    """Return the index entry at ``key``, or None."""
+    row = conn.execute(
+        "SELECT imdb_id, title, year, genres, runtime_min, rating, votes"  # pragma: no mutate[case-insensitive]
+        " FROM imdb_titles WHERE key = ?",  # pragma: no mutate[case-insensitive]
+        (key,),
+    ).fetchone()
+    if row is None:
+        return None
+    credits: dict[str, list[str]] = {}
+    for role, name in conn.execute(
+        "SELECT c.role, n.name FROM imdb_credits c JOIN imdb_names n ON n.id = c.name_id"  # pragma: no mutate[case-insensitive]
+        " WHERE c.title_key = ? ORDER BY c.role, c.billing",  # pragma: no mutate[case-insensitive]
+        (key,),
+    ):
+        credits.setdefault(str(role), []).append(str(name))
+    imdb_id, title, year, genres, runtime_min, rating, votes = row
+    return Info(
+        imdb_id=str(imdb_id),
+        title=str(title),
+        year=int(year),
+        genres=str(genres).split(",") if genres else [],
+        runtime_min=int(runtime_min),
+        rating=float(rating),
+        votes=int(votes),
+        directors=credits.pop("director", []),
+        writers=credits.pop("writer", []),
+        cast=credits.pop("cast", []),
+        crew=credits,
+    )
+
+
+# A build keeps them until IMDb has the title.
+#
+# The title row's empty ``imdb_id`` marks it as the provider's.
+def _add(key: str, title: str, directors: list[str], cast: list[str]) -> None:
+    """Index one title's provider credits."""
+    conn = db.connection()
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO imdb_titles VALUES (?, '', ?, 0, '', 0, 0.0, 0)",  # pragma: no mutate[case-insensitive]
+            (key, title),
+        )
+        conn.execute(
+            "DELETE FROM imdb_credits WHERE title_key = ?",  # pragma: no mutate[case-insensitive]
+            (key,),
+        )
+        names = [*directors, *cast]
+        conn.executemany(
+            "INSERT OR IGNORE INTO imdb_names (name) VALUES (?)",  # pragma: no mutate[case-insensitive]
+            ((name,) for name in names),
+        )
+        ids = {
+            str(name): int(name_id)
+            for name, name_id in conn.execute(
+                f"SELECT name, id FROM imdb_names WHERE name IN ({','.join('?' * len(names))})",  # noqa: S608 -- Only placeholders are interpolated.
+                names,
+            )
+        }
+        conn.executemany(
+            "INSERT INTO imdb_credits VALUES (?, ?, ?, ?)",  # pragma: no mutate[case-insensitive]
+            [
+                (key, role, billing, ids[name])
+                for role, credited in (("director", directors), ("cast", cast))
+                for billing, name in enumerate(credited)
+            ],
+        )
+
+
+def _write(index: Mapping[str, Info], superseded: Set[str]) -> None:
     """Replace the index tables in one transaction, so readers never see half."""
+    conn = db.connection()
+    saved = (
+        str(row[0])
+        for row in conn.execute(
+            "SELECT key FROM imdb_titles WHERE imdb_id = ''",  # pragma: no mutate[case-insensitive]
+        )
+    )
+    provided = [key for key in saved if key not in index and key not in superseded]
+    index = {**{k: found for k in provided if (found := _info_at(conn, k))}, **index}
     names = sorted({name for found in index.values() for name in people(found)})
     name_ids = {name: i for i, name in enumerate(names)}
     credits = [
@@ -273,7 +371,6 @@ def _write(index: Mapping[str, Info]) -> None:
         )
         for billing, name in enumerate(credited)
     ]
-    conn = db.connection()
     with conn:
         conn.execute("DELETE FROM imdb_titles")
         conn.execute("DELETE FROM imdb_names")
@@ -305,26 +402,66 @@ def _write(index: Mapping[str, Info]) -> None:
 
 def _catalog_keys(record: ProviderRecord) -> tuple[str | None, str | None]:
     """The record's index keys: by TMDB id, and by title and year."""
-    kind = "series" if "series_id" in record else "movies"
-    tmdb = text_field(record, "tmdb")
-    found = _catalog_title(record)
+    return _keys(
+        "series" if "series_id" in record else "movies",
+        text_field(record, "tmdb"),
+        text_field(record, "name"),
+        text_field(record, "releaseDate") or text_field(record, "release_date"),
+    )
+
+
+# Each search keys the whole catalog; normalizing 36k titles each time costs 0.2 s.
+@functools.lru_cache(maxsize=1 << 17)
+def _keys(kind: str, tmdb: str, name: str, aired: str) -> tuple[str | None, str | None]:
+    found = _title_and_year(name, aired)
     return (
         f"{kind}:tmdb:{tmdb}" if tmdb.isdigit() else None,
-        None if found is None else f"{kind}:{title_key(found[1], found[2])}",
+        None if found is None else f"{kind}:{title_key(*found)}",
     )
+
+
+# Search reads every name; loading them costs 0.16 s, so each index version loads once.
+@functools.lru_cache(maxsize=1)
+def _all_names(file: str, built: float | None, max_id: int | None) -> list[tuple[int, str]]:
+    del file, built, max_id
+    rows = db.connection().execute("SELECT id, name FROM imdb_names")
+    return [(int(row[0]), str(row[1])) for row in rows]
 
 
 def _catalog_title(record: ProviderRecord) -> tuple[str, str, int] | None:
     """The kind, title, and year of a catalog record; series fall back to air date."""
+    found = _title_and_year(
+        text_field(record, "name"),
+        text_field(record, "releaseDate") or text_field(record, "release_date"),
+    )
     kind = "series" if "series_id" in record else "movies"
-    name = text_field(record, "name")
+    return None if found is None else (kind, *found)
+
+
+def _title_and_year(name: str, aired: str) -> tuple[str, int] | None:
+    """A name's title and year, the year from ``aired`` when the name lacks one."""
     parsed = title_year(name)
     if parsed is not None:
-        return kind, *parsed
-    aired = text_field(record, "releaseDate") or text_field(record, "release_date")
-    return (kind, name, int(aired[:4])) if aired[:4].isdigit() else None
+        return parsed
+    return (name, int(aired[:4])) if aired[:4].isdigit() else None
 
 
+def _retried(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Wrap ``fn`` to retry twice when the connection drops; IMDb's files are large."""
+
+    @functools.wraps(fn)
+    def retrying(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        for _ in range(2):
+            try:
+                return fn(*args, **kwargs)
+            except OSError as exc:  # URLError and a reset connection are OSErrors.
+                log.warning("IMDb download failed, retrying: %s", exc)
+        return fn(*args, **kwargs)
+
+    return retrying
+
+
+@_retried
 def _scan_basics(
     base_url: str,
     wanted: Mapping[str, set[str]],
@@ -390,7 +527,9 @@ class _SparqlResult(TypedDict):
 def _tmdb_to_imdb(sparql_url: str) -> dict[str, str]:
     """Map ``kind:tmdb:<id>`` to its IMDb id; empty when Wikidata is unreachable."""
     try:
-        with safe_urlopen(_tmdb_query_url(sparql_url), timeout=120, user_agent="neTV") as resp:
+        # Wikidata refuses requests without a descriptive User-Agent naming a contact.
+        agent = "neTV (https://github.com/jvdillon/netv)"
+        with safe_urlopen(_tmdb_query_url(sparql_url), timeout=120, user_agent=agent) as resp:
             rows = json_loads(resp.read(), _SparqlResult)["results"]["bindings"]
     except (OSError, ValueError) as exc:  # URLError is an OSError; ReadError a ValueError.
         log.warning("Wikidata TMDB ids unavailable, joining by title: %s", exc)
@@ -400,6 +539,7 @@ def _tmdb_to_imdb(sparql_url: str) -> dict[str, str]:
     }
 
 
+@_retried
 def _ratings(base_url: str) -> dict[str, tuple[float, int]]:
     """Every rated title's average and vote count."""
     return {
@@ -407,6 +547,7 @@ def _ratings(base_url: str) -> dict[str, tuple[float, int]]:
     }
 
 
+@_retried
 def _crew(base_url: str, basics: Mapping[str, list[str]]) -> dict[str, tuple[list[str], list[str]]]:
     """Each title's director and writer ids."""
     return {
@@ -448,6 +589,7 @@ def _infos(
     return infos
 
 
+@_retried
 def _billing(
     base_url: str,
     basics: Mapping[str, list[str]],
@@ -479,6 +621,16 @@ def _rows(url: str, keep: Iterable[str] = ()) -> Iterator[list[str]]:
             if wanted and line.partition("\t")[0] not in wanted:
                 continue
             yield line.rstrip("\n").split("\t")
+
+
+def _optional_float(value: object) -> float | None:
+    """A nullable SQLite number as a float."""
+    return None if value is None else float(str(value))
+
+
+def _split(names: str) -> list[str]:
+    """Split a provider's comma-separated names, dropping blanks."""
+    return [name for name in (n.strip() for n in names.split(",")) if name]
 
 
 def _ids(field: str) -> list[str]:

@@ -3,7 +3,7 @@
 <div class="series-card relative group" data-series-id="{{ s.series_id }}" data-series-name="{{ s.name }}" data-series-cover="{{ cover }}">
   <a href="/series/{{ s.series_id }}"
      class="block bg-gray-800 rounded-lg overflow-hidden hover:ring-2 hover:ring-blue-500 focus:ring-2 focus:ring-blue-500 focusable transition-all"
-     tabindex="0" data-nav="grid" title="{{ s.name }}{% if s.rating %}&#10;★ {{ s.rating }}{% endif %}">
+     tabindex="0" data-nav="grid" title="{{ s.name }}{% if s.rating %}&#10;★ {{ s.rating | rating }}{% endif %}">
     <div class="aspect-[2/3] bg-gray-700">
       {% if s.cover %}
       <img src="{{ cover }}" alt="" class="w-full h-full object-cover" loading="lazy"
@@ -13,7 +13,7 @@
     <div class="p-2">
       <div class="text-sm line-clamp-2 leading-tight">{{ s.name }}</div>
       {% if s.rating %}
-      <div class="text-xs text-yellow-400 mt-1">★ {{ s.rating }}</div>
+      <div class="text-xs text-yellow-400 mt-1">★ {{ s.rating | rating }}</div>
       {% endif %}
     </div>
   </a>

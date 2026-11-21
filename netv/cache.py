@@ -365,6 +365,9 @@ def get_cached_info(
 ) -> ProviderRecord:
     """Get information using stale-while-revalidate caching.
 
+    Providers sometimes answer with an empty ``info``. Such an answer is returned
+    but never cached, and one cached by an older release counts as missing.
+
     Args:
         cache_key: File and memory cache identity.
         fetch_fn: Callback retrieving fresh information.
@@ -380,7 +383,7 @@ def get_cached_info(
     cached_ts = 0.0
     if cached is not None:
         tree, cached_ts = cached
-        if isinstance(tree, dict):
+        if isinstance(tree, dict) and _has_info(tree):
             cached_data = tree
     age = time.time() - cached_ts
 
@@ -408,8 +411,9 @@ def get_cached_info(
         return cached_data
 
     data = fetch_fn()
-    _info_cache[cache_key] = data
-    save_file_cache(cache_key, data)
+    if _has_info(data):
+        _info_cache[cache_key] = data
+        save_file_cache(cache_key, data)
     return data
 
 
@@ -855,6 +859,9 @@ def _source(config: SourceConfig) -> Source:
 def _refresh_cached_info(cache_key: str, fetch_fn: Callable[[], ProviderRecord]) -> None:
     try:
         data = fetch_fn()
+        if not _has_info(data):
+            log.warning("Background refresh of %s got no info; keeping the cached copy", cache_key)
+            return
         _info_cache[cache_key] = data
         save_file_cache(cache_key, data)
         log.info("Background refreshed %s", cache_key)
@@ -1034,3 +1041,9 @@ def _test_encoder(
         return False, "ffmpeg not found"
     except Exception as e:
         return False, str(e)
+
+
+def _has_info(data: ProviderRecord) -> bool:
+    """Whether a provider's info response carries its ``info`` object."""
+    info = data.get("info")
+    return isinstance(info, dict) and bool(info)

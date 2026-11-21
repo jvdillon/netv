@@ -1,7 +1,9 @@
 {% macro people(label, names, spacing) %}
+{% if names %}
 <p class="text-sm text-gray-400 {{ spacing }}"><span class="text-gray-500">{{ label }}:</span>
-  {%- for name in names.split(',') | map('trim') | select %}
+  {%- for name in names %}
   <a href="/search?q={{ name | urlencode }}" class="hover:text-blue-400 hover:underline focusable rounded focus:outline-none focus:ring-2 focus:ring-blue-500" tabindex="0">{{ name }}</a>{% if not loop.last %},{% endif %}
   {%- endfor %}
 </p>
+{% endif %}
 {% endmacro %}

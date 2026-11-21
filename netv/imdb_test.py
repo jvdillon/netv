@@ -222,10 +222,10 @@ def test_a_rebuild_replaces_the_index(monkeypatch: pytest.MonkeyPatch):
     heat: ProviderRecord = {"stream_id": 1, "name": "Heat - 1995"}
     key = f"movies:{imdb.title_key('Heat', 1995)}"
     monkeypatch.setattr(imdb.time, "time", lambda: 1000.0)
-    imdb._write({key: _HEAT})
+    imdb._write({key: _HEAT}, set())
     assert imdb.info(heat) == _HEAT
     monkeypatch.setattr(imdb.time, "time", lambda: 2000.0)
-    imdb._write({key: {**_HEAT, "votes": 1, "cast": ["Val Kilmer"], "crew": {}}})
+    imdb._write({key: {**_HEAT, "votes": 1, "cast": ["Val Kilmer"], "crew": {}}}, set())
     found = imdb.info(heat)
     assert found is not None and found["votes"] == 1 and found["cast"] == ["Val Kilmer"]
     assert imdb.matching_keys(lambda name: "Pacino" in name) == set()
@@ -240,6 +240,7 @@ def test_matching_and_resolved_keys():
             "movies:heat|1995": {**_HEAT, "imdb_id": "tt2", "cast": ["Val Kilmer"], "crew": {}},
             "movies:ronin|1998": {**_HEAT, "cast": [], "writers": [], "directors": [], "crew": {}},
         },
+        set(),
     )
     ronin = imdb.info({"stream_id": 4, "name": "Ronin - 1998"})
     assert ronin is not None and ronin["cast"] == [] and ronin["writers"] == []
@@ -287,9 +288,84 @@ def test_rows_keep_wanted_ids_and_empty_last_fields(web: testing.FakeWeb):
     assert list(imdb._rows(f"{_BASE}/t.tsv.gz", ["a", "c"])) == [["a", "x", ""], ["c", "X"]]
 
 
+def test_credits_prefer_imdb_and_index_the_providers():
+    imdb._write({"movies:tmdb:9": _HEAT}, set())
+    heat: ProviderRecord = {"stream_id": 1, "name": "Heat - 1995", "tmdb": "9"}
+    assert imdb.credits(heat, directors="Someone", cast="Else") == (
+        ["Michael Mann"],
+        ["Al Pacino", "Robert De Niro"],
+    )
+    assert imdb.matching_keys(lambda name: name == "Else") == set()
+
+    film: ProviderRecord = {"stream_id": 2, "name": "Film", "tmdb": "5"}
+    assert imdb.credits(film, directors="Ann Dir, ", cast=" Cy Star,Di Lead") == (
+        ["Ann Dir"],
+        ["Cy Star", "Di Lead"],
+    )
+    assert imdb.matching_keys(lambda name: name in {"Ann Dir", "Di Lead"}) == {"movies:tmdb:5"}
+    found = imdb.info(film)
+    assert found is not None and found["imdb_id"] == "" and found["title"] == "Film"
+
+    # A record with no key cannot be indexed; its names are still shown.
+    nameless: ProviderRecord = {"stream_id": 3, "name": "No year"}
+    assert imdb.credits(nameless, directors="", cast="Solo") == ([], ["Solo"])
+    assert imdb.matching_keys(lambda name: name == "Solo") == set()
+    # Nor is a record whose provider credits nothing.
+    blank: ProviderRecord = {"stream_id": 4, "name": "Blank", "tmdb": "4"}
+    assert imdb.credits(blank, directors="", cast="") == ([], [])
+    assert imdb.info(blank) is None
+
+
+def test_saving_credits_again_replaces_only_that_title():
+    film: ProviderRecord = {"stream_id": 2, "name": "Film", "tmdb": "5"}
+    other: ProviderRecord = {"stream_id": 3, "name": "Other", "tmdb": "6"}
+    imdb.credits(film, directors="", cast="Shared, Cy Star")
+    imdb.credits(other, directors="", cast="Shared")
+    imdb._add("movies:tmdb:5", "Film", [], ["Di Lead"])
+    assert imdb.matching_keys(lambda name: name == "Shared") == {"movies:tmdb:6"}
+    assert imdb.matching_keys(lambda name: name == "Di Lead") == {"movies:tmdb:5"}
+    found = imdb.info(film)
+    assert found is not None and found["cast"] == ["Di Lead"]
+
+
+def test_a_build_keeps_saved_credits_until_imdb_has_the_title(web: testing.FakeWeb):
+    del web
+    film: ProviderRecord = {"stream_id": 2, "name": "Film", "tmdb": "5"}
+    heat: ProviderRecord = {"stream_id": 1, "name": "Heat - 1995", "tmdb": "1"}
+    imdb.credits(film, directors="", cast="Cy Star")
+    imdb.credits(heat, directors="", cast="Stale Name")
+    assert imdb.build([film, heat], base_url=_BASE, sparql_url=_SPARQL) == 1
+    # Heat now joins by title, so its saved entry under the TMDB key is dropped.
+    found = imdb.info(heat)
+    assert found is not None and found["imdb_id"] == "tt1"
+    assert imdb.matching_keys(lambda name: name == "Stale Name") == set()
+    assert imdb.matching_keys(lambda name: name == "Cy Star") == {"movies:tmdb:5"}
+
+
+def test_retried_retries_dropped_connections(caplog: pytest.LogCaptureFixture):
+    calls: list[int] = []
+
+    def flaky(n: int) -> int:
+        calls.append(n)
+        if len(calls) < 3:
+            raise ConnectionResetError("reset")
+        return n * 2
+
+    with caplog.at_level(logging.WARNING, logger="netv.imdb"):
+        assert imdb._retried(flaky)(4) == 8
+    assert calls == [4, 4, 4]
+    assert caplog.text.count("retrying") == 2
+
+    def broken() -> int:
+        raise ConnectionResetError("reset")
+
+    with pytest.raises(ConnectionResetError):
+        imdb._retried(broken)()
+
+
 def test_is_stale_by_age(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(imdb.time, "time", lambda: 1000.0)
-    imdb._write({})
+    imdb._write({}, set())
     monkeypatch.setattr(imdb.time, "time", lambda: 1060.0)
     assert not imdb.is_stale(max_age_sec=60)
     assert imdb.is_stale(max_age_sec=59)

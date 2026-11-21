@@ -1556,7 +1556,7 @@ class TestSearch:
             # Live channels are never looked up, even when a key would match.
             f"movies:{imdb.title_key('Mann TV', 1995)}": heat,
         }
-        imdb._write(index)
+        imdb._write(index, set())
 
         by_director = auth_client.get("/search?q=mann").text
         assert "Heat - 1995" in by_director and "Miami Vice" in by_director
