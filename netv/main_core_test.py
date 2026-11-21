@@ -369,6 +369,8 @@ def test_lifespan_runs_workers_and_shuts_down(
     # The recording reused the viewer's one upstream connection.
     assert web.urls[6] == stream_url
     imdb_urls = {f"https://datasets.imdbws.com/title.{n}.tsv.gz" for n in ("basics", "ratings")}
+    # Wikidata is unreachable too; the build falls back to titles, then fails on IMDb.
+    imdb_urls.add(imdb._tmdb_query_url("https://query.wikidata.org/sparql"))
     assert set(web.urls[7:]) == imdb_urls
     assert not flags
     # Shutdown stopped the remaining transcode, the recorder, its upstream and the

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from email.message import Message
 from pathlib import Path
+from urllib import error, parse
 
 import gzip
+import json
+import logging
 import os
 import time
 
@@ -15,6 +19,13 @@ from netv.xtream import ProviderRecord
 
 
 _BASE = "https://imdb.test"
+_SPARQL = "https://wikidata.test/sparql"
+_TMDB = {
+    ("movies", "500"): "tt2",
+    ("series", "77"): "tt4",
+    ("movies", "600"): "tt99",
+    ("movies", "700"): "tt6",
+}
 
 
 @pytest.fixture
@@ -26,6 +37,12 @@ def web(monkeypatch: pytest.MonkeyPatch) -> testing.FakeWeb:
     for name, lines in _DATASETS.items():
         body = gzip.compress("\n".join(lines).encode() + b"\n")
         web.routes[f"{_BASE}/{name}.tsv.gz"] = lambda body=body: testing.FakeResponse(body)
+    bindings = [
+        {"kind": {"value": k}, "tmdb": {"value": t}, "imdb": {"value": i}}
+        for (k, t), i in _TMDB.items()
+    ]
+    answer = json.dumps({"results": {"bindings": bindings}}).encode()
+    web.routes[imdb._tmdb_query_url(_SPARQL)] = lambda: testing.FakeResponse(answer)
     return web
 
 
@@ -39,8 +56,16 @@ _DATASETS = {
         "tt5\tmovie\tAmélie & Co\tLe Fabuleux\t0\t2001\t\\N\t\\N\t\\N",
         "tt6\tmovie\tNo Year\tNo Year\t0\t\\N\t\\N\t\\N\t\\N",
         "tt7\ttvEpisode\tHeat\tHeat\t0\t1995\t\\N\t\\N\t\\N",
+        "tt8\tmovie\tThreehundred\tThreehundred\t0\t2006\t\\N\t\\N\t\\N",
+        "tt9\tmovie\tThreehundred\tThreehundred\t0\t2007\t\\N\t\\N\t\\N",
     ],
-    "title.ratings": ["tconst\taverageRating\tnumVotes", "tt1\t8.3\t700000", "tt3\t5\t9"],
+    "title.ratings": [
+        "tconst\taverageRating\tnumVotes",
+        "tt1\t8.3\t700000",
+        "tt3\t5\t9",
+        "tt8\t7.6\t800000",
+        "tt9\t3\t3",
+    ],
     "title.crew": ["tconst\tdirectors\twriters", "tt1\tnm1\tnm7", "tt5\t\\N\t\\N"],
     "title.principals": [
         "tconst\tordering\tnconst\tcategory",
@@ -102,8 +127,9 @@ def test_build_joins_movies_and_series_by_title_and_year(tmp_path: Path, web: te
         {"series_id": 8, "name": "Undated", "release_date": ""},
     ]
 
-    assert imdb.build(index, [heat, show, film, *unmatched], base_url=_BASE) == 3
-    assert {f.timeout for f in web.fetches} == {60}
+    records = [heat, show, film, *unmatched]
+    assert imdb.build(index, records, base_url=_BASE, sparql_url=_SPARQL) == 3
+    assert {f.timeout for f in web.fetches if f.url.startswith(_BASE)} == {60}
     # The exact-year movie with the most votes wins over a video, a remake, and an episode.
     assert imdb.info(index, heat) == _HEAT
     # A series dates by air date; a one-year difference still matches a movie.
@@ -114,6 +140,61 @@ def test_build_joins_movies_and_series_by_title_and_year(tmp_path: Path, web: te
     assert found_film["runtime_min"] == 0 and found_film["genres"] == []
     assert found_film["rating"] == 0.0 and found_film["directors"] == []
     assert [imdb.info(index, r) for r in unmatched] == [None, None, None]
+
+
+def test_build_prefers_the_tmdb_id_then_votes(tmp_path: Path, web: testing.FakeWeb):
+    index = tmp_path / "imdb.json"
+    # Wikidata maps this TMDB id to the 1986 Heat, so the title join is not used.
+    remake: ProviderRecord = {"stream_id": 1, "name": "Heat - 1995", "tmdb": 500}
+    show: ProviderRecord = {"series_id": 4, "name": "Renamed", "tmdb": "77"}
+    # An id IMDb no longer lists, and an unmapped id, both join by title.
+    gone: ProviderRecord = {"stream_id": 2, "name": "Heat - 1995", "tmdb": "600"}
+    unmapped: ProviderRecord = {"stream_id": 3, "name": "Heat - 1995", "tmdb": "1"}
+    # A popular film a year off beats an obscure one of the exact year.
+    popular: ProviderRecord = {"stream_id": 4, "name": "Threehundred - 2007"}
+    undated: ProviderRecord = {"stream_id": 5, "name": "Whatever", "tmdb": "700"}
+    records = [remake, show, gone, unmapped, popular, undated]
+
+    assert imdb.build(index, records, base_url=_BASE, sparql_url=_SPARQL) == 5
+    found = [imdb.info(index, r) for r in records]
+    assert [f and f["imdb_id"] for f in found] == ["tt2", "tt4", "tt1", "tt1", "tt8", "tt6"]
+    assert found[5] is not None and found[5]["year"] == 0
+    stored = json.loads(index.read_text())
+    # A record joined by id keeps no title key.
+    assert "movies:heat|1995" in stored and "series:renamed|0" not in stored
+    assert "movies:tmdb:500" in stored and "movies:tmdb:600" not in stored
+
+
+def test_build_joins_by_title_when_wikidata_is_down(
+    tmp_path: Path,
+    web: testing.FakeWeb,
+    caplog: pytest.LogCaptureFixture,
+):
+    web.routes[imdb._tmdb_query_url(_SPARQL)] = error.HTTPError(
+        _SPARQL,
+        429,
+        "slow",
+        Message(),
+        None,
+    )
+    index = tmp_path / "imdb.json"
+    remake: ProviderRecord = {"stream_id": 1, "name": "Heat - 1995", "tmdb": "500"}
+    with caplog.at_level(logging.WARNING, logger="netv.imdb"):
+        assert imdb.build(index, [remake], base_url=_BASE, sparql_url=_SPARQL) == 1
+    found = imdb.info(index, remake)
+    assert found is not None and found["imdb_id"] == "tt1"
+    assert "joining by title" in caplog.text
+
+
+def test_tmdb_query_names_movie_and_tv_ids():
+    query = parse.unquote(imdb._tmdb_query_url(_SPARQL).partition("query=")[2])
+    assert imdb._tmdb_query_url(_SPARQL).startswith(f"{_SPARQL}?format=json&query=")
+    for clause in (
+        'wdt:P4947 ?tmdb BIND("movies"',
+        'wdt:P4983 ?tmdb BIND("series"',
+        "wdt:P345 ?imdb",
+    ):
+        assert clause in query
 
 
 def test_people_lists_cast_first():
