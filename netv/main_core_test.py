@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import signal
 import threading
 import time
@@ -28,6 +29,7 @@ from netv import (
     ffmpeg_command,
     ffmpeg_session,
     handoff,
+    imdb,
     m3u as m3u_module,
     main,
     testing,
@@ -221,6 +223,8 @@ def test_lifespan_runs_workers_and_shuts_down(
     ):
         monkeypatch.setattr(handoff, name, value)
     monkeypatch.setattr(main, "_shutdown_event", None)
+    # Threads share the test's fake internet; spawned processes would not.
+    monkeypatch.setattr(imdb, "ProcessPoolExecutor", testing.thread_pool)
     monkeypatch.setattr(chromecast.manager, "_sessions", {})
     monkeypatch.setattr(chromecast.manager, "_stop", threading.Event())
     monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", None)
@@ -292,14 +296,16 @@ def test_lifespan_runs_workers_and_shuts_down(
 
     async def serve() -> None:
         async with main.lifespan(main.app):
-            load_all, load_vod, load_series, cleanup, handoff_loop, scheduler = threads.threads
+            load_all, load_vod, load_series, cleanup, handoff_loop, imdb_loop, scheduler = (
+                threads.threads[:7]
+            )
             load_all.run()
             load_vod.run()
             load_series.run()
             # Each deadline lets a worker loop pass the given number of times.
             clock.deadline = clock.now + 2 * 30 + 1
             scheduler.run()
-            for refresh in threads.threads[6:]:
+            for refresh in threads.threads[7:]:
                 refresh.run()
             # The viewer is still playing the channel it will be handed off from.
             viewing = asyncio.create_task(
@@ -318,6 +324,9 @@ def test_lifespan_runs_workers_and_shuts_down(
             clock.deadline = clock.now + 15 + 1
             with caplog.at_level(logging.ERROR, logger="netv.main"):
                 await asyncio.to_thread(handoff_loop.run)
+                # A failed IMDb build is logged; the loop then ends with the server.
+                cache.get_cache()["vod_streams"] = [{"name": "Heat - 1995"}]
+                imdb_loop.run()
             viewer, recording = launcher.launches
             await recording.process.stdin.wait_for(len(testing.ts_source()))
             # The recording took over before shutdown, which would stop the viewer anyway.
@@ -352,12 +361,15 @@ def test_lifespan_runs_workers_and_shuts_down(
     assert bytes(recording.process.stdin.written) == testing.ts_source()
     assert "Handoff sweep failed" in caplog.text
     # Five due sources, triggered once each even though the scheduler looped twice.
-    assert len(threads.threads) == 6 + 5
+    assert "IMDb index build failed" in caplog.text
+    assert len(threads.threads) == 7 + 5
     assert sorted(web.urls[1:6]) == sorted(
         ["http://bad", "http://e/epg", "http://m/epg", "http://m/list", xtream_epg],
     )
     # The recording reused the viewer's one upstream connection.
-    assert web.urls[6:] == [stream_url]
+    assert web.urls[6] == stream_url
+    imdb_urls = {f"https://datasets.imdbws.com/title.{n}.tsv.gz" for n in ("basics", "ratings")}
+    assert set(web.urls[7:]) == imdb_urls
     assert not flags
     # Shutdown stopped the remaining transcode, the recorder, its upstream and the
     # cast monitor.
@@ -746,7 +758,12 @@ def test_series_detail_cleans_episode_metadata(api: TestClient, web: testing.Fak
     cache.get_cache()["series"] = [{"series_id": 5, "source_id": "s1"}]
     cache.save_file_cache("series_info_s1_5", {"info": {"name": "Stale"}, "episodes": {}})
     series = {
-        "info": {"name": "Show", "releaseDate": "2019-05-01"},
+        "info": {
+            "name": "Show",
+            "releaseDate": "2019-05-01",
+            "director": "Ann Dir",
+            "cast": "Cy Star, Di Lead",
+        },
         "episodes": {
             "1": [
                 {
@@ -775,6 +792,8 @@ def test_series_detail_cleans_episode_metadata(api: TestClient, web: testing.Fak
     assert "Plot A" in resp.text
     assert "Desc C" in resp.text
     assert "2019" in resp.text
+    people = re.findall(r'<a href="/search\?q=([^"]*)"[^>]*>([^<]*)</a>', resp.text)
+    assert people == [("Ann%20Dir", "Ann Dir"), ("Cy%20Star", "Cy Star"), ("Di%20Lead", "Di Lead")]
 
 
 def test_movie_detail_loads_vod_and_restricts(api: TestClient) -> None:
@@ -803,7 +822,7 @@ def test_movie_detail_merges_provider_info(api: TestClient, web: testing.FakeWeb
         "info": {
             "plot": "Great plot",
             "director": "Dir",
-            "actors": "Actor A",
+            "actors": "Actor A, Bé & Co,",
             "genre": "Drama",
             "rating": "7",
             "releasedate": "2001-02-03",
@@ -819,8 +838,15 @@ def test_movie_detail_merges_provider_info(api: TestClient, web: testing.FakeWeb
     assert resp.status_code == 200
     stored = cache.load_file_cache("vod_info_s1_7")
     assert stored is not None and stored[0] == info
-    for text in ("Great plot", "Dir", "Actor A", "Drama", "2001", "01:30", "yt123"):
+    for text in ("Great plot", "Drama", "2001", "01:30", "yt123"):
         assert text in resp.text
+    # Each credited name searches for itself; empty list entries are dropped.
+    people = re.findall(r'<a href="/search\?q=([^"]*)"[^>]*>([^<]*)</a>', resp.text)
+    assert people == [
+        ("Dir", "Dir"),
+        ("Actor%20A", "Actor A"),
+        ("B%C3%A9%20%26%20Co", "Bé &amp; Co"),
+    ]
 
 
 # =============================================================================

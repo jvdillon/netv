@@ -29,12 +29,9 @@
       <p class="text-gray-300 mb-6 max-w-3xl">{{ movie.plot }}</p>
       {% endif %}
 
-      {% if movie.director %}
-      <p class="text-sm text-gray-400 mb-1"><span class="text-gray-500">Director:</span> {{ movie.director }}</p>
-      {% endif %}
-      {% if movie.cast %}
-      <p class="text-sm text-gray-400 mb-4"><span class="text-gray-500">Cast:</span> {{ movie.cast }}</p>
-      {% endif %}
+      {% from "_people.html" import people %}
+      {% if movie.director %}{{ people('Director', movie.director, 'mb-1') }}{% endif %}
+      {% if movie.cast %}{{ people('Cast', movie.cast, 'mb-4') }}{% endif %}
 
       <div class="flex flex-wrap gap-2 sm:gap-4">
         <a href="/play/movie/{{ movie.stream_id }}?ext={{ movie.container_extension or 'mkv' }}"

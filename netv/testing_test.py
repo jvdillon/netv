@@ -715,6 +715,11 @@ def test_xtream_client_serves_server_info():
     assert client.calls == ["get_server_info"]
 
 
+def test_thread_pool_runs_work_on_threads():
+    with testing.thread_pool(max_workers=2, mp_context=None) as pool:
+        assert pool.submit(threading.current_thread).result() is not threading.current_thread()
+
+
 if __name__ == "__main__":
     from codedoctor.lib.testing.runner import test_main
 

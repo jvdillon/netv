@@ -18,6 +18,7 @@ real ones. Example::
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, tzinfo
 from email.message import Message
@@ -1184,6 +1185,12 @@ def install_web(monkeypatch: pytest.MonkeyPatch, web: FakeWeb, *modules: ModuleT
             urlopen=web,
             build_opener=web.build_opener,
         )
+
+
+def thread_pool(*, max_workers: int, mp_context: object) -> ThreadPoolExecutor:
+    """A ``ProcessPoolExecutor`` stand-in whose workers share the test's fakes."""
+    del mp_context
+    return ThreadPoolExecutor(max_workers=max_workers)
 
 
 def cheap_pbkdf2_hmac(

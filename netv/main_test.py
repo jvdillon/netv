@@ -33,6 +33,7 @@ from netv import (
     ffmpeg_command,
     ffmpeg_session,
     handoff,
+    imdb,
     m3u as m3u_module,
     main,
     testing,
@@ -1505,6 +1506,69 @@ class TestSearch:
         assert "CNBC Finance" in resp.text
         assert "BBC World" not in resp.text
 
+    def test_search_matches_cast_and_director(self, auth_client: TestClient):
+        cache_module.get_cache()["live_streams"] = []
+        cache_module.get_cache()["vod_streams"] = []
+        cache_module.get_cache()["series"] = [
+            {"series_id": 1, "name": "Fargo", "director": "Noah Hawley", "cast": "Billy Bob"},
+            {"series_id": 2, "name": "Legion", "director": "Noah Hawley", "cast": "Dan Stevens"},
+            {"series_id": 3, "name": "Lost", "director": "J. J. Abrams", "cast": "Matthew Fox"},
+        ]
+
+        by_director = auth_client.get("/search?q=hawley&series=true").text
+        assert "Fargo" in by_director and "Legion" in by_director and "Lost" not in by_director
+        by_cast = auth_client.get("/search?q=stevens&series=true").text
+        assert "Legion" in by_cast and "Fargo" not in by_cast
+
+    def test_search_matches_credits_from_imdb(self, auth_client: TestClient):
+        cache_module.get_cache()["live_streams"] = [{"stream_id": 9, "name": "Mann TV - 1995"}]
+        cache_module.get_cache()["vod_streams"] = [
+            {"stream_id": 1, "name": "Heat - 1995", "container_extension": "mkv"},
+            {"stream_id": 2, "name": "Ronin - 1998", "container_extension": "mkv"},
+        ]
+        cache_module.get_cache()["series"] = [
+            {"series_id": 3, "name": "Miami Vice (1984)", "cast": "Don Johnson"},
+        ]
+        heat: imdb.Info = {
+            "imdb_id": "tt1",
+            "title": "Heat",
+            "year": 1995,
+            "genres": [],
+            "runtime_min": 0,
+            "rating": 0.0,
+            "votes": 0,
+            "directors": ["Michael Mann"],
+            "writers": [],
+            "cast": ["Al Pacino"],
+            "crew": {},
+        }
+        index = {
+            f"movies:{imdb.title_key('Heat', 1995)}": heat,
+            f"series:{imdb.title_key('Miami Vice', 1984)}": {**heat, "directors": ["Mann"]},
+            # Live channels are never looked up, even when a key would match.
+            f"movies:{imdb.title_key('Mann TV', 1995)}": heat,
+        }
+        util.atomic_write_json(cache_module.CACHE_DIR / "imdb.json", index)
+
+        by_director = auth_client.get("/search?q=mann").text
+        assert "Heat - 1995" in by_director and "Miami Vice" in by_director
+        assert "Ronin" not in by_director and "Mann TV" in by_director
+        assert "Heat - 1995" in auth_client.get("/search?q=pacino&vod=true").text
+        assert "Mann TV" not in auth_client.get("/search?q=pacino&live=true").text
+
+    def test_search_survives_an_index_from_another_release(self, auth_client: TestClient):
+        cache_module.get_cache()["live_streams"] = []
+        cache_module.get_cache()["series"] = []
+        cache_module.get_cache()["vod_streams"] = [
+            {"stream_id": 1, "name": "Heat - 1995", "container_extension": "mkv"},
+        ]
+        old = {imdb.title_key("Heat", 1995): {"director": "Michael Mann", "cast": "Al Pacino"}}
+        util.atomic_write_json(cache_module.CACHE_DIR / "imdb.json", old)
+
+        resp = auth_client.get("/search?q=heat")
+        assert resp.status_code == 200 and "Heat - 1995" in resp.text
+        assert "Heat - 1995" not in auth_client.get("/search?q=mann").text
+
     def test_search_rejects_long_regex(self, auth_client: TestClient):
         cache_module.get_cache()["live_streams"] = []
 
@@ -2500,16 +2564,17 @@ class TestPlaylists:
         url: str = "/guide",
     ) -> tuple[list[tuple[str, str]], list[str], int]:
         text = client.get(url).text
-        aside = text[text.index("<aside") : text.index("</aside>")]
+        start = text.index('aria-label="Channel categories"')
+        chips = text[start : text.index("</div>", start)]
         links = cast(
             list[tuple[str, str]],
             re.findall(
                 r'data-nav="cat".*?title="([^"]*)">.*?tabular-nums[^>]*>(\d+)<',
-                aside,
+                chips,
                 re.S,
             ),
         )
-        current = cast(list[str], re.findall(r'aria-current="page" title="([^"]*)"', aside))
+        current = cast(list[str], re.findall(r'aria-current="page" title="([^"]*)"', chips))
         rows = re.findall(r'<div class="guide-row[^"]*" data-row="\d+"', text)
         return links, current, len(rows)
 
@@ -2520,19 +2585,19 @@ class TestPlaylists:
         playlist = self._create(auth_client)
 
         links, current, rows = self._sidebar(auth_client)
-        assert links == [("All Channels", "3"), ("Favorites", "2"), ("News", "1"), ("Sports", "2")]
+        assert links == [("All", "3"), ("★ Favorites", "2"), ("News", "1"), ("Sports", "2")]
         assert current == ["Sports"]
         assert rows == 2
 
         links, current, rows = self._sidebar(auth_client, f"/guide?cats={playlist['category_id']}")
-        assert current == ["Favorites"]
+        assert current == ["★ Favorites"]
         assert rows == 2
         assert main.load_user_settings("testuser").get("guide_selected_cats") == [
             playlist["category_id"],
         ]
 
         _, current, rows = self._sidebar(auth_client, "/guide?cats=")
-        assert current == ["All Channels"]
+        assert current == ["All"]
         assert rows == 3
         settings = main.load_user_settings("testuser")
         assert "guide_selected_cats" in settings
@@ -2545,7 +2610,7 @@ class TestPlaylists:
         self._create(auth_client)
 
         _, current, rows = self._sidebar(auth_client)
-        assert current == ["All Channels"]
+        assert current == ["All"]
         assert rows == 3
 
     def test_guide_rows_use_earliest_selected_category(self, auth_client: TestClient):

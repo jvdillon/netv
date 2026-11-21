@@ -32,12 +32,9 @@
       <p class="text-gray-300 mb-6 max-w-3xl">{{ series.info.plot }}</p>
       {% endif %}
 
-      {% if series.info.director %}
-      <p class="text-sm text-gray-400 mb-1"><span class="text-gray-500">Director:</span> {{ series.info.director }}</p>
-      {% endif %}
-      {% if series.info.cast %}
-      <p class="text-sm text-gray-400 mb-4"><span class="text-gray-500">Cast:</span> {{ series.info.cast }}</p>
-      {% endif %}
+      {% from "_people.html" import people %}
+      {% if series.info.director %}{{ people('Director', series.info.director, 'mb-1') }}{% endif %}
+      {% if series.info.cast %}{{ people('Cast', series.info.cast, 'mb-4') }}{% endif %}
     </div>
   </div>
   {% endif %}

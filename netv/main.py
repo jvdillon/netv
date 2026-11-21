@@ -67,6 +67,7 @@ from netv import (
     ffmpeg_command,
     ffmpeg_session,
     handoff,
+    imdb,
     playlists,
 )
 from netv.auth import TokenClaims, create_token, verify_password, verify_token
@@ -263,6 +264,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 log.exception("Handoff sweep failed")
 
     threading.Thread(target=handoff_loop, daemon=True).start()
+
+    def imdb_loop():
+        while True:
+            movies, series = get_cache().get("vod_streams"), get_cache().get("series")
+            # A build from half the catalog would stay fresh, missing the rest, for a week.
+            loaded = movies is not None and series is not None
+            index = cache.CACHE_DIR / "imdb.json"
+            if (
+                movies is not None
+                and series is not None
+                and imdb.is_stale(index, max_age_sec=7 * 86_400)
+            ):
+                try:
+                    imdb.build(index, [*movies, *series])
+                except Exception:
+                    log.exception("IMDb index build failed")
+            # Each minute until the catalog loads, then hourly; fresh indexes are skipped.
+            if cleanup_stop.wait(3600 if loaded else 60):
+                return
+
+    threading.Thread(target=imdb_loop, daemon=True).start()
 
     # EPG scheduler.
     scheduler_stop = threading.Event()
@@ -3619,17 +3641,29 @@ def _store_cached_series_data() -> bool:
     return True
 
 
+# Movies and series add IMDb's credits to the provider's. A ``limit`` of 0 keeps all.
 def _matching_names(
     records: list[ProviderRecord],
     match_fn: Callable[[str], bool],
     limit: int,
 ) -> list[ProviderRecord]:
-    """Records whose names match, sorted by name, at most ``limit`` (0 keeps all)."""
+    """Records whose name or credited people match, sorted by name, at most ``limit``."""
+    index = cache.CACHE_DIR / "imdb.json"
     matched = sorted(
-        (r for r in records if match_fn(text_field(r, "name"))),
+        (r for r in records if any(map(match_fn, _search_texts(r, index)))),
         key=lambda r: text_field(r, "name").lower(),
     )
     return matched[:limit] if limit else matched
+
+
+def _search_texts(record: ProviderRecord, index: pathlib.Path) -> list[str]:
+    """The record's name, cast, and director, plus everyone IMDb credits on it."""
+    texts = [text_field(record, f) for f in ("name", "cast", "director")]
+    if "container_extension" in record or "series_id" in record:
+        found = imdb.info(index, record)
+        if found:
+            texts += imdb.people(found)
+    return texts
 
 
 def _clean_episode(ep: ProviderRecord) -> None:

@@ -49,48 +49,14 @@
 {% endblock %}
 
 {% block content %}
-{% macro cat_icon(kind) %}<svg class="w-4 h-4 flex-shrink-0 opacity-70" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
-{%- if kind == 'star' %}<path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z"/>
-{%- elif kind == 'tv' %}<path d="M4 7h16v11H4zM9 21h6M9 3l3 4 3-4"/>
-{%- else %}<path d="M4 6h16M4 12h16M4 18h16"/>{% endif %}</svg>{% endmacro %}
-{% macro cat_link(id, name, count, icon) %}
-      <a href="/guide?offset={{ offset }}&cats={{ id | urlencode }}" data-nav="cat" tabindex="0"
-         class="guide-cat flex items-center gap-2 px-3 py-2 rounded-md text-sm focusable focus:outline-none focus:ring-2 focus:ring-blue-500
-                {% if (selected_id or '') == id %}bg-blue-600 text-white{% else %}text-gray-300 hover:bg-gray-800{% endif %}"
-         {% if (selected_id or '') == id %}aria-current="page"{% endif %} title="{{ name }}">
-        {{ cat_icon(icon) }}
-        <span class="flex-1 min-w-0 truncate font-medium">{{ name }}</span>
-        <span class="text-xs tabular-nums {% if (selected_id or '') == id %}text-blue-100{% else %}text-gray-500{% endif %}">{{ count }}</span>
-      </a>
+{% macro cat_chip(id, name, count) %}
+    <a href="/guide?offset={{ offset }}&cats={{ id | urlencode }}" data-nav="cat" tabindex="0"
+       class="px-3 py-1 rounded-full text-xs whitespace-nowrap focusable focus:outline-none focus:ring-2 focus:ring-blue-500
+              {% if (selected_id or '') == id %}bg-blue-600 text-white{% else %}bg-gray-800 text-gray-300 hover:bg-gray-700{% endif %}"
+       {% if (selected_id or '') == id %}aria-current="page"{% endif %} title="{{ name }}">{{ name }}
+      <span class="tabular-nums {% if (selected_id or '') == id %}text-blue-100{% else %}text-gray-500{% endif %}">{{ count }}</span></a>
 {% endmacro %}
-{% macro cat_chip(id, name) %}
-    <a href="/guide?offset={{ offset }}&cats={{ id | urlencode }}"
-       class="flex-shrink-0 px-3 py-1 rounded-full text-xs whitespace-nowrap focusable
-              {% if (selected_id or '') == id %}bg-blue-600 text-white{% else %}bg-gray-800 text-gray-300{% endif %}">{{ name }}</a>
-{% endmacro %}
-<div class="flex h-full min-w-0 gap-3">
-  {% if sidebar_categories is defined %}
-  <!-- Category sidebar (matches the Apple apps) -->
-  <aside class="hidden md:flex flex-col w-56 lg:w-64 flex-shrink-0 bg-gray-900 rounded-lg py-4" aria-label="Channel categories">
-    <div class="px-4 mb-3">
-      <div class="text-[10px] font-bold tracking-[0.2em] text-gray-500">LIVE TV</div>
-      <div class="text-xl font-bold">Categories</div>
-    </div>
-    <div class="flex-1 overflow-y-auto px-2 py-1 space-y-0.5">
-      {{ cat_link('', 'All Channels', all_count, 'all') }}
-      {% if sidebar_playlists %}
-      <div class="px-3 pt-4 pb-1 text-[10px] font-semibold tracking-[0.15em] text-gray-500">PLAYLISTS</div>
-      {% for c in sidebar_playlists %}{{ cat_link(c.id, c.name, c.count, 'star') }}{% endfor %}
-      {% endif %}
-      <div class="px-3 pt-4 pb-1 text-[10px] font-semibold tracking-[0.15em] text-gray-500">CATEGORIES</div>
-      {% for c in sidebar_categories %}{{ cat_link(c.id, c.name, c.count, 'tv') }}{% endfor %}
-      {% if not sidebar_categories %}
-      <p class="px-3 py-2 text-xs text-gray-500">No categories selected.</p>
-      {% endif %}
-    </div>
-    <a href="/settings#filters" class="mx-4 mt-3 text-xs text-gray-500 hover:text-blue-400">Edit categories</a>
-  </aside>
-  {% endif %}
+<div class="flex h-full min-w-0">
 <div class="guide-container flex flex-col h-full min-w-0 flex-1">
   <!-- Desktop header (fixed, non-scrolling) -->
   <div class="desktop-only flex items-center justify-between gap-2 mb-4 h-10">
@@ -159,11 +125,10 @@
   </div>
 
   {% if sidebar_categories is defined %}
-  <!-- Category chips for narrow screens (sidebar is hidden) -->
-  <div class="md:hidden flex gap-1.5 overflow-x-auto pb-2 -mt-1 mb-1">
-    {{ cat_chip('', 'All') }}
-    {% for c in sidebar_playlists %}{{ cat_chip(c.id, '★ ' ~ c.name) }}{% endfor %}
-    {% for c in sidebar_categories %}{{ cat_chip(c.id, c.name) }}{% endfor %}
+  <div class="guide-cats flex flex-wrap gap-1.5 p-0.5 pb-2 mb-1" aria-label="Channel categories">
+    {{ cat_chip('', 'All', all_count) }}
+    {% for c in sidebar_playlists %}{{ cat_chip(c.id, '★ ' ~ c.name, c.count) }}{% endfor %}
+    {% for c in sidebar_categories %}{{ cat_chip(c.id, c.name, c.count) }}{% endfor %}
   </div>
   {% endif %}
 
@@ -382,7 +347,7 @@ localizeGuideTimes(document);
     return unique;
   }
 
-  // Sidebar: the highlighted category, and the row to return to from it
+  // Category chips: the highlighted one, and the row to return to from it
   const selectedCat = () => Array.from(document.querySelectorAll('[data-nav="cat"][aria-current]')).find(isVisible);
   let lastRow = 0;
   document.addEventListener('focusin', (e) => {
@@ -455,16 +420,15 @@ localizeGuideTimes(document);
     if (active?.dataset?.nav === 'cat') {
       const cats = Array.from(document.querySelectorAll('[data-nav="cat"]')).filter(isVisible);
       const i = cats.indexOf(active);
-      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      if (e.key === 'ArrowRight' && cats[i + 1]) {
         e.preventDefault();
-        const next = cats[i + (e.key === 'ArrowDown' ? 1 : -1)];
-        if (next) { next.focus(); next.scrollIntoView({ block: 'nearest' }); }
-      } else if (e.key === 'ArrowRight') {
-        e.preventDefault();
-        focusCell(Math.min(lastRow, maxRow()), -1);
+        cats[i + 1].focus();
       } else if (e.key === 'ArrowLeft') {
         e.preventDefault();
-        (document.querySelector('nav .nav-link.active') || document.querySelector('nav .nav-link'))?.focus();
+        (cats[i - 1] || document.querySelector('nav .nav-link.active') || document.querySelector('nav .nav-link'))?.focus();
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        focusCell(Math.min(lastRow, maxRow()), -1);
       }
       return;
     }
@@ -476,7 +440,8 @@ localizeGuideTimes(document);
     switch(e.key) {
       case 'ArrowUp':
         e.preventDefault();
-        focusCell(Math.max(0, row - 1), col);
+        if (row === 0 && selectedCat()) selectedCat().focus();
+        else focusCell(Math.max(0, row - 1), col);
         break;
       case 'ArrowDown':
         e.preventDefault();
@@ -565,7 +530,7 @@ localizeGuideTimes(document);
 
   // Initial focus
   // Start on the selected category, like the Apple TV app (rows may be
-  // re-rendered by the virtual scroller, the sidebar isn't).
+  // re-rendered by the virtual scroller, the chips aren't).
   setTimeout(() => {
     const active = document.activeElement;
     if (active !== document.body && active?.dataset?.nav !== 'cat') return;
