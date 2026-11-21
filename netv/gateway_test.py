@@ -21,7 +21,7 @@ from treekle import MutablePlainTree, ReadError, json_loads
 
 import pytest
 
-from netv import auth, cache, epg, ffmpeg_command, ffmpeg_session, gateway, testing, util
+from netv import auth, cache, db, epg, ffmpeg_command, ffmpeg_session, gateway, testing, util
 from netv.cache import SourceConfig
 from netv.ffmpeg_session import TranscodeSession
 from netv.gateway_catalog import CatalogSnapshot, GatewayCatalog, GatewayStream, StreamIdRegistry
@@ -478,7 +478,7 @@ def test_xmltv_builds_feed_for_visible_streams(gateway_client: GatewayClient):
         epg.insert_channel("news.one", "News One HD", "src_1")
         epg.commit()
     finally:
-        epg.close()
+        db.close()
 
     response = client.get(
         "/xmltv.php",

@@ -204,6 +204,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     cache.initialize()
     # Initialize EPG database.
     epg.init(cache.CACHE_DIR)
+    imdb.init()
 
     # Initialize transcoding module with settings callback.
     ffmpeg_command.init(
@@ -270,14 +271,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             movies, series = get_cache().get("vod_streams"), get_cache().get("series")
             # A build from half the catalog would stay fresh, missing the rest, for a week.
             loaded = movies is not None and series is not None
-            index = cache.CACHE_DIR / "imdb.json"
-            if (
-                movies is not None
-                and series is not None
-                and imdb.is_stale(index, max_age_sec=7 * 86_400)
-            ):
+            if movies is not None and series is not None and imdb.is_stale(max_age_sec=7 * 86_400):
                 try:
-                    imdb.build(index, [*movies, *series])
+                    imdb.build([*movies, *series])
                 except Exception:
                     log.exception("IMDb index build failed")
             # Each minute until the catalog loads, then hourly; fresh indexes are skipped.
@@ -1551,6 +1547,7 @@ async def search_page(
                 get_cache().get("live_streams", []),
                 match_fn,
                 limit,
+                imdb_credits=False,
             )
 
         # Load VOD data (run in thread to avoid blocking)
@@ -1560,7 +1557,12 @@ async def search_page(
                 with get_cache_lock():
                     get_cache()["vod_categories"] = vod_cats
                     get_cache()["vod_streams"] = vod_streams
-            results["vod"] = _matching_names(get_cache().get("vod_streams", []), match_fn, limit)
+            results["vod"] = _matching_names(
+                get_cache().get("vod_streams", []),
+                match_fn,
+                limit,
+                imdb_credits=True,
+            )
 
         # Load series data (run in thread to avoid blocking)
         if series:
@@ -1569,7 +1571,12 @@ async def search_page(
                 with get_cache_lock():
                     get_cache()["series_categories"] = series_cats
                     get_cache()["series"] = series_list
-            results["series"] = _matching_names(get_cache().get("series", []), match_fn, limit)
+            results["series"] = _matching_names(
+                get_cache().get("series", []),
+                match_fn,
+                limit,
+                imdb_credits=True,
+            )
 
     username = user["sub"]
     user_settings = load_user_settings(username)
@@ -3646,24 +3653,22 @@ def _matching_names(
     records: list[ProviderRecord],
     match_fn: Callable[[str], bool],
     limit: int,
+    *,
+    imdb_credits: bool,
 ) -> list[ProviderRecord]:
     """Records whose name or credited people match, sorted by name, at most ``limit``."""
-    index = cache.CACHE_DIR / "imdb.json"
+    credited = imdb.matching_keys(match_fn) if imdb_credits else set()
+    keys = imdb.resolved_keys(records) if credited else [None] * len(records)
     matched = sorted(
-        (r for r in records if any(map(match_fn, _search_texts(r, index)))),
+        (
+            r
+            for r, key in zip(records, keys, strict=True)
+            if key in credited
+            or any(match_fn(text_field(r, f)) for f in ("name", "cast", "director"))
+        ),
         key=lambda r: text_field(r, "name").lower(),
     )
     return matched[:limit] if limit else matched
-
-
-def _search_texts(record: ProviderRecord, index: pathlib.Path) -> list[str]:
-    """The record's name, cast, and director, plus everyone IMDb credits on it."""
-    texts = [text_field(record, f) for f in ("name", "cast", "director")]
-    if "container_extension" in record or "series_id" in record:
-        found = imdb.info(index, record)
-        if found:
-            texts += imdb.people(found)
-    return texts
 
 
 def _clean_episode(ep: ProviderRecord) -> None:

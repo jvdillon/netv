@@ -29,6 +29,7 @@ from netv import (
     cache as cache_module,
     catchup,
     chromecast,
+    db,
     epg,
     ffmpeg_command,
     ffmpeg_session,
@@ -1058,7 +1059,7 @@ class TestGuide:
         assert len(threads.threads) == 1, "A load in progress is not started twice"
 
         if not guide_db_open:
-            epg.close()
+            db.close()
         threads.run_all()
         assert threads.errors == []
         assert cache_module.get_cache().get("live_streams") == []
@@ -1463,8 +1464,14 @@ class TestSeries:
         assert "Show 1" in resp.text
 
 
+@pytest.mark.usefixtures("imdb_index")
 class TestSearch:
     """Tests for search page."""
+
+    @pytest.fixture
+    def imdb_index(self, guide_db: None) -> None:
+        del guide_db
+        imdb.init()
 
     def test_search_page_renders(self, auth_client: TestClient):
         cache_module.get_cache()["live_streams"] = []
@@ -1542,32 +1549,20 @@ class TestSearch:
             "cast": ["Al Pacino"],
             "crew": {},
         }
+        vice: imdb.Info = {**heat, "directors": ["Mann"]}
         index = {
             f"movies:{imdb.title_key('Heat', 1995)}": heat,
-            f"series:{imdb.title_key('Miami Vice', 1984)}": {**heat, "directors": ["Mann"]},
+            f"series:{imdb.title_key('Miami Vice', 1984)}": vice,
             # Live channels are never looked up, even when a key would match.
             f"movies:{imdb.title_key('Mann TV', 1995)}": heat,
         }
-        util.atomic_write_json(cache_module.CACHE_DIR / "imdb.json", index)
+        imdb._write(index)
 
         by_director = auth_client.get("/search?q=mann").text
         assert "Heat - 1995" in by_director and "Miami Vice" in by_director
         assert "Ronin" not in by_director and "Mann TV" in by_director
         assert "Heat - 1995" in auth_client.get("/search?q=pacino&vod=true").text
         assert "Mann TV" not in auth_client.get("/search?q=pacino&live=true").text
-
-    def test_search_survives_an_index_from_another_release(self, auth_client: TestClient):
-        cache_module.get_cache()["live_streams"] = []
-        cache_module.get_cache()["series"] = []
-        cache_module.get_cache()["vod_streams"] = [
-            {"stream_id": 1, "name": "Heat - 1995", "container_extension": "mkv"},
-        ]
-        old = {imdb.title_key("Heat", 1995): {"director": "Michael Mann", "cast": "Al Pacino"}}
-        util.atomic_write_json(cache_module.CACHE_DIR / "imdb.json", old)
-
-        resp = auth_client.get("/search?q=heat")
-        assert resp.status_code == 200 and "Heat - 1995" in resp.text
-        assert "Heat - 1995" not in auth_client.get("/search?q=mann").text
 
     def test_search_rejects_long_regex(self, auth_client: TestClient):
         cache_module.get_cache()["live_streams"] = []

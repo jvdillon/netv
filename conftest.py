@@ -8,7 +8,7 @@ from typing import Final
 
 import pytest
 
-from netv import auth, cache, epg, testing
+from netv import auth, cache, db, epg, testing
 
 
 # Each invocation claims its own basetemp, so concurrent runs never delete each other's.
@@ -20,7 +20,7 @@ def guide_db(tmp_path: Path) -> Iterator[None]:
     """An empty guide database, for the tests that read or write the guide."""
     epg.init(tmp_path / "epg")
     yield
-    epg.close()
+    db.close()
 
 
 @pytest.fixture(autouse=True)

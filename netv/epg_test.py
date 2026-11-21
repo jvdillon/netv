@@ -6,35 +6,31 @@ from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import gc
 import gzip
 import logging
-import sqlite3
-import threading
 import tracemalloc
-import warnings
 import zlib
 
 import defusedxml.ElementTree as ET
 import pytest
 
-from netv import epg, testing, util
+from netv import db, epg, testing, util
 from netv.epg import Program
 
 
 @pytest.fixture
-def db(tmp_path: Path) -> Iterator[None]:
+def epg_db(tmp_path: Path) -> Iterator[None]:
     """Initialize EPG database in temp directory."""
     epg.init(tmp_path)
     yield
-    epg.close()
+    db.close()
 
 
 class TestInit:
     """Tests for database initialization."""
 
-    def test_init_creates_tables(self, db: None):
-        conn = epg._get_conn()
+    def test_init_creates_tables(self, epg_db: None):
+        conn = db.connection()
         tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         table_names = {t["name"] for t in tables}
         assert "channels" in table_names
@@ -42,33 +38,10 @@ class TestInit:
         assert "programs" in table_names
 
 
-class TestConnectionLifecycle:
-    """Tests that every per-thread connection is closed."""
+class TestReinit:
+    """Tests for opening another guide database."""
 
-    def test_connection_of_exited_thread_is_closed(self, db: None):
-        worker = threading.Thread(target=epg.has_programs)
-        worker.start()
-        worker.join()
-        del worker
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always", ResourceWarning)
-            gc.collect()
-        assert [w for w in caught if issubclass(w.category, ResourceWarning)] == []
-
-    def test_close_closes_connections_of_every_thread(self, db: None):
-        conns: list[sqlite3.Connection] = []
-        worker = threading.Thread(target=_append_connection, args=(conns,))
-        worker.start()
-        worker.join()
-        conns.append(epg._get_conn())
-        epg.close()
-        for conn in conns:
-            with pytest.raises(sqlite3.ProgrammingError, match="closed"):
-                conn.execute("SELECT 1")
-        with pytest.raises(RuntimeError, match="not initialized"):
-            epg.has_programs()
-
-    def test_reinit_reconnects_to_new_database(self, db: None, tmp_path: Path):
+    def test_reinit_reconnects_to_new_database(self, epg_db: None, tmp_path: Path):
         epg.insert_channel("ch1", "Channel One", "src1")
         epg.commit()
         epg.init(tmp_path / "other")
@@ -78,21 +51,21 @@ class TestConnectionLifecycle:
 class TestChannels:
     """Tests for channel operations."""
 
-    def test_insert_channel(self, db: None):
+    def test_insert_channel(self, epg_db: None):
         epg.insert_channel("ch1", "Channel One", "src1")
         epg.commit()
 
-        conn = epg._get_conn()
+        conn = db.connection()
         row = conn.execute("SELECT * FROM channels WHERE id = ?", ("ch1",)).fetchone()
         assert row["name"] == "Channel One"
         assert row["source_id"] == "src1"
 
-    def test_insert_channel_upsert(self, db: None):
+    def test_insert_channel_upsert(self, epg_db: None):
         epg.insert_channel("ch1", "Old Name", "src1")
         epg.insert_channel("ch1", "New Name", "src1")
         epg.commit()
 
-        conn = epg._get_conn()
+        conn = db.connection()
         rows = conn.execute("SELECT * FROM channels WHERE id = ?", ("ch1",)).fetchall()
         assert len(rows) == 1
         assert rows[0]["name"] == "New Name"
@@ -101,18 +74,18 @@ class TestChannels:
 class TestIcons:
     """Tests for icon operations."""
 
-    def test_insert_icon(self, db: None):
+    def test_insert_icon(self, epg_db: None):
         epg.insert_icon("ch1", "http://example.com/icon.png")
         epg.commit()
 
         result = epg.get_icon("ch1")
         assert result == "http://example.com/icon.png"
 
-    def test_get_icon_not_found(self, db: None):
+    def test_get_icon_not_found(self, epg_db: None):
         result = epg.get_icon("nonexistent")
         assert result == ""
 
-    def test_get_icons_batch(self, db: None):
+    def test_get_icons_batch(self, epg_db: None):
         epg.insert_icon("ch1", "http://example.com/1.png")
         epg.insert_icon("ch2", "http://example.com/2.png")
         epg.insert_icon("ch3", "http://example.com/3.png")
@@ -124,7 +97,7 @@ class TestIcons:
             "ch3": "http://example.com/3.png",
         }
 
-    def test_get_icons_batch_empty(self, db: None):
+    def test_get_icons_batch_empty(self, epg_db: None):
         result = epg.get_icons_batch([])
         assert result == {}
 
@@ -132,7 +105,7 @@ class TestIcons:
 class TestPrograms:
     """Tests for program operations."""
 
-    def test_insert_programs(self, db: None):
+    def test_insert_programs(self, epg_db: None):
         now = datetime.now(timezone.utc)
         programs = [
             (
@@ -158,7 +131,7 @@ class TestPrograms:
         count = epg.get_program_count()
         assert count == 2
 
-    def test_get_programs_in_range(self, db: None):
+    def test_get_programs_in_range(self, epg_db: None):
         now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
         programs = [
             (
@@ -199,12 +172,12 @@ class TestPrograms:
         assert result[0].title == "Show 1"
         assert result[1].title == "Show 2"
 
-    def test_get_programs_in_range_empty(self, db: None):
+    def test_get_programs_in_range_empty(self, epg_db: None):
         now = datetime.now(timezone.utc)
         result = epg.get_programs_in_range("ch1", now, now + timedelta(hours=1))
         assert result == []
 
-    def test_get_programs_batch(self, db: None):
+    def test_get_programs_batch(self, epg_db: None):
         now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
         programs = [
             ("ch1", "Show A", now.timestamp(), (now + timedelta(hours=1)).timestamp(), "", "src1"),
@@ -224,14 +197,14 @@ class TestPrograms:
         assert result["ch1"][0].title == "Show A"
         assert result["ch2"][0].title == "Show B"
 
-    def test_get_programs_batch_empty_channels(self, db: None):
+    def test_get_programs_batch_empty_channels(self, epg_db: None):
         result = epg.get_programs_batch([], datetime.now(timezone.utc), datetime.now(timezone.utc))
         assert result == {}
 
-    def test_has_programs_false(self, db: None):
+    def test_has_programs_false(self, epg_db: None):
         assert epg.has_programs() is False
 
-    def test_has_programs_true(self, db: None):
+    def test_has_programs_true(self, epg_db: None):
         now = datetime.now(timezone.utc)
         epg.insert_programs(
             [("ch1", "Show", now.timestamp(), (now + timedelta(hours=1)).timestamp(), "", "src1")],
@@ -239,7 +212,7 @@ class TestPrograms:
         epg.commit()
         assert epg.has_programs() is True
 
-    def test_get_program_count(self, db: None):
+    def test_get_program_count(self, epg_db: None):
         now = datetime.now(timezone.utc)
         assert epg.get_program_count() == 0
 
@@ -267,7 +240,7 @@ class TestPrograms:
 
         assert epg.get_program_count() == 2
 
-    def test_get_channel_count(self, db: None):
+    def test_get_channel_count(self, epg_db: None):
         assert epg.get_channel_count() == 0
 
         epg.insert_channel("ch1", "Channel 1", "src1")
@@ -280,7 +253,7 @@ class TestPrograms:
 class TestClear:
     """Tests for clear operations."""
 
-    def test_clear_all(self, db: None):
+    def test_clear_all(self, epg_db: None):
         now = datetime.now(timezone.utc)
         epg.insert_channel("ch1", "Channel 1", "src1")
         epg.insert_icon("ch1", "http://example.com/icon.png")
@@ -295,7 +268,7 @@ class TestClear:
         assert epg.get_program_count() == 0
         assert epg.get_icon("ch1") == ""
 
-    def test_clear_source(self, db: None):
+    def test_clear_source(self, epg_db: None):
         now = datetime.now(timezone.utc)
         epg.insert_channel("ch1", "Channel 1", "src1")
         epg.insert_channel("ch2", "Channel 2", "src2")
@@ -330,7 +303,7 @@ class TestClear:
 class TestPrune:
     """Tests for prune operations."""
 
-    def test_has_programs_after(self, db: None):
+    def test_has_programs_after(self, epg_db: None):
         now = datetime.now(timezone.utc)
         epg.insert_programs(
             [("ch1", "Show", now.timestamp(), (now + timedelta(hours=1)).timestamp(), "", "src1")],
@@ -340,7 +313,7 @@ class TestPrune:
         assert epg.has_programs_after(now)
         assert not epg.has_programs_after(now + timedelta(hours=2))
 
-    def test_search_channels_ranks_channels_with_listings_first(self, db: None):
+    def test_search_channels_ranks_channels_with_listings_first(self, epg_db: None):
         now = datetime.now(timezone.utc)
         epg.insert_channel("alpha.one", "XX| ALPHA ONE", "src1")
         epg.insert_channel("XX-Alpha One", "XX| ALPHA ONE HD", "src1")
@@ -365,7 +338,7 @@ class TestPrune:
         assert [r["has_listings"] for r in results] == [True, False]
         assert epg.search_channels([]) == []
 
-    def test_prune_old_programs(self, db: None):
+    def test_prune_old_programs(self, epg_db: None):
         now = datetime.now(timezone.utc)
         old = now - timedelta(days=2)
         epg.insert_programs(
@@ -399,7 +372,7 @@ class TestPrune:
 class TestPreferredSource:
     """Tests for preferred source deduplication."""
 
-    def test_prefer_source_in_range(self, db: None):
+    def test_prefer_source_in_range(self, epg_db: None):
         now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
         # Two overlapping programs from different sources.
         epg.insert_programs(
@@ -473,7 +446,7 @@ class TestProgram:
 class TestBatchPreferredSources:
     """Tests for get_programs_batch deduplication."""
 
-    def test_batch_dedupes_only_channels_with_preference(self, db: None):
+    def test_batch_dedupes_only_channels_with_preference(self, epg_db: None):
         now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
         hour = (now + timedelta(hours=1)).timestamp()
         later = (now + timedelta(hours=2)).timestamp()
@@ -501,7 +474,7 @@ class TestBatchPreferredSources:
         assert [p.title for p in result["ch3"]] == ["Only"]
         assert result["ch4"] == []
 
-    def test_batch_keeps_existing_when_preferred_comes_first(self, db: None):
+    def test_batch_keeps_existing_when_preferred_comes_first(self, epg_db: None):
         now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
         hour = (now + timedelta(hours=1)).timestamp()
         epg.insert_programs(
@@ -527,7 +500,7 @@ class TestBatchPreferredSources:
         ]
         assert epg._dedupe_programs(programs, "") is programs
 
-    def test_batch_chunks_channel_ids(self, db: None):
+    def test_batch_chunks_channel_ids(self, epg_db: None):
         now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
         hour = (now + timedelta(hours=1)).timestamp()
         epg.insert_programs([(f"ch{i}", f"S{i}", now.timestamp(), hour, "", "s") for i in range(5)])
@@ -569,10 +542,6 @@ class TestParseEpgTime:
     def test_garbage_raises(self):
         with pytest.raises(ValueError):
             epg._parse_epg_time("abcdefghijklmn")
-
-
-def _append_connection(conns: list[sqlite3.Connection]) -> None:
-    conns.append(epg._get_conn())
 
 
 def _serve(monkeypatch: pytest.MonkeyPatch, url: str, body: bytes) -> testing.FakeWeb:
@@ -618,7 +587,7 @@ def _guide(*programmes: tuple[str, str, str]) -> bytes:
 
 
 def _titles(source_id: str) -> list[tuple[str, str]]:
-    rows = epg._get_conn().execute(
+    rows = db.connection().execute(
         "SELECT channel_id, title FROM programs WHERE source_id = ? ORDER BY channel_id, start_ts",
         (source_id,),
     )
@@ -630,7 +599,7 @@ class TestRefetch:
 
     def test_refetch_replaces_the_schedule_from_the_feed_start(
         self,
-        db: None,
+        epg_db: None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
@@ -654,7 +623,7 @@ class TestRefetch:
 
     def test_one_of_a_source_s_guides_leaves_the_others_channels_alone(
         self,
-        db: None,
+        epg_db: None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
@@ -667,7 +636,7 @@ class TestRefetch:
 
     def test_refetch_leaves_other_sources_alone(
         self,
-        db: None,
+        epg_db: None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
@@ -682,7 +651,7 @@ class TestRefetch:
 
     def test_a_feed_without_programmes_or_source_deletes_nothing(
         self,
-        db: None,
+        epg_db: None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
@@ -704,7 +673,7 @@ class TestFetchEpg:
 
     def test_parses_channels_icons_and_programs(
         self,
-        db: None,
+        epg_db: None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
@@ -725,7 +694,7 @@ class TestFetchEpg:
             "EPG parsed: 3 channels, 2 unique program channel IDs, 2 programs",
         ]
         assert _requests(web) == [("http://epg.example/guide.xml", 7, {"User-agent": "UA/1"})]
-        conn = epg._get_conn()
+        conn = db.connection()
         names = dict(conn.execute("SELECT id, name FROM channels").fetchall())
         assert names == {"ch1": "Channel One", "ch2": "ch2", "ch3": "ch3"}
         assert epg.get_icons_batch(["ch1", "ch2", "ch3"]) == {"ch1": "http://i/1.png"}
@@ -741,18 +710,18 @@ class TestFetchEpg:
             (start + hour, start + 2 * hour),
         ]
 
-    def test_decompresses_gzip(self, db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def test_decompresses_gzip(self, epg_db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         url = "http://epg.example/guide.xml.gz"
         web = _serve(monkeypatch, url, gzip.compress(XMLTV.encode()))
         assert epg.fetch_epg(url, tmp_path) == 2
         assert _requests(web) == [(url, 120, VLC)]
-        conn = epg._get_conn()
+        conn = db.connection()
         assert {row[0] for row in conn.execute("SELECT source_id FROM channels")} == {""}
         assert {row[0] for row in conn.execute("SELECT source_id FROM programs")} == {""}
 
     def test_missing_attributes_use_empty_defaults(
         self,
-        db: None,
+        epg_db: None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
@@ -768,7 +737,7 @@ class TestFetchEpg:
         _serve(monkeypatch, "http://epg.example/defaults.xml", body.encode())
         # A programme without both times is skipped rather than placed at "now".
         assert epg.fetch_epg("http://epg.example/defaults.xml", tmp_path) == 1
-        conn = epg._get_conn()
+        conn = db.connection()
         assert [tuple(row) for row in conn.execute("SELECT * FROM channels")] == [("", "", "")]
         assert [tuple(row) for row in conn.execute("SELECT * FROM icons")] == [("", "")]
         noon = datetime(2024, 11, 30, 12, tzinfo=timezone.utc).timestamp()
@@ -781,7 +750,7 @@ class TestFetchEpg:
 
     def test_counts_rows_streamed_from_a_generator(
         self,
-        db: None,
+        epg_db: None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
@@ -800,7 +769,7 @@ class TestFetchEpg:
 
     def test_sanitizes_corrupt_xml(
         self,
-        db: None,
+        epg_db: None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
@@ -833,7 +802,7 @@ class TestFetchEpg:
 
     def test_raises_when_sanitized_xml_also_fails(
         self,
-        db: None,
+        epg_db: None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
@@ -849,7 +818,7 @@ class TestFetchEpg:
 class TestStreaming:
     def test_fetch_memory_does_not_grow_with_the_feed(
         self,
-        db: None,
+        epg_db: None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
@@ -878,7 +847,7 @@ class TestStreaming:
 
     def test_a_feed_that_breaks_late_writes_only_the_repaired_parse(
         self,
-        db: None,
+        epg_db: None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
@@ -895,12 +864,12 @@ class TestStreaming:
         assert epg.get_program_count() == 2
         # The repair fetches the feed again exactly as the first request did.
         assert _requests(web) == [(url, 7, {"User-agent": "UA/1"})] * 2
-        conn = epg._get_conn()
+        conn = db.connection()
         assert {row[0] for row in conn.execute("SELECT source_id FROM programs")} == {"src1"}
 
     def test_only_top_level_channels_and_programmes_are_read(
         self,
-        db: None,
+        epg_db: None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
@@ -912,7 +881,7 @@ class TestStreaming:
         body = f'<tv><channel id="outer"/>{nested}{prog.format("outer")}</tv>'
         _serve(monkeypatch, "http://epg.example/nested.xml", body.encode())
         assert epg.fetch_epg("http://epg.example/nested.xml", tmp_path) == 1
-        conn = epg._get_conn()
+        conn = db.connection()
         assert [row[0] for row in conn.execute("SELECT id FROM channels")] == ["outer"]
         assert [row[0] for row in conn.execute("SELECT channel_id FROM programs")] == ["outer"]
 
@@ -1020,7 +989,7 @@ class TestReadEpgBody:
 
     def test_fetch_epg_rejects_an_oversized_feed(
         self,
-        db: None,
+        epg_db: None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):

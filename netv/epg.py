@@ -6,21 +6,18 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Thread
 from typing import Final, Protocol, TypedDict, cast
-from weakref import finalize
 from xml.etree.ElementTree import Element
 
 import logging
 import os
 import re
-import sqlite3
-import threading
 import time
 import zlib
 
 import defusedxml.ElementTree as ET  # Safe XML parsing.
 
+from netv import db
 from netv.util import safe_urlopen
 
 
@@ -55,31 +52,14 @@ class ChannelMatch(TypedDict):
 # =============================================================================
 
 
-class _ThreadState(threading.local):
-    """Per-thread SQLite connection and the finalizer that closes it."""
-
-    conn: sqlite3.Connection | None = None
-    closer: finalize[[], Thread] | None = None
-
-
-_DB_PATH: Path | None = None
-_local: _ThreadState | None = None
-_closers: list[finalize[[], Thread]] = []
-
-
 def init(cache_dir: Path) -> None:
     """Initialize EPG database, closing connections to any earlier one.
 
     Args:
         cache_dir: Directory containing the persistent guide database.
     """
-    global _DB_PATH, _local
-    close()
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    _DB_PATH = cache_dir / "epg.db"
-    if _local is None:
-        _local = _ThreadState()
-    conn = _get_conn()
+    db.open_database(cache_dir / "epg.db")
+    conn = db.connection()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS channels (
             id TEXT PRIMARY KEY,
@@ -107,24 +87,16 @@ def init(cache_dir: Path) -> None:
     conn.commit()
 
 
-def close() -> None:
-    """Close every thread's connection and forget the database path."""
-    global _DB_PATH
-    _DB_PATH = None
-    while _closers:
-        _closers.pop()()
-
-
 def clear() -> None:
     """Clear all EPG data."""
-    conn = _get_conn()
+    conn = db.connection()
     conn.executescript("DELETE FROM programs; DELETE FROM channels; DELETE FROM icons;")
     conn.commit()
 
 
 def clear_source(source_id: str) -> None:
     """Clear EPG data for a specific source."""
-    conn = _get_conn()
+    conn = db.connection()
     conn.execute("DELETE FROM programs WHERE source_id = ?", (source_id,))
     conn.execute("DELETE FROM channels WHERE source_id = ?", (source_id,))
     conn.commit()
@@ -132,7 +104,7 @@ def clear_source(source_id: str) -> None:
 
 def insert_channel(channel_id: str, name: str, source_id: str) -> None:
     """Insert or update a channel."""
-    conn = _get_conn()
+    conn = db.connection()
     conn.execute(
         "INSERT OR REPLACE INTO channels (id, name, source_id) VALUES (?, ?, ?)",
         (channel_id, name, source_id),
@@ -141,9 +113,9 @@ def insert_channel(channel_id: str, name: str, source_id: str) -> None:
 
 def insert_icon(channel_id: str, url: str) -> None:
     """Insert or update a channel icon."""
-    conn = _get_conn()
+    conn = db.connection()
     conn.execute(
-        "INSERT OR REPLACE INTO icons (channel_id, url) VALUES (?, ?)",
+        "INSERT OR REPLACE INTO icons (channel_id, url) VALUES (?, ?)",  # pragma: no mutate[case-insensitive]
         (channel_id, url),
     )
 
@@ -157,7 +129,7 @@ def insert_programs(programs: Iterable[tuple[str, str, float, float, str, str]])
     Returns:
         count: Rows inserted.
     """
-    conn = _get_conn()
+    conn = db.connection()
     return conn.executemany(
         "INSERT INTO programs (channel_id, title, start_ts, stop_ts, desc, source_id) VALUES (?, ?, ?, ?, ?, ?)",  # pragma: no mutate[case-insensitive]
         programs,
@@ -174,7 +146,7 @@ def clear_source_from(source_id: str, channel_ids: Iterable[str], start_ts: floa
         channel_ids: Channels the fresh feed lists programs for.
         start_ts: Start of the fresh feed's earliest program.
     """
-    _get_conn().executemany(
+    db.connection().executemany(
         "DELETE FROM programs WHERE source_id = ? AND channel_id = ? AND start_ts >= ?",  # pragma: no mutate[case-insensitive]
         ((source_id, channel_id, start_ts) for channel_id in channel_ids),
     )
@@ -182,12 +154,12 @@ def clear_source_from(source_id: str, channel_ids: Iterable[str], start_ts: floa
 
 def commit() -> None:
     """Commit current transaction."""
-    _get_conn().commit()
+    db.connection().commit()
 
 
 def get_icon(channel_id: str) -> str:
     """Get icon URL for a channel."""
-    conn = _get_conn()
+    conn = db.connection()
     row = conn.execute("SELECT url FROM icons WHERE channel_id = ?", (channel_id,)).fetchone()
     # Typeshed types sqlite rows as Any; insert_icon stores text.
     return cast(str, row["url"]) if row else ""
@@ -210,7 +182,7 @@ def get_programs_in_range(
     Returns:
         programs: Matching programs ordered by start time.
     """
-    conn = _get_conn()
+    conn = db.connection()
     start_ts = start.timestamp()
     end_ts = end.timestamp()
 
@@ -278,7 +250,7 @@ def get_programs_batch(
     """
     if not channel_ids:
         return {}
-    conn = _get_conn()
+    conn = db.connection()
     start_ts = start.timestamp()
     end_ts = end.timestamp()
     result: dict[str, list[Program]] = {ch: [] for ch in channel_ids}
@@ -335,7 +307,7 @@ def get_icons_batch(channel_ids: list[str], *, chunk_size: int = 500) -> dict[st
     """
     if not channel_ids:
         return {}
-    conn = _get_conn()
+    conn = db.connection()
     result: dict[str, str] = {}
     for i in range(0, len(channel_ids), chunk_size):
         chunk = channel_ids[i : i + chunk_size]
@@ -351,7 +323,7 @@ def get_icons_batch(channel_ids: list[str], *, chunk_size: int = 500) -> dict[st
 
 def has_programs() -> bool:
     """Check if there are any programs in the database."""
-    conn = _get_conn()
+    conn = db.connection()
     row = conn.execute("SELECT 1 FROM programs LIMIT 1").fetchone()
     return row is not None
 
@@ -365,9 +337,9 @@ def has_programs_after(when: datetime) -> bool:
     Returns:
         available: Whether a program ends after the instant.
     """
-    conn = _get_conn()
+    conn = db.connection()
     row = conn.execute(
-        "SELECT 1 FROM programs WHERE stop_ts > ? LIMIT 1",
+        "SELECT 1 FROM programs WHERE stop_ts > ? LIMIT 1",  # pragma: no mutate[case-insensitive]
         (when.timestamp(),),
     ).fetchone()
     return row is not None
@@ -394,7 +366,7 @@ def search_channels(terms: list[str], limit: int = 20) -> list[ChannelMatch]:
         like = f"%{t}%"
         params += [like, like]
     now = datetime.now(timezone.utc).timestamp()
-    conn = _get_conn()
+    conn = db.connection()
     rows = conn.execute(
         f"""
         SELECT c.id, c.name, EXISTS(
@@ -413,21 +385,21 @@ def search_channels(terms: list[str], limit: int = 20) -> list[ChannelMatch]:
 
 def get_program_count() -> int:
     """Get total program count."""
-    conn = _get_conn()
+    conn = db.connection()
     row = conn.execute("SELECT COUNT(*) FROM programs").fetchone()
     return cast(int, row[0]) if row else 0
 
 
 def get_channel_count() -> int:
     """Get total channel count."""
-    conn = _get_conn()
+    conn = db.connection()
     row = conn.execute("SELECT COUNT(*) FROM channels").fetchone()
     return cast(int, row[0]) if row else 0
 
 
 def prune_old_programs(before: datetime) -> int:
     """Delete programs that ended before the given time. Returns count deleted."""
-    conn = _get_conn()
+    conn = db.connection()
     cursor = conn.execute("DELETE FROM programs WHERE stop_ts < ?", (before.timestamp(),))
     conn.commit()
     return cursor.rowcount
@@ -668,24 +640,6 @@ def fetch_epg(
         program_count,
     )
     return program_count
-
-
-def _get_conn() -> sqlite3.Connection:
-    """Get thread-local database connection."""
-    if _local is None or _DB_PATH is None:
-        raise RuntimeError("EPG database not initialized")
-    if _local.conn is None or _local.closer is None or not _local.closer.alive:
-        # A thread's locals vanish when it exits, dropping the connection
-        # unclosed. The finalizer closes it once the thread object is gone, or
-        # at exit; it may run on another thread, hence check_same_thread=False.
-        conn = sqlite3.connect(_DB_PATH, timeout=30.0, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        closer = finalize(threading.current_thread(), conn.close)
-        _closers.append(closer)
-        _local.conn = conn
-        _local.closer = closer
-    return _local.conn
 
 
 def _dedupe_programs(programs: list[Program], preferred_source_id: str) -> list[Program]:

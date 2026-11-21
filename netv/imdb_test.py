@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 from email.message import Message
-from pathlib import Path
 from urllib import error, parse
 
 import gzip
 import json
 import logging
-import os
-import time
 
 import pytest
 
-from netv import imdb, testing, util
+from netv import db, imdb, testing, util
 from netv.xtream import ProviderRecord
 
 
@@ -26,6 +23,13 @@ _TMDB = {
     ("movies", "600"): "tt99",
     ("movies", "700"): "tt6",
 }
+
+
+@pytest.fixture(autouse=True)
+def index(guide_db: None) -> None:
+    """The index tables, in the per-test database."""
+    del guide_db
+    imdb.init()
 
 
 @pytest.fixture
@@ -116,8 +120,7 @@ def test_title_key_ignores_case_accents_and_punctuation():
     assert imdb.title_key("Heat", 1995) != imdb.title_key("Heat", 1996)
 
 
-def test_build_joins_movies_and_series_by_title_and_year(tmp_path: Path, web: testing.FakeWeb):
-    index = tmp_path / "imdb.json"
+def test_build_joins_movies_and_series_by_title_and_year(web: testing.FakeWeb):
     heat: ProviderRecord = {"stream_id": 1, "name": "Heat - 1995"}
     show: ProviderRecord = {"series_id": 4, "name": "Amelie and Co", "releaseDate": "2001-05-01"}
     film: ProviderRecord = {"stream_id": 5, "name": "Amelie and Co - 2002"}
@@ -128,22 +131,21 @@ def test_build_joins_movies_and_series_by_title_and_year(tmp_path: Path, web: te
     ]
 
     records = [heat, show, film, *unmatched]
-    assert imdb.build(index, records, base_url=_BASE, sparql_url=_SPARQL) == 3
+    assert imdb.build(records, base_url=_BASE, sparql_url=_SPARQL) == 3
     assert {f.timeout for f in web.fetches if f.url.startswith(_BASE)} == {60}
     # The exact-year movie with the most votes wins over a video, a remake, and an episode.
-    assert imdb.info(index, heat) == _HEAT
+    assert imdb.info(heat) == _HEAT
     # A series dates by air date; a one-year difference still matches a movie.
-    found_show = imdb.info(index, show)
+    found_show = imdb.info(show)
     assert found_show is not None and found_show["imdb_id"] == "tt4"
-    found_film = imdb.info(index, film)
+    found_film = imdb.info(film)
     assert found_film is not None and found_film["imdb_id"] == "tt5"
     assert found_film["runtime_min"] == 0 and found_film["genres"] == []
     assert found_film["rating"] == 0.0 and found_film["directors"] == []
-    assert [imdb.info(index, r) for r in unmatched] == [None, None, None]
+    assert [imdb.info(r) for r in unmatched] == [None, None, None]
 
 
-def test_build_prefers_the_tmdb_id_then_votes(tmp_path: Path, web: testing.FakeWeb):
-    index = tmp_path / "imdb.json"
+def test_build_prefers_the_tmdb_id_then_votes(web: testing.FakeWeb):
     # Wikidata maps this TMDB id to the 1986 Heat, so the title join is not used.
     remake: ProviderRecord = {"stream_id": 1, "name": "Heat - 1995", "tmdb": 500}
     show: ProviderRecord = {"series_id": 4, "name": "Renamed", "tmdb": "77"}
@@ -155,18 +157,22 @@ def test_build_prefers_the_tmdb_id_then_votes(tmp_path: Path, web: testing.FakeW
     undated: ProviderRecord = {"stream_id": 5, "name": "Whatever", "tmdb": "700"}
     records = [remake, show, gone, unmapped, popular, undated]
 
-    assert imdb.build(index, records, base_url=_BASE, sparql_url=_SPARQL) == 5
-    found = [imdb.info(index, r) for r in records]
+    assert imdb.build(records, base_url=_BASE, sparql_url=_SPARQL) == 5
+    found = [imdb.info(r) for r in records]
     assert [f and f["imdb_id"] for f in found] == ["tt2", "tt4", "tt1", "tt1", "tt8", "tt6"]
     assert found[5] is not None and found[5]["year"] == 0
-    stored = json.loads(index.read_text())
+    stored = {row[0] for row in db.connection().execute("SELECT key FROM imdb_titles")}
     # A record joined by id keeps no title key.
-    assert "movies:heat|1995" in stored and "series:renamed|0" not in stored
-    assert "movies:tmdb:500" in stored and "movies:tmdb:600" not in stored
+    assert stored == {
+        "movies:tmdb:500",
+        "series:tmdb:77",
+        "movies:heat|1995",
+        "movies:threehundred|2007",
+        "movies:tmdb:700",
+    }
 
 
 def test_build_joins_by_title_when_wikidata_is_down(
-    tmp_path: Path,
     web: testing.FakeWeb,
     caplog: pytest.LogCaptureFixture,
 ):
@@ -177,11 +183,10 @@ def test_build_joins_by_title_when_wikidata_is_down(
         Message(),
         None,
     )
-    index = tmp_path / "imdb.json"
     remake: ProviderRecord = {"stream_id": 1, "name": "Heat - 1995", "tmdb": "500"}
     with caplog.at_level(logging.WARNING, logger="netv.imdb"):
-        assert imdb.build(index, [remake], base_url=_BASE, sparql_url=_SPARQL) == 1
-    found = imdb.info(index, remake)
+        assert imdb.build([remake], base_url=_BASE, sparql_url=_SPARQL) == 1
+    found = imdb.info(remake)
     assert found is not None and found["imdb_id"] == "tt1"
     assert "joining by title" in caplog.text
 
@@ -207,26 +212,48 @@ def test_people_lists_cast_first():
     ]
 
 
-@pytest.mark.parametrize("text", ['{"heat|1995": {"director": "Michael Mann"}}', '{"trunc'])
-def test_an_unreadable_index_is_absent_and_stale(tmp_path: Path, text: str):
-    index = tmp_path / "imdb.json"
-    index.write_text(text)
-    assert imdb.info(index, {"stream_id": 1, "name": "Heat - 1995"}) is None
-    assert imdb.is_stale(index, max_age_sec=60)
+def test_an_unbuilt_index_is_empty_and_stale():
+    assert imdb.info({"stream_id": 1, "name": "Heat - 1995"}) is None
+    assert imdb.is_stale(max_age_sec=float("inf"))
+    assert imdb.matching_keys(lambda name: True) == set()
 
 
-def test_a_repaired_index_is_fresh_again(tmp_path: Path):
-    index = tmp_path / "imdb.json"
-    index.write_text("{")
-    os.utime(index, (time.time(), 1000))
-    assert imdb.is_stale(index, max_age_sec=float("inf"))
-    util.atomic_write_json(index, {})
-    os.utime(index, (time.time(), 2000))
-    assert not imdb.is_stale(index, max_age_sec=float("inf"))
+def test_a_rebuild_replaces_the_index(monkeypatch: pytest.MonkeyPatch):
+    heat: ProviderRecord = {"stream_id": 1, "name": "Heat - 1995"}
+    key = f"movies:{imdb.title_key('Heat', 1995)}"
+    monkeypatch.setattr(imdb.time, "time", lambda: 1000.0)
+    imdb._write({key: _HEAT})
+    assert imdb.info(heat) == _HEAT
+    monkeypatch.setattr(imdb.time, "time", lambda: 2000.0)
+    imdb._write({key: {**_HEAT, "votes": 1, "cast": ["Val Kilmer"], "crew": {}}})
+    found = imdb.info(heat)
+    assert found is not None and found["votes"] == 1 and found["cast"] == ["Val Kilmer"]
+    assert imdb.matching_keys(lambda name: "Pacino" in name) == set()
+    # Only the latest build's age counts.
+    assert not imdb.is_stale(max_age_sec=0)
 
 
-def test_info_without_an_index_is_none(tmp_path: Path):
-    assert imdb.info(tmp_path / "missing.json", {"stream_id": 1, "name": "Heat - 1995"}) is None
+def test_matching_and_resolved_keys():
+    imdb._write(
+        {
+            "movies:tmdb:9": {**_HEAT, "cast": ["Al Pacino"], "crew": {}},
+            "movies:heat|1995": {**_HEAT, "imdb_id": "tt2", "cast": ["Val Kilmer"], "crew": {}},
+            "movies:ronin|1998": {**_HEAT, "cast": [], "writers": [], "directors": [], "crew": {}},
+        },
+    )
+    ronin = imdb.info({"stream_id": 4, "name": "Ronin - 1998"})
+    assert ronin is not None and ronin["cast"] == [] and ronin["writers"] == []
+    assert imdb.matching_keys(lambda name: "pacino" in name.lower()) == {"movies:tmdb:9"}
+    assert imdb.matching_keys(lambda name: "Mann" in name) == {"movies:tmdb:9", "movies:heat|1995"}
+    records: list[ProviderRecord] = [
+        {"stream_id": 1, "name": "Heat - 1995", "tmdb": "9"},
+        {"stream_id": 2, "name": "Heat - 1995", "tmdb": "8"},
+        {"stream_id": 3, "name": "Unknown"},
+    ]
+    # An indexed TMDB id wins over the title; an unindexed one falls back to it.
+    assert imdb.resolved_keys(records) == ["movies:tmdb:9", "movies:heat|1995", None]
+    found = [imdb.info(r) for r in records]
+    assert [f and f["imdb_id"] for f in found] == ["tt1", "tt2", None]
 
 
 def test_billing_keeps_the_top_ten_wanted_cast(web: testing.FakeWeb):
@@ -246,19 +273,6 @@ def test_billing_keeps_the_top_ten_wanted_cast(web: testing.FakeWeb):
     assert roles == {}
 
 
-def test_info_rereads_an_index_rebuilt_elsewhere(tmp_path: Path):
-    index = tmp_path / "imdb.json"
-    heat: ProviderRecord = {"stream_id": 1, "name": "Heat - 1995"}
-    key = f"movies:{imdb.title_key('Heat', 1995)}"
-    util.atomic_write_json(index, {key: _HEAT})
-    os.utime(index, (1000, 1000))
-    assert imdb.info(index, heat) == _HEAT
-    util.atomic_write_json(index, {key: {**_HEAT, "votes": 1}})
-    os.utime(index, (2000, 2000))
-    found = imdb.info(index, heat)
-    assert found is not None and found["votes"] == 1
-
-
 def test_crew_keeps_wanted_titles(web: testing.FakeWeb):
     web.routes[f"{_BASE}/title.crew.tsv.gz"] = testing.FakeResponse(
         gzip.compress(b"tconst\tdirectors\twriters\ntt1\tnm1\tnm2\ntt2\tnm3\t\\N\n"),
@@ -273,14 +287,12 @@ def test_rows_keep_wanted_ids_and_empty_last_fields(web: testing.FakeWeb):
     assert list(imdb._rows(f"{_BASE}/t.tsv.gz", ["a", "c"])) == [["a", "x", ""], ["c", "X"]]
 
 
-def test_is_stale_by_age(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    index = tmp_path / "imdb.json"
-    assert imdb.is_stale(index, max_age_sec=60)
-    index.write_text("{}")
-    os.utime(index, (1000, 1000))
+def test_is_stale_by_age(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(imdb.time, "time", lambda: 1000.0)
+    imdb._write({})
     monkeypatch.setattr(imdb.time, "time", lambda: 1060.0)
-    assert not imdb.is_stale(index, max_age_sec=60)
-    assert imdb.is_stale(index, max_age_sec=59)
+    assert not imdb.is_stale(max_age_sec=60)
+    assert imdb.is_stale(max_age_sec=59)
 
 
 if __name__ == "__main__":

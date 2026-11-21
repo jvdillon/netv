@@ -450,7 +450,7 @@ def test_preload_epg_logs_errors(caplog: pytest.LogCaptureFixture) -> None:
     cache.get_cache()["epg_urls"] = [("http://e/epg", 5, "s")]
     with caplog.at_level(logging.ERROR):
         main._preload_epg()
-    assert "EPG load error: EPG database not initialized" in caplog.text
+    assert "EPG load error: Database not initialized" in caplog.text
 
 
 def test_load_all_epg_skips_when_another_thread_filled_it(
@@ -973,7 +973,9 @@ def test_player_missing_stream(api: TestClient, guide_db: None) -> None:
 # =============================================================================
 
 
+@pytest.mark.usefixtures("guide_db")
 def test_search_loads_data_and_applies_filters(api: TestClient) -> None:
+    imdb.init()
     live = [
         {"stream_id": 1, "name": "News One", "category_ids": ["1"]},
         {"stream_id": 2, "name": "News Two", "category_ids": ["2"]},
@@ -1272,7 +1274,7 @@ def test_settings_page_starts_background_load_without_cache(
     load.run()
     # No sources load no channels, and the guide database is not open.
     assert cache.get_cache().get("live_streams") == []
-    assert cache.get_cache().get("epg_error") == "EPG database not initialized"
+    assert cache.get_cache().get("epg_error") == "Database not initialized"
     assert not flags
 
 

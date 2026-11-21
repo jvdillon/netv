@@ -13,7 +13,6 @@ import json
 import logging
 import pathlib
 import re
-import runpy
 import sys
 import time
 
@@ -28,6 +27,7 @@ from netv import (
     auth,
     cache as cache_module,
     chromecast,
+    db,
     epg,
     ffmpeg_command,
     handoff,
@@ -1368,10 +1368,10 @@ def test_guide_background_load_records_guide_error(
     monkeypatch: pytest.MonkeyPatch,
 ):
     del threads
-    monkeypatch.setattr(epg, "_DB_PATH", None)
+    monkeypatch.setattr(db, "_path", None)
     cache_module.save_file_cache("live_data", {"cats": [], "streams": [], "epg_urls": []})
     main._start_guide_background_load()
-    assert cache_module.get_cache().get("epg_error") == "EPG database not initialized"
+    assert cache_module.get_cache().get("epg_error") == "Database not initialized"
     assert "guide_load" not in refresh_flags
 
 
@@ -1984,9 +1984,13 @@ def test_script_guard_exits_with_main_status(monkeypatch: pytest.MonkeyPatch, ro
     server = ServerRecorder()
     install_server(monkeypatch, server)
     monkeypatch.setattr(sys, "argv", ["main.py"])
-    monkeypatch.delitem(sys.modules, "netv.main")
+    # Run only the guard, at its own lines; re-importing all of main costs ~0.1 s.
+    path = Path(main.__file__)
+    lines = path.read_text().splitlines(keepends=True)
+    start = lines.index('if __name__ == "__main__":\n')
+    guard = compile("\n" * start + "".join(lines[start:]), str(path), "exec")
     with pytest.raises(SystemExit) as exit_info:
-        runpy.run_module("netv.main", run_name="__main__", alter_sys=True)
+        exec(guard, {**vars(main), "__name__": "__main__"})  # noqa: S102 -- Runs main's own guard lines, compiled from its source.
     assert exit_info.value.code == 0
     [run] = server.runs
     assert run.options["port"] == 8000

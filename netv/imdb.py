@@ -2,29 +2,28 @@
 
 Xtream catalogs carry little beyond a name: movie lists have no people at all, and
 series lists only sometimes. IMDb's non-commercial datasets have ids, genres,
-runtimes, ratings, and full credits. Only titles in the catalog are kept, which
-leaves a small JSON index next to the other caches.
+runtimes, ratings, and full credits. Only titles in the catalog are kept, in
+``imdb_*`` tables of neTV's database.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping, Sequence, Set
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set
 from concurrent.futures import ProcessPoolExecutor
 from typing import TypedDict, cast
 from urllib import parse
 
-import functools
 import gzip
 import logging
 import multiprocessing
-import pathlib
 import re
 import time
 import unicodedata
 
 from treekle import json_loads
 
-from netv.util import atomic_write_json, safe_urlopen
+from netv import db
+from netv.util import safe_urlopen
 from netv.xtream import ProviderRecord, text_field
 
 
@@ -73,31 +72,121 @@ def title_key(title: str, year: int) -> str:
     return "".join(c for c in folded if c.isalnum()) + f"|{year}"
 
 
-def is_stale(path: pathlib.Path, *, max_age_sec: float) -> bool:
-    """Whether the index at ``path`` is missing, unreadable, or older than ``max_age_sec``."""
-    if not path.exists():
-        return True
-    mtime = path.stat().st_mtime
-    return time.time() - mtime > max_age_sec or _index(path, mtime) is None
+def init() -> None:
+    """Create the index tables in the open database."""
+    conn = db.connection()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS imdb_titles (
+            key TEXT PRIMARY KEY,
+            imdb_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            year INTEGER NOT NULL,
+            genres TEXT NOT NULL,
+            runtime_min INTEGER NOT NULL,
+            rating REAL NOT NULL,
+            votes INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS imdb_names (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS imdb_credits (
+            title_key TEXT NOT NULL,
+            role TEXT NOT NULL,
+            billing INTEGER NOT NULL,
+            name_id INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_imdb_credits_title ON imdb_credits(title_key);
+        CREATE INDEX IF NOT EXISTS idx_imdb_credits_name ON imdb_credits(name_id);
+        CREATE TABLE IF NOT EXISTS imdb_builds (built_ts REAL NOT NULL);
+    """)
+    conn.commit()
 
 
-def info(path: pathlib.Path, record: ProviderRecord) -> Info | None:
-    """Return what the index at ``path`` knows of a catalog movie or series.
+def is_stale(*, max_age_sec: float) -> bool:
+    """Whether the index was never built or is older than ``max_age_sec``.
 
     Args:
-        path: JSON index ``build`` wrote.
+        max_age_sec: Oldest a build may be and still count as fresh.
+
+    Returns:
+        stale: True when the index needs a rebuild.
+    """
+    [built] = (
+        db.connection()
+        .execute(
+            "SELECT MAX(built_ts) FROM imdb_builds",  # pragma: no mutate[case-insensitive]
+        )
+        .fetchone()
+    )
+    return built is None or time.time() - built > max_age_sec
+
+
+def resolved_keys(records: Sequence[ProviderRecord]) -> list[str | None]:
+    """Return each record's index key: its TMDB id's when indexed, else its title's."""
+    present = {row[0] for row in db.connection().execute("SELECT key FROM imdb_titles")}
+    return [next((k for k in _catalog_keys(r) if k in present), None) for r in records]
+
+
+def matching_keys(match: Callable[[str], bool]) -> set[str]:
+    """Return the index keys of titles crediting anyone whose name ``match`` accepts.
+
+    Args:
+        match: Predicate on a person's name, run once per distinct name.
+
+    Returns:
+        keys: Index keys, as ``resolved_keys`` gives them.
+    """
+    conn = db.connection()
+    conn.create_function("netv_match", 1, match, deterministic=True)
+    rows = conn.execute(
+        "SELECT DISTINCT c.title_key FROM imdb_names n"
+        " JOIN imdb_credits c ON c.name_id = n.id WHERE netv_match(n.name)",
+    )
+    return {row[0] for row in rows}
+
+
+def info(record: ProviderRecord) -> Info | None:
+    """Return what the index knows of a catalog movie or series.
+
+    Args:
         record: Provider movie or series.
 
     Returns:
         found: IMDb's facts, or None for a title the index lacks.
     """
-    if not path.exists():
+    conn = db.connection()
+    for key in filter(None, _catalog_keys(record)):
+        row = conn.execute(
+            "SELECT imdb_id, title, year, genres, runtime_min, rating, votes"  # pragma: no mutate[case-insensitive]
+            " FROM imdb_titles WHERE key = ?",  # pragma: no mutate[case-insensitive]
+            (key,),
+        ).fetchone()
+        if row is not None:
+            break
+    else:
         return None
-    index = _index(path, path.stat().st_mtime)
-    if index is None:
-        return None
-    by_id, by_title = _catalog_keys(record)
-    return next((index[k] for k in (by_id, by_title) if k is not None and k in index), None)
+    credits: dict[str, list[str]] = {}
+    for role, name in conn.execute(
+        "SELECT c.role, n.name FROM imdb_credits c JOIN imdb_names n ON n.id = c.name_id"  # pragma: no mutate[case-insensitive]
+        " WHERE c.title_key = ? ORDER BY c.role, c.billing",  # pragma: no mutate[case-insensitive]
+        (key,),
+    ):
+        credits.setdefault(role, []).append(name)
+    imdb_id, title, year, genres, runtime_min, rating, votes = row
+    return Info(
+        imdb_id=imdb_id,
+        title=title,
+        year=year,
+        genres=genres.split(",") if genres else [],
+        runtime_min=runtime_min,
+        rating=rating,
+        votes=votes,
+        directors=credits.pop("director", []),
+        writers=credits.pop("writer", []),
+        cast=credits.pop("cast", []),
+        crew=credits,
+    )
 
 
 def people(found: Info) -> list[str]:
@@ -108,13 +197,12 @@ def people(found: Info) -> list[str]:
 
 
 def build(
-    path: pathlib.Path,
     records: Sequence[ProviderRecord],
     *,
     base_url: str = "https://datasets.imdbws.com",
     sparql_url: str = "https://query.wikidata.org/sparql",
 ) -> int:
-    """Write what IMDb knows of every catalog movie and series to ``path``.
+    """Replace the index with what IMDb knows of every catalog movie and series.
 
     A record joins by its TMDB id, which Wikidata maps to an IMDb id. One without
     a mapping joins by title and year: a provider year may differ from IMDb's by
@@ -123,7 +211,6 @@ def build(
     parallel processes.
 
     Args:
-        path: JSON index to replace.
         records: Provider movies and series.
         base_url: Where IMDb's ``*.tsv.gz`` datasets are served.
         sparql_url: Wikidata's SPARQL endpoint.
@@ -166,11 +253,54 @@ def build(
         crew = executor.submit(_crew, base_url, kept)
         cast_ids, roles = executor.submit(_billing, base_url, kept).result()
         infos = _infos(base_url, kept, ratings, crew.result(), (cast_ids, roles))
-    index = {key: infos[chosen[key]] for key in needed}
-    atomic_write_json(path, index)
-    _index.cache_clear()
-    log.info("IMDb index: %d catalog titles", len(index))
-    return len(index)
+    _write({key: infos[chosen[key]] for key in needed})
+    log.info("IMDb index: %d catalog titles", len(needed))
+    return len(needed)
+
+
+def _write(index: Mapping[str, Info]) -> None:
+    """Replace the index tables in one transaction, so readers never see half."""
+    names = sorted({name for found in index.values() for name in people(found)})
+    name_ids = {name: i for i, name in enumerate(names)}
+    credits = [
+        (key, role, billing, name_ids[name])
+        for key, found in index.items()
+        for role, credited in (
+            ("cast", found["cast"]),
+            ("director", found["directors"]),
+            ("writer", found["writers"]),
+            *found["crew"].items(),
+        )
+        for billing, name in enumerate(credited)
+    ]
+    conn = db.connection()
+    with conn:
+        conn.execute("DELETE FROM imdb_titles")
+        conn.execute("DELETE FROM imdb_names")
+        conn.execute("DELETE FROM imdb_credits")
+        conn.execute("DELETE FROM imdb_builds")
+        conn.executemany(
+            "INSERT INTO imdb_titles VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                (
+                    key,
+                    f["imdb_id"],
+                    f["title"],
+                    f["year"],
+                    ",".join(f["genres"]),
+                    f["runtime_min"],
+                    f["rating"],
+                    f["votes"],
+                )
+                for key, f in index.items()
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO imdb_names VALUES (?, ?)",
+            ((i, n) for n, i in name_ids.items()),
+        )
+        conn.executemany("INSERT INTO imdb_credits VALUES (?, ?, ?, ?)", credits)
+        conn.execute("INSERT INTO imdb_builds VALUES (?)", (time.time(),))
 
 
 def _catalog_keys(record: ProviderRecord) -> tuple[str | None, str | None]:
@@ -358,14 +488,3 @@ def _ids(field: str) -> list[str]:
 
 def _names(ids: Iterable[str], names: Mapping[str, str]) -> list[str]:
     return [names[i] for i in ids if i in names]
-
-
-# ``mtime`` keys the cache so a rebuilt file is reread.
-@functools.lru_cache(maxsize=1)
-def _index(path: pathlib.Path, mtime: float) -> dict[str, Info] | None:
-    """Load the index, or None when another release or a crash left it unreadable."""
-    del mtime
-    try:
-        return json_loads(path.read_text(), dict[str, Info])
-    except ValueError:  # ReadError is a ValueError; so is truncated JSON.
-        return None
