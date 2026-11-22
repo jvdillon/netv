@@ -102,10 +102,10 @@ def test_main_builds_guide_from_api(
     (cache_dir / "1000.json.gz").write_bytes(b"")
     urls: list[str] = []
 
-    def urlopen(req: request.Request) -> FakeResponse:
+    def urlopen(req: request.Request, *, timeout: float) -> FakeResponse:
         urls.append(req.full_url)
         assert req.get_header("Accept") == "*/*"
-        # Only the first chunk may declare channels; later ones name another.
+        # A later chunk may name a channel the first did not.
         channel = {**CHANNEL, "callSign": "KXTVDT" if len(urls) == 1 else "KOVRDT5"}
         event = _event(flag=[], program={"title": "Gämé"})
         body = {"channels": [{**channel, "events": [event]}]}
@@ -161,16 +161,68 @@ def test_main_builds_guide_from_api(
     assert "isOverride=False" in urls[1]
     assert int(parse.parse_qs(parse.urlsplit(urls[1]).query)["time"][0]) == times[0] + window
     tv = xml.parse(tmp_path / "xmltv.xml").getroot()
-    assert [c.get("id") for c in tv.iter("channel")] == ["KXTVDT"]
+    assert [c.get("id") for c in tv.iter("channel")] == ["KXTVDT", "KOVRDT5"]
+    assert [el.tag for el in tv] == ["channel", "channel", "programme", "programme"]
     titles = [p.findtext("sub-title") for p in tv.iter("programme")]
     assert titles == ["Finals", "Finals"]
+
+
+def test_main_writes_each_programme_and_channel_once(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def urlopen(req: request.Request, *, timeout: float) -> FakeResponse:
+        calls.append(req.full_url)
+        if len(calls) == 1:
+            # The site refuses some windows; a refused first one names no channels.
+            raise error.HTTPError(req.full_url, 400, "Bad Request", message.Message(), None)
+        # Each window lists every programme overlapping it, so one straddling the
+        # boundary between windows comes back from both.
+        straddling = _event(startTime="2025-04-20T05:30:00Z", endTime="2025-04-20T06:30:00Z")
+        own = _event(startTime=f"2025-04-20T0{len(calls) + 5}:00:00Z")
+        body = {"channels": [{**CHANNEL, "events": [straddling, own]}]}
+        return FakeResponse(json.dumps(body).encode())
+
+    monkeypatch.setattr(request, "urlopen", urlopen)
+    argv = ["zap2xml", "--zip", "1", "--path", str(tmp_path), "--delay", "0"]
+    monkeypatch.setattr(sys, "argv", [*argv, "--days", "0.375"])
+    assert zap2xml.main(sleep=lambda _: None) == 0
+    assert len(calls) == 3
+    tv = xml.parse(tmp_path / "xmltv.xml").getroot()
+    assert [c.get("id") for c in tv.iter("channel")] == ["KXTVDT"]
+    starts = [p.get("start") for p in tv.iter("programme")]
+    assert starts == ["20250420053000 +0000", "20250420070000 +0000", "20250420080000 +0000"]
+
+
+def test_main_keeps_the_last_guide_when_writing_fails(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "xmltv.xml").write_bytes(b"last good guide")
+
+    def tostring(*args: object, **kwargs: object) -> bytes:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(xml, "tostring", tostring)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["zap2xml", "--zip", "1", "--path", str(tmp_path), "--days", "0"],
+    )
+    with pytest.raises(OSError, match="disk full"):
+        zap2xml.main()
+    # Readers see the old guide or the new one, never a part-written file.
+    assert (tmp_path / "xmltv.xml").read_bytes() == b"last good guide"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".zap2xml", "xmltv.xml"]
 
 
 def test_main_accepts_fifteen_days(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def urlopen(req: request.Request) -> FakeResponse:
+    def urlopen(req: request.Request, *, timeout: float) -> FakeResponse:
         del req
         return FakeResponse(b'{"channels": []}')
 
@@ -267,8 +319,11 @@ def test_get_cached_paths(
         error.HTTPError("https://x/400", 400, "err", message.Message(), None) as bad_request,
         error.HTTPError("https://x/500", 500, "err", message.Message(), None) as server_error,
     ):
+        timeouts: list[float] = []
 
-        def urlopen(req: request.Request) -> FakeResponse:
+        def urlopen(req: request.Request, *, timeout: float) -> FakeResponse:
+            # A stalled server must not hang a cron job forever.
+            timeouts.append(timeout)
             code = int(req.full_url.rsplit("/", 1)[1])
             if code == 200:
                 return FakeResponse(b"fresh")
@@ -276,6 +331,7 @@ def test_get_cached_paths(
 
         monkeypatch.setattr(request, "urlopen", urlopen)
         assert zap2xml.get_cached(tmp_path, 7, 3, "http://x/200", sleep=sleeps.append) == b"fresh"
+        assert timeouts == [60]
         with gzip.open(tmp_path / "7.json.gz", "rb") as f:
             assert f.read() == b"fresh"
 
@@ -284,6 +340,8 @@ def test_get_cached_paths(
         assert bad_request.closed
         assert "Got a 400 error! Ignoring it." in capsys.readouterr().out
         assert sleeps == [3, 4]
+        # A refused window is asked for again next run, not remembered as empty.
+        assert not (tmp_path / "8.json.gz").exists()
 
         with pytest.raises(error.HTTPError) as exc:
             zap2xml.get_cached(tmp_path, 9, 3, "https://x/500", sleep=sleeps.append)
@@ -460,10 +518,11 @@ def test_parse_callsign() -> None:
     assert zap2xml.parse_callsign("KXTVDT") == "KXTV-DT-1"
     assert zap2xml.parse_callsign("kovrdt5") == "KOVR-DT-5"
     assert zap2xml.parse_callsign("KQSLD") == "KQSL-LD-1"
-    with pytest.raises(ValueError, match="Expected result."):
-        zap2xml.parse_callsign("WGN")
-    with pytest.raises(ValueError, match='Expected num != "1".'):
-        zap2xml.parse_callsign("KXTVDT1")
+    # Only KQS's low-power code is misspelled; other low-power stations keep theirs.
+    assert zap2xml.parse_callsign("KTVULD") == "KTVU-LD-1"
+    # One call sign of an unexpected shape is shown as given, not fatal to the guide.
+    assert zap2xml.parse_callsign("WGN") == "WGN"
+    assert zap2xml.parse_callsign("KXTVDT1") == "KXTVDT1"
 
 
 def test_time_and_xml_helpers() -> None:

@@ -90,6 +90,10 @@ def main(*, sleep: Callable[[float], object] = time.sleep) -> int:
     if flags.days > 15:
         raise ValueError(f"Can only collect at most 15 days; {flags.days} too large.")
     num_fetch = math.ceil(flags.days * 24 / flags.zap_timespan)
+    # Each chunk lists every programme overlapping it, so one straddling the
+    # boundary between chunks comes back twice; a refused chunk lists no channels.
+    declared: set[str] = set()
+    written: set[tuple[str, str]] = set()
     for i in range(num_fetch):
         i_time = zap_time + (i * zap_time_window)
         print(f"Getting data:   {i_time}  {strf_time_int(i_time)}")
@@ -100,9 +104,10 @@ def main(*, sleep: Callable[[float], object] = time.sleep) -> int:
         result = get_cached(cache_dir, i_time, flags.delay, url, sleep=sleep)
         json_result = json.loads(result)
 
-        # Every chunk lists the same channels; the first one declares them.
-        if i == 0:
-            for c_in in json_result["channels"]:
+        f = add_programme_tvimate if flags.tvimate else add_programme
+        for c_in in json_result["channels"]:
+            channel_key = get_channel_key(c_in)
+            if channel_key not in declared:
                 # {'affiliateCallSign': 'null',
                 #  'affiliateName': 'AMERICAN BROADCASTING COMPANY',
                 #  'callSign': 'KXTVDT',
@@ -112,7 +117,6 @@ def main(*, sleep: Callable[[float], object] = time.sleep) -> int:
                 #  'stationFilters': ['filter-sports'],
                 #  'stationGenres': [False],
                 #  'thumbnail': '//zap2it.tmsimg.com/h3/NowShowing/20775/s28708_ll_h15_ac.png?w=55'}.
-                channel_key = get_channel_key(c_in)
                 channel_display_name = " - ".join(
                     [
                         c_in["affiliateName"].title(),  # Eg, "CATCHY COMEDY"
@@ -121,10 +125,13 @@ def main(*, sleep: Callable[[float], object] = time.sleep) -> int:
                     ],
                 )
                 c_out = add_xml_child(
-                    parent=out,
+                    parent=None,
                     tag="channel",
                     id=channel_key,
                 )
+                # XMLTV lists every channel before any programme.
+                out.insert(len(declared), c_out)
+                declared.add(channel_key)
                 _ = add_xml_child(
                     parent=c_out,
                     tag="display-name",
@@ -135,24 +142,22 @@ def main(*, sleep: Callable[[float], object] = time.sleep) -> int:
                     tag="icon",
                     src=f"https:{c_in['thumbnail'].split('?')[0]}",
                 )
-
-        f = add_programme_tvimate if flags.tvimate else add_programme
-        for c_in in json_result["channels"]:
-            channel_key = get_channel_key(c_in)
             for event in c_in["events"]:
-                f(out, event, channel_key)
+                if (channel_key, event["startTime"]) not in written:
+                    written.add((channel_key, event["startTime"]))
+                    f(out, event, channel_key)
 
     # https://docs.python.org/3/library/xml.etree.elementtree.html#xml.etree.ElementTree.indent
     # Note: xml.indent must be done last.
     xml.indent(out, space="\t")
-    with pathlib.Path.open((working_dir / "xmltv.xml").resolve(), "wb") as f:
-        f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
-        f.write(
-            xml.tostring(
-                out,
-                encoding="UTF-8",  # pragma: no mutate[case-insensitive]
-            ),
-        )
+    guide = xml.tostring(
+        out,
+        encoding="UTF-8",  # pragma: no mutate[case-insensitive]
+    )
+    _replace(
+        (working_dir / "xmltv.xml").resolve(),
+        b'<?xml version="1.0" encoding="UTF-8"?>\n' + guide,
+    )
 
     return 0
 
@@ -164,6 +169,7 @@ def get_cached(
     url: str,
     *,
     sleep: Callable[[float], object] = time.sleep,
+    timeout: float = 60,
 ) -> bytes:
     cache_path = (cache_dir / str(timestamp)).with_suffix(".json.gz")
     if cache_path.is_file():
@@ -192,18 +198,19 @@ def get_cached(
         },
     )
     try:
-        response = request.urlopen(req)
+        response = request.urlopen(req, timeout=timeout)
         # Typeshed types urlopen's return as Any.
         result = cast(bytes, response.read())
     except error.HTTPError as e:
         if e.code != 400:
             e.add_note(f'Url is "{url}".')
             raise
+        # Not cached: the next run asks for this window again.
         with e:
             print("Got a 400 error! Ignoring it.")
             result = b'{"note": "Got a 400 error at this time, skipping.","channels": []}'
-    with gzip.open(cache_path, "wb") as f:
-        f.write(result)
+    else:
+        _replace(cache_path, gzip.compress(result))
     sleep(delay)
     return result
 
@@ -517,16 +524,22 @@ def get_channel_key(c: CallSigned) -> str:
 
 
 def parse_callsign(coded_callsign: str) -> str:
+    """Spell out a coded call sign.
+
+    Args:
+        coded_callsign: Gracenote's call sign, e.g. "KOVRDT5".
+
+    Returns:
+        callsign: Spelled out, e.g. "KOVR-DT-5"; one of another shape as given.
+    """
     result = _CALLSIGN_REGEX.search(coded_callsign.upper())
-    if not result:
-        raise ValueError("Expected result.")
+    # A first subchannel is coded without its number, so "1" is not a coded call sign.
+    if not result or result[3] == "1":
+        return coded_callsign
     call, suffix, num = result.groups()
-    if num == "1":
-        raise ValueError('Expected num != "1".')
     if call == "KQS" and suffix == "LD":
         # Appears to be a bug in their coded callsign.
         call = "KQSL"
-        suffix = "LD"
     if not num:
         num = "1"
     return f"{call}-{suffix}-{num}"
@@ -730,6 +743,13 @@ def _expired(
     data_time_within_limit = data_time < zap_time + data_days * 86_400
     file_time_within_limit = zap_time < file_time + file_days * 86_400
     return data_time_within_limit and not file_time_within_limit
+
+
+def _replace(path: pathlib.Path, data: bytes) -> None:
+    """Write ``path`` whole or not at all, so no reader sees it part-written."""
+    partial = path.with_name(f"{path.name}.partial")
+    partial.write_bytes(data)
+    partial.replace(path)
 
 
 if __name__ == "__main__":
