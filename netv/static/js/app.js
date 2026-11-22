@@ -193,6 +193,12 @@
     if (!next) return false;
     lastMove = { from: current, to: next, direction };
     next.focus();
+    // A text field takes the caret at the side it was entered from, so the opposite
+    // arrow leaves it again at once; Up and Down leave the caret at the end.
+    if (typeof next.selectionStart === "number" && next.type !== "number") {
+      const at = direction === "right" ? 0 : next.value.length;
+      next.setSelectionRange(at, at);
+    }
     next.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" });
     return true;
   }
@@ -249,14 +255,27 @@
   // Priority: [autofocus] or [data-initial-focus] (a search field, Play, the selected
   // guide category), the page's content, its first focusable. The page stays at its
   // top: focus far down would scroll the title away.
+  // Set when the page started before its content had loaded (favorites, browse rows
+  // fill in later): the first content item to appear then takes focus, unless the
+  // user has moved it first.
+  let awaitingContent = false;
+
   function focusPageStart() {
     const main = document.querySelector("main");
-    const start =
-      document.querySelector("[autofocus], [data-initial-focus]") ||
-      mainContentItem() ||
-      (main && getFocusables(main)[0]);
-    start?.focus({ preventScroll: true });
+    const content =
+      document.querySelector("[autofocus], [data-initial-focus]") || mainContentItem();
+    awaitingContent = !content;
+    (content || (main && getFocusables(main)[0]))?.focus({ preventScroll: true });
   }
+
+  new MutationObserver(() => {
+    const item = awaitingContent && mainContentItem();
+    if (!item) return;
+    awaitingContent = false;
+    item.focus({ preventScroll: true });
+  }).observe(document.body, { childList: true, subtree: true });
+  for (const kind of ["keydown", "pointerdown"])
+    document.addEventListener(kind, () => (awaitingContent = false), true);
 
   function setInitialFocus() {
     // Skip if something is already focused (other than body)

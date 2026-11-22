@@ -264,6 +264,7 @@
 {% block scripts %}
 <script src="/static/js/virtual-guide.js"></script>
 <script src="/static/js/handoff-card.js"></script>
+<script src="/static/js/pretune.js"></script>
 <script>
 // Virtual scroll configuration
 const GUIDE_CONFIG = {
@@ -414,6 +415,8 @@ localizeGuideTimes(document);
       cell.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
     }
   }
+
+  window.netvPretune(document.getElementById('guide-grid'));
 
   // The guide's rows are rendered only near the screen, so it moves among them itself,
   // by row and column; app.js's one definition does the rest (chips, Now, the sidebar).

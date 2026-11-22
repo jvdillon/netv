@@ -1029,6 +1029,54 @@ def prestart_live(
     )
 
 
+# The channel each viewer's guide focus rests on, started before they press Enter.
+_pretuned: dict[str, str] = {}
+
+
+def pretune_live(
+    url: str,
+    *,
+    username: str,
+    source_id: str,
+    deinterlace_fallback: bool,
+    user_max_streams: int,
+    source_max_streams: int,
+) -> None:
+    """Start the channel a viewer rests on in the guide, releasing their previous one.
+
+    Like ``prestart_live``, the session has no viewer until a page joins it, so it stops
+    ``stop_when_unwatched``'s grace after starting if none does. A viewer holds one
+    pretune at a time.
+
+    Args:
+        url: Live stream URL the guide's focus rests on.
+        username: Viewer browsing the guide.
+        source_id: Source used for access checks and stream limits.
+        deinterlace_fallback: Deinterlace when probe data is unavailable.
+        user_max_streams: Per-user stream limit; zero disables it.
+        source_max_streams: Per-source stream limit; zero disables it.
+    """
+    previous = _pretuned.get(username)
+    _pretuned[username] = url
+    if previous is not None and previous != url:
+        _spawn_background_task(_stop_if_unwatched(previous))
+    prestart_live(
+        url,
+        username=username,
+        source_id=source_id,
+        deinterlace_fallback=deinterlace_fallback,
+        user_max_streams=user_max_streams,
+        source_max_streams=source_max_streams,
+    )
+
+
+async def release_pretune(username: str) -> None:
+    """Stop ``username``'s pretuned channel now, unless a page has joined it."""
+    url = _pretuned.pop(username, None)
+    if url is not None:
+        await _stop_if_unwatched(url)
+
+
 # ===========================================================================
 # Session Query/Update
 # ===========================================================================
@@ -3256,3 +3304,9 @@ def _admit(session_id: str, username: str) -> None:
         session = _transcode_sessions.get(session_id)
         if session is not None:
             session["guests"] = session.get("guests", frozenset()) | {username}
+
+
+async def _stop_if_unwatched(url: str) -> None:
+    existing = _get_existing_session(url)
+    if existing is not None and _is_fast_live(existing.session) and not existing.session["viewers"]:
+        await stop_session(existing.session_id)

@@ -1636,6 +1636,60 @@ async def player_page(
     )
 
 
+@app.post("/api/pretune/{link}")
+async def pretune_api(
+    link: str,
+    user: Annotated[TokenClaims, Depends(require_auth)],
+) -> dict[str, bool]:
+    """Start the live channel the guide's focus rests on, so Enter plays it at once.
+
+    Only a home tuner's channel is pretuned, and only while another tuner stays free
+    for the house's other TVs; a viewer holds one pretune at a time.
+
+    Args:
+        link: The channel's ``_play_path`` segment.
+        user: Authenticated viewer claims.
+
+    Returns:
+        answer: Whether the channel is being pretuned.
+    """
+    try:
+        target = _play_target(link)
+    except ValueError as error:
+        raise HTTPException(404, "Stream not found") from error
+    if target.kind != "live":
+        raise HTTPException(404, "Stream not found")
+    username = user["sub"]
+    info = await asyncio.to_thread(_get_live_player_info, target.stream_id)
+    if not info.url:
+        raise HTTPException(404, "Stream not found")
+    live: ProviderRecord = {"source_id": info.source_id, "category_ids": info.category_ids}
+    if not _live_allowed(live, _unavailable_groups(username)):
+        raise HTTPException(403, "Access to this channel is restricted")
+    _require_visible_source(username, info.url, info.source_id)
+    if chromecast.manager.owns_url(info.url):
+        return {"pretuned": False}
+    if not await asyncio.to_thread(_tuner_to_spare, info.url, info.source_id):
+        return {"pretuned": False}
+    user_max_streams, source_max_streams = _stream_limits(username, info.source_id)
+    ffmpeg_session.pretune_live(
+        info.url,
+        username=username,
+        source_id=info.source_id,
+        deinterlace_fallback=info.deinterlace_fallback,
+        user_max_streams=user_max_streams,
+        source_max_streams=source_max_streams,
+    )
+    return {"pretuned": True}
+
+
+@app.delete("/api/pretune", status_code=204)
+async def release_pretune_api(user: Annotated[TokenClaims, Depends(require_auth)]) -> Response:
+    """Stop the viewer's pretuned channel: their guide focus left it."""
+    await ffmpeg_session.release_pretune(user["sub"])
+    return Response(status_code=204)
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _PlayTarget:
     """What a play path plays: a channel, a movie, or an episode of a series."""
@@ -5972,14 +6026,14 @@ def _require_visible_source(username: str, url: str, source_id: str = "") -> Non
         raise HTTPException(403, "Access to this source is restricted")
 
 
-# These need no cookie (a TV fetches them), so their unguessable names are the only key;
-# the owner's account must still exist and, if LAN-only, be home.
 def _require_session_user(session_id: str, user: TokenClaims) -> None:
     """Refuse a session to anyone who neither started it nor was handed it."""
     if ffmpeg_session.user_session(session_id, user["sub"]) is None:
         raise HTTPException(404, "Session not found")
 
 
+# These need no cookie (a TV fetches them), so their unguessable names are the only key;
+# the owner's account must still exist and, if LAN-only, be home.
 def _require_owner_here(request: Request, owner: str) -> None:
     """Refuse playback files to a client the files' owner could not sign in from."""
     if not auth.allowed_from(owner, _client_address(request)):
@@ -6088,6 +6142,26 @@ def _current_live_id(stream_id: str) -> str:
         if renamed is not None:
             return renamed
     return stream_id
+
+
+# An HDHomeRun lists its tuners at ``/status.json``; one in use names its channel.
+# A tuner that does not answer, or a provider's stream, is not counted on.
+def _tuner_to_spare(url: str, source_id: str) -> bool:
+    """Whether the home tuner ``url`` plays from has two idle tuners: one to spare."""
+    if not proxy.home_stream(url, source_id):
+        return False
+    parts = parse.urlsplit(url)
+    try:
+        with safe_urlopen(
+            f"{parts.scheme}://{parts.hostname}/status.json",
+            timeout=3,
+            allow_address=proxy.address_rule(url, source_id),
+        ) as resp:
+            tuners = json_loads(resp.read(), list[ProviderRecord])
+    except (OSError, ValueError) as error:  # ReadError is a ValueError.
+        log.info("Tuner status unavailable for %s: %s", parts.hostname, error)
+        return False
+    return sum("VctNumber" not in tuner for tuner in tuners) >= 2
 
 
 if __name__ == "__main__":

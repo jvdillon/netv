@@ -13,6 +13,9 @@ const assertPercent = (actual, expected) =>
     `${actual} is not about ${expected}%`,
   );
 
+// The element last focused, as document.activeElement would be.
+let focused = null;
+
 function element() {
   const listeners = new Map();
   const classes = new Set(["hidden"]);
@@ -57,6 +60,22 @@ function element() {
       this.open = false;
     },
     getBoundingClientRect: () => ({ left: 0, width: 100, top: 0, height: 4 }),
+    // Tests that walk focus set these: the element's containers, its children.
+    parents: [],
+    children: [],
+    closest(selector) {
+      return this.parents.find((parent) => parent.matches === selector) || null;
+    },
+    querySelectorAll() {
+      return this.children;
+    },
+    focus() {
+      focused = this;
+    },
+    click() {
+      this.clicks = (this.clicks || 0) + 1;
+      return this.emit("click", { target: this });
+    },
   };
 }
 
@@ -303,9 +322,17 @@ async function player({
     querySelectorAll: () => [],
     visibilityState: "visible",
   });
+  const history = {
+    length: 2,
+    backs: 0,
+    back() {
+      this.backs++;
+    },
+  };
   const context = createContext({
     window,
     document,
+    history,
     Hls,
     VTTCue: class {
       constructor(startTime, endTime, text) {
@@ -413,6 +440,7 @@ async function player({
     video,
     window,
     document,
+    history,
     elements,
     frames,
     engines,
@@ -1201,6 +1229,58 @@ test("closing archive playback force-releases its upstream slot", async () => {
   const p = await player({ catchup: true });
   await p.window.emit("pagehide");
   assert.deepEqual(p.beacons, ["/transcode/session1/stop?force=true"]);
+});
+
+test("the settings menu opens and is walked by keyboard without touching the volume", async () => {
+  const p = await player({ isVod: true });
+  const menu = p.elements.get("settings-menu");
+  const items = ["menu-transcode", "menu-restart", "menu-cc-tracks"].map((id) => {
+    const item = p.document.getElementById(id);
+    item.classList.remove("hidden");
+    item.parents = [Object.assign(menu, { matches: "#settings-menu" })];
+    return item;
+  });
+  menu.children = items;
+  const key = (target, k) =>
+    p.document.emit("keydown", { key: k, target, preventDefault() {}, altKey: false });
+
+  // "s" opens the menu on its first item, as every control answers a key.
+  await key(p.video, "s");
+  assert.ok(menu.classList.contains("open"));
+  assert.equal(focused, items[0]);
+  // Up and Down walk the items and stop at the ends; the volume stays.
+  await key(items[0], "ArrowUp");
+  await key(items[0], "ArrowDown");
+  await key(items[1], "ArrowDown");
+  await key(items[2], "ArrowDown");
+  assert.equal(focused, items[2]);
+  assert.equal(p.video.volume, 1);
+  // Enter picks the item; Escape closes the menu and returns to the gear.
+  await key(items[2], "Enter");
+  assert.equal(items[2].clicks, 1);
+  await key(items[2], "Escape");
+  assert.ok(!menu.classList.contains("open"));
+  assert.equal(focused, p.document.getElementById("settings-btn"));
+  assert.equal(p.window.location.href, "http://netv.test/play/live/1");
+});
+
+test("Escape returns to the netv page it came from, else the guide", async () => {
+  // Another site, or none (a typed address, a bookmark), is never gone back to.
+  for (const [referrer, backs, href] of [
+    ["http://netv.test/guide", 1, "http://netv.test/play/live/1"],
+    ["https://elsewhere.example/netv.test/", 0, "/guide"],
+    ["", 0, "/guide"],
+  ]) {
+    const p = await player({ isVod: true });
+    p.document.referrer = referrer;
+    await p.document.emit("keydown", {
+      key: "Escape",
+      target: p.video,
+      preventDefault() {},
+      altKey: false,
+    });
+    assert.deepEqual([p.history.backs, p.window.location.href], [backs, href]);
+  }
 });
 
 test("go live releases archive playback before navigating", async () => {

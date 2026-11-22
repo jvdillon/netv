@@ -9,6 +9,22 @@
   const ccBtn = document.getElementById("toggle-cc");
   const settingsMenu = document.getElementById("settings-menu");
 
+  function settingsItems() {
+    return [...settingsMenu.querySelectorAll(".settings-item")].filter(
+      (item) => !item.classList.contains("hidden"),
+    );
+  }
+
+  function openSettings() {
+    settingsMenu.classList.add("open");
+    settingsItems()[0]?.focus();
+  }
+
+  function closeSettings() {
+    settingsMenu.classList.remove("open");
+    document.getElementById("settings-btn")?.focus();
+  }
+
   // State
   let transcodeSessionId = null;
   let currentHls = null;
@@ -1568,6 +1584,17 @@
     document.addEventListener("keydown", (e) => {
       if (castController?.active || document.getElementById("cast-dialog")?.open)
         return;
+      // In the settings menu, arrows walk its items rather than seek or set volume.
+      if (e.target.closest("#settings-menu")) {
+        const items = settingsItems();
+        const step = { ArrowDown: 1, ArrowUp: -1 }[e.key];
+        if (step) items[items.indexOf(e.target) + step]?.focus();
+        else if (e.key === "Enter" || e.key === " ") e.target.click();
+        else if (e.key === "Escape") closeSettings();
+        else return;
+        e.preventDefault();
+        return;
+      }
       // In seek input: allow player hotkeys, block other non-time chars
       if (e.target.id === "seek-input") {
         const passthrough = ["j", "m", "f", " ", "k", "c", "i", "Escape"];
@@ -1655,6 +1682,10 @@
         case "p":
           document.getElementById("pip-btn")?.click();
           break;
+        case "s":
+          e.preventDefault();
+          openSettings();
+          break;
         case "h": {
           const container = document.getElementById("player-container");
           if (container.classList.contains("controls-visible")) {
@@ -1685,7 +1716,9 @@
           } else if (settingsMenu.classList.contains("open")) {
             settingsMenu.classList.remove("open");
           } else if (!document.fullscreenElement) {
-            if (history.length > 1) history.back();
+            // Back only to a netv page: the tab's history may hold another site.
+            const from = document.referrer ? new URL(document.referrer).origin : "";
+            if (from === window.location.origin) history.back();
             else window.location.href = "/guide";
           }
           break;
@@ -1889,8 +1922,12 @@
     }
 
     // Settings menu toggle
-    document.getElementById("settings-btn")?.addEventListener("click", () => {
-      settingsMenu.classList.toggle("open");
+    document.getElementById("settings-btn")?.addEventListener("click", (e) => {
+      if (settingsMenu.classList.contains("open"))
+        settingsMenu.classList.remove("open");
+      // Opened by keyboard (no pointer, so no click count): focus goes into the menu.
+      else if (e.detail === 0) openSettings();
+      else settingsMenu.classList.add("open");
     });
 
     // Close settings menu when clicking outside

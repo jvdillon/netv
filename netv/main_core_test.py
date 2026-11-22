@@ -2166,6 +2166,171 @@ def test_a_bookmark_of_a_retired_positional_channel_id_finds_that_channel(
     assert resp.headers["location"] == main._play_path("live", "t:v2.1")
 
 
+_TUNER = "http://192.168.1.87:5004/auto/v5.1"
+
+
+class _Pretunes:
+    """Stands in for ``ffmpeg_session``'s pretune calls: no stream is started."""
+
+    def __init__(self) -> None:
+        self.tuned: list[tuple[str, str]] = []
+        self.released: list[str] = []
+
+    def pretune(self, url: str, *, username: str, **options: object) -> None:
+        del options
+        self.tuned.append((username, url))
+
+    async def release(self, username: str) -> None:
+        self.released.append(username)
+
+
+@pytest.fixture
+def pretunes(monkeypatch: pytest.MonkeyPatch) -> _Pretunes:
+    recorder = _Pretunes()
+    monkeypatch.setattr(ffmpeg_session, "pretune_live", recorder.pretune)
+    monkeypatch.setattr(ffmpeg_session, "release_pretune", recorder.release)
+    return recorder
+
+
+def _tuner_status(web: testing.FakeWeb, busy: int) -> None:
+    tuners = [
+        {"Resource": f"tuner{i}", **({"VctNumber": f"{i}.1"} if i < busy else {})} for i in range(4)
+    ]
+    web.routes["http://192.168.1.87/status.json"] = lambda: testing.FakeResponse(
+        json.dumps(tuners).encode(),
+    )
+
+
+def _ota_channel(category: str = "") -> str:
+    _set_sources(
+        {"id": "t", "name": "Tuner", "type": "m3u", "url": "http://192.168.1.24/lineup.m3u"},
+        _XTREAM,
+    )
+    cache.get_cache()["live_streams"] = [
+        {
+            "stream_id": "t:v5.1",
+            "name": "KPIX",
+            "source_id": "t",
+            "direct_url": _TUNER,
+            "category_ids": [category] if category else [],
+        },
+        {
+            "stream_id": 9,
+            "name": "News",
+            "source_id": "s1",
+            "category_ids": ["3"],
+            "direct_url": "http://provider.example/live/9.ts",
+        },
+    ]
+    return main._play_path("live", "t:v5.1").removeprefix("/play/")
+
+
+def test_resting_on_a_channel_pretunes_it_only_while_a_tuner_stays_free(
+    api: TestClient,
+    web: testing.FakeWeb,
+    pretunes: _Pretunes,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    link = _ota_channel()
+    answers = []
+    for busy in (2, 3, 4):
+        _tuner_status(web, busy)
+        answers.append(api.post(f"/api/pretune/{link}").json())
+    # Two free: one may go to the guide. One free stays for the house's other TVs.
+    assert answers == [{"pretuned": True}, {"pretuned": False}, {"pretuned": False}]
+    assert pretunes.tuned == [("testuser", _TUNER)]
+    # The tuner is asked briefly, and only the home network is dialed.
+    fetch = web.fetches[0]
+    assert (fetch.url, fetch.timeout) == ("http://192.168.1.87/status.json", 3)
+    vets = testing.address_vets(fetch)
+    assert vets and all(vet(ipaddress.ip_address("192.168.1.87")) for vet in vets)
+    # A tuner that does not answer is not counted on.
+    web.routes.clear()
+    with caplog.at_level(logging.INFO, logger="netv.main"):
+        assert api.post(f"/api/pretune/{link}").json() == {"pretuned": False}
+    assert len(pretunes.tuned) == 1
+    assert caplog.messages[-1] == (
+        "Tuner status unavailable for 192.168.1.87: "
+        "<urlopen error no route to http://192.168.1.87/status.json>"
+    )
+    # Nor is one whose answer is not a tuner list.
+    web.routes["http://192.168.1.87/status.json"] = testing.FakeResponse(b'{"a": 1, "b": 2}')
+    assert api.post(f"/api/pretune/{link}").json() == {"pretuned": False}
+    assert len(pretunes.tuned) == 1
+
+
+def _casting(url: str) -> bool:
+    return url == _TUNER
+
+
+def test_a_channel_gone_from_the_lineup_or_on_a_tv_is_not_pretuned(
+    api: TestClient,
+    web: testing.FakeWeb,
+    pretunes: _Pretunes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    link = _ota_channel()
+    _tuner_status(web, 0)
+    monkeypatch.setattr(chromecast.manager, "owns_url", _casting)
+    assert api.post(f"/api/pretune/{link}").json() == {"pretuned": False}
+    cache.get_cache()["live_streams"] = []
+    assert api.post(f"/api/pretune/{link}").status_code == 404
+    assert pretunes.tuned == []
+
+
+def test_only_home_tuner_channels_are_pretuned(
+    api: TestClient,
+    web: testing.FakeWeb,
+    pretunes: _Pretunes,
+) -> None:
+    _ota_channel()
+    _tuner_status(web, 0)
+    # A provider's channel: its connection count is the provider's to know.
+    provider = main._play_path("live", "9").removeprefix("/play/")
+    assert api.post(f"/api/pretune/{provider}").json() == {"pretuned": False}
+    assert web.urls == []
+    assert pretunes.tuned == []
+
+
+@pytest.mark.parametrize(
+    ("link", "status"),
+    [
+        ("movie", 404),
+        ("unissued", 404),
+        ("restricted", 403),
+        ("signed-out", 303),
+    ],
+)
+def test_a_pretune_is_refused_where_playing_would_be(
+    api: TestClient,
+    web: testing.FakeWeb,
+    pretunes: _Pretunes,
+    link: str,
+    status: int,
+) -> None:
+    channel = _ota_channel("kids")
+    _tuner_status(web, 0)
+    client = api
+    if link == "movie":
+        channel = main._play_path("movie", "7").removeprefix("/play/")
+    elif link == "unissued":
+        channel = "aaaaaaaaaa"
+    elif link == "restricted":
+        auth.set_user_limits("testuser", None, ["cat:kids"])
+    else:
+        client = TestClient(main.app)
+    assert client.post(f"/api/pretune/{channel}", follow_redirects=False).status_code == status
+    assert pretunes.tuned == []
+
+
+def test_leaving_the_guide_releases_the_users_pretune(
+    api: TestClient,
+    pretunes: _Pretunes,
+) -> None:
+    assert api.delete("/api/pretune").status_code == 204
+    assert pretunes.released == ["testuser"]
+
+
 def test_an_unknown_play_path_is_not_found(api: TestClient) -> None:
     assert api.get("/play/!!").status_code == 404
     assert api.get("/play/tv/1").status_code == 404

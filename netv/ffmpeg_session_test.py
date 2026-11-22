@@ -173,6 +173,7 @@ def env(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> _Env:
     monkeypatch.setattr(ffmpeg_session, "_url_to_session", urls)
     monkeypatch.setattr(ffmpeg_session, "_startup_guards", {})
     monkeypatch.setattr(ffmpeg_session, "_recordings", set())
+    monkeypatch.setattr(ffmpeg_session, "_pretuned", {})
     monkeypatch.setattr(ffmpeg_command, "_load_settings", cache.load_server_settings)
     monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", None)
     monkeypatch.setattr(ffmpeg_command, "_probe_cache", {})
@@ -3645,6 +3646,108 @@ async def test_a_prestarted_live_session_waits_for_its_page(env: _Env, fast_env:
     assert list(session["viewers"]) == [page.get("viewer_id")]
     assert len(env.launcher.launches) == 1
     await ffmpeg_session.stop_session(session_id, force=True)
+
+
+def _pretune(url: str, username: str = "alice") -> None:
+    ffmpeg_session.pretune_live(
+        url,
+        username=username,
+        source_id="src",
+        deinterlace_fallback=False,
+        user_max_streams=0,
+        source_max_streams=0,
+    )
+
+
+async def _run_new(tasks: BackgroundTasks, seen: int) -> int:
+    """Run the background tasks spawned since ``seen``; return how many exist now."""
+    for task in tasks.tasks[seen:]:
+        await task.run()
+    return len(tasks.tasks)
+
+
+@pytest.mark.asyncio
+async def test_a_pretuned_channel_is_joined_by_the_page_that_plays_it(
+    env: _Env,
+    fast_env: BackgroundTasks,
+):
+    _pretune("http://live")
+    # A first pretune has nothing earlier to release.
+    assert _coroutine_names(fast_env) == ["_prestart"]
+    await _run_new(fast_env, 0)
+    [session_id] = env.sessions
+    page = await ffmpeg_session.start_transcode(
+        "http://live",
+        username="alice",
+        source_id="src",
+        min_segments=1,
+    )
+    assert page["session_id"] == session_id
+    assert len(env.launcher.launches) == 1
+    # The page now watches it, so letting the guide go leaves it playing.
+    await ffmpeg_session.release_pretune("alice")
+    assert session_id in env.sessions
+    await ffmpeg_session.stop_session(session_id, force=True)
+
+
+@pytest.mark.asyncio
+async def test_resting_on_another_channel_releases_the_last_pretune(
+    env: _Env,
+    fast_env: BackgroundTasks,
+):
+    _pretune("http://one")
+    seen = await _run_new(fast_env, 0)
+    [first] = env.sessions
+    _pretune("http://two")
+    await _run_new(fast_env, seen)
+    # One tuner at a time per viewer: the first channel stopped once the second began.
+    assert [env.sessions[s]["url"] for s in env.sessions] == ["http://two"]
+    assert first not in env.sessions
+    await ffmpeg_session.release_pretune("alice")
+    assert env.sessions == {}
+
+
+def test_a_pretune_starts_the_channel_as_its_page_would(monkeypatch: pytest.MonkeyPatch):
+    starts: list[tuple[str, dict[str, object]]] = []
+
+    def prestart(url: str, **options: object) -> None:
+        starts.append((url, options))
+
+    monkeypatch.setattr(ffmpeg_session, "prestart_live", prestart)
+    ffmpeg_session.pretune_live(
+        "http://live",
+        username="alice",
+        source_id="src",
+        deinterlace_fallback=True,
+        user_max_streams=2,
+        source_max_streams=3,
+    )
+    assert starts == [
+        (
+            "http://live",
+            {
+                "username": "alice",
+                "source_id": "src",
+                "deinterlace_fallback": True,
+                "user_max_streams": 2,
+                "source_max_streams": 3,
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_releasing_one_viewers_pretune_leaves_anothers(
+    env: _Env,
+    fast_env: BackgroundTasks,
+):
+    _pretune("http://one", "alice")
+    _pretune("http://two", "bob")
+    await _run_new(fast_env, 0)
+    await ffmpeg_session.release_pretune("alice")
+    await ffmpeg_session.release_pretune("carol")
+    assert [env.sessions[s]["url"] for s in env.sessions] == ["http://two"]
+    await ffmpeg_session.release_pretune("bob")
 
 
 class _Starts:
