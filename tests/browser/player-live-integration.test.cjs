@@ -230,6 +230,7 @@ async function player({
       transcodeMode: auto ? "auto" : direct ? "never" : "always",
       liveDvrMins: isVod ? 0 : 60,
       streamId: "1",
+      liveUrl: "/play/k3f9x2abqe",
       programStart,
       programEnd,
       catchup,
@@ -1057,7 +1058,7 @@ test("archive scrubbing previews the full program and reopens only on release", 
   assert.equal(slider.getAttribute("aria-valuetext"), "45:00");
   assertPercent(p.elements.get("progress-played").style.width, 75);
   await slider.emit("change");
-  assert.equal(p.window.location.href, `/play/live/1?start=${start + 2700}`);
+  assert.equal(p.window.location.href, `/play/k3f9x2abqe?start=${start + 2700}`);
   assert.equal(
     p.calls.some((call) => call.url.startsWith("/transcode/seek/")),
     false,
@@ -1078,7 +1079,7 @@ test("archive scrubbing backward before the opened archive requests that earlier
   slider.value = "10";
   await slider.emit("input");
   await slider.emit("change");
-  assert.equal(p.window.location.href, `/play/live/1?start=${start + 360}`);
+  assert.equal(p.window.location.href, `/play/k3f9x2abqe?start=${start + 360}`);
   assert.equal(
     p.calls.some((call) => call.url.startsWith("/transcode/seek/")),
     false,
@@ -1125,7 +1126,7 @@ test("archive jump times remain relative to the full program after seeking", asy
     const input = p.elements.get("seek-input");
     input.value = text;
     await input.emit("keydown", { key: "Enter", preventDefault() {} });
-    assert.equal(p.window.location.href, `/play/live/1?start=${start + seconds}`);
+    assert.equal(p.window.location.href, `/play/k3f9x2abqe?start=${start + seconds}`);
     assert.equal(input.classList.contains("ring-red-500"), false);
   }
 });
@@ -1155,7 +1156,7 @@ test("archive seek waits for a forced stop before navigating", async () => {
   );
   release();
   await seek;
-  assert.equal(p.window.location.href, `/play/live/1?start=${start + 1800}`);
+  assert.equal(p.window.location.href, `/play/k3f9x2abqe?start=${start + 1800}`);
   assert.deepEqual(p.errors, []);
 });
 
@@ -1177,7 +1178,7 @@ test("archive seek during startup releases the eventual session before navigatin
   assert.equal(p.window.location.href, originalUrl);
   finishStartup();
   await seek;
-  assert.equal(p.window.location.href, `/play/live/1?start=${start + 1800}`);
+  assert.equal(p.window.location.href, `/play/k3f9x2abqe?start=${start + 1800}`);
   assert.ok(p.calls.some((call) => call.url === "/transcode/session1?force=true"));
 });
 
@@ -1207,7 +1208,7 @@ test("go live releases archive playback before navigating", async () => {
   await p.elements.get("go-live-btn").emit("click", { preventDefault() {} });
   await flush();
   assert.ok(p.calls.some((call) => call.url === "/transcode/session1?force=true"));
-  assert.equal(p.window.location.href, "/play/live/1");
+  assert.equal(p.window.location.href, "/play/k3f9x2abqe");
 });
 
 test("user archive seek cancels a pending sub-minute startup skip", async () => {

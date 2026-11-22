@@ -56,7 +56,7 @@
     <h3 class="text-xl font-semibold mb-3">Season {{ season_num }}</h3>
     <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3 pr-1" data-nav-main>
       {% for ep in episodes %}
-      <a href="/play/series/{{ ep.id }}?series_id={{ series_id }}&ext={{ ep.container_extension or 'mkv' }}"
+      <a href="{{ play_path('series', ep.id | string, series_id=series_id | int) }}"
          class="bg-gray-800 rounded-lg p-3 hover:ring-2 hover:ring-blue-500 focus:ring-2 focus:ring-blue-500 focusable transition-all"
          tabindex="0" data-nav="grid" {% if ns.first_ep %}data-initial-focus{% set ns.first_ep = false %}{% endif %}
          title="{{ shown.name }} — S{{ '%02d' | format(season_num | int) }}E{{ '%02d' | format(ep.episode_num | int) }} — {{ ep.title }}{% if ep.description %}&#10;{{ ep.description }}{% elif ep.plot %}&#10;{{ ep.plot }}{% endif %}">

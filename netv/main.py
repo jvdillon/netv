@@ -39,14 +39,17 @@ from xml.sax.saxutils import escape as xml_escape
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import functools
+import hashlib
 import logging
 import math
 import os
 import pathlib
 import re
 import signal
+import sqlite3
 import subprocess
 import threading
 import time
@@ -65,6 +68,7 @@ from netv import (
     cache,
     catchup,
     chromecast,
+    db,
     epg,
     ffmpeg_command,
     ffmpeg_session,
@@ -161,6 +165,7 @@ def _create_templates() -> Jinja2Templates:
     templates.env.filters["logo_url"] = _logo_url_filter
     templates.env.filters["rating"] = _rating_filter
     templates.env.globals["with_shown"] = _shown
+    templates.env.globals["play_path"] = _play_path
     templates.env.filters["youtube_id"] = _youtube_id
     templates.env.globals["get_content_access"] = _get_content_access
     templates.env.globals["get_content_access_from_request"] = _get_content_access_from_request
@@ -1350,6 +1355,7 @@ class GuideChannel(TypedDict):
     epg_id: str
     category_ids: list[str]
     catchup_days: int
+    play_url: str
     direct_url: NotRequired[str]
 
 
@@ -1426,14 +1432,40 @@ class PlayerInfo:
     handoff_recording: bool = False  # Plays a handoff recording kept on this server.
 
 
-@app.get("/play/{stream_type}/{stream_id:path}", response_class=HTMLResponse)
+@app.get("/play/{kind}/{stream_id:path}")
+async def old_player_page(
+    request: Request,
+    kind: str,
+    stream_id: str,
+    series_id: int = 0,
+) -> RedirectResponse:
+    """Move a ``/play/<kind>/<id>`` link to the stream's one-segment path.
+
+    Args:
+        request: Request whose catchup and handoff parameters carry over.
+        kind: Live, movie or series.
+        stream_id: Channel, movie, or episode identifier.
+        series_id: The episode's series.
+
+    Returns:
+        redirect: A permanent redirect to the stream's ``_play_path``.
+    """
+    try:
+        content_type = _play_kind(kind)
+    except ValueError as error:
+        raise HTTPException(404, "Stream not found") from error
+    if content_type == "live":
+        stream_id = await asyncio.to_thread(_current_live_id, stream_id)
+    path = _play_path(content_type, stream_id, series_id=series_id)
+    kept = [(k, v) for k, v in request.query_params.multi_items() if k in ("start", "handoff")]
+    return RedirectResponse(f"{path}?{parse.urlencode(kept)}" if kept else path, 308)
+
+
+@app.get("/play/{token}", response_class=HTMLResponse)
 async def player_page(
     request: Request,
-    stream_type: str,
-    stream_id: str,
+    token: str,
     user: Annotated[TokenClaims, Depends(require_auth)],
-    ext: str = "",
-    series_id: int | None = None,
     start: float | None = Query(default=None, description="Catchup: unix start of a past program"),
     handoff_id: str = Query(default="", alias="handoff", description="Resume this handoff"),
 ):
@@ -1441,14 +1473,16 @@ async def player_page(
 
     Args:
         request: Player request carrying connection information.
-        stream_type: Live, movie or series content type.
-        stream_id: Source stream identifier.
+        token: ``_play_path`` segment naming the stream.
         user: Authenticated viewer claims.
-        ext: Requested container extension.
-        series_id: Parent series identifier.
         start: Archive broadcast timestamp to resume.
         handoff_id: Handoff identifier to claim.
     """
+    try:
+        target = _play_target(token)
+    except ValueError as error:
+        raise HTTPException(404, "Stream not found") from error
+    stream_type, stream_id = target.kind, target.stream_id
     username = user["sub"]
     next_episode_url = None
     if stream_type == "live" and handoff_id:
@@ -1464,16 +1498,13 @@ async def player_page(
     elif stream_type == "live":
         info = await asyncio.to_thread(_get_live_player_info, stream_id)
     elif stream_type == "movie":
-        info = await asyncio.to_thread(_get_movie_player_info, stream_id, ext)
-    elif stream_type == "series":
+        info = await asyncio.to_thread(_get_movie_player_info, stream_id)
+    else:
         info, next_episode_url = await asyncio.to_thread(
             _get_series_player_info,
             stream_id,
-            series_id,
-            ext,
+            target.series_id,
         )
-    else:
-        raise HTTPException(404, "Invalid stream type")
 
     if not info.url:
         raise HTTPException(404, "Stream not found")
@@ -1521,7 +1552,10 @@ async def player_page(
         # Recordings are already packaged for every client.
         transcode_mode = "never"
     elif transcode_mode == "auto":
-        needs_transcode = info.is_m3u or is_catchup or ext in ("mkv", "mp4", "avi", "wmv", "flv")
+        container = parse.urlsplit(info.url).path.rpartition(".")[2]
+        needs_transcode = (
+            info.is_m3u or is_catchup or container in ("mkv", "mp4", "avi", "wmv", "flv")
+        )
         mixed_content = is_https and info.url.startswith("http://")
         # Pause/rewind requires a server-side buffer; route live through a
         # local HLS session (stream copy when codecs allow) when DVR is on.
@@ -1571,6 +1605,7 @@ async def player_page(
             "stream_ref": ref,
             "direct_url": _direct_path(ref, info.url),
             "stream_id": stream_id,
+            "live_url": _play_path("live", stream_id),
             "transcode_mode": transcode_mode,
             "live_dvr_mins": server_settings["live_dvr_mins"],
             "stream_type": stream_type,
@@ -1581,7 +1616,7 @@ async def player_page(
             "program_end": info.program_end,
             "captions_enabled": user_settings.get("captions_enabled", False),
             "resume_position": resume_position,
-            "series_id": series_id,
+            "series_id": target.series_id or None,
             "episode_id": episode_id,
             "series_name": series_name,
             "cc_lang": user_settings.get("cc_lang", ""),
@@ -1599,6 +1634,29 @@ async def player_page(
             "handoff_recording": info.handoff_recording,
         },
     )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _PlayTarget:
+    """What a play path plays: a channel, a movie, or an episode of a series."""
+
+    kind: ffmpeg_session.ContentType
+    stream_id: str
+    series_id: int = 0
+
+
+# The same stream always gets the same link; the database remembers what it plays.
+def _play_path(kind: ffmpeg_session.ContentType, stream_id: str, *, series_id: int = 0) -> str:
+    """The player URL of a channel, movie, or episode: ten characters naming nothing."""
+    digest = hashlib.sha256(f"{kind}:{series_id}:{stream_id}".encode()).digest()
+    link = base64.b32encode(digest).decode()[:10].lower()
+    conn = _play_links()
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO play_links VALUES (?, ?, ?, ?)",  # pragma: no mutate[case-insensitive]
+            (link, kind, stream_id, series_id),
+        )
+    return f"/play/{link}"
 
 
 @app.get("/api/live/program/{stream_id:path}")
@@ -3383,8 +3441,14 @@ async def handoff_api(user: Annotated[TokenClaims, Depends(require_auth)]):
         "position",
         "mode",
     )
+    play_url = _play_path("live", str(record["stream_id"]))
     return JSONResponse(
-        {"handoff": {key: record[key] for key in keys}},
+        {
+            "handoff": {
+                **{key: record[key] for key in keys},
+                "play_url": f"{play_url}?{parse.urlencode({'handoff': record['id']})}",
+            },
+        },
         headers={"Cache-Control": "no-store"},
     )
 
@@ -4645,6 +4709,7 @@ def _build_guide_rows(
             "epg_id": epg_id,
             "category_ids": category_ids(s),
             "catchup_days": catchup.archive_days(s),
+            "play_url": _play_path("live", text_field(s, "stream_id")),
         }
         row: GuideRow = {"channel": ch, "programs": [], "programs_mobile": [], "index": idx}
 
@@ -4881,7 +4946,7 @@ def _get_catchup_player_info(stream_id: str, start_ts: float) -> PlayerInfo:
     )
 
 
-def _get_movie_player_info(stream_id: str, ext: str) -> PlayerInfo:
+def _get_movie_player_info(stream_id: str) -> PlayerInfo:
     """Get player info for movie."""
     # Find movie in cache to get its source_id.
     cached_movie = next(
@@ -4898,9 +4963,9 @@ def _get_movie_player_info(stream_id: str, ext: str) -> PlayerInfo:
         return PlayerInfo()
     client = xtream
 
-    ext = ext or "mkv"
+    ext = "" if cached_movie is None else text_field(cached_movie, "container_extension")
     info = PlayerInfo(
-        url=client.build_stream_url("movie", int(stream_id), ext),
+        url=client.build_stream_url("movie", int(stream_id), ext or "mkv"),
         source_id=source_id,
     )
 
@@ -4921,16 +4986,12 @@ def _get_movie_player_info(stream_id: str, ext: str) -> PlayerInfo:
     return info
 
 
-def _get_series_player_info(
-    stream_id: str,
-    series_id: int | None,
-    ext: str,
-) -> tuple[PlayerInfo, str | None]:
+def _get_series_player_info(stream_id: str, series_id: int) -> tuple[PlayerInfo, str | None]:
     """Get player info for series episode. Returns (info, next_episode_url)."""
     # Find series in cache to get its source_id.
     source_id = ""
     cached_series: ProviderRecord | None = None
-    if series_id is not None and series_id != 0:
+    if series_id:
         cached_series = next(
             (s for s in get_cache().get("series", []) if str(s.get("series_id")) == str(series_id)),
             None,
@@ -4946,13 +5007,12 @@ def _get_series_player_info(
         return PlayerInfo(), None
     client = xtream
 
-    ext = ext or "mkv"
     info = PlayerInfo(
-        url=client.build_stream_url("series", int(stream_id), ext),
+        url=client.build_stream_url("series", int(stream_id), "mkv"),
         source_id=source_id,
     )
 
-    if series_id is None or series_id == 0:
+    if not series_id:
         return info, None
     requested_series = series_id
 
@@ -4985,25 +5045,24 @@ def _get_series_player_info(
             if " - " in title:
                 title = title.split(" - ")[-1]
             episode_num = _int_value(ep.get("episode_num"))
+            ext = text_field(ep, "container_extension") or "mkv"
             info = replace(
                 info,
+                url=client.build_stream_url("series", int(stream_id), ext),
                 program_title=f"S{season_num:02d}E{episode_num:02d} -- {title.strip()}",
                 program_desc=_get_episode_desc(ep),
             )
-            # Get next episode URL.
             if i + 1 < len(all_episodes):
-                _, next_ep = all_episodes[i + 1]
-                next_ext = text_field(next_ep, "container_extension") or ext
-                next_episode_url = (
-                    f"/play/series/{next_ep['id']}?series_id={series_id}&ext={next_ext}"
-                )
+                next_id = text_field(all_episodes[i + 1][1], "id")
+                next_episode_url = _play_path("series", next_id, series_id=series_id)
             break
     return info, next_episode_url
 
 
-def _ensure_live_cache() -> None:
-    """Ensure live streams and EPG are loaded."""
-    if "live_streams" not in get_cache():
+def _ensure_live_cache() -> list[ProviderRecord]:
+    """Ensure live streams and EPG are loaded; return the live streams."""
+    streams = get_cache().get("live_streams")
+    if streams is None:
         cats, streams, epg_urls = load_all_live_data()
         with get_cache_lock():
             get_cache()["live_categories"] = cats
@@ -5012,6 +5071,7 @@ def _ensure_live_cache() -> None:
     if not epg.has_programs():
         with contextlib.suppress(Exception):
             load_all_epg(get_cache().get("epg_urls", []))
+    return streams
 
 
 def _handoff_channel(
@@ -5983,6 +6043,51 @@ async def _relay_direct(
         media_type="application/vnd.apple.mpegurl",
         headers={"Cache-Control": "no-store"},
     )
+
+
+def _play_target(link: str) -> _PlayTarget:
+    """The stream a ``_play_path`` link plays; ``ValueError`` for a link never issued."""
+    row = (
+        _play_links()
+        .execute("SELECT kind, stream_id, series_id FROM play_links WHERE link = ?", (link,))
+        .fetchone()
+    )
+    if row is None:
+        raise ValueError(f"Unknown play path: {link!r}")
+    return _PlayTarget(
+        kind=_play_kind(row["kind"]),
+        stream_id=row["stream_id"],
+        series_id=row["series_id"],
+    )
+
+
+def _play_links() -> sqlite3.Connection:
+    conn = db.connection()
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS play_links ("
+        "link TEXT PRIMARY KEY, kind TEXT NOT NULL, stream_id TEXT NOT NULL,"
+        " series_id INTEGER NOT NULL)",
+    )
+    return conn
+
+
+def _play_kind(text: str) -> ffmpeg_session.ContentType:
+    match text:
+        case "live" | "movie" | "series":
+            return text
+        case _:
+            raise ValueError(f"Unknown stream kind: {text!r}")
+
+
+def _current_live_id(stream_id: str) -> str:
+    """``stream_id``, or the stable id a retired positional M3U id now names."""
+    streams = _ensure_live_cache()
+    for source in get_sources():
+        ids = [text_field(s, "stream_id") for s in streams if s.get("source_id") == source.id]
+        renamed = cache.retired_live_ids(source.id, ids).get(stream_id)
+        if renamed is not None:
+            return renamed
+    return stream_id
 
 
 if __name__ == "__main__":

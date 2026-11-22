@@ -30,6 +30,7 @@ from netv import (
     auth,
     cache,
     chromecast,
+    db,
     epg,
     ffmpeg_command,
     ffmpeg_session,
@@ -58,8 +59,9 @@ _XTREAM: SourceConfig = {
 
 
 @pytest.fixture
-def api() -> TestClient:
+def api(guide_db: None) -> TestClient:
     """A client signed in as ``testuser``, the first and therefore admin account."""
+    del guide_db  # Play links are kept in the database.
     auth.create_user("testuser", "testpass123")
     return _client("testuser")
 
@@ -515,7 +517,7 @@ def test_http_error_renders_html_for_browsers(api: TestClient) -> None:
     resp = api.get("/play/bogus/1", headers={"accept": "text/html"})
     assert resp.status_code == 404
     assert resp.headers["content-type"].startswith("text/html")
-    assert "Invalid stream type" in resp.text
+    assert "Stream not found" in resp.text
 
 
 def test_setup_post_redirects_once_users_exist(api: TestClient) -> None:
@@ -1085,13 +1087,13 @@ def test_pages_show_one_rating_and_year_per_title(api: TestClient, web: testing.
     card = r'<span class="text-gray-400 shrink-0">([^<]*)</span><span class="text-yellow-400 shrink-0">([^<]*)<'
     assert year_and_rating(api.get("/movie/5").text) == ["1976", "IMDb 7.0"]
     assert re.findall(card, api.get("/search?q=spy&vod=true").text) == [("1976", "IMDb 7.0")]
-    assert main._get_movie_player_info("5", "mkv").channel_name == "Spy (1976)"
+    assert main._get_movie_player_info("5").channel_name == "Spy (1976)"
     assert year_and_rating(api.get("/series/6").text) == ["2007", "IMDb 8.5"]
-    assert main._get_series_player_info("1", 6, "")[0].channel_name == "Show (2007)"
+    assert main._get_series_player_info("1", 6)[0].channel_name == "Show (2007)"
     # Without IMDb's, every page shows the provider's.
     assert year_and_rating(api.get("/movie/7").text) == ["1977", "★ 6.8"]
     assert re.findall(card, api.get("/search?q=other&vod=true").text) == [("1977", "★ 6.8")]
-    assert main._get_movie_player_info("7", "mkv").channel_name == "Spy (1977)"
+    assert main._get_movie_player_info("7").channel_name == "Spy (1977)"
 
 
 @pytest.mark.usefixtures("imdb_index")
@@ -1235,7 +1237,7 @@ def test_search_lists_every_kind_in_one_grid(api: TestClient) -> None:
         ("movie", "2", "Movie"),
         ("series", "4", "Series"),
     ]
-    assert 'href="/play/live/31"' in page
+    assert f'href="{main._play_path("live", "31")}"' in page
     # A channel has no IMDb rating or year, so those sorts put it last.
     by_imdb = _cards_shown(api.get("/search?q=heat&sort=imdb").text)
     assert [(k, i) for k, i, _ in by_imdb] == [
@@ -1456,7 +1458,7 @@ def test_series_pages_name_the_network(api: TestClient, web: testing.FakeWeb) ->
     _assert_header_resizes_smoothly(page)
     # The first episode takes focus without the browser's autofocus, which scrolled
     # the page past the title to show it.
-    first = re.search(r'<a href="/play/series/11[^>]*>', page)
+    first = re.search(rf'<a href="{main._play_path("series", "11", series_id=5)}"[^>]*>', page)
     assert first is not None
     assert "data-initial-focus" in first.group(0) and "autofocus" not in first.group(0)
     assert 'href="/search?q=network%3A%22HBO%22"' in page
@@ -1869,6 +1871,7 @@ def test_templates_carry_the_app_filters_and_globals() -> None:
     assert env.filters["rating"] is main._rating_filter
     assert env.filters["youtube_id"] is main._youtube_id
     assert env.globals["with_shown"] is main._shown
+    assert env.globals["play_path"] is main._play_path
     assert env.globals["get_content_access"] is main._get_content_access
     assert env.globals["get_content_access_from_request"] is main._get_content_access_from_request
 
@@ -1931,7 +1934,8 @@ def test_detail_pages_embed_the_trailer_paused(
         assert "isFav ? '★ Favorite' : '☆ Favorite'" in page, path
     # Title, then its year, rating and length, then Play and Favorite, then the rest:
     # the buttons no longer split a title from its facts.
-    for path, first in (("/movie/7", 'href="/play/movie/7'), ("/series/5", 'href="?refresh=1"')):
+    movie_play = f'href="{main._play_path("movie", "7")}"'
+    for path, first in (("/movie/7", movie_play), ("/series/5", 'href="?refresh=1"')):
         page = api.get(path).text
         facts = page.index('<div class="flex gap-4 text-gray-400')
         assert page.index("</h2>") < facts < page.index(first) < page.index('id="fav-btn"'), path
@@ -1995,8 +1999,8 @@ def test_series_with_listed_seasons_plays_and_shows(api: TestClient, web: testin
     assert page.status_code == 200
     assert re.findall(r"Season (\d+)", page.text) == ["1", "2"]
     assert ">Murder by the Book<" in page.text and ">Etude in Black<" in page.text
-    _, next_url = main._get_series_player_info("11", 5, "")
-    assert next_url == "/play/series/21?series_id=5&ext=mkv"
+    _, next_url = main._get_series_player_info("11", 5)
+    assert next_url == main._play_path("series", "21", series_id=5)
     assert main._episode_labels(series) == {
         11: "S01E01 Murder by the Book",
         21: "S02E01 Etude in Black",
@@ -2089,7 +2093,7 @@ def test_player_movie_resumes_watch_position(api: TestClient, web: testing.FakeW
     cache.get_cache()["vod_streams"] = [{"stream_id": 9, "name": "Film", "source_id": "s1"}]
     cache.save_watch_position("testuser", "http://x/movie/u/p/9.mkv", 42.5, 100.0)
     auth.set_user_limits("testuser", None, ["cat:other"])
-    resp = api.get("/play/movie/9?ext=mkv")
+    resp = api.get(main._play_path("movie", "9"))
     assert resp.status_code == 200
     assert testing.played_url(resp.text) == "http://x/movie/u/p/9.mkv"
     assert "/u/p/" not in resp.text
@@ -2119,11 +2123,52 @@ def test_player_series_strips_year_from_name(api: TestClient, web: testing.FakeW
         ).encode(),
     )
     auth.set_user_limits("testuser", None, ["movies:s1"])
-    resp = api.get("/play/series/11?series_id=5&ext=mkv")
+    resp = api.get(main._play_path("series", "11", series_id=5))
     assert resp.status_code == 200
     assert testing.played_url(resp.text) == "http://x/series/u/p/11.mkv"
     assert 'seriesName: "Great Show"' in resp.text
-    assert "/play/series/12?series_id=5\\u0026ext=mp4" in resp.text
+    assert f'nextEpisodeUrl: "{main._play_path("series", "12", series_id=5)}"' in resp.text
+
+
+@pytest.mark.parametrize(
+    ("old", "kind", "stream_id", "series_id", "query"),
+    [
+        ("/play/live/ota:v2.1", "live", "ota:v2.1", 0, ""),
+        ("/play/live/7?start=60&handoff=h1", "live", "7", 0, "?start=60&handoff=h1"),
+        ("/play/movie/9?ext=mp4", "movie", "9", 0, ""),
+        ("/play/series/11?series_id=5&ext=mkv", "series", "11", 5, ""),
+    ],
+)
+def test_an_old_player_link_moves_to_its_one_segment_path(
+    api: TestClient,
+    old: str,
+    kind: ffmpeg_session.ContentType,
+    stream_id: str,
+    series_id: int,
+    query: str,
+) -> None:
+    resp = api.get(old, follow_redirects=False)
+    assert (resp.status_code, resp.headers["location"]) == (
+        308,
+        main._play_path(kind, stream_id, series_id=series_id) + query,
+    )
+
+
+def test_a_bookmark_of_a_retired_positional_channel_id_finds_that_channel(
+    api: TestClient,
+) -> None:
+    _set_sources({"id": "t", "name": "Tuner", "type": "m3u", "url": "http://tuner/lineup.m3u"})
+    cache.get_cache()["live_streams"] = [
+        {"stream_id": "t:v1.1", "name": "KAXT", "source_id": "t"},
+        {"stream_id": "t:v2.1", "name": "KTVU", "source_id": "t"},
+    ]
+    resp = api.get("/play/live/t_2", follow_redirects=False)
+    assert resp.headers["location"] == main._play_path("live", "t:v2.1")
+
+
+def test_an_unknown_play_path_is_not_found(api: TestClient) -> None:
+    assert api.get("/play/!!").status_code == 404
+    assert api.get("/play/tv/1").status_code == 404
 
 
 @pytest.mark.parametrize(
@@ -2179,8 +2224,10 @@ def test_player_live_playlist_stream_transcodes_with_source_and_guide(
     ]
     now = datetime.now(timezone.utc)
     _insert_program("cnn", "m", now - timedelta(minutes=5), now + timedelta(hours=1), "Breaking")
-    resp = api.get("/play/live/m_1")
+    resp = api.get(main._play_path("live", "m_1"))
     assert resp.status_code == 200
+    # Leaving a past program returns to the channel's own path.
+    assert f'liveUrl: "{main._play_path("live", "m_1")}"' in resp.text
     # Playlist streams always go through the server; the source keeps its default.
     assert 'transcodeMode: "always"' in resp.text
     # So the server starts the stream while the page loads.
@@ -2292,7 +2339,7 @@ def test_movie_detail_offers_each_version(api: TestClient, web: testing.FakeWeb)
         ("1", ' aria-current="true"', "Added May 4, 2026 · MKV · 10.8 Mbps · 01:38:47"),
         ("2", "", "Added Jun 10, 2026 · MP4"),
     ]
-    assert "/play/movie/1?ext=mkv" in page
+    assert main._play_path("movie", "1") in page
     assert sorted(web.urls) == sorted(
         _api_url("http://x", "get_vod_info", vod_id=v) for v in ("1", "2")
     )
@@ -2827,6 +2874,7 @@ def test_settings_page_starts_background_load_without_cache(
     (load,) = threads.threads
     assert load.daemon
     assert flags == {"guide_load"}
+    db.close()
     load.run()
     # No sources load no channels, and the guide database is not open.
     assert cache.get_cache().get("live_streams") == []

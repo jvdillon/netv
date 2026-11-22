@@ -61,7 +61,7 @@ function localizeGuideTimes(root) {
 // Programs still in the upstream archive open from their start.
 function programHref(ch, prog) {
   if (prog.unavailable) return "";
-  const base = `/play/live/${ch.stream_id}`;
+  const base = ch.play_url;
   return prog.catchup ? `${base}?start=${Math.floor(prog.start_timestamp)}` : base;
 }
 
@@ -723,7 +723,7 @@ class VirtualGuide {
       <div class="guide-row flex border-b border-gray-700 hover:bg-gray-750" data-row="${index}">
         <!-- Mobile Channel Info -->
         <div class="compact-only w-32 flex-shrink-0 p-1 items-center bg-gray-800 sticky left-0 z-10 border-r border-gray-700">
-          <a href="/play/live/${ch.stream_id}"
+          <a href="${ch.play_url}"
              class="text-xs line-clamp-2 hover:text-blue-400 focus:text-blue-400 focus:outline focus:outline-2 focus:outline-blue-500 focusable"
              tabindex="0" data-nav="epg" data-row="${index}" data-col="-1"
              title="${escapeGuideHtml(ch.name)}">
@@ -734,7 +734,7 @@ class VirtualGuide {
         <!-- Desktop Channel Info -->
         <div class="desktop-only w-36 lg:w-48 flex-shrink-0 p-1 items-center gap-1 bg-gray-800 sticky left-0 z-10 border-r border-gray-700">
           ${iconUrl ? `<img src="${iconUrl}" alt="" class="w-10 h-10 object-contain" loading="lazy" onerror="this.style.display='none'">` : ""}
-          <a href="/play/live/${ch.stream_id}"
+          <a href="${ch.play_url}"
              class="text-sm line-clamp-3 hover:text-blue-400 focus:text-blue-400 focus:outline focus:outline-2 focus:outline-blue-500 focusable"
              tabindex="0" data-nav="epg" data-row="${index}" data-col="-1"
              title="${escapeGuideHtml(ch.name)}">

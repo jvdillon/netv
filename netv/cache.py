@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent import futures
 from dataclasses import dataclass, field
 from typing import Literal, NotRequired, TypeAlias, TypedDict
@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import subprocess
 import threading
 import time
@@ -764,6 +765,49 @@ def record_live_view(username: str, source_id: str, stream_id: str | int) -> int
             {"counts": counts},
         )
         return counts[key]
+
+
+def retired_live_ids(source_id: str, stream_ids: Sequence[str]) -> dict[str, str]:
+    """Map an M3U source's retired positional ids (``<source>_<n>``) to its stable ones.
+
+    Args:
+        source_id: M3U source whose channels were renamed.
+        stream_ids: The source's stable stream ids, in playlist order.
+
+    Returns:
+        renames: Each positional id to the stable id now at that position.
+    """
+    return {f"{source_id}_{n}": stream_id for n, stream_id in enumerate(stream_ids, start=1)}
+
+
+def adopt_stable_live_ids(source_id: str, stream_ids: Sequence[str]) -> None:
+    """Move every user's view counts from an M3U source's positional ids.
+
+    Positional ids (``<source>_<n>``) renumbered whenever the lineup changed; the
+    n-th id of the playlist as fetched now is the best mapping left. Stable ids never
+    take the positional form, so a second call finds nothing to move.
+
+    Args:
+        source_id: M3U source whose channels were renamed.
+        stream_ids: The source's stable stream ids, in playlist order.
+    """
+    initialize_paths()
+    positional = re.compile(rf"{re.escape(source_id)}:{re.escape(source_id)}_(\d+)")
+    renames = {
+        live_stream_key(source_id, old): live_stream_key(source_id, new)
+        for old, new in retired_live_ids(source_id, stream_ids).items()
+    }
+    with _live_view_lock:
+        for path in USERS_DIR.glob("*/live_views.json"):
+            counts = _load_live_view_counts(path.parent.name)
+            moved: dict[str, int] = {}
+            for key, count in counts.items():
+                if positional.fullmatch(key) and key not in renames:
+                    continue
+                new_key = renames.get(key, key)
+                moved[new_key] = moved.get(new_key, 0) + count
+            if moved != counts:
+                atomic_write_json(path, {"counts": moved})
 
 
 def get_watch_position(username: str, stream_url: str) -> WatchEntry | None:

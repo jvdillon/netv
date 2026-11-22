@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import NotRequired, TypedDict
+from urllib import parse
 
+import collections
 import logging
 import re
 import threading
@@ -14,6 +16,7 @@ from treekle import MutablePlainTree, ReadError, from_plain
 
 from netv.cache import (
     Source,
+    adopt_stable_live_ids,
     get_cache,
     get_cache_lock,
     get_sources,
@@ -25,7 +28,7 @@ from netv.cache import (
     update_source_epg_url,
 )
 from netv.util import safe_urlopen
-from netv.xtream import ProviderRecord, XtreamClient
+from netv.xtream import ProviderRecord, XtreamClient, text_field
 
 
 class LiveData(TypedDict):
@@ -77,7 +80,7 @@ def parse_m3u(
     """
     categories: dict[str, ProviderRecord] = {}
     streams: list[ProviderRecord] = []
-    stream_id_counter = 0
+    id_counts: collections.Counter[str] = collections.Counter()
     streams_with_epg = 0
     epg_url = ""
 
@@ -121,13 +124,18 @@ def parse_m3u(
                     "source_id": source_id,
                 }
 
-            stream_id_counter += 1
+            # The URL's last path segment survives a lineup reorder, a tuner's new
+            # address and a provider password change; a position survives none.
+            key = parse.urlsplit(url).path.rpartition("/")[2] or name
+            id_counts[key] += 1
+            if id_counts[key] > 1:
+                key = f"{key}~{id_counts[key]}"
             epg_channel_id = attrs.get("tvg-id", "")
             if epg_channel_id:
                 streams_with_epg += 1
             streams.append(
                 {
-                    "stream_id": f"{source_id}_{stream_id_counter}",
+                    "stream_id": f"{source_id}:{key}",
                     "name": name,
                     "stream_icon": attrs.get("tvg-logo", ""),
                     "epg_channel_id": epg_channel_id,
@@ -139,7 +147,7 @@ def parse_m3u(
         i += 1
 
     log.debug(
-        "M3U parsed: %d streams (%d with tvg-id, %d without), %d categories",
+        "M3U parsed: %d streams (%d with tvg-id, %d without), %d categories",  # pragma: no mutate[diagnostic-text]
         len(streams),
         streams_with_epg,
         len(streams) - streams_with_epg,
@@ -155,8 +163,10 @@ def fetch_m3u(
 ) -> tuple[list[ProviderRecord], list[ProviderRecord], str]:
     """Fetch and parse M3U from URL, return (categories, streams, epg_url)."""
     with safe_urlopen(url, timeout=timeout, user_agent=get_user_agent()) as resp:
-        content = resp.read().decode("utf-8")
-    return parse_m3u(content, source_id)
+        content = resp.read().decode("utf-8")  # pragma: no mutate[case-insensitive]
+    categories, streams, epg_url = parse_m3u(content, source_id)
+    adopt_stable_live_ids(source_id, [text_field(s, "stream_id") for s in streams])
+    return categories, streams, epg_url
 
 
 def fetch_source_live_data(

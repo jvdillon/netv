@@ -82,8 +82,9 @@ def client(mock_deps: None) -> TestClient:
 
 
 @pytest.fixture
-def auth_client(mock_deps: None) -> TestClient:
+def auth_client(mock_deps: None, guide_db: None) -> TestClient:
     """Create test client with a logged-in user."""
+    del guide_db  # Play links are kept in the database.
     client = TestClient(main.app)
     auth.create_user("testuser", "testpass123")
     client.cookies.set("token", auth.create_token({"sub": "testuser"}))
@@ -549,7 +550,7 @@ def test_catchup_player_page_plays_archive_as_vod(auth_client: TestClient):
     assert f"catchupStart: {begin.timestamp()}" in response.text
     assert "catchupSeek: 25.0" in response.text
     assert "/timeshift/user/pass/" in testing.played_url(response.text)
-    assert 'id="go-live-btn"' in response.text
+    assert f'id="go-live-btn" href="{main._play_path("live", "src1_42")}"' in response.text
     assert 'id="jump-btn"' in response.text
     assert 'id="start-over-btn"' not in response.text
 
@@ -1164,6 +1165,7 @@ class TestGuide:
         query = parse.parse_qs(proxy.query)
         assert query["url"] == [icon]
         assert auth.verify_logo_url_signature(icon, query["sig"][0])
+        assert channel["play_url"] == main._play_path("live", "1")
 
     def test_guide_rows_categories_cover_all_pages(self, auth_client: TestClient):
         categories: list[ProviderRecord] = [
@@ -1315,7 +1317,9 @@ class TestGuide:
         assert len(parser.links) == 2
         for link in parser.links:
             if archive_days == 3:
-                assert link["href"] == f"/play/live/1?start={int(start.timestamp())}"
+                assert (
+                    link["href"] == f"{main._play_path('live', '1')}?start={int(start.timestamp())}"
+                )
                 assert link["data-nav"] == "epg"
                 assert "aria-disabled" not in link
             else:
@@ -3060,6 +3064,7 @@ def test_handoff_api_offers_the_users_handoff(auth_client: TestClient, clean_han
     assert body is not None
     assert body["id"] == "h1"
     assert body["stream_id"] == "src1_42"
+    assert body["play_url"] == main._play_path("live", "src1_42") + "?handoff=h1"
     assert "recording_id" not in body
     handoff._records["testuser"]["resumed"] = True
     assert auth_client.get("/api/handoff").json() == {"handoff": None}

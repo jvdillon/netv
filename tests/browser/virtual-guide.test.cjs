@@ -15,7 +15,7 @@ function renderProgram(program) {
     VirtualGuide.prototype.renderRow.call({
       currentRowHeight: 64, logoUrlFilter: value => value,
     }, {
-      channel: { stream_id: '1', name: 'Stream' },
+      channel: { stream_id: '1', name: 'Stream', play_url: '/play/k3f9x2abqe' },
       programs: [program], programs_mobile: [program],
     }, 0)
   `,
@@ -160,7 +160,7 @@ test("virtual guide retains archive URLs and current or future live links", () =
       catchup,
       unavailable: false,
     });
-    const expected = catchup ? "/play/live/1?start=100" : "/play/live/1";
+    const expected = catchup ? "/play/k3f9x2abqe?start=100" : "/play/k3f9x2abqe";
     const links = [...html.matchAll(/<a\s+([^>]+)>([\s\S]*?)<\/a>/g)].filter(
       ([, attributes]) => attributes.includes('title="Program'),
     );

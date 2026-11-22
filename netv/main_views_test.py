@@ -31,6 +31,7 @@ from netv import (
     db,
     epg,
     ffmpeg_command,
+    ffmpeg_session,
     handoff,
     imdb,
     m3u as m3u_module,
@@ -370,7 +371,7 @@ def test_source_refresh_m3u(
     assert store["live_streams"] == [
         {"source_id": "other"},
         {
-            "stream_id": "s1_1",
+            "stream_id": "s1:1.ts",
             "name": "One",
             "stream_icon": "",
             "epg_channel_id": "",
@@ -1782,7 +1783,7 @@ def test_catchup_player_info_unknown_stream(guide_db: None):
 
 def test_movie_player_info_without_client():
     cache_module.get_cache().pop("vod_streams", None)
-    assert main._get_movie_player_info("1", "") == PlayerInfo()
+    assert main._get_movie_player_info("1") == PlayerInfo()
 
 
 @pytest.mark.parametrize(
@@ -1802,16 +1803,18 @@ def test_movie_player_info(web: FakeWeb, movie: ProviderRecord, name: str, desc:
         _source("s1", "xtream", url="http://x"),
     )
     web.routes[_api("http://x", "get_vod_info", vod_id=5)] = _json(movie)
-    info = main._get_movie_player_info("5", "")
+    info = main._get_movie_player_info("5")
     assert info.url == "http://x/movie/u/p/5.mkv"
     assert info.source_id == "s1"
     assert (info.channel_name, info.program_desc) == (name, desc)
 
 
-def test_movie_player_info_survives_upstream_error(web: FakeWeb):
-    cache_module.get_cache()["vod_streams"] = []
+def test_movie_player_info_plays_the_catalog_s_container(web: FakeWeb):
+    cache_module.get_cache()["vod_streams"] = [
+        {"stream_id": 5, "source_id": "s0", "container_extension": "mp4"},
+    ]
     _use_sources(_source("s0", "xtream", url="http://x"))
-    info = main._get_movie_player_info("5", "mp4")
+    info = main._get_movie_player_info("5")
     assert info.url == "http://x/movie/u/p/5.mp4"
     assert info.channel_name == ""
     assert web.urls == [_api("http://x", "get_vod_info", vod_id=5)]
@@ -1833,40 +1836,41 @@ _SERIES: ProviderRecord = {
 
 
 def test_series_player_info_without_client():
-    assert main._get_series_player_info("1", None, "") == (PlayerInfo(), None)
+    assert main._get_series_player_info("1", 0) == (PlayerInfo(), None)
 
 
-@pytest.mark.parametrize("series_id", [None, 0])
-def test_series_player_info_without_series_id(web: FakeWeb, series_id: int | None):
-    cache_module.get_cache()["series"] = [{"series_id": series_id, "source_id": "ignored"}]
+def test_series_player_info_without_series_id(web: FakeWeb):
+    cache_module.get_cache()["series"] = [{"series_id": 0, "source_id": "ignored"}]
     _use_sources(
         _source("s0", "xtream", url="http://x"),
         _source("ignored", "xtream", url="http://ignored"),
     )
-    info, next_url = main._get_series_player_info("1", series_id, "")
+    info, next_url = main._get_series_player_info("1", 0)
     assert info == PlayerInfo(url="http://x/series/u/p/1.mkv")
     assert next_url is None
     assert web.fetches == []
 
 
 @pytest.mark.parametrize(
-    ("stream_id", "title", "desc", "next_url"),
+    ("stream_id", "ext", "title", "desc", "next_id"),
     [
-        ("10", "S01E00 -- Prologue", "", "/play/series/11?series_id=1&ext=mkv"),
-        ("11", "S01E01 -- Pilot", "Start", "/play/series/12?series_id=1&ext=mp4"),
-        ("12", "S01E02 -- Second", "", "/play/series/21?series_id=1&ext=mkv"),
-        ("21", "S02E01 -- Grand Finale", "", "/play/series/101?series_id=1&ext=mkv"),
-        ("101", "S10E01 -- Last", "", None),
+        ("10", "mkv", "S01E00 -- Prologue", "", "11"),
+        ("11", "mkv", "S01E01 -- Pilot", "Start", "12"),
+        ("12", "mp4", "S01E02 -- Second", "", "21"),
+        ("21", "mkv", "S02E01 -- Grand Finale", "", "101"),
+        ("101", "mkv", "S10E01 -- Last", "", None),
     ],
 )
 @pytest.mark.usefixtures("guide_db")
 def test_series_player_info_episodes(
     web: FakeWeb,
     stream_id: str,
+    ext: str,
     title: str,
     desc: str,
-    next_url: str | None,
+    next_id: str | None,
 ):
+    next_url = None if next_id is None else main._play_path("series", next_id, series_id=1)
     imdb.init()
     cache_module.get_cache()["series"] = [{"series_id": 1, "source_id": "s1"}]
     _use_sources(
@@ -1875,8 +1879,8 @@ def test_series_player_info_episodes(
     )
     url = _api("http://x", "get_series_info", series_id=1)
     web.routes[url] = _json(_SERIES)
-    info, found_next = main._get_series_player_info(stream_id, 1, "")
-    assert info.url == f"http://x/series/u/p/{stream_id}.mkv"
+    info, found_next = main._get_series_player_info(stream_id, 1)
+    assert info.url == f"http://x/series/u/p/{stream_id}.{ext}"
     assert info.source_id == "s1"
     assert info.channel_name == "Show (2020)"
     assert (info.program_title, info.program_desc, found_next) == (title, desc, next_url)
@@ -1969,7 +1973,7 @@ def test_series_player_info_partial_data(
     # A fresh response each run: a body is read once, and a test may run twice.
     web.routes[url] = route if isinstance(route, Exception) else _json(route)
     with caplog.at_level(logging.WARNING, logger="netv.main"):
-        info, next_url = main._get_series_player_info("1", 9, "")
+        info, next_url = main._get_series_player_info("1", 9)
     assert info == PlayerInfo(url="http://x/series/u/p/1.mkv", channel_name=name)
     assert next_url is None
     assert web.urls == [url]
@@ -1987,11 +1991,30 @@ def test_ensure_live_cache_loads_streams_and_epg(guide_db: None, web: FakeWeb):
         {"cats": [{"c": 1}], "streams": [{"s": 1}], "epg_urls": [["http://u", 1, "s"]]},
     )
     web.routes["http://u"] = RuntimeError("offline")
-    main._ensure_live_cache()
+    assert main._ensure_live_cache() == [{"s": 1}]
     store = cache_module.get_cache()
     assert store.get("live_streams") == [{"s": 1}]
     assert store.get("live_categories") == [{"c": 1}]
     assert web.urls == ["http://u"]
+
+
+def test_ensure_live_cache_survives_a_failed_guide_load(
+    guide_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    del guide_db
+    # Channels cached without guide URLs; the guide loader then fails outright.
+    cache_module.get_cache()["live_streams"] = [{"s": 1}]
+    cache_module.get_cache().pop("epg_urls", None)
+    asked: list[list[tuple[str, int, str]]] = []
+
+    def failing_load(urls: list[tuple[str, int, str]]) -> None:
+        asked.append(urls)
+        raise RuntimeError("guide down")
+
+    monkeypatch.setattr(main, "load_all_epg", failing_load)
+    assert main._ensure_live_cache() == [{"s": 1}]
+    assert asked == [[]]
 
 
 # ===========================================================================
@@ -2396,6 +2419,41 @@ def test_created_app_serves_static_files_that_browsers_revalidate() -> None:
     assert again.status_code == 304
     assert again.headers["cache-control"] == "no-cache"
     assert application.url_path_for("static", path="/js/app.js") == "/static/js/app.js"
+
+
+_PLAY_TARGETS: list[tuple[ffmpeg_session.ContentType, str, int]] = [
+    ("live", "ota:v2.1", 0),
+    ("live", "20080", 0),
+    ("movie", "486947", 0),
+    ("series", "12", 15_137),
+    ("series", "12", 0),
+]
+
+
+def test_a_play_link_is_short_opaque_and_survives_a_restart(tmp_path: pathlib.Path):
+    epg.init(tmp_path)
+    paths = [main._play_path(k, s, series_id=n) for k, s, n in _PLAY_TARGETS]
+    # Ten letters and digits that say nothing of what plays.
+    assert all(re.fullmatch(r"/play/[a-z2-7]{10}", p) for p in paths)
+    assert len(set(paths)) == len(paths)
+    assert not any(s in p for p, (_, s, _) in zip(paths, _PLAY_TARGETS, strict=True))
+    # After a restart the links still play, and the same streams get the same links.
+    db.close()
+    epg.init(tmp_path)
+    found = [main._play_target(p.removeprefix("/play/")) for p in paths]
+    assert [(t.kind, t.stream_id, t.series_id) for t in found] == _PLAY_TARGETS
+    assert [main._play_path(k, s, series_id=n) for k, s, n in _PLAY_TARGETS] == paths
+    db.close()
+
+
+@pytest.mark.usefixtures("guide_db")
+@pytest.mark.parametrize("link", ["", "aaaaaaaaaa", "!!"])
+def test_an_unissued_play_link_names_nothing(link: str):
+    # A channel's link, built without a series, names none.
+    channel = main._play_target(main._play_path("live", "1").removeprefix("/play/"))
+    assert (channel.kind, channel.stream_id, channel.series_id) == ("live", "1", 0)
+    with pytest.raises(ValueError, match="Unknown play path"):
+        main._play_target(link)
 
 
 if __name__ == "__main__":

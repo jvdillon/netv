@@ -6,6 +6,7 @@ from urllib import parse
 
 import json
 import logging
+import re
 import time
 
 import pytest
@@ -99,25 +100,46 @@ def _serve_xtream(
 
 
 class TestParseM3u:
-    def test_parse_basic_m3u(self):
+    def test_parse_basic_m3u(self, caplog: pytest.LogCaptureFixture):
         content = """#EXTM3U
-#EXTINF:-1 tvg-id="ch1" tvg-logo="http://logo.png" group-title="News",Channel One
+#EXTINF:-1 tvg-id="ch1" tvg-logo="http://logo.png" group-title="!X-News!",Channel One
 http://stream.example.com/ch1.m3u8
 #EXTINF:-1 tvg-id="ch2" group-title="Sports",Channel Two
 http://stream.example.com/ch2.m3u8
+#EXTINF:-1 group-title="Sports",Channel Three
+http://stream.example.com/ch3.m3u8
 """
-        cats, streams, _ = m3u.parse_m3u(content, "src1")
+        with caplog.at_level(logging.DEBUG, logger="netv.m3u"):
+            cats, streams, _ = m3u.parse_m3u(content, "src1")
 
-        assert len(cats) == 2
-        assert any(c["category_name"] == "News" for c in cats)
-        assert any(c["category_name"] == "Sports" for c in cats)
-
-        assert len(streams) == 2
-        assert streams[0]["name"] == "Channel One"
-        assert streams[0]["epg_channel_id"] == "ch1"
-        assert streams[0]["stream_icon"] == "http://logo.png"
-        assert streams[0]["direct_url"] == "http://stream.example.com/ch1.m3u8"
-        assert streams[0]["source_id"] == "src1"
+        assert cats == [
+            {
+                "category_id": "src1_x_news",
+                "category_name": "!X-News!",
+                "parent_id": 0,
+                "source_id": "src1",
+            },
+            {
+                "category_id": "src1_sports",
+                "category_name": "Sports",
+                "parent_id": 0,
+                "source_id": "src1",
+            },
+        ]
+        assert streams[0] == {
+            "stream_id": "src1:ch1.m3u8",
+            "name": "Channel One",
+            "stream_icon": "http://logo.png",
+            "epg_channel_id": "ch1",
+            "category_ids": ["src1_x_news"],
+            "direct_url": "http://stream.example.com/ch1.m3u8",
+            "source_id": "src1",
+        }
+        # A channel without a guide id or logo has empty ones, not missing ones.
+        assert (streams[2]["epg_channel_id"], streams[2]["stream_icon"]) == ("", "")
+        # Streams, those with and without a guide id, and categories.
+        [record] = [r for r in caplog.records if r.name == "netv.m3u"]
+        assert re.findall(r"\d+", record.getMessage().replace("M3U", "")) == ["3", "2", "1", "2"]
 
     def test_parse_m3u_with_epg_url(self):
         content = """#EXTM3U url-tvg="http://epg.example.com/guide.xml"
@@ -211,11 +233,20 @@ class TestMakeClientUserAgent:
         assert m3u._make_client(source).user_agent == "MyAgent/9.9"
 
     def test_fetch_m3u_sends_user_agent(self, web: testing.FakeWeb):
-        cache.save_server_settings({**cache.load_server_settings(), "user_agent_preset": "vlc"})
+        # Neither value is safe_urlopen's default, so each must be passed on.
+        cache.save_server_settings(
+            {
+                **cache.load_server_settings(),
+                "user_agent_preset": "custom",
+                "user_agent_custom": "MyAgent/9.9",
+            },
+        )
         _serve(web, "http://example.com/list.m3u", "#EXTM3U\n")
-        assert m3u.fetch_m3u("http://example.com/list.m3u", "src1") == ([], [], "")
+        assert m3u.fetch_m3u("http://example.com/list.m3u", "src1", timeout=7) == ([], [], "")
+        m3u.fetch_m3u("http://example.com/list.m3u", "src1")
         assert [(f.url, f.timeout, f.headers) for f in web.fetches] == [
-            ("http://example.com/list.m3u", 30, {"User-agent": "VLC/3.0.20 LibVLC/3.0.20"}),
+            ("http://example.com/list.m3u", 7, {"User-agent": "MyAgent/9.9"}),
+            ("http://example.com/list.m3u", 30, {"User-agent": "MyAgent/9.9"}),
         ]
 
 
@@ -269,7 +300,7 @@ class TestAggregateSourceData:
         cats, streams, epg_urls = m3u._fetch_all_live_data()
 
         assert cats == [{"category_id": "xtream_news", "source_id": "xtream"}, *m3u_cats]
-        assert [s["stream_id"] for s in streams] == [1, 2, "m3u_1"]
+        assert [s["stream_id"] for s in streams] == [1, 2, "m3u:live"]
         assert streams[0]["category_ids"] == ["xtream_news"]
         assert streams[1]["category_ids"] == ["xtream_news", "xtream_sport"]
         assert all(s["source_id"] == "xtream" for s in streams[:2])
@@ -355,10 +386,14 @@ class TestAggregateSourceData:
 
 
 class TestParseM3uEdgeCases:
-    def test_skips_blank_and_directive_lines_before_url(self):
-        content = "#EXTM3U\n#EXTINF:-1,Alpha\n\n#EXTVLCOPT:http-user-agent=x\nhttp://a\n"
+    @pytest.mark.parametrize("skipped", ["\n#EXTVLCOPT:http-user-agent=x\n", "#EXTGRP:x\n"])
+    def test_skips_blank_and_directive_lines_before_url(self, skipped: str):
+        content = f"#EXTM3U\n#EXTINF:-1,Alpha\n{skipped}http://a\n#EXTINF:-1,Beta\nhttp://b\n"
         _, streams, _ = m3u.parse_m3u(content, "s")
-        assert [(s["name"], s["direct_url"]) for s in streams] == [("Alpha", "http://a")]
+        assert [(s["name"], s["direct_url"]) for s in streams] == [
+            ("Alpha", "http://a"),
+            ("Beta", "http://b"),
+        ]
 
     def test_trailing_extinf_without_url(self):
         _, streams, _ = m3u.parse_m3u("#EXTM3U\n#EXTINF:-1,Last\n", "s")
@@ -381,7 +416,58 @@ class TestParseM3uEdgeCases:
             "s",
         )
         assert [c["category_id"] for c in cats] == ["s_us_news_talk"]
-        assert [s["stream_id"] for s in streams] == ["s_1", "s_2"]
+        assert len(streams) == 2
+
+
+def _stream_ids(content: str) -> list[tuple[str, str]]:
+    _, streams, _ = m3u.parse_m3u(content, "ota")
+    return [(text_field(s, "name"), text_field(s, "stream_id")) for s in streams]
+
+
+class TestStreamIds:
+    def test_a_channel_keeps_its_id_when_the_lineup_reorders_or_moves_host(self):
+        before = (
+            "#EXTM3U\n#EXTINF:-1,KTVU\nhttp://192.168.1.87:5004/auto/v2.1\n"
+            "#EXTINF:-1,KQED\nhttp://192.168.1.87:5004/auto/v9.1\n"
+        )
+        after = (
+            "#EXTM3U\n#EXTINF:-1,KQED\nhttp://192.168.1.24:5004/auto/v9.1\n"
+            "#EXTINF:-1,KICU\nhttp://192.168.1.24:5004/auto/v36.1\n"
+            "#EXTINF:-1,KTVU\nhttp://192.168.1.24:5004/auto/v2.1\n"
+        )
+        assert _stream_ids(before) == [("KTVU", "ota:v2.1"), ("KQED", "ota:v9.1")]
+        assert _stream_ids(after) == [
+            ("KQED", "ota:v9.1"),
+            ("KICU", "ota:v36.1"),
+            ("KTVU", "ota:v2.1"),
+        ]
+
+    def test_an_id_carries_no_credentials_or_query(self):
+        content = "#EXTINF:-1,News\nhttp://h/live/user/secret/123.ts?token=abc\n"
+        assert _stream_ids(content) == [("News", "ota:123.ts")]
+
+    def test_repeated_names_are_numbered_in_playlist_order(self):
+        content = (
+            "#EXTINF:-1,A\nhttp://h/a/index.m3u8\n"
+            "#EXTINF:-1,B\nhttp://h/b/index.m3u8\n"
+            "#EXTINF:-1,C\n"
+        )
+        assert _stream_ids(content) == [
+            ("A", "ota:index.m3u8"),
+            ("B", "ota:index.m3u8~2"),
+            ("C", "ota:C"),
+        ]
+
+    def test_a_fetch_moves_view_counts_off_positional_ids(self, web: testing.FakeWeb):
+        cache.record_live_view("viewer", "ota", "ota_2")
+        _serve(web, _PLAYLIST_URL, "#EXTINF:-1,A\nhttp://h/a\n#EXTINF:-1,B\nhttp://h/b\n")
+        m3u.fetch_m3u(_PLAYLIST_URL, "ota")
+        assert cache.load_live_view_counts("viewer") == {"ota:ota:b": 1}
+
+    def test_an_id_never_takes_the_retired_positional_form(self):
+        # Positional ids were "<source>_<n>"; a stored one must not name a new channel.
+        content = "#EXTINF:-1,A\nhttp://h/live/u/p/2\n"
+        assert _stream_ids(content) == [("A", "ota:2")]
 
 
 class TestFetchSourceLiveDataPersistence:

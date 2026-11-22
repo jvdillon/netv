@@ -187,6 +187,9 @@ def test_catalog_maps_full_public_stream_and_access_ids(
         monkeypatch,
         [{"category_id": "news", "category_name": "News"}, {"category_id": "kids"}],
         [
+            # Entries without an id come first: they are skipped, not where listing stops.
+            {"stream_id": None, "name": "No id", "category_ids": ["news"]},
+            {"stream_id": "", "name": "Empty id", "category_ids": ["news"]},
             {
                 "stream_id": 7,
                 "num": 3,
@@ -199,12 +202,18 @@ def test_catalog_maps_full_public_stream_and_access_ids(
                 "tv_archive": "1",
                 "tv_archive_duration": "bad",
             },
-            {"stream_id": None, "name": "No id", "category_ids": ["news"]},
-            {"stream_id": "", "name": "Empty id", "category_ids": ["news"]},
         ],
     )
 
     snapshot = _catalog(tmp_path).get()
+
+    # Native apps keep these ids, so the keys naming them are a stored contract.
+    assert set(json.loads((tmp_path / "ids.json").read_text())["ids"]) == {
+        "source-a:category:source-a_news",
+        "source-a:category:source-a_kids",
+        "source-a:category:source-a_extra",
+        "source-a:live:7",
+    }
 
     # The account API tells live sessions whether the panel serves TS.
     assert web.urls == [CATEGORIES_URL, STREAMS_URL, API]
@@ -279,13 +288,52 @@ def test_catalog_assigns_uncategorized_streams_numeric_category(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    _serve(monkeypatch, [], [{"stream_id": 7, "name": "Uncategorized", "category_ids": []}])
+    _serve(
+        monkeypatch,
+        [],
+        [
+            {"stream_id": 7, "name": "Uncategorized", "category_ids": []},
+            # A provider listing one channel twice still gets an id per listing.
+            {"stream_id": 8, "name": "Twice", "category_ids": []},
+            {"stream_id": 8, "name": "Twice", "category_ids": []},
+            {"stream_id": 8, "name": "Twice", "category_ids": []},
+        ],
+    )
     snapshot = _catalog(tmp_path, ttl_seconds=60).get()
 
-    category_id = snapshot.categories[0]["category_id"]
+    [category] = snapshot.categories
+    category_id = category["category_id"]
+    assert category == {
+        "category_id": category_id,
+        "category_name": "Uncategorized",
+        "parent_id": 0,
+    }
     assert category_id.isdigit()
-    assert snapshot.streams[0].public["category_id"] == category_id
+    assert [(s.public["category_id"], s.access_group_ids) for s in snapshot.streams] == [
+        (category_id, ()),
+    ] * 4
     assert snapshot.streams[0].public["category_ids"] == [category_id]
+    assert set(json.loads((tmp_path / "ids.json").read_text())["ids"]) == {
+        "source-a:category:source-a_gateway_uncategorized",
+        "source-a:live:7",
+        "source-a:live:8",
+        "source-a:live:8:duplicate:2",
+        "source-a:live:8:duplicate:3",
+    }
+
+
+def test_a_failing_source_leaves_the_others_listed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _configure(_xtream("down"), _other("m3u", "up"))
+    playlist = b"#EXTINF:-1,News\nhttps://streams.example/news\n"
+    testing.install_web(
+        monkeypatch,
+        testing.FakeWeb({PLAYLIST_URL: testing.FakeResponse(playlist)}),
+        util,
+    )
+    assert [s.public["name"] for s in _catalog(tmp_path).get().streams] == ["News"]
 
 
 def test_catalog_skips_unsupported_source_types(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -304,45 +352,36 @@ def test_catalog_skips_unsupported_source_types(tmp_path: Path, monkeypatch: pyt
     )
 
 
-def test_m3u_registry_key_uses_url_instead_of_playlist_position(tmp_path: Path):
+def test_an_m3u_channel_keeps_its_id_when_the_playlist_reorders_or_rotates_tokens(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _configure(_other("m3u", "source-a"))
+    web = testing.FakeWeb()
+    testing.install_web(monkeypatch, web, util)
     catalog = _catalog(tmp_path, ttl_seconds=60)
-    first = catalog._stream_registry_key(
-        "source-a",
-        "m3u",
-        {
-            "stream_id": "source-a_1",
-            "direct_url": "https://streams.example/news?token=first",
-            "epg_channel_id": "news.example",
-            "name": "News",
-        },
+
+    def ids(playlist: str) -> dict[str, int]:
+        web.routes[PLAYLIST_URL] = testing.FakeResponse(playlist.encode())
+        return {s.public["name"]: s.local_id for s in catalog.get(force=True).streams}
+
+    first = ids(
+        "#EXTINF:-1,News\nhttps://streams.example/news?token=first\n"
+        "#EXTINF:-1,Sports\nhttps://streams.example/sports?token=first\n",
     )
-    reordered = catalog._stream_registry_key(
-        "source-a",
-        "m3u",
-        {
-            "stream_id": "source-a_42",
-            "direct_url": "https://streams.example/news?token=rotated",
-            "epg_channel_id": "news.example",
-            "name": "News",
-        },
-    )
-    different = catalog._stream_registry_key(
-        "source-a",
-        "m3u",
-        {
-            "stream_id": "source-a_1",
-            "direct_url": "https://streams.example/sports",
-            "epg_channel_id": "sports.example",
-            "name": "Sports",
-        },
+    rotated = ids(
+        "#EXTINF:-1,Weather\nhttps://streams.example/weather?token=rotated\n"
+        "#EXTINF:-1,Sports\nhttps://streams.example/sports?token=rotated\n"
+        "#EXTINF:-1,News\nhttps://streams.example/news?token=rotated\n",
     )
 
-    assert first == reordered
-    assert first != different
+    assert {name: rotated[name] for name in first} == first
+    assert rotated["Weather"] not in first.values()
 
 
 def test_registry_key_formats():
     assert GatewayCatalog._stream_registry_key("s", "xtream", {"stream_id": 9}) == "s:live:9"
+    # An M3U entry with no guide id, name or URL falls back to its stream id.
     digest = hashlib.sha256(b"s_3").hexdigest()
     assert GatewayCatalog._stream_registry_key("s", "m3u", {"stream_id": "s_3"}) == (
         f"s:live-url:{digest}"

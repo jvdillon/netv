@@ -25,11 +25,7 @@
     if (handoff.program_end > Date.now() / 1000)
       detail.push(`ends ${clock(handoff.program_end)}`);
     document.getElementById("handoff-detail").textContent = detail.join(" · ");
-    resume.href =
-      "/play/live/" +
-      encodeURIComponent(handoff.stream_id) +
-      "?handoff=" +
-      encodeURIComponent(handoff.id);
+    resume.href = handoff.play_url;
     card.classList.remove("hidden");
   }
 

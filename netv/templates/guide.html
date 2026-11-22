@@ -181,7 +181,7 @@
     <div class="guide-row flex border-b border-gray-700 hover:bg-gray-750" data-row="{{ loop.index0 }}">
       <!-- Mobile Channel Info -->
       <div class="compact-only w-32 flex-shrink-0 p-1 items-center bg-gray-800 sticky left-0 z-10 border-r border-gray-700">
-        <a href="/play/live/{{ row.channel.stream_id }}"
+        <a href="{{ row.channel.play_url }}"
            class="text-xs line-clamp-2 hover:text-blue-400 focus:text-blue-400 focus:outline focus:outline-2 focus:outline-blue-500 focusable"
            tabindex="0" data-nav="epg" data-row="{{ loop.index0 }}" data-col="-1"
            title="{{ row.channel.name }}">
@@ -195,7 +195,7 @@
         <img src="{{ row.channel.icon | logo_url }}" alt="" class="w-10 h-10 object-contain" loading="lazy"
              onerror="this.style.display='none'">
         {% endif %}
-        <a href="/play/live/{{ row.channel.stream_id }}"
+        <a href="{{ row.channel.play_url }}"
            class="text-sm line-clamp-3 hover:text-blue-400 focus:text-blue-400 focus:outline focus:outline-2 focus:outline-blue-500 focusable"
            tabindex="0" data-nav="epg" data-row="{{ loop.index0 }}" data-col="-1"
            title="{{ row.channel.name }}">
@@ -208,7 +208,7 @@
       <div class="compact-only-block flex-1 relative h-10 ml-1">
         {% if row.programs_mobile %}
         {% for prog in row.programs_mobile %}
-        <a {% if prog.unavailable %}aria-disabled="true" role="link" tabindex="-1"{% else %}href="/play/live/{{ row.channel.stream_id }}{% if prog.catchup %}?start={{ prog.start_timestamp | int }}{% endif %}"
+        <a {% if prog.unavailable %}aria-disabled="true" role="link" tabindex="-1"{% else %}href="{{ row.channel.play_url }}{% if prog.catchup %}?start={{ prog.start_timestamp | int }}{% endif %}"
            tabindex="0" data-nav="epg" data-row="{{ row_idx }}" data-col="{{ loop.index0 }}"{% endif %}
            class="absolute top-0.5 bottom-0.5 bg-gray-700 hover:bg-gray-600 rounded px-1 overflow-hidden
                   {% if prog.unavailable %}opacity-50 cursor-not-allowed{% else %}focusable{% endif %} border border-gray-600 focus:ring-2 focus:ring-blue-500 focus:ring-offset-1 focus:ring-offset-gray-800"
@@ -229,7 +229,7 @@
       <div class="desktop-only-block flex-1 relative h-16 ml-1">
         {% if row.programs %}
         {% for prog in row.programs %}
-        <a {% if prog.unavailable %}aria-disabled="true" role="link" tabindex="-1"{% else %}href="/play/live/{{ row.channel.stream_id }}{% if prog.catchup %}?start={{ prog.start_timestamp | int }}{% endif %}"
+        <a {% if prog.unavailable %}aria-disabled="true" role="link" tabindex="-1"{% else %}href="{{ row.channel.play_url }}{% if prog.catchup %}?start={{ prog.start_timestamp | int }}{% endif %}"
            tabindex="0" data-nav="epg" data-row="{{ row_idx }}" data-col="{{ loop.index0 }}"{% endif %}
            class="absolute top-1 bottom-1 bg-gray-700 hover:bg-gray-600 rounded px-2 py-1 overflow-hidden
                   {% if prog.unavailable %}opacity-50 cursor-not-allowed{% else %}focusable{% endif %} border-2 border-transparent focus:border-blue-500 focus:bg-blue-900/50"
@@ -336,15 +336,13 @@ localizeGuideTimes(document);
   };
 
   function getVisiblePrograms(row) {
-    // Select ONLY from desktop-only-block containers
-    const containers = document.querySelectorAll('.desktop-only-block');
-    let programs = [];
-    containers.forEach(c => {
-      const rowDiv = c.closest('[data-row]');
-      if (rowDiv && rowDiv.dataset.row === String(row)) {
-        programs.push(...c.querySelectorAll('a[data-nav="epg"]'));
-      }
-    });
+    // Each row draws its programmes twice, for phones and wider screens; one shows.
+    const containers = document.querySelectorAll(
+      `[data-row="${row}"] > .compact-only-block, [data-row="${row}"] > .desktop-only-block`,
+    );
+    const programs = [...containers]
+      .filter(c => c.checkVisibility())
+      .flatMap(c => [...c.querySelectorAll('a[data-nav="epg"]')]);
     // Filter to unique visual positions (first element at each left position)
     const seen = new Set();
     const unique = programs.filter(p => {

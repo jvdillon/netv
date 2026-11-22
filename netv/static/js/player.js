@@ -761,7 +761,7 @@
     try {
       // Release the upstream connection before the next page starts probing.
       await cleanupTranscode();
-      const base = `/play/live/${encodeURIComponent(cfg.streamId)}`;
+      const base = cfg.liveUrl;
       // A handoff recording's channel has no archive: anything past it is live.
       const live =
         target >= Date.now() / 1000 - 30 || (cfg.handoffRecording && !cfg.catchupDays);

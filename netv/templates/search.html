@@ -19,7 +19,7 @@
       <button type="submit" class="px-5 py-3 rounded-lg bg-blue-600 hover:bg-blue-700 text-base sm:text-lg focusable">Search</button>
     </div>
     {# What to search. #}
-    <div class="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-gray-400 mb-2">
+    <div class="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-gray-400 mb-2" data-nav="row">
       <label class="flex items-center gap-2 cursor-pointer">
         <input type="checkbox" name="live" value="true" {% if search_live %}checked{% endif %}
                class="w-4 h-4 rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
@@ -42,7 +42,7 @@
       </label>
     </div>
     {# What to keep; year and IMDb apply to movies and series only. #}
-    <div class="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-gray-400 mb-2">
+    <div class="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-gray-400 mb-2" data-nav="row">
       <label class="flex items-center gap-2">
         <span>Year</span>
         <input type="number" name="year_from" value="{{ filters.year_from if filters.year_from is not none else '' }}"

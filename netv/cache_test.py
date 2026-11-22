@@ -364,6 +364,28 @@ class TestUserSettings:
             "source-b:7": 1,
         }
 
+    def test_positional_view_counts_move_to_stable_ids_once(self):
+        # Views already counted under a stable id add to the moved ones.
+        for stream_id in ("ota:v2.1", "ota_1", "ota_1", "ota_2", "ota_9", "ota_1x"):
+            cache.record_live_view("user1", "ota", stream_id)
+        cache.record_live_view("user1", "iptv", "iptv_1")
+        cache.record_live_view("user2", "ota", "ota_2")
+        cache.record_live_view("user3", "ota", "ota:v2.1")
+        untouched = cache.USERS_DIR / "user3" / "live_views.json"
+        untouched.write_text(json.dumps({"counts": {"ota:ota:v2.1": 1}}, indent=4))
+        expected = {
+            "user1": {"ota:ota:v2.1": 3, "ota:ota:v9.1": 1, "ota:ota_1x": 1, "iptv:iptv_1": 1},
+            "user2": {"ota:ota:v9.1": 1},
+            "user3": {"ota:ota:v2.1": 1},
+        }
+        cache.adopt_stable_live_ids("ota", ["ota:v2.1", "ota:v9.1"])
+        assert {u: cache.load_live_view_counts(u) for u in expected} == expected
+        # A file with nothing to move is left as it was.
+        assert '    "counts"' in untouched.read_text()
+        # A later reorder finds no positional ids left to move.
+        cache.adopt_stable_live_ids("ota", ["ota:v9.1", "ota:v2.1"])
+        assert {u: cache.load_live_view_counts(u) for u in expected} == expected
+
 
 class TestSource:
     def test_source_dataclass(self):

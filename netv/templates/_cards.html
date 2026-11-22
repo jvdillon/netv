@@ -5,7 +5,7 @@
 {% set own = kind if kind is defined else ('series' if record.series_id is defined else ('live' if record.netv_kind == 'live' else 'movies')) %}
 {% set noun = {'movies': 'movie', 'series': 'series', 'live': 'live'}[own] %}
 {% set item_id = record.series_id if own == 'series' else record.stream_id %}
-{% set href = '/play/live/' ~ item_id if own == 'live' else '/' ~ noun ~ '/' ~ item_id %}
+{% set href = play_path('live', item_id | string) if own == 'live' else '/' ~ noun ~ '/' ~ item_id %}
 {% set cover = shown.poster | logo_url %}
 {% set meta = [shown.year, shown.rating] | select | join(' · ') %}
 <div class="{{ noun }}-card relative group" draggable="true" data-{{ noun }}-id="{{ item_id }}" data-{{ noun }}-name="{{ shown.name }}" data-{{ noun }}-cover="{{ cover }}"{% if own == 'movies' %} data-movie-ext="{{ record.container_extension or 'mkv' }}"{% endif %}>

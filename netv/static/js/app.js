@@ -86,25 +86,37 @@
     const from = current.getBoundingClientRect();
     const cx = from.left + from.width / 2;
     const cy = from.top + from.height / 2;
+    const vertical = direction === "up" || direction === "down";
     let best = null;
     let bestScore = Infinity;
+    let bestAcross = Infinity;
     for (const el of focusables) {
       if (el === current || el.classList.contains("fav-btn") || current.contains(el))
         continue;
-      const r = el.getBoundingClientRect();
-      const dx = r.left + r.width / 2 - cx;
+      // Up or down, another row (data-nav="row") is one stop: it is as near as its
+      // whole box, however small and far aside its items sit.
+      const row = vertical ? el.closest('[data-nav="row"]') : null;
+      const r = (row && !row.contains(current) ? row : el).getBoundingClientRect();
+      const dx =
+        row && vertical
+          ? Math.max(r.left - cx, 0, cx - r.right)
+          : r.left + r.width / 2 - cx;
       const dy = r.top + r.height / 2 - cy;
       const ahead = { up: -dy, down: dy, left: -dx, right: dx }[direction];
-      const aside =
-        direction === "up" || direction === "down" ? Math.abs(dx) : Math.abs(dy);
+      const aside = vertical ? Math.abs(dx) : Math.abs(dy);
       // Ahead means past the current element's edge, not merely offset by a pixel.
       const edge =
         direction === "up" || direction === "down" ? from.height / 2 : from.width / 2;
       if (ahead <= edge * 0.5) continue;
       const score = ahead + 2 * aside;
-      if (score < bestScore) {
+      // A row's items tie on its box; the one nearest across is entered.
+      const across = Math.abs(
+        el.getBoundingClientRect().left + el.offsetWidth / 2 - cx,
+      );
+      if (score < bestScore || (score === bestScore && across < bestAcross)) {
         best = el;
         bestScore = score;
+        bestAcross = across;
       }
     }
     return best;
