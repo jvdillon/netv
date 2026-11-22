@@ -18,7 +18,7 @@
       {# Without it, Enter does nothing: the form has several text and number fields. #}
       <button type="submit" class="px-5 py-3 rounded-lg bg-blue-600 hover:bg-blue-700 text-base sm:text-lg focusable">Search</button>
     </div>
-    {# What to search, and filters; year and IMDb apply to movies and series only. #}
+    {# What to search. #}
     <div class="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-gray-400 mb-2">
       <label class="flex items-center gap-2 cursor-pointer">
         <input type="checkbox" name="live" value="true" {% if search_live %}checked{% endif %}
@@ -40,6 +40,9 @@
                class="w-4 h-4 rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
         Regex
       </label>
+    </div>
+    {# What to keep; year and IMDb apply to movies and series only. #}
+    <div class="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-gray-400 mb-2">
       <label class="flex items-center gap-2">
         <span>Year</span>
         <input type="number" name="year_from" value="{{ filters.year_from if filters.year_from is not none else '' }}"
@@ -56,7 +59,9 @@
                min="0" max="10" step="0.1" onchange="this.form.submit()"
                class="h-8 w-16 bg-gray-700 rounded px-2 text-sm">
       </label>
-      {# The categories results fall in, one name across channels, movies, and series. #}
+      {# The categories results fall in, one name across channels, movies, and series;
+         none to offer without results, unless one is chosen and so must be clearable. #}
+      {% if categories or filters.category %}
       <label class="flex items-center gap-2">
         <span>Category</span>
         <select name="category" class="h-8 bg-gray-700 rounded px-2 text-sm max-w-[12rem]" onchange="this.form.submit()">
@@ -69,6 +74,7 @@
           {% endif %}
         </select>
       </label>
+      {% endif %}
     </div>
     {# How results are listed. #}
     <div class="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-gray-400">

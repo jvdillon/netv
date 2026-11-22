@@ -934,7 +934,10 @@ def test_api_keys_are_set_by_admins_and_never_shown(auth_client: TestClient):
     page = auth_client.get("/settings").text
     section = re.search(r'<div id="api-keys".*?</details>', page, re.DOTALL)
     assert section is not None
-    assert "TMDB" in section.group(0) and "Saved" in section.group(0)
+    # A stored key shows as a filled password field that can be removed; no badge.
+    assert "TMDB" in section.group(0) and "api-key-remove" in section.group(0)
+    assert 'placeholder="••••••••••••"' in section.group(0)
+    assert "Saved" not in section.group(0)
     # The key itself never leaves the server, on the page or through the settings API.
     assert "s.e.c" not in page
     assert "s.e.c" not in auth_client.get("/api/settings").text
@@ -945,7 +948,9 @@ def test_api_keys_are_set_by_admins_and_never_shown(auth_client: TestClient):
     # An empty key removes it.
     auth_client.post("/settings/api-keys", data={"service": "tmdb", "key": " "})
     assert cache_module.load_server_settings().get("api_keys") == {}
-    assert "Not set" in auth_client.get("/settings").text
+    page = auth_client.get("/settings").text
+    assert "api-key-remove" not in page and 'placeholder="Paste the key"' in page
+    assert "Not set" not in page
     auth.create_user("viewer", "password123")
     viewer = TestClient(main.app)
     viewer.cookies.set("token", auth.create_token({"sub": "viewer"}))

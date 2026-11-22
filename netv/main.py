@@ -3593,6 +3593,15 @@ class Shown(NamedTuple):
     year: int  # 0 when unknown.
     name: str
     poster: str  # Its image URL, as the provider gives it; or "".
+    genres: tuple[str, ...] = ()  # IMDb's, else the provider's.
+
+
+def _genres(rank: imdb.Ranking, record: ProviderRecord) -> tuple[str, ...]:
+    """A title's genres: IMDb's, else the provider's "Drama / Sci-Fi & Fantasy" split."""
+    if rank.genres:
+        return rank.genres
+    named = text_field(record, "genre").replace("/", ",").split(",")
+    return tuple(g.strip() for g in named if g.strip())
 
 
 # Cards, detail pages, and the player all show these, read from the catalog record
@@ -3612,7 +3621,7 @@ def _shown(records: list[ProviderRecord]) -> list[tuple[ProviderRecord, Shown]]:
         name = text_field(record, "name")
         titled = imdb.title_year(name)
         title = name if titled is None else titled[0]
-        shown.append((record, Shown(rating, rank.year, title, poster)))
+        shown.append((record, Shown(rating, rank.year, title, poster, _genres(rank, record))))
     return shown
 
 
@@ -4107,9 +4116,7 @@ def _fact_matches(
 ) -> bool:
     """Whether a title's year, genre, or IMDb rating matches a search term's ``text``."""
     if field == "genre":
-        # IMDb's genres, else the provider's.
-        genres = ",".join(rank.genres) or text_field(record, "genre")
-        return _name_matcher(text, regex=regex)(genres)
+        return _name_matcher(text, regex=regex)(",".join(_genres(rank, record)))
     number = r"\d+(?:\.\d+)?"
     bounds = re.fullmatch(rf"({number})(?:(?:-|\.\.)({number}))?", text)
     if bounds is None:

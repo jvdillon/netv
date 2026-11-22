@@ -741,7 +741,6 @@
         <summary class="flex items-center justify-between p-2 cursor-pointer hover:bg-gray-600 rounded">
           <div>
             <span class="font-medium">TMDB</span>
-            <span class="ml-2 px-2 py-0.5 text-xs rounded {% if saved %}bg-green-700{% else %}bg-gray-600{% endif %}">{% if saved %}Saved{% else %}Not set{% endif %}</span>
             <div class="text-sm text-gray-400">Optional: names the network for series that IMDb and Wikidata do not</div>
           </div>
           <span class="text-gray-400 text-xs group-open:hidden">Expand</span>
@@ -750,7 +749,7 @@
           <p class="text-sm text-gray-400 pt-3">A free key or read-access token from
             <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener" class="text-blue-400 hover:underline">themoviedb.org</a>.
             The <code>TMDB_API_KEY</code> environment variable, when set, takes precedence.</p>
-          <input type="password" name="key" autocomplete="off" placeholder="{% if saved %}Saved; enter a new one to replace it{% else %}Paste the key{% endif %}"
+          <input type="password" name="key" autocomplete="off" placeholder="{% if saved %}••••••••••••{% else %}Paste the key{% endif %}"
                  class="w-full px-3 py-1.5 bg-gray-600 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none">
           <div class="flex justify-end gap-2">
             {% if saved %}<button type="button" class="api-key-remove px-3 py-1.5 text-sm bg-red-600 hover:bg-red-700 rounded">Remove</button>{% endif %}

@@ -8,6 +8,7 @@ from typing import Literal, cast
 from urllib import parse
 
 import asyncio
+import html
 import json
 import logging
 import math
@@ -1229,6 +1230,12 @@ def test_search_filters_by_category_across_kinds_and_remembers_it(api: TestClien
     live_only = api.get("/search?q=heat&live=true&category=").text
     select = re.search(r'<select name="category".*?</select>', live_only, re.DOTALL)
     assert select is not None and "Drama" not in select.group(0)
+    # With no results there is nothing to narrow, so no choice is offered.
+    assert 'name="category"' not in api.get("/search").text
+    assert 'name="category"' not in api.get("/search?q=nothing+matches").text
+    # Unless one was chosen before: it stays, so it can be cleared.
+    api.get("/search?q=heat&category=Drama")
+    assert 'value="Drama" selected' in api.get("/search?q=nothing+matches").text
 
 
 @pytest.mark.usefixtures("imdb_index")
@@ -1268,6 +1275,7 @@ def test_detail_pages_name_the_composer(api: TestClient, web: testing.FakeWeb) -
         {
             "movies:tmdb:5": {
                 **_imdb_facts(7.0, 1, 1995),
+                "genres": ["Crime", "Drama"],
                 "writers": ["Michael Mann"],
                 "crew": {
                     "composer": ["Elliot Goldenthal"],
@@ -1288,19 +1296,29 @@ def test_detail_pages_name_the_composer(api: TestClient, web: testing.FakeWeb) -
         web.routes[_api_url("http://x", "get_vod_info", vod_id=stream_id)] = TimeoutError()
     # Linked like every credit, to a search for its own field.
     page = api.get("/movie/5").text
-    assert '<span class="text-gray-500">Composer:</span>' in page
-    assert 'href="/search?q=composer%3A%22Elliot%20Goldenthal%22"' in page
-    assert '<span class="text-gray-500">Writer:</span>' in page
-    assert 'href="/search?q=writer%3A%22Michael%20Mann%22"' in page
-    assert '<span class="text-gray-500">Country:</span>' in page
-    assert 'href="/search?q=country%3A%22United%20States%22"' in page
-    assert '<span class="text-gray-500">Language:</span>' in page
-    assert 'href="/search?q=language%3A%22Spanish%22"' in page
+    # Two columns: each label, then its names, which wrap in their own column
+    # rather than under the label.
+    credits = re.search(r'<dl class="grid grid-cols-\[auto_1fr\][^"]*">(.*?)</dl>', page, re.DOTALL)
+    assert credits is not None
+    rows = re.findall(r"<dt[^>]*>(\w+)</dt>\s*<dd[^>]*>(.*?)</dd>", credits.group(1), re.DOTALL)
+    named = {label: re.findall(r'href="([^"]*)"', names) for label, names in rows}
+    assert named == {
+        # IMDb's genres, the ones a genre: search matches.
+        "Genre": ["/search?q=genre%3A%22Crime%22", "/search?q=genre%3A%22Drama%22"],
+        "Writer": ["/search?q=writer%3A%22Michael%20Mann%22"],
+        "Composer": ["/search?q=composer%3A%22Elliot%20Goldenthal%22"],
+        "Country": ["/search?q=country%3A%22United%20States%22"],
+        "Language": [
+            "/search?q=language%3A%22English%22",
+            "/search?q=language%3A%22Spanish%22",
+        ],
+    }
     # Each name is a finger's height to tap on a phone, not a 19px line of text.
     link = re.search(r'<a href="/search\?q=writer%3A[^>]*>', page)
     assert link is not None and "inline-block py-1" in link.group(0)
-    other = api.get("/movie/6").text
-    assert "Composer:" not in other and "Country:" not in other and "Language:" not in other
+    # A comma stays with the name before it; a line never starts with one.
+    assert re.search(r'<span class="whitespace-nowrap"><a [^>]*>English</a>,</span>', page)
+    assert "<dt" not in api.get("/movie/6").text
 
 
 @pytest.mark.usefixtures("imdb_index")
@@ -1317,7 +1335,13 @@ def test_series_pages_name_the_network(api: TestClient, web: testing.FakeWeb) ->
     )
     cache.get_cache().update(
         series=[
-            {"series_id": 5, "name": "Game of Thrones", "tmdb": 5, "source_id": "s1"},
+            {
+                "series_id": 5,
+                "name": "Game of Thrones",
+                "tmdb": 5,
+                "source_id": "s1",
+                "genre": "Drama / Sci-Fi & Fantasy, Action",
+            },
             {"series_id": 6, "name": "Unaired", "tmdb": 6, "source_id": "s1"},
         ],
     )
@@ -1327,17 +1351,41 @@ def test_series_pages_name_the_network(api: TestClient, web: testing.FakeWeb) ->
             testing.FakeResponse(b'{"info": {"name": "Show"}, "episodes": ' + episodes + b"}")
         )
     page = api.get("/series/5").text
-    assert '<span class="text-gray-500">Network:</span>' in page
+    assert re.search(r"<dt[^>]*>Network</dt>", page)
     # The first episode takes focus without the browser's autofocus, which scrolled
     # the page past the title to show it.
     first = re.search(r'<a href="/play/series/11[^>]*>', page)
     assert first is not None
     assert "data-initial-focus" in first.group(0) and "autofocus" not in first.group(0)
     assert 'href="/search?q=network%3A%22HBO%22"' in page
+    # Without IMDb's genres, the provider's, one link each, not its "a / b" text.
+    genre = re.search(r"<dt[^>]*>Genre</dt>\s*<dd[^>]*>(.*?)</dd>", page, re.DOTALL)
+    assert genre is not None
+    named = [html.unescape(n) for n in re.findall(r">([^<]+)</a>", genre.group(1))]
+    assert named == ["Drama", "Sci-Fi & Fantasy", "Action"]
+    # Each finds the series, as every credit's link does.
+    assert 'data-series-id="5"' in api.get("/search?q=genre%3A%22Sci-Fi%20%26%20Fantasy%22").text
+    assert "Drama / Sci-Fi" not in page
     assert 'href="/search?q=country%3A%22United%20States%22"' in page
     assert 'href="/search?q=language%3A%22English%22"' in page
-    other = api.get("/series/6").text
-    assert "Network:" not in other and "Country:" not in other and "Language:" not in other
+    assert "<dt" not in api.get("/series/6").text
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_search_form_is_laid_out_in_rows(api: TestClient) -> None:
+    _mixed_catalog()
+    page = api.get("/search?q=heat").text
+    form = re.search(r'<form action="/search".*?</form>', page, re.DOTALL)
+    assert form is not None
+    rows = re.findall(r'\n    <div class="flex.*?\n    </div>', form.group(0), re.DOTALL)
+    named = [re.findall(r'name="(\w+)"', row) for row in rows]
+    # What to search, which kinds, what to keep, then how to list it.
+    assert named == [
+        ["q"],
+        ["live", "vod", "series", "regex"],
+        ["year_from", "year_to", "min_imdb", "category"],
+        ["sort", "limit"],
+    ]
 
 
 @pytest.mark.usefixtures("imdb_index")
@@ -1865,7 +1913,13 @@ def test_movie_detail_tolerates_provider_error(api: TestClient, web: testing.Fak
 def test_movie_detail_merges_provider_info(api: TestClient, web: testing.FakeWeb) -> None:
     imdb.init()
     _set_sources(_XTREAM)
-    movie: ProviderRecord = {"stream_id": 7, "name": "Film", "source_id": "s1", "tmdb": 55}
+    movie: ProviderRecord = {
+        "stream_id": 7,
+        "name": "Film",
+        "source_id": "s1",
+        "tmdb": 55,
+        "genre": "Drama",
+    }
     cache.get_cache()["vod_streams"] = [movie]
     info = {
         "info": {
@@ -1892,6 +1946,7 @@ def test_movie_detail_merges_provider_info(api: TestClient, web: testing.FakeWeb
     # Each credited name searches its own role; empty list entries are dropped.
     people = re.findall(r'<a href="/search\?q=([^"]*)"[^>]*>([^<]*)</a>', resp.text)
     assert [(parse.unquote(q), name) for q, name in people] == [
+        ('genre:"Drama"', "Drama"),
         ('director:"Dir"', "Dir"),
         ('cast:"Actor A"', "Actor A"),
         ('cast:"Bé & Co"', "Bé &amp; Co"),

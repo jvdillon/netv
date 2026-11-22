@@ -22,22 +22,21 @@
         </button>
       </div>
 
-      {% if series.info.genre %}
-      <div class="text-sm text-gray-400 mb-4">{{ series.info.genre }}</div>
-      {% endif %}
-
       {% if series.info.plot %}
       <p class="text-gray-300 mb-6 max-w-3xl">{{ series.info.plot }}</p>
       {% endif %}
 
       {% from "_people.html" import people %}
-      {{ people('Network', 'network', networks, 'mb-1') }}
-      {{ people('Director', 'director', directors, 'mb-1') }}
-      {{ people('Writer', 'writer', writers, 'mb-1') }}
-      {{ people('Composer', 'composer', composers, 'mb-1') }}
-      {{ people('Cast', 'cast', cast, 'mb-1') }}
-      {{ people('Country', 'country', countries, 'mb-1') }}
-      {{ people('Language', 'language', languages, 'mb-4') }}
+      <dl class="grid grid-cols-[auto_1fr] gap-x-3 text-sm mb-4">
+        {{ people('Genre', 'genre', shown.genres) }}
+        {{ people('Network', 'network', networks) }}
+        {{ people('Director', 'director', directors) }}
+        {{ people('Writer', 'writer', writers) }}
+        {{ people('Composer', 'composer', composers) }}
+        {{ people('Cast', 'cast', cast) }}
+        {{ people('Country', 'country', countries) }}
+        {{ people('Language', 'language', languages) }}
+      </dl>
 
       {% from "_versions.html" import versions_list %}
       {{ versions_list(versions) }}
