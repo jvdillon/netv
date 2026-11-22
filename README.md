@@ -481,7 +481,18 @@ Forwarded client addresses are trusted only from localhost by default. If a
 reverse proxy runs elsewhere, set `NETV_GATEWAY_TRUSTED_PROXIES` (gateway) and
 `NETV_TRUSTED_PROXIES` (web app) to its IP address or a comma-separated list of
 proxy IP addresses. LAN-only users depend on this: netv judges "home" by the
-client address, so trust only proxies you run.
+client address, so trust only proxies you run. Home is a private, loopback,
+link-local, or unique-local address. A proxy on the same host that does not
+forward the client's address makes every visitor look local, and so does
+Docker's userland proxy for IPv6 clients; run LAN-only accounts only where
+netv sees real client addresses. A fresh install's first account, its
+administrator, can be created only from home.
+
+Browsers never receive a provider's stream URL, which carries the provider's
+account and password. Direct playback, "Copy URL", external players, and the
+guide API's `direct=true` export all play through `/direct/...` links that this
+server relays; a link lasts a week, ends with its viewer's account, and follows
+that viewer's LAN-only rule.
 
 For restricted users, the gateway hides uncategorized streams because they
 cannot be proven to belong to an allowed category.

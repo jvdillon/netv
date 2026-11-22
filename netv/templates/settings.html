@@ -465,6 +465,19 @@
       </details>
       {% endif %}
     </div>
+    {% if is_admin %}
+    {# LAN-only users must be on these; blank means any private address. #}
+    <form id="home-networks-form" class="mt-4 space-y-2">
+      <label class="block text-sm text-gray-400" for="home-networks">Home network for LAN-only users
+        <span class="text-gray-500">(e.g. 192.168.1.0/24; blank: any private address. Name it if a proxy on this host forwards requests.)</span></label>
+      <div class="flex gap-2">
+        <input id="home-networks" type="text" name="networks" value="{{ home_networks }}" placeholder="Any private address"
+               class="flex-1 px-3 py-1.5 bg-gray-700 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none">
+        <button type="submit" class="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 rounded">Save</button>
+      </div>
+      <span id="home-networks-msg" class="text-sm text-red-400 hidden"></span>
+    </form>
+    {% endif %}
   </div>
 
   {% if is_admin %}

@@ -13,13 +13,14 @@
 .desktop-only-block { display: block; }
 
 /* Performance: contain layout recalculations to each row */
+/* Rows and section headings, borders included, are exactly the heights the
+   virtual guide places them by (rowHeight/rowHeightMobile, sectionHeight). */
 .guide-row {
+  height: 64px;
   contain: layout style paint;
   content-visibility: auto;
-  contain-intrinsic-size: auto 4rem; /* approximate row height */
+  contain-intrinsic-size: auto 64px;
 }
-
-/* Section headings; heights must match VirtualGuide sectionHeight/sectionHeightMobile */
 .guide-section { height: 32px; }
 
 /* Mobile (width < 512px): show compact-only, hide desktop-only */
@@ -28,6 +29,7 @@
   .guide-container .compact-only-block { display: block; }
   .guide-container .desktop-only { display: none; }
   .guide-container .desktop-only-block { display: none; }
+  .guide-row { height: 40px; }
   .guide-section { height: 24px; }
 }
 
@@ -53,7 +55,7 @@
     <a href="/guide?offset={{ offset }}&cats={{ id | urlencode }}" data-nav="cat" tabindex="0"
        class="px-3 py-1 rounded-full text-xs whitespace-nowrap focusable focus:outline-none focus:ring-2 focus:ring-blue-500
               {% if (selected_id or '') == id %}bg-blue-600 text-white{% else %}bg-gray-800 text-gray-300 hover:bg-gray-700{% endif %}"
-       {% if (selected_id or '') == id %}aria-current="page"{% endif %} title="{{ name }}">{{ name }}
+       {% if (selected_id or '') == id %}data-initial-focus aria-current="page"{% endif %} title="{{ name }}">{{ name }}
       <span class="tabular-nums {% if (selected_id or '') == id %}text-blue-100{% else %}text-gray-500{% endif %}">{{ count }}</span></a>
 {% endmacro %}
 <div class="flex h-full min-w-0">
@@ -132,7 +134,7 @@
   </div>
 
   {% if sidebar_categories is defined %}
-  <div class="guide-cats flex flex-wrap gap-1.5 p-0.5 pb-2 mb-1" aria-label="Channel categories">
+  <div class="guide-cats flex flex-wrap gap-1.5 p-0.5 pb-2 mb-1" aria-label="Channel categories" data-nav="row">
     {{ cat_chip('', 'All', all_count) }}
     {% for c in sidebar_playlists %}{{ cat_chip(c.id, '★ ' ~ c.name, c.count) }}{% endfor %}
     {% for c in sidebar_categories %}{{ cat_chip(c.id, c.name, c.count) }}{% endfor %}
@@ -141,7 +143,7 @@
 
   {% if grid_data %}
   <!-- EPG Grid (scrollable) -->
-  <div id="guide-grid" class="flex-1 overflow-y-auto overflow-x-hidden bg-gray-800 rounded-lg">
+  <div id="guide-grid" class="flex-1 overflow-y-auto overflow-x-hidden bg-gray-800 rounded-lg" data-nav-main>
     <!-- Mobile Time Header -->
     <div class="compact-only sticky top-0 z-20 bg-gray-900 border-b border-gray-700">
       <div class="w-32 flex-shrink-0 p-1 bg-gray-900"></div>
@@ -364,7 +366,8 @@ localizeGuideTimes(document);
   function getCurrentPos() {
     const el = document.activeElement;
     if (!el || !el.dataset || el.dataset.nav !== 'epg') {
-      return { row: 0, col: -1 };
+      // A move still waiting for its row counts as made, so keys keep going.
+      return window.virtualGuide?.pendingFocus || { row: 0, col: -1 };
     }
     const row = parseInt(el.dataset.row) || 0;
     const dataCol = parseInt(el.dataset.col);
@@ -378,20 +381,15 @@ localizeGuideTimes(document);
   }
 
   function focusCell(row, col) {
-    // If virtual scrolling is active, ensure row is in view first
-    if (window.virtualGuide) {
-      const vg = window.virtualGuide;
-      const rowHeight = vg.currentRowHeight;
-      const viewport = vg.viewport;
-
-      // Check if row is outside rendered range
+    const vg = window.virtualGuide;
+    if (vg) {
+      // The guide focuses this cell when its row renders, however long the
+      // row takes to load; doFocus clears it when the row is already here.
+      vg.pendingFocus = { row, col };
       if (row < vg.renderedRange.start || row >= vg.renderedRange.end) {
-        // Scroll to bring row into view, then focus after render
-        const targetScroll = vg.rowTop(row) - (viewport.clientHeight / 2) + (rowHeight / 2);
+        const viewport = vg.viewport;
+        const targetScroll = vg.rowTop(row) - (viewport.clientHeight / 2) + (vg.currentRowHeight / 2);
         viewport.scrollTop = Math.max(0, targetScroll);
-
-        // Wait for render and then focus
-        setTimeout(() => doFocus(row, col), 100);
         return;
       }
     }
@@ -413,95 +411,58 @@ localizeGuideTimes(document);
       }
     }
     if (cell) {
+      if (window.virtualGuide) window.virtualGuide.pendingFocus = null;
       cell.focus();
       cell.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
     }
   }
 
-  document.addEventListener('keydown', (e) => {
-    if (e.target.type === 'checkbox' || e.target.tagName === 'INPUT') return;
-    if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter', 'PageUp', 'PageDown', 'Home', 'End'].includes(e.key)) return;
-    if (e.altKey) return; // Allow browser back/forward
-
-    const active = document.activeElement;
-    if (active?.dataset?.nav === 'cat') {
-      const cats = Array.from(document.querySelectorAll('[data-nav="cat"]')).filter(isVisible);
-      const i = cats.indexOf(active);
-      if (e.key === 'ArrowRight' && cats[i + 1]) {
-        e.preventDefault();
-        cats[i + 1].focus();
-      } else if (e.key === 'ArrowLeft') {
-        e.preventDefault();
-        (cats[i - 1] || document.querySelector('nav .nav-link.active') || document.querySelector('nav .nav-link'))?.focus();
-      } else if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        focusCell(Math.min(lastRow, maxRow()), -1);
-      }
-      return;
+  // The guide's rows are rendered only near the screen, so it moves among them itself,
+  // by row and column; app.js's one definition does the rest (chips, Now, the sidebar).
+  window.netvNav.region(document.querySelector('.guide-container'), (current, e) => {
+    const waiting = window.virtualGuide?.pendingFocus;
+    if (current?.dataset?.nav === 'cat') {
+      if (e.key !== 'ArrowDown') return false;
+      e.preventDefault();
+      focusCell(Math.min(lastRow, maxRow()), -1);
+      return true;
     }
-
+    // A move still waiting for its row counts as made, so keys keep going.
+    if (current?.dataset?.nav !== 'epg' && !(current === document.body && waiting)) return false;
     const { row, col } = getCurrentPos();
-    const catsParam = '{{ cats_param }}';
-    const catsSuffix = catsParam ? '&cats=' + catsParam : '';
-
-    switch(e.key) {
+    e.preventDefault();
+    switch (e.key) {
       case 'ArrowUp':
-        e.preventDefault();
         if (row === 0 && selectedCat()) selectedCat().focus();
         else focusCell(Math.max(0, row - 1), col);
         break;
       case 'ArrowDown':
-        e.preventDefault();
         focusCell(Math.min(maxRow(), row + 1), col);
         break;
       case 'ArrowLeft':
-        e.preventDefault();
-        if (col > -1) {
-          focusCell(row, col - 1);
-        } else if (selectedCat()) {
-          selectedCat().focus();
-        } else {
-          window.location.href = `/guide?offset={{ offset - 3 }}${catsSuffix}`;
-        }
+        if (col > -1) focusCell(row, col - 1);
+        else if (selectedCat()) selectedCat().focus();
+        else window.location.href = `/guide?offset={{ offset - 3 }}{% if cats_param %}&cats={{ cats_param }}{% endif %}`;
         break;
       case 'ArrowRight':
-        e.preventDefault();
-        const progs = getVisiblePrograms(row);
-        if (col < progs.length - 1) {
-          focusCell(row, col + 1);
-        }
-        break;
-      case 'Enter':
-        if (document.activeElement?.href) {
-          e.preventDefault();
-          if (e.ctrlKey || e.metaKey) {
-            window.open(document.activeElement.href, '_blank');
-          } else {
-            window.location.href = document.activeElement.href;
-          }
-        }
+        if (col < getVisiblePrograms(row).length - 1) focusCell(row, col + 1);
         break;
       case 'PageUp':
-      case 'PageDown':
-        e.preventDefault();
-        const container = document.getElementById("guide-grid");
+      case 'PageDown': {
+        const container = document.getElementById('guide-grid');
         const rowEl = document.querySelector('[data-row="0"]');
         const pageSize = (container && rowEl) ? Math.floor(container.clientHeight / rowEl.offsetHeight) : 10;
-        if (e.key === 'PageUp') {
-          focusCell(Math.max(0, row - pageSize), col);
-        } else {
-          focusCell(Math.min(maxRow(), row + pageSize), col);
-        }
+        focusCell(e.key === 'PageUp' ? Math.max(0, row - pageSize) : Math.min(maxRow(), row + pageSize), col);
         break;
+      }
       case 'Home':
-        e.preventDefault();
         focusCell(0, col);
         break;
       case 'End':
-        e.preventDefault();
         focusCell(maxRow(), col);
         break;
     }
+    return true;
   });
 
   // Save/restore scroll position (persists across reloads and navigation)
@@ -535,16 +496,6 @@ localizeGuideTimes(document);
     });
   }
 
-  // Initial focus
-  // Start on the selected category, like the Apple TV app (rows may be
-  // re-rendered by the virtual scroller, the chips aren't).
-  setTimeout(() => {
-    const active = document.activeElement;
-    if (active !== document.body && active?.dataset?.nav !== 'cat') return;
-    const target = selectedCat()
-      || Array.from(document.querySelectorAll('[data-nav="epg"][data-row="0"][data-col="-1"]')).find(isVisible);
-    if (target) target.focus({ preventScroll: true });
-  }, 0);
 })();
 
 </script>

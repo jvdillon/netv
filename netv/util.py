@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from http import client
 from http.client import HTTPMessage, HTTPResponse
 from typing import IO, cast, get_args, get_origin, get_type_hints, is_typeddict, override
 from urllib import error, parse, request
 
+import functools
+import ipaddress
 import json
 import logging
 import os
 import pathlib
 import re
 import shutil
+import socket
+import ssl
 import tempfile
 
 from treekle import MutablePlainTree, json_loads, mutable, to_plain
@@ -229,6 +234,8 @@ def safe_urlopen(
     timeout: int = 30,
     user_agent: str | None = None,
     headers: Mapping[str, str] | None = None,
+    *,
+    allow_address: Callable[[IPAddress], bool] | None = None,
 ) -> HTTPResponse:
     """Open URL with safe redirect handling.
 
@@ -238,6 +245,9 @@ def safe_urlopen(
         user_agent: User-Agent header to send. If None, uses a default VLC User-Agent
             to avoid being blocked by providers that reject Python's default.
         headers: Other headers to send, such as an API's Authorization.
+        allow_address: When given, each connection, redirects' included, resolves
+            its host once, refuses it unless every address passes, and dials the
+            address it checked, so a second DNS answer cannot redirect it.
 
     Returns:
         response: Open HTTP response; the caller must close it.
@@ -247,9 +257,128 @@ def safe_urlopen(
         raise error.URLError(f"Unsafe URL scheme: {parsed.scheme}")
     ua = "VLC/3.0.20 LibVLC/3.0.20" if user_agent is None or user_agent == "" else user_agent
     req = request.Request(url, headers={"User-Agent": ua, **(headers or {})})
-    opener = request.build_opener(_SafeRedirectHandler())
+    handlers: list[request.BaseHandler] = [_SafeRedirectHandler()]
+    if allow_address is not None:
+        handlers += [_PinnedHTTPHandler(allow_address), _PinnedHTTPSHandler(allow_address)]
+    opener = request.build_opener(*handlers)
     # Typeshed types ``open`` as Any; the scheme check above leaves only HTTP(S).
     return cast(HTTPResponse, opener.open(req, timeout=timeout))
+
+
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+
+class RefusedAddress(OSError):
+    """A host resolved to an address the caller does not allow."""
+
+
+def pinned_connection(
+    address: tuple[str, int],
+    timeout: float | None = None,
+    source_address: tuple[str, int] | None = None,
+    *,
+    allow_address: Callable[[IPAddress], bool],
+) -> socket.socket:
+    """``socket.create_connection`` to the one address of ``address``'s host it vetted.
+
+    Args:
+        address: Host name or address, and port.
+        timeout: Socket timeout; None blocks.
+        source_address: Local address to bind, or None for any.
+        allow_address: Whether a resolved address may be dialed.
+
+    Returns:
+        connection: Connected to the first address, once every address passed.
+
+    Raises:
+        RefusedAddress: The host resolves to an address ``allow_address`` refuses.
+    """
+    host, port = address
+    found = [
+        str(sockaddr[0]).split("%")[0]
+        for *_, sockaddr in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    ]
+    for answer in found:
+        ip = ipaddress.ip_address(answer)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        if not allow_address(ip):
+            raise RefusedAddress(f"Refused address for {host}")
+    return socket.create_connection((found[0], port), timeout, source_address)
+
+
+class _PinnedHTTPConnection(client.HTTPConnection):
+    """An HTTP connection that dials only the address it vetted."""
+
+    def __init__(
+        self,
+        host: str,
+        /,
+        *,
+        allow_address: Callable[[IPAddress], bool],
+        port: int | None = None,
+        timeout: float = 30.0,
+        source_address: tuple[str, int] | None = None,
+        blocksize: int = 8192,
+    ) -> None:
+        super().__init__(
+            host,
+            port=port,
+            timeout=timeout,
+            source_address=source_address,
+            blocksize=blocksize,
+        )
+        self._create_connection = functools.partial(pinned_connection, allow_address=allow_address)
+
+
+class _PinnedHTTPSConnection(client.HTTPSConnection):
+    """An HTTPS connection that dials only the address it vetted.
+
+    It wraps the socket for the host's name, so SNI and certificate checks use the
+    name, not the address.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        /,
+        *,
+        allow_address: Callable[[IPAddress], bool],
+        port: int | None = None,
+        timeout: float = 30.0,
+        source_address: tuple[str, int] | None = None,
+        blocksize: int = 8192,
+        context: ssl.SSLContext | None = None,
+    ) -> None:
+        super().__init__(
+            host,
+            port=port,
+            timeout=timeout,
+            source_address=source_address,
+            blocksize=blocksize,
+            context=context,
+        )
+        self._create_connection = functools.partial(pinned_connection, allow_address=allow_address)
+
+
+class _PinnedHTTPHandler(request.HTTPHandler):
+    def __init__(self, allow_address: Callable[[IPAddress], bool]) -> None:
+        super().__init__()
+        self._connection = functools.partial(_PinnedHTTPConnection, allow_address=allow_address)
+
+    @override
+    def http_open(self, req: request.Request) -> HTTPResponse:
+        return self.do_open(self._connection, req)
+
+
+class _PinnedHTTPSHandler(request.HTTPSHandler):
+    def __init__(self, allow_address: Callable[[IPAddress], bool]) -> None:
+        super().__init__()
+        self._connection = functools.partial(_PinnedHTTPSConnection, allow_address=allow_address)
+
+    @override
+    def https_open(self, req: request.Request) -> HTTPResponse:
+        return self.do_open(self._connection, req)
 
 
 class _SafeRedirectHandler(request.HTTPRedirectHandler):

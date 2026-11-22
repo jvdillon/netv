@@ -77,8 +77,8 @@ def transcode_dir(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def client(mock_deps: None) -> TestClient:
-    """Create a test client with no users signed in."""
-    return TestClient(main.app)
+    """Create a test client with no users signed in, on the home network."""
+    return TestClient(main.app, client=("127.0.0.1", 50_000))
 
 
 @pytest.fixture
@@ -307,7 +307,8 @@ def test_cast_source_cannot_be_restarted_while_receiver_owns_it(
 ):
     session = _add_session("abc", tmp_path, url="http://provider/live")
     _cast_owns(monkeypatch, session_id="abc", url="http://provider/live")
-    assert auth_client.delete("/transcode-clear?url=http://provider/live").status_code == 409
+    clear = {"ref": auth.stream_ref("testuser", "http://provider/live")}
+    assert auth_client.delete("/transcode-clear", params=clear).status_code == 409
     assert (
         auth_client.get("/transcode/start", params=_start("http://provider/live")).status_code
         == 409
@@ -547,7 +548,7 @@ def test_catchup_player_page_plays_archive_as_vod(auth_client: TestClient):
     assert "catchup: true" in response.text
     assert f"catchupStart: {begin.timestamp()}" in response.text
     assert "catchupSeek: 25.0" in response.text
-    assert "/timeshift/user/pass/" in response.text
+    assert "/timeshift/user/pass/" in testing.played_url(response.text)
     assert 'id="go-live-btn"' in response.text
     assert 'id="jump-btn"' in response.text
     assert 'id="start-over-btn"' not in response.text
@@ -623,8 +624,8 @@ def test_catchup_api_unknown_stream_is_not_found(auth_client: TestClient):
 
 
 def _start(url: str, *, user: str = "testuser", **params: str) -> dict[str, str]:
-    """Query for /transcode/start with the token a player page gives ``user``."""
-    return {"url": url, "url_token": auth.stream_url_token(user, url), **params}
+    """Query for /transcode/start with the ref a player page gives ``user``."""
+    return {"ref": auth.stream_ref(user, url), **params}
 
 
 class _StartRecorder:
@@ -718,49 +719,45 @@ def test_a_stream_playing_on_a_tv_is_not_started_again(
     assert prestarts.calls == []
 
 
-@pytest.mark.parametrize("case", ["missing", "other-user", "other-url", "forged", "not-hex"])
+@pytest.mark.parametrize("case", ["missing", "other-user", "forged", "not-ascii", "tampered"])
 def test_transcode_start_refuses_urls_the_server_did_not_issue(
     auth_client: TestClient,
     start_recorder: _StartRecorder,
     case: str,
 ):
     url = "http://169.254.169.254/x"
-    params = {"url": url}
-    # Tokens are made here, inside the fixture: the secret key lives in its settings.
-    tokens = {
-        "other-user": auth.stream_url_token("other", url),
-        "other-url": auth.stream_url_token("testuser", "http://provider/live"),
+    # Refs are made here, inside the fixture: the secret key lives in its settings.
+    mine = auth.stream_ref("testuser", url)
+    refs = {
+        "other-user": auth.stream_ref("other", url),
         "forged": "0" * 64,
-        "not-hex": "\u00e9" * 64,
+        "not-ascii": "\u00e9" * 64,
+        "tampered": mine[:20] + ("A" if mine[20] != "A" else "B") + mine[21:],
     }
-    if case in tokens:
-        params["url_token"] = tokens[case]
+    params = {"ref": refs[case]} if case in refs else {}
     response = auth_client.get("/transcode/start", params=params)
     assert response.status_code == 403
     assert start_recorder.urls == []
 
 
 @pytest.mark.usefixtures("guide_db")
-def test_player_page_token_starts_that_stream_for_that_user(
+def test_player_page_hides_the_provider_and_its_ref_starts_that_stream_for_that_user(
     auth_client: TestClient,
     start_recorder: _StartRecorder,
 ):
-    _set_live(
-        {
-            "stream_id": "test",
-            "name": "Test channel",
-            "direct_url": "https://provider.example/live.m3u8?user=a&pass=b",
-        },
-    )
-    page = auth_client.get("/play/live/test")
-    url_match = re.search(r"rawUrl: (\"[^\"]*\")", page.text)
-    token_match = re.search(r"rawUrlToken: (\"[0-9a-f]+\")", page.text)
-    assert url_match is not None and token_match is not None
-    url, token = json.loads(url_match.group(1)), json.loads(token_match.group(1))
-    assert url == "https://provider.example/live.m3u8?user=a&pass=b"
-    ok = auth_client.get("/transcode/start", params={"url": url, "url_token": token})
+    url = "https://provider.example/live.m3u8?user=a&pass=b"
+    _set_live({"stream_id": "test", "name": "Test channel", "direct_url": url})
+    page = auth_client.get("/play/live/test").text
+    # The provider's address, account, and password never reach the browser.
+    assert "provider.example" not in page and "pass=b" not in page
+    ref_match = re.search(r'streamRef: "([^"]+)"', page)
+    assert ref_match is not None
+    ref = ref_match.group(1)
+    assert f'directUrl: "/direct/{ref}/stream.m3u8"' in page
+    ok = auth_client.get("/transcode/start", params={"ref": ref})
+    auth.create_user("other", "otherpass1")
     auth_client.cookies.set("token", auth.create_token({"sub": "other"}))
-    other = auth_client.get("/transcode/start", params={"url": url, "url_token": token})
+    other = auth_client.get("/transcode/start", params={"ref": ref})
     assert ok.status_code == 200
     assert other.status_code == 403
     assert start_recorder.urls == [url]
@@ -829,8 +826,7 @@ async def test_disconnected_adaptive_start_is_cleaned_up(fast_live: _FastLive, d
     start = main.transcode_start(
         request,
         {"sub": "testuser"},
-        PROVIDER,
-        auth.stream_url_token("testuser", PROVIDER),
+        auth.stream_ref("testuser", PROVIDER),
     )
     if disconnected:
         with pytest.raises(HTTPException) as excinfo:
@@ -1630,6 +1626,14 @@ class TestSearch:
         assert names('cast:"don johnson"') == {"Miami Vice"}
         assert names("writer:johnson") == set()
         assert names("writer:ann") == {"Heat"}
+        # A quoted name is a whole name, as a credit's link sends it: "Ann" is not
+        # "Ann Writer", nor "nn W" part of it; unquoted, part of a name is enough.
+        assert names('writer:"ann writer"') == {"Heat"}
+        assert names('writer:"ann"') == set()
+        assert names('writer:"nn w"') == set()
+        assert names('cast:"johnson"') == set()
+        assert names('genre:"thrill"') == set()
+        assert names('genre:"thriller"') == {"Heat", "Ronin"}
         assert names("composer:goldenthal") == {"Heat"}
         assert names("composer:linson") == set()
         assert names("network:nbc") == {"Miami Vice"}
@@ -1872,15 +1876,29 @@ class TestWatchPosition:
     def test_save_watch_position(self, auth_client: TestClient):
         resp = auth_client.post(
             "/api/watch-position",
-            json={"url": "http://example.com/movie.mkv", "position": 1234.5, "duration": 7200},
+            json={
+                "ref": auth.stream_ref("testuser", "http://example.com/movie.mkv"),
+                "position": 1234.5,
+                "duration": 7200,
+            },
         )
         assert resp.status_code == 200
+        # A ref issued to someone else saves nothing.
+        stolen = auth_client.post(
+            "/api/watch-position",
+            json={"ref": auth.stream_ref("other", "http://x/y.mkv"), "position": 1.0},
+        )
+        assert stolen.status_code == 403
 
     def test_get_watch_position(self, auth_client: TestClient):
         # Save first.
         auth_client.post(
             "/api/watch-position",
-            json={"url": "http://example.com/movie.mkv", "position": 1234.5, "duration": 7200},
+            json={
+                "ref": auth.stream_ref("testuser", "http://example.com/movie.mkv"),
+                "position": 1234.5,
+                "duration": 7200,
+            },
         )
 
         resp = auth_client.get("/api/watch-position?url=http://example.com/movie.mkv")
@@ -1930,11 +1948,16 @@ class TestPlaylistXspf:
     """Tests for XSPF playlist generation."""
 
     def test_playlist_xspf(self, auth_client: TestClient):
-        resp = auth_client.get("/playlist.xspf?url=http://example.com/stream.m3u8")
+        ref = auth.stream_ref("testuser", "http://example.com/live/u/p/1.m3u8")
+        resp = auth_client.get("/playlist.xspf", params={"ref": ref})
         assert resp.status_code == 200
         assert b"<?xml" in resp.content
-        assert b"http://example.com/stream.m3u8" in resp.content
+        # The external player is sent through this server, not to the provider.
+        assert f"<location>http://testserver/direct/{ref}/live/stream.m3u8</location>" in resp.text
+        assert b"example.com" not in resp.content
         assert resp.headers["content-type"] == "application/xspf+xml"
+        other = auth.stream_ref("other", "http://example.com/x.m3u8")
+        assert auth_client.get("/playlist.xspf", params={"ref": other}).status_code == 403
 
 
 class TestApiSettings:
@@ -2133,6 +2156,9 @@ def fast_live(
     transcode_dir: Path,
 ) -> Iterator[_FastLive]:
     del transcode_dir
+    # Its sessions are testuser's, whose files are served only while the account exists.
+    if "testuser" not in auth.get_all_usernames():
+        auth.create_user("testuser", "testpass123")
     fake = _FastLive(monkeypatch, upstreams)
     yield fake
     fake.tasks.discard()
@@ -3066,7 +3092,7 @@ def test_handoff_catchup_resumes_through_the_archive(auth_client: TestClient, cl
     _set_live(_archive_stream())
     response = auth_client.get("/play/live/src1_42?handoff=h1")
     assert response.status_code == 200
-    assert "/timeshift/user/pass/" in response.text
+    assert "/timeshift/user/pass/" in testing.played_url(response.text)
     assert f"catchupStart: {position}" in response.text
     assert "catchupSeek: 0.0" in response.text
     assert handoff._records["testuser"]["resumed"] is True
@@ -3230,7 +3256,27 @@ class TestManagedDirectGuide:
                 "category_ids": ["2"],
                 "direct_url": "https://media.test/hidden.m3u8",
             },
+            {
+                "stream_id": "ota_5",
+                "name": "OTA",
+                "category_ids": ["1"],
+                "source_id": "t",
+                "direct_url": "http://192.168.1.87:5004/auto/v5.1",
+            },
         ]
+        cache_module.save_server_settings(
+            {
+                **cache_module.load_server_settings(),
+                "sources": [
+                    {
+                        "id": "t",
+                        "name": "Tuner",
+                        "type": "m3u",
+                        "url": "http://192.168.1.24/lineup.m3u",
+                    },
+                ],
+            },
+        )
         _save_guide_filter(["1"])
         normal = _body(auth_client.get("/api/guide/rows"), GuideRowsResponse)
         response = auth_client.get("/api/guide/rows?direct=true")
@@ -3240,11 +3286,18 @@ class TestManagedDirectGuide:
         assert all(row["channel"]["catchup_days"] == 0 for row in payload["rows"])
         assert response.headers["cache-control"] == "no-store"
         urls = {
-            row["channel"]["stream_id"]: row["channel"].get("direct_url") for row in payload["rows"]
+            row["channel"]["stream_id"]: str(row["channel"].get("direct_url"))
+            for row in payload["rows"]
         }
-        assert urls == {
-            "src_42": "https://provider.test/live/user%40name/p%23ss/42.m3u8",
-            "m3u_1": "https://media.test/channel.m3u8",
+        # Played through this server: the provider's URL and account stay here.
+        assert all(u.startswith("http://testserver/direct/") for u in urls.values())
+        assert not any("provider.test" in u or "media.test" in u for u in urls.values())
+        targets = {sid: auth.stream_ref_target(u.split("/")[4]) for sid, u in urls.items()}
+        assert targets == {
+            "src_42": ("testuser", "https://provider.test/live/user%40name/p%23ss/42.m3u8", False),
+            "m3u_1": ("testuser", "https://media.test/channel.m3u8", False),
+            # A home lineup's tuner, on another home host, may be reached.
+            "ota_5": ("testuser", "http://192.168.1.87:5004/auto/v5.1", True),
         }
 
     def test_direct_export_excludes_restricted_channels(self, auth_client: TestClient):
@@ -3357,6 +3410,9 @@ def _add_session(
     caption_timestamp_origin: float | None = None,
 ) -> ffmpeg_session.TranscodeSession:
     """Register a running VOD transcode (a movie, or catchup when ``is_archive``)."""
+    # Its files are served only while its owner's account exists.
+    if username not in auth.get_all_usernames():
+        auth.create_user(username, "password123")
     session: ffmpeg_session.TranscodeSession = {
         "dir": str(directory),
         "process": testing.FakeProcess(exit_code=None),

@@ -347,10 +347,14 @@ class TestRecordingFiles:
         (directory / "stream.m3u8").write_text("#EXTM3U\n")
         assert handoff.recording_file("abc123", "stream.m3u8") is None
         handoff._records["ann"] = {"id": "h", "recording_id": "abc123"}
-        assert handoff.recording_file("abc123", "stream.m3u8") == directory / "stream.m3u8"
+        # With its owner, whose LAN rule the server applies to the file.
+        assert handoff.recording_file("abc123", "stream.m3u8") == (directory / "stream.m3u8", "ann")
         assert handoff.recording_file("abc123", "missing.ts") is None
         assert handoff.recording_file("abc123", "../stream.m3u8") is None
         assert handoff.recording_file("../x", "stream.m3u8") is None
+        # A file beside the recording is out of reach, though it exists.
+        (directory.parent / "secret.ts").write_bytes(b"x")
+        assert handoff.recording_file("abc123", "../secret.ts") is None
 
     def test_orphaned_recordings_are_deleted(self, env: Env):
         kept = handoff.recording_dir("kept")

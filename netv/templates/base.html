@@ -45,7 +45,7 @@
       </a>
       {% set access = content_access if content_access is defined else get_content_access_from_request(request) %}
       {% if access.movies %}
-      <a href="/vod" class="nav-link p-1.5 rounded hover:bg-gray-700 {% if request.url.path.startswith('/vod') %}active{% endif %}" tabindex="0" title="Movies">
+      <a href="/vod" class="nav-link p-1.5 rounded hover:bg-gray-700 {% if request.url.path.startswith(('/vod', '/movie/')) %}active{% endif %}" tabindex="0" title="Movies">
         <svg class="w-6 h-6" fill="white" viewBox="0 0 24 24">
           <!-- Board -->
           <rect x="4" y="10" width="16" height="10" rx="1"/>

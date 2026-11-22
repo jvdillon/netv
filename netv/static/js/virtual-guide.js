@@ -104,6 +104,7 @@ class VirtualGuide {
     this.maxRetries = D.MAX_RETRIES;
     this.needsRecheck = false;
     this.renderedRange = { start: 0, end: 0 };
+    this.pendingFocus = null; // { row, col } a key asked for before its row arrived
     this.pendingFetch = null;
     this.pendingFetchRange = null;
     this.scrollDebounce = null;
@@ -135,6 +136,11 @@ class VirtualGuide {
       this.totalRows * this.currentRowHeight +
       this.sectionStarts.length * this.currentSectionHeight
     );
+  }
+
+  /** The viewport's scroll height: the rows, and the time header above them. */
+  get scrollableHeight() {
+    return this.totalHeight + this.content.offsetTop;
   }
 
   /** Number of section headings at or above the given row. */
@@ -225,7 +231,6 @@ class VirtualGuide {
     // Create spacer for full height scrollbar
     this.spacer = document.createElement("div");
     this.spacer.className = "virtual-spacer";
-    this.spacer.style.height = `${this.totalHeight}px`;
     this.spacer.style.position = "absolute";
     this.spacer.style.top = "0";
     this.spacer.style.left = "0";
@@ -250,6 +255,8 @@ class VirtualGuide {
     // Add spacer and content to viewport
     this.viewport.appendChild(this.spacer);
     this.viewport.insertBefore(this.content, this.spacer);
+    // Sized once the rows are placed, below the time header.
+    this.spacer.style.height = `${this.scrollableHeight}px`;
 
     // Set initial rendered range based on SSR content
     this.renderedRange = { start: 0, end: this.initialRows.length };
@@ -284,7 +291,7 @@ class VirtualGuide {
         this.isMobile = window.innerWidth < D.MOBILE_BREAKPOINT;
         if (wasMobile !== this.isMobile) {
           // Row height changed, update spacer
-          this.spacer.style.height = `${this.totalHeight}px`;
+          this.spacer.style.height = `${this.scrollableHeight}px`;
           this.updateVisibleRange();
         }
       }, D.RESIZE_DEBOUNCE_MS);
@@ -533,6 +540,14 @@ class VirtualGuide {
   render() {
     if (!this.content) return;
 
+    // Replacing the rows removes the focused one; focus returns to the same cell,
+    // or to the one a key asked for once its row has arrived.
+    const active = document.activeElement;
+    const kept =
+      this.content.contains(active) && active.dataset.nav === "epg"
+        ? { row: Number(active.dataset.row), col: Number(active.dataset.col) }
+        : null;
+
     const html = [];
 
     for (let i = this.renderedRange.start; i < this.renderedRange.end; i++) {
@@ -552,6 +567,30 @@ class VirtualGuide {
       this.rowTop(start) - (this.sections.has(start) ? this.currentSectionHeight : 0);
     this.content.style.transform = `translateY(${top}px)`;
     this.content.innerHTML = html.join("");
+
+    // Until a requested row arrives, focus stays where it was.
+    const wanted = this.pendingFocus && this.cellNear(this.pendingFocus);
+    if (wanted) {
+      this.pendingFocus = null;
+      wanted.focus({ preventScroll: true });
+      // Scrolling the list alone can leave the row below the window.
+      wanted.scrollIntoView({ block: "nearest", inline: "nearest" });
+    } else if (kept) {
+      this.cellNear(kept)?.focus({ preventScroll: true });
+    }
+  }
+
+  // A cell at a row and column, or the row's channel when that column is gone.
+  cellNear({ row, col }) {
+    return this.cellAt(row, col) || this.cellAt(row, -1);
+  }
+
+  // The shown cell at a row and column; desktop and mobile layouts both render it.
+  cellAt(row, col) {
+    const cells = this.content.querySelectorAll(
+      `[data-nav="epg"][data-row="${row}"][data-col="${col}"]`,
+    );
+    return [...cells].find((el) => el.offsetParent !== null);
   }
 
   /**

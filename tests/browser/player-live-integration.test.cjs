@@ -220,9 +220,11 @@ async function player({
     }
   }
   const window = Object.assign(element(), {
+    // app.js, loaded before player.js on every page, defines this.
+    netvNav: { region() {} },
     PLAYER_CONFIG: {
-      rawUrl: "https://provider.example/live.m3u8",
-      rawUrlToken: "token-1",
+      streamRef: "ref-1",
+      directUrl: "/direct/ref-1/live/stream.m3u8",
       streamType: isVod ? "movie" : "live",
       isVod,
       transcodeMode: auto ? "auto" : direct ? "never" : "always",
@@ -292,6 +294,7 @@ async function player({
       },
     };
   }
+  const frames = [];
   const document = Object.assign(element(), {
     getElementById,
     createElement: element,
@@ -321,6 +324,8 @@ async function player({
       },
     },
     performance: { now: () => 1000 },
+    // Frames run when a test calls them, as the browser would draw.
+    requestAnimationFrame: (fn) => frames.push(fn),
     localStorage: { getItem: () => null, setItem() {} },
     setTimeout: setTimer,
     clearTimeout: (id) => timers.delete(id),
@@ -408,6 +413,7 @@ async function player({
     window,
     document,
     elements,
+    frames,
     engines,
     calls,
     beacons,
@@ -453,8 +459,9 @@ test("web live startup and health polls use one shared adaptive session", async 
   const start = p.calls.find((call) => call.url.startsWith("/transcode/start?"));
   const params = new URL(start.url, "http://netv.test").searchParams;
   assert.equal(params.get("content_type"), "live");
-  assert.equal(params.get("url"), "https://provider.example/live.m3u8");
-  assert.equal(params.get("url_token"), "token-1");
+  // The provider's URL never reaches the page: the server knows it by this ref.
+  assert.equal(params.get("ref"), "ref-1");
+  assert.equal(params.get("url"), null);
   // The player waits for its own lead, so the server answers at the first segment.
   assert.equal(params.get("min_segments"), "1");
   assert.equal(p.engines.length, 1);
@@ -580,7 +587,12 @@ test("native playback of embedded captions keeps CC and turns it on", async () =
   assert.equal(p.video.src, "/transcode/session1/low-captions.m3u8");
   await p.video.emit("loadedmetadata");
   assert.equal(p.elements.get("toggle-cc").disabled, false);
-  const track = { kind: "captions", label: "CC1", language: "en", mode: "hidden" };
+  const track = Object.assign(element(), {
+    kind: "captions",
+    label: "CC1",
+    language: "en",
+    mode: "hidden",
+  });
   p.video.textTracks.push(track);
   await p.video.textTracks.emit("addtrack", { track });
   assert.equal(track.mode, "showing");
@@ -881,7 +893,8 @@ test("native HLS recognizes a recovered fast-start session", async () => {
 
 test("direct playback does not opt into server transcoding or adaptive health", async () => {
   const p = await player({ direct: true });
-  assert.deepEqual(p.engines[0].sources, ["https://provider.example/live.m3u8"]);
+  // Played through the server's relay, never from the provider itself.
+  assert.deepEqual(p.engines[0].sources, ["/direct/ref-1/live/stream.m3u8"]);
   assert.equal(p.engines[0].config.liveSyncDurationCount, 3);
   assert.deepEqual(
     p.calls.map((call) => call.url),
@@ -1355,12 +1368,12 @@ test("live playback gives up after two minutes without the stream", async () => 
   }
 });
 
-test("direct live playback reconnects to the provider", async () => {
+test("direct live playback reconnects through the relay", async () => {
   const p = await player({ direct: true });
   lose(p.engines[0]);
   await p.fireTimer(1000);
   assert.equal(transcodeStarts(p), 0);
-  assert.deepEqual(p.engines[1].sources, ["https://provider.example/live.m3u8"]);
+  assert.deepEqual(p.engines[1].sources, ["/direct/ref-1/live/stream.m3u8"]);
   assert.equal(isHidden(p, "error"), true);
 });
 
@@ -1437,6 +1450,51 @@ test("roll-up captions show each line at its broadcast time without gaps", async
   assert.deepEqual(shown(10.5), ["D\nE"]);
   assert.deepEqual(shown(11.5), []);
   for (let t = 0; t < 11; t += 0.1) assert.equal(shown(t).length, 1, `t=${t}`);
+});
+
+test("captions roll up one row at a time instead of redrawing the block", async () => {
+  const p = await player({ captionsEnabled: true });
+  const drawn = [];
+  const box = p.elements.get("caption-box");
+  box.replaceChildren = (...lines) => drawn.push(lines.map((line) => line.textContent));
+  const overlay = p.elements.get("caption-overlay");
+  const track = Object.assign(element(), {
+    kind: "captions",
+    label: "English",
+    language: "en",
+    mode: "showing",
+    activeCues: [],
+  });
+  p.video.textTracks.push(track);
+  await p.video.textTracks.emit("addtrack", { track });
+  const show = async (...lines) => {
+    track.activeCues = lines.length ? [{ text: lines.join("\n") }] : [];
+    await track.emit("cuechange");
+  };
+  await show("A");
+  await show("A", "<i>B</i>");
+  assert.deepEqual(drawn.at(-1), ["A", "B"]);
+  assert.equal(overlay.style.height, "2.7em");
+  // The new line rolls in: the old screen is drawn above it and slides up one row,
+  // so the line being read moves up smoothly rather than leaping to the top.
+  await show("B", "C");
+  assert.deepEqual(drawn.at(-1), ["A", "B", "C"]);
+  assert.equal(box.style.transform, "translateY(0)");
+  for (const frame of p.frames.splice(0)) frame();
+  assert.equal(box.style.transform, "translateY(-1.35em)");
+  assert.equal(overlay.style.height, "2.7em");
+  // A new screen that is no roll (a pop-on caption) is drawn as it is.
+  await show("X");
+  assert.deepEqual(drawn.at(-1), ["X"]);
+  assert.equal(overlay.classList.contains("hidden"), false);
+  await show();
+  assert.equal(overlay.classList.contains("hidden"), true);
+  // The browser's own drawing is hidden while the overlay draws.
+  assert.equal(p.video.classList.contains("overlay-captions"), true);
+  // A track not showing draws nothing.
+  track.mode = "hidden";
+  await show("Y");
+  assert.deepEqual(drawn.at(-1), []);
 });
 
 test("captions cached before their track exists keep broadcast timing", async () => {

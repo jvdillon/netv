@@ -119,22 +119,25 @@ def recording_dir(recording_id: str) -> pathlib.Path:
     return ffmpeg_command.get_transcode_dir() / f"netv_handoff_{recording_id}"
 
 
-def recording_file(recording_id: str, filename: str) -> pathlib.Path | None:
-    """Find a recording's playlist or segment.
+def recording_file(recording_id: str, filename: str) -> tuple[pathlib.Path, str] | None:
+    """Find a recording's playlist or segment, and whose recording it is.
 
     Args:
         recording_id: Identifier of a retained recording.
         filename: Single filename inside the recording directory.
 
     Returns:
-        path: Existing file in a known recording, or None.
+        found: The existing file in a known recording and its owner, or None.
     """
     if not recording_id.isalnum() or pathlib.Path(filename).name != filename:
         return None
     with _lock:
-        known = any(r.get("recording_id") == recording_id for r in _records.values())
+        owner = next(
+            (user for user, r in _records.items() if r.get("recording_id") == recording_id),
+            None,
+        )
     path = recording_dir(recording_id) / filename
-    return path if known and path.is_file() else None
+    return (path, owner) if owner is not None and path.is_file() else None
 
 
 def cleanup_orphans() -> None:

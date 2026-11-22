@@ -25,6 +25,7 @@ from urllib import parse
 import argparse
 import asyncio
 import contextlib
+import functools
 import hashlib
 import logging
 import os
@@ -40,12 +41,11 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from netv import auth, cache, ffmpeg_command, ffmpeg_session
+from netv import auth, cache, ffmpeg_command, ffmpeg_session, proxy
 from netv.cache import ServerSettings
 from netv.gateway_catalog import CatalogSnapshot, GatewayCatalog, GatewayStream
 from netv.gateway_epg import EpgUnavailableError, build_filtered_xmltv
 from netv.m3u import get_xtream_client_by_source
-from netv.relay import Feed, Relay
 from netv.util import configure_logging, safe_urlopen
 from netv.xtream import credentials_path
 
@@ -149,19 +149,21 @@ class GatewayAuthenticator:
         auth_cache_seconds: float = 30,
         login_window_seconds: float = 300,
         max_login_failures: int = 10,
-        max_global_login_failures: int = 100,
+        max_account_failures: int = 20,
         max_auth_cache_entries: int = 1024,
         max_failure_clients: int = 1024,
     ) -> None:
         self.auth_cache_seconds = auth_cache_seconds
         self.login_window_seconds = login_window_seconds
         self.max_login_failures = max_login_failures
-        self.max_global_login_failures = max_global_login_failures
+        self.max_account_failures = max_account_failures
         self.max_auth_cache_entries = max_auth_cache_entries
         self.max_failure_clients = max_failure_clients
         self._lock = threading.Lock()
         self._failures: dict[str, list[float]] = {}
-        self._global_failures: list[float] = []
+        # Failures from away per account: guesses spread over many addresses still
+        # add up, yet no one locks out every account or its owner at home.
+        self._account_failures: dict[str, list[float]] = {}
         self._success_cache: dict[str, float] = {}
 
     @classmethod
@@ -171,33 +173,28 @@ class GatewayAuthenticator:
     async def verify(self, request: Request, username: str, password: str) -> bool:
         client_ip = request.client.host if request.client else "unknown"
         # Before the cache: a password accepted at home is no key from away.
-        if not await asyncio.to_thread(auth.allowed_from, username, client_ip):
-            return False
+        allowed = await asyncio.to_thread(auth.allowed_from, username, client_ip)
         fingerprint = self._fingerprint(username, password)
         now = time.monotonic()
         with self._lock:
             expires_at = self._success_cache.get(fingerprint, 0)
-            if expires_at > now:
+            if allowed and expires_at > now:
                 return True
-            self._success_cache.pop(fingerprint, None)
+            if expires_at <= now:
+                self._success_cache.pop(fingerprint, None)
 
             cutoff = now - self.login_window_seconds
-            self._global_failures = [
-                timestamp for timestamp in self._global_failures if timestamp > cutoff
-            ]
-            self._failures = {
-                key: [timestamp for timestamp in timestamps if timestamp > cutoff]
-                for key, timestamps in self._failures.items()
-                if any(timestamp > cutoff for timestamp in timestamps)
-            }
-            failures = self._failures.get(client_ip, [])
-            if (
-                len(failures) >= self.max_login_failures
-                or len(self._global_failures) >= self.max_global_login_failures
+            self._failures = _recent(self._failures, cutoff)
+            self._account_failures = _recent(self._account_failures, cutoff)
+            away = not auth.is_home_address(client_ip)
+            if len(self._failures.get(client_ip, [])) >= self.max_login_failures or (
+                away and len(self._account_failures.get(username, [])) >= self.max_account_failures
             ):
                 raise HTTPException(429, "Too many login attempts, try again later")
 
-        valid = await asyncio.to_thread(auth.verify_password, username, password)
+        # Checked even from away, and refused like a wrong password, so neither the
+        # answer nor its timing tells a LAN-only account's right password apart.
+        valid = await asyncio.to_thread(auth.verify_password, username, password) and allowed
         now = time.monotonic()
         with self._lock:
             if valid:
@@ -214,18 +211,26 @@ class GatewayAuthenticator:
                         del self._success_cache[oldest]
                 self._success_cache[fingerprint] = now + self.auth_cache_seconds
             else:
-                if (
-                    client_ip not in self._failures
-                    and len(self._failures) >= self.max_failure_clients
-                ):
-                    oldest_client = min(
-                        self._failures,
-                        key=lambda key: self._failures[key][-1],
-                    )
-                    del self._failures[oldest_client]
-                self._failures.setdefault(client_ip, []).append(now)
-                self._global_failures.append(now)
+                _note_failure(self._failures, client_ip, now, self.max_failure_clients)
+                if away:
+                    _note_failure(self._account_failures, username, now, self.max_failure_clients)
         return valid
+
+
+def _recent(failures: dict[str, list[float]], cutoff: float) -> dict[str, list[float]]:
+    """``failures`` without the times at or before ``cutoff``, or keys left with none."""
+    return {
+        key: [timestamp for timestamp in timestamps if timestamp > cutoff]
+        for key, timestamps in failures.items()
+        if any(timestamp > cutoff for timestamp in timestamps)
+    }
+
+
+def _note_failure(failures: dict[str, list[float]], key: str, now: float, max_keys: int) -> None:
+    """Record a failure for ``key``, dropping the stalest key to stay within ``max_keys``."""
+    if key not in failures and len(failures) >= max_keys:
+        del failures[min(failures, key=lambda k: failures[k][-1])]
+    failures.setdefault(key, []).append(now)
 
 
 authenticator = GatewayAuthenticator()
@@ -405,18 +410,23 @@ async def live_stream(request: Request, stream_path: str) -> Response:
             f"/upscale/{result['session_id']}/low.m3u8",
             status_code=302,
         )
-    return await _proxy_url(_resolve_upstream(stream, extension))
+    return await _proxy_url(_resolve_upstream(stream, extension), stream.source_id)
 
 
 @app.get("/upscale/{session_id}/{filename}")
-async def upscale_file(session_id: str, filename: str) -> Response:
+async def upscale_file(request: Request, session_id: str, filename: str) -> Response:
     safe_filename = Path(filename).name
     if safe_filename != filename or ".." in filename:
         raise HTTPException(400, "Invalid filename")
-    if not ffmpeg_session.touch_session(session_id):
-        raise HTTPException(404, "Upscale session not found")
     session = ffmpeg_session.get_session(session_id)
     if session is None:
+        raise HTTPException(404, "Upscale session not found")
+    # The unguessable name is the only key here, so its owner's rule still holds:
+    # a deleted account's or a LAN-only one's away from home neither plays nor lives on.
+    client_ip = request.client.host if request.client else ""
+    if not auth.allowed_from(session.get("username", ""), client_ip):
+        raise HTTPException(403, "This stream is not available from here")
+    if not ffmpeg_session.touch_session(session_id):
         raise HTTPException(404, "Upscale session not found")
     file_path = Path(session["dir"]) / safe_filename
     if not file_path.exists():
@@ -654,42 +664,22 @@ def _resolve_upstream(stream: GatewayStream, extension: str) -> str:
     return client.build_stream_url("live", int(stream.upstream_id), extension)
 
 
-async def _relay_body(stream: Relay, feed: Feed) -> AsyncGenerator[bytes]:
-    """Yield the relay's bytes; a client that leaves closes the upstream."""
+async def _proxy_url(url: str, source_id: str) -> StreamingResponse:
     try:
-        async for chunk in feed:
-            yield chunk
-    finally:
-        await stream.close()
-
-
-async def _proxy_url(url: str) -> StreamingResponse:
-    try:
+        # The provider's redirects may not turn the relay on this server or the LAN.
         upstream = await asyncio.to_thread(
-            safe_urlopen,
-            url,
-            30,
-            cache.get_user_agent(),
+            functools.partial(
+                safe_urlopen,
+                url,
+                30,
+                cache.get_user_agent(),
+                allow_address=await asyncio.to_thread(proxy.address_rule, url, source_id),
+            ),
         )
     except OSError as exc:
         log.warning("Gateway upstream connection failed (%s)", type(exc).__name__)
         raise HTTPException(502, "Unable to connect to upstream stream") from exc
-    content_type = upstream.headers.get("Content-Type") or "video/mp2t"
-    # Response header names are case-insensitive; Starlette sends them lowercase.
-    headers = {"cache-control": "no-store"}  # pragma: no mutate
-    content_length = upstream.headers.get("Content-Length")
-    if content_length is not None and content_length:
-        headers["content-length"] = content_length  # pragma: no mutate
-    content_encoding = upstream.headers.get("Content-Encoding")
-    if content_encoding is not None and content_encoding:
-        headers["content-encoding"] = content_encoding  # pragma: no mutate
-    # The client pulls at its own pace; one that falls far behind is dropped
-    # rather than stalling the upstream read. Its only subscriber joins before
-    # the first byte, so the relay keeps no history (memory, not behavior).
-    stream, feed = Relay(lambda: upstream, history_sec=0), Feed()  # pragma: no mutate
-    stream.subscribe(feed)
-    await stream.start()
-    return StreamingResponse(_relay_body(stream, feed), media_type=content_type, headers=headers)
+    return await proxy.relay_response(upstream)
 
 
 if __name__ == "__main__":

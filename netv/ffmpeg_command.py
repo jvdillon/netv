@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import Final, NotRequired, TypedDict
-from urllib import request
 from urllib.parse import urljoin
 
+import functools
 import json
 import logging
 import pathlib
@@ -19,9 +19,9 @@ import time
 
 from treekle import json_loads
 
-from netv import cache
+from netv import cache, proxy
 from netv.cache import HwAccel, ServerSettings, get_user_agent
-from netv.util import atomic_write_json
+from netv.util import atomic_write_json, safe_urlopen
 
 
 log = logging.getLogger(__name__)
@@ -478,28 +478,32 @@ def restore_probe_cache_entry(
 # ===========================================================================
 
 
-def resolve_hls_master_playlist(url: str) -> str:
+def resolve_hls_master_playlist(url: str, source_id: str) -> str:
     """Resolve HLS master playlist to highest bandwidth variant URL.
 
     Args:
         url: Media URL, possibly an HLS master playlist.
+        source_id: The configured source that listed it; "" for none.
 
     Returns:
-        resolved_url: Highest-bandwidth variant, or url when none is resolvable.
+        resolved_url: Highest-bandwidth variant the source's rule lets ffmpeg reach,
+            or url when none is resolvable.
     """
 
     if not url.endswith(".m3u8") and ".m3u8?" not in url:
         return url  # Not an m3u8, return as-is.
 
+    lan = proxy.home_stream(url, source_id)
     try:
-        req = request.Request(url)
-        user_agent = get_user_agent()
-        if user_agent is not None:
-            req.add_header("User-Agent", user_agent)  # pragma: no mutate
-        with request.urlopen(req, timeout=10) as response:
+        with safe_urlopen(
+            url,
+            10,
+            get_user_agent(),
+            allow_address=functools.partial(proxy.allowed_address, lan=lan),
+        ) as response:
             content = response.read().decode(errors="replace")
             # Where the playlist was served after redirects; reusing it saves a hop.
-            url = str(response.geturl())
+            url = response.url
 
         # Check if this is a master playlist (has #EXT-X-STREAM-INF)
         if "#EXT-X-STREAM-INF" not in content:
@@ -523,7 +527,8 @@ def resolve_hls_master_playlist(url: str) -> str:
                     if variant_line and not variant_line.startswith("#"):
                         # Resolve relative URL.
                         variant_url = urljoin(url, variant_line)
-                        variants.append((bandwidth, variant_url))
+                        if proxy.allowed_upstream(variant_url, lan=lan):
+                            variants.append((bandwidth, variant_url))
                         break
 
         if not variants:
@@ -552,6 +557,7 @@ def probe_media(
     episode_id: int | None = None,
     series_name: str = "",
     *,
+    source_id: str,
     probe_timeout_sec: float = 30,
 ) -> tuple[MediaInfo | None, list[SubtitleStream]]:
     """Probe media facts and text subtitle streams, using cached results.
@@ -563,6 +569,7 @@ def probe_media(
         series_id: Series cache key, when the media is an episode.
         episode_id: Episode cache key.
         series_name: Display name stored with new series entries.
+        source_id: The configured source that listed ``url``; "" for none.
         probe_timeout_sec: Deadline for each ffprobe attempt.
 
     Returns:
@@ -639,6 +646,7 @@ def probe_media(
     user_agent = get_user_agent()
     if user_agent is not None:
         base_cmd.extend(["-user_agent", user_agent])
+    base_cmd.extend(proxy.ffmpeg_input_args(url, source_id))
 
     # Try probe without forcing HLS first, retry with HLS options if it fails.
     is_hls = False
@@ -656,6 +664,7 @@ def probe_media(
                 capture_output=True,
                 text=True,
                 timeout=probe_timeout_sec,
+                env=proxy.ffmpeg_env(),
             )
             if result.returncode == 0:
                 data = json_loads(result.stdout, _ProbeOutput)
@@ -924,6 +933,7 @@ def build_hls_ffmpeg_cmd(
     source: MediaInfo | None = None,
     audio_passthrough: bool = False,
     *,
+    input_args: Sequence[str],
     sr_segment_duration: float = 2.0,
     vod_read_burst_sec: int = 120,
 ) -> list[str]:
@@ -945,6 +955,8 @@ def build_hls_ffmpeg_cmd(
             re-encodes (a live relay); used in place of ``media_info`` for every
             decision but stream copy.
         audio_passthrough: Copy Dolby audio for clients that decode it natively.
+        input_args: Options that keep the input's connections behind the egress
+            proxy (``proxy.ffmpeg_input_args``); none for a pipe.
         sr_segment_duration: HLS segment length when AI Upscale applies.
         vod_read_burst_sec: Seconds of a network VOD input read at full speed
             before reading holds to real time.
@@ -1034,6 +1046,7 @@ def build_hls_ffmpeg_cmd(
             "ignore_err",
         ],
     )
+    cmd.extend(input_args)
     cmd.extend(http_reconnect_args(input_url))
     if is_vod and input_url.startswith(("http://", "https://")):
         # Copying video outruns playback many times over and fills the transcode dir
@@ -1403,8 +1416,9 @@ def _get_gpu_nvdec_codecs() -> set[str]:
         compute_cap = float(parts[1].strip())
         # Minimum compute capability per NVDEC codec:
         # https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new
-        # HEVC 10-bit requires Pascal; the Maxwell GM206 edge case is ignored.
-        nvdec_min_compute = {"h264": 5.0, "hevc": 6.0, "av1": 8.0}
+        # HEVC 10-bit requires Pascal; the Maxwell GM206 edge case is ignored. Every
+        # NVDEC (Kepler on) decodes MPEG-2, the codec of US broadcast TV.
+        nvdec_min_compute = {"mpeg2video": 3.0, "h264": 5.0, "hevc": 6.0, "av1": 8.0}
         _gpu_nvdec_codecs = {
             codec for codec, min_cap in nvdec_min_compute.items() if compute_cap >= min_cap
         }
@@ -1412,7 +1426,7 @@ def _get_gpu_nvdec_codecs() -> set[str]:
             "GPU: %s (compute %.1f) NVDEC: %s",
             gpu_name,
             compute_cap,
-            _gpu_nvdec_codecs or "none",
+            ", ".join(sorted(_gpu_nvdec_codecs)) or "none",
         )
     except Exception as e:
         log.debug("GPU probe failed: %s", e)

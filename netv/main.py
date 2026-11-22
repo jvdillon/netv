@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import (
     TYPE_CHECKING,
     Annotated,
+    Final,
     Literal,
     NamedTuple,
     NotRequired,
@@ -70,6 +71,7 @@ from netv import (
     handoff,
     imdb,
     playlists,
+    proxy,
 )
 from netv.auth import TokenClaims, create_token, verify_password, verify_token
 from netv.cache import (
@@ -451,6 +453,8 @@ class _RevalidatedStaticFiles(StaticFiles):
 
 def _create_app() -> FastAPI:
     application = FastAPI(title="neTV", lifespan=lifespan)
+    # Streams relayed through /direct, which a ref holder may open without a cookie.
+    application.state.relay_limits = proxy.RelayLimits()
     application.mount(
         "/static",
         _RevalidatedStaticFiles(directory=APP_DIR / "static"),
@@ -497,11 +501,9 @@ def get_current_user(request: Request) -> TokenClaims | None:
     token = request.cookies.get("token")
     if token is None or token == "":
         return None
-    claims = verify_token(token)
-    # A LAN-only user's session, started at home, does not work from away.
-    if claims is not None and not auth.allowed_from(claims["sub"], _client_address(request)):
-        return None
-    return claims
+    # Checked per request: a deleted account, a changed password, or a LAN-only
+    # account away from home ends the session.
+    return auth.session_user(token, _client_address(request))
 
 
 def _client_address(request: Request) -> str:
@@ -534,6 +536,7 @@ async def setup_page(request: Request):
     """Initial setup page - create first admin user."""
     if not auth.is_setup_required():
         return RedirectResponse("/login", status_code=303)
+    _require_home(request)
     return TEMPLATES.TemplateResponse(request, "setup.html", {"error": None})
 
 
@@ -554,6 +557,7 @@ async def setup_create_user(
     """
     if not auth.is_setup_required():
         return RedirectResponse("/login", status_code=303)
+    _require_home(request)
     # Validate.
     if len(username) < 3:
         return TEMPLATES.TemplateResponse(
@@ -610,27 +614,26 @@ async def login(
     """
     ip = request.client.host if request.client else "unknown"
     _check_rate_limit(ip)
-    if not verify_password(username, password):
-        _login_attempts.setdefault(ip, []).append(time.time())
+    # Guesses from many addresses add up against the account they target, but only
+    # from away: strangers cannot lock an account's owner out at home.
+    account = "" if auth.is_home_address(_client_address(request)) else f"account:{username}"
+    if account:
+        _check_rate_limit(account, max_attempts=20)
+    # Both checks, always, with one answer: a LAN-only account's right password
+    # tried from away must not be told apart from a wrong one.
+    valid = verify_password(username, password)
+    if not (valid and auth.allowed_from(username, _client_address(request))):
+        for key in (ip, account) if account else (ip,):
+            _login_attempts.setdefault(key, []).append(time.time())
         return RedirectResponse("/login?error=invalid", status_code=303)
-    if not auth.allowed_from(username, _client_address(request)):
-        return RedirectResponse("/login?error=lan", status_code=303)
-    token = create_token({"sub": username})
     response = RedirectResponse("/", status_code=303)
-    is_secure = (
-        request.url.scheme == "https"
-        or "https" in request.headers.get("x-forwarded-proto", "").lower()
-        or "https" in request.headers.get("x-forwarded-scheme", "").lower()
-    )
+    _start_session(request, response, username)
     response.set_cookie(
-        "token",
-        token,
-        httponly=True,
-        samesite="strict",
-        max_age=86_400 * 7,
-        secure=is_secure,
+        "last_user",
+        username,
+        max_age=86_400 * 365,
+        secure=_is_https(request),
     )
-    response.set_cookie("last_user", username, max_age=86_400 * 365, secure=is_secure)
     return response
 
 
@@ -854,6 +857,7 @@ async def guide_page(
 
 @app.get("/api/guide/rows")
 async def guide_rows_api(
+    request: Request,
     user: Annotated[TokenClaims, Depends(require_auth)],
     start: int = Query(default=0, ge=0, description="Starting row index"),
     count: int = Query(default=130, ge=1, le=500, description="Number of rows to fetch"),
@@ -862,19 +866,20 @@ async def guide_rows_api(
     exact: bool = Query(default=False, description="Use cats as-is, without adding playlists"),
     direct: bool = Query(
         default=False,
-        description="Include provider URLs for direct-play clients",
+        description="Include relayed stream URLs for direct-play clients",
     ),
 ):
     """Return guide rows for virtual scrolling.
 
     Args:
+        request: Request whose address relayed stream URLs point back to.
         user: Authenticated viewer claims.
         start: First requested row index.
         count: Maximum number of rows.
         offset: Guide offset in hours.
         cats: Comma-separated category identifiers.
         exact: Use categories without prepending shared playlists.
-        direct: Include permission-filtered upstream live URLs.
+        direct: Include permission-filtered live URLs, relayed by this server.
     """
     username = user.get("sub", "")
 
@@ -930,13 +935,24 @@ async def guide_rows_api(
 
     rows = _build_guide_rows(streams, start, count, window_start, window_end)
     if direct:
-        # Only export URLs from the already permission-filtered guide page.
-        # Nothing is proxied or transcoded; the client connects to the provider.
-        for row, stream in zip(rows, streams[start : start + count], strict=False):
-            url = text_field(stream, "direct_url")
-            if not url and stream.get("source_type") == "xtream":
-                url = live_stream_url(stream)
-            row["channel"]["direct_url"] = url
+        # Only export URLs from the already permission-filtered guide page. Nothing
+        # is transcoded, but the stream is relayed: the provider's URL carries its
+        # account and password, so the client gets this server's instead.
+        origin = str(request.base_url).rstrip("/")
+        shown = streams[start : start + count]
+        urls = [
+            text_field(s, "direct_url")
+            or (live_stream_url(s) if s.get("source_type") == "xtream" else "")
+            for s in shown
+        ]
+        # Off the event loop: telling home streams apart resolves their hosts.
+        refs = await asyncio.to_thread(
+            _stream_refs,
+            username,
+            [(url, text_field(s, "source_id")) for url, s in zip(urls, shown, strict=True)],
+        )
+        for row, url, ref in zip(rows, urls, refs, strict=False):
+            row["channel"]["direct_url"] = origin + _direct_path(ref, url)
             # This contract exports live URLs only, not archive playback URLs.
             row["channel"]["catchup_days"] = 0
 
@@ -1218,16 +1234,15 @@ async def movie_detail_page(
         movie = detailed[listings.index(movie)]
         # Off the event loop: the rating and year are read from the database.
         shown = await asyncio.to_thread(_shown_detail, catalog_movie, movie)
-        if len(detailed) > 1:
-            versions = [
-                {
-                    "id": _int_value(d.get("stream_id")),
-                    "href": f"/movie/{_int_value(d.get('stream_id'))}",
-                    "label": _version_label(d),
-                    "current": d is movie,
-                }
-                for d in detailed
-            ]
+        versions = [
+            {
+                "id": _int_value(d.get("stream_id")),
+                "href": f"/movie/{_int_value(d.get('stream_id'))}",
+                "label": _version_label(d),
+                "current": d is movie,
+            }
+            for d in detailed
+        ]
     directors: list[str] = []
     cast: list[str] = []
     writers: list[str] = []
@@ -1501,11 +1516,7 @@ async def player_page(
     server_settings = load_server_settings()
     user_settings = load_user_settings(username)
     transcode_mode = server_settings["transcode_mode"]
-    is_https = (
-        request.url.scheme == "https"
-        or "https" in request.headers.get("x-forwarded-proto", "").lower()
-        or "https" in request.headers.get("x-forwarded-scheme", "").lower()
-    )
+    is_https = _is_https(request)
     if info.handoff_recording:
         # Recordings are already packaged for every client.
         transcode_mode = "never"
@@ -1551,12 +1562,14 @@ async def player_page(
         # Strip year suffix like " (2020)"
         series_name = re.sub(r"\s*\(\d{4}\)$", "", info.channel_name)
 
+    # Off the event loop: telling a home stream apart resolves its host.
+    ref = await asyncio.to_thread(_stream_ref, username, info.url, info.source_id)
     return TEMPLATES.TemplateResponse(
         request,
         "player.html",
         {
-            "raw_url": info.url,
-            "raw_url_token": auth.stream_url_token(username, info.url),
+            "stream_ref": ref,
+            "direct_url": _direct_path(ref, info.url),
             "stream_id": stream_id,
             "transcode_mode": transcode_mode,
             "live_dvr_mins": server_settings["live_dvr_mins"],
@@ -1850,18 +1863,72 @@ async def stream_redirect(
     if first_xtream and first_xtream.id in _hidden_sources(user.get("sub", "")):
         raise HTTPException(403, "Access to this source is restricted")
     url = xtream.build_stream_url(stream_type, stream_id, ext)
-    return RedirectResponse(url, status_code=302)
+    ref = await asyncio.to_thread(
+        _stream_ref,
+        user["sub"],
+        url,
+        "" if first_xtream is None else first_xtream.id,
+    )
+    return RedirectResponse(_direct_path(ref, url), status_code=302)
+
+
+# A known extension tells the player how to play a relayed stream; others carry none.
+_MEDIA_SUFFIXES: Final = frozenset(
+    (".m3u8", ".ts", ".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".wmv", ".flv"),
+)
+
+
+@app.get("/direct/{ref}/{name:path}")
+async def direct_stream(request: Request, ref: str, name: str):
+    """Relay an upstream stream, so the client never sees the provider's URL.
+
+    Needs no cookie: the ref, which only this server can make, is the key, so an
+    external player or a TV can follow it. Its viewer's account must still exist
+    with the same password, a LAN-only viewer must be home, and the source must
+    still be the viewer's. A stream from the internet reaches only the internet.
+
+    Args:
+        request: Request carrying the client's address and any byte range.
+        ref: ``auth.stream_ref`` of the upstream URL.
+        name: The path's media name, for the player only.
+    """
+    del name
+    target = await asyncio.to_thread(auth.stream_ref_target, ref)
+    if target is None:
+        raise HTTPException(403, "This stream link is not valid. Reload the player page.")
+    if not await asyncio.to_thread(auth.allowed_from, target.username, _client_address(request)):
+        raise HTTPException(403, "This stream is not available from here")
+    _require_visible_source(target.username, target.url)
+    limits = cast(proxy.RelayLimits, request.app.state.relay_limits)
+    if not limits.acquire(target.username):
+        raise HTTPException(429, "Too many streams at once")
+    try:
+        response = await _relay_direct(target, request.headers.get("range", ""), limits)
+    except BaseException:
+        limits.release(target.username)
+        raise
+    if not isinstance(response, StreamingResponse):
+        limits.release(target.username)
+    return response
 
 
 @app.get("/playlist.xspf")
 async def playlist_xspf(
+    request: Request,
     user: Annotated[TokenClaims, Depends(require_auth)],
-    url: str,
+    ref: str,
 ):
-    del user
+    """An XSPF playlist an external player opens, playing through this server.
+
+    Args:
+        request: Request whose address the player is sent back to.
+        user: Authenticated viewer claims.
+        ref: ``auth.stream_ref`` from the player page.
+    """
+    location = str(request.base_url).rstrip("/") + _direct_path(ref, _issued_url(ref, user["sub"]))
     content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <playlist xmlns="http://xspf.org/ns/0/" version="1">
-  <trackList><track><location>{xml_escape(url)}</location></track></trackList>
+  <trackList><track><location>{xml_escape(location)}</location></track></trackList>
 </playlist>"""
     return Response(
         content=content,
@@ -1879,8 +1946,7 @@ async def playlist_xspf(
 async def transcode_start(
     request: Request,
     user: Annotated[TokenClaims, Depends(require_auth)],
-    url: str,
-    url_token: str = "",
+    ref: str = "",
     content_type: ffmpeg_session.ContentType = "live",
     series_id: int | None = None,
     episode_id: int | None = None,
@@ -1896,8 +1962,7 @@ async def transcode_start(
     Args:
         request: Request used to detect disconnected playback clients.
         user: Authenticated viewer claims.
-        url: Upstream media URL.
-        url_token: ``stream_url_token`` for ``url``, from the player page.
+        ref: ``auth.stream_ref`` of the upstream URL, from the player page.
         content_type: Live, movie or series content type.
         series_id: Parent series identifier.
         episode_id: Episode identifier for probe caching.
@@ -1912,8 +1977,7 @@ async def transcode_start(
     username = user.get("sub", "")
     # The server opens this URL, so it must be one a player page issued to this
     # user: otherwise any account could point ffmpeg at internal hosts or files.
-    if not auth.verify_stream_url_token(username, url, url_token):
-        raise HTTPException(403, "This stream link is not valid. Reload the player page.")
+    url = _issued_url(ref, username)
     if chromecast.manager.owns_url(url):
         raise HTTPException(
             409,
@@ -1921,15 +1985,7 @@ async def transcode_start(
         )
     deinterlace_fb = deinterlace_fallback == "1"
 
-    hidden = _hidden_sources(username)
-    if hidden and (
-        source_id in hidden
-        or any(
-            s.id in hidden and s.type == "xtream" and _is_xtream_source_url(url, s)
-            for s in get_sources()
-        )
-    ):
-        raise HTTPException(403, "Access to this source is restricted")
+    _require_visible_source(username, url, source_id)
 
     user_max_streams, source_max_streams = _stream_limits(username, source_id)
     result = await ffmpeg_session.start_transcode(
@@ -1978,7 +2034,7 @@ async def transcode_seek(
     user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     """Seek VOD transcode to a new position."""
-    del user
+    _require_session_user(session_id, user)
     if chromecast.manager.owns_session(session_id):
         raise HTTPException(409, "Stop casting before changing the transcode position.")
     return await ffmpeg_session.seek_transcode(session_id, time)
@@ -1990,8 +2046,7 @@ async def transcode_progress(
     user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     """Get transcode progress (segment count, duration)."""
-    del user
-    progress = ffmpeg_session.get_session_progress(session_id)
+    progress = ffmpeg_session.get_session_progress(session_id, user["sub"])
     if progress is None:
         raise HTTPException(404, "Session not found")
     return progress
@@ -2024,6 +2079,7 @@ async def transcode_file(
     if session is None:
         log.debug("[CAST] 404 session not found: %s", session_id)
         raise HTTPException(404, "Transcode session not found")
+    _require_owner_here(request, session.get("username", ""))
 
     file_path = pathlib.Path(session["dir"]) / safe_filename
     if not file_path.exists():
@@ -2073,10 +2129,11 @@ async def transcode_file(
 
 
 @app.get("/subs/{session_id}/{filename}")
-async def subtitle_file(session_id: str, filename: str):
+async def subtitle_file(request: Request, session_id: str, filename: str):
     """Serve VTT subtitle files using unguessable session identifiers.
 
     Args:
+        request: Request carrying the client's address.
         session_id: Active playback session identifier.
         filename: Subtitle filename within the session directory.
     """
@@ -2089,6 +2146,7 @@ async def subtitle_file(session_id: str, filename: str):
     session = ffmpeg_session.get_session(session_id)
     if session is None:
         raise HTTPException(404, "Session not found")
+    _require_owner_here(request, session.get("username", ""))
     file_path = pathlib.Path(session["dir"]) / safe_filename
     # A file without cues yet is served empty at once: the player polls every 0.5 s.
     try:
@@ -2119,9 +2177,11 @@ async def transcode_stop(
         viewer: The leaving page's ``viewer_id``; a live session other pages
             still watch keeps playing.
     """
+    session = ffmpeg_session.get_session(session_id)
+    if session is not None:
+        _require_session_user(session_id, user)
     if chromecast.manager.owns_session(session_id):
         return {"status": "casting"}
-    session = ffmpeg_session.get_session(session_id)
     force = force or (session is not None and session.get("is_archive", False))
     if force and session is not None and session.get("username") != user["sub"]:
         raise HTTPException(404, "Session not found")
@@ -2142,16 +2202,16 @@ async def transcode_stop_post(
 
 @app.delete("/transcode-clear")
 async def transcode_clear(
-    url: str,
+    ref: str,
     user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     """Force-delete any cached transcode session for a URL.
 
     Args:
-        url: Upstream URL identifying the cached session.
+        ref: ``auth.stream_ref`` of the upstream URL identifying the cached session.
         user: Authenticated viewer claims.
     """
-    del user
+    url = _issued_url(ref, user["sub"])
     if chromecast.manager.owns_url(url):
         raise HTTPException(409, "Stop casting before restarting this transcode.")
     session_id = ffmpeg_session.clear_url_session(url)
@@ -2213,6 +2273,7 @@ async def settings_page(request: Request, user: Annotated[TokenClaims, Depends(r
             "sources": server_settings["sources"],
             # Which keys are saved, never the keys.
             "api_keys_saved": sorted(server_settings.get("api_keys", {})),
+            "home_networks": ", ".join(auth.home_networks()),
             "transcode_mode": server_settings["transcode_mode"],
             "transcode_hw": server_settings["transcode_hw"],
             "max_resolution": server_settings.get("max_resolution", "1080p"),
@@ -3220,16 +3281,16 @@ async def save_watch_position_api(
     """Save a user's watch position for a stream.
 
     Args:
-        request: Request carrying URL, position and duration.
+        request: Request carrying the stream's ref, position and duration.
         user: Authenticated viewer claims identifying the watch owner.
     """
     username = user["sub"]
     data = json_loads(await request.body())
     fields = data if isinstance(data, dict) else {}
-    url = text_field(fields, "url")
+    url = _issued_url(text_field(fields, "ref"), username)
     position = _float_field(fields, "position")
     duration = _float_field(fields, "duration")
-    if url and position >= 0:
+    if position >= 0:
         save_watch_position(username, url, position, duration)
     return {"status": "ok"}
 
@@ -3336,16 +3397,19 @@ async def handoff_dismiss_api(user: Annotated[TokenClaims, Depends(require_auth)
 
 
 @app.get("/handoff/{recording_id}/{filename}")
-async def handoff_file(recording_id: str, filename: str):
+async def handoff_file(request: Request, recording_id: str, filename: str):
     """Serve a handoff recording using its unguessable identifier.
 
     Args:
+        request: Request carrying the client's address.
         recording_id: Retained recording identifier.
         filename: Recording playlist or segment filename.
     """
-    path = handoff.recording_file(recording_id, filename)
-    if path is None:
+    found = handoff.recording_file(recording_id, filename)
+    if found is None:
         raise HTTPException(404, "File not found")
+    path, owner = found
+    _require_owner_here(request, owner)
     if filename.endswith(".m3u8"):
         return Response(
             content=path.read_text(),
@@ -3375,14 +3439,14 @@ async def settings_delete_user(
     if username == current_user:
         if not password or not auth.verify_password(username, password):
             raise HTTPException(400, "Password required to delete your own account")
-        auth.delete_user(username)
+        _delete_user(username)
         response = RedirectResponse("/login", status_code=303)
         response.delete_cookie("token")
         return response
     # Deleting other users requires admin.
     if not auth.is_admin(current_user):
         raise HTTPException(403, "Admin access required")
-    if not auth.delete_user(username):
+    if not _delete_user(username):
         raise HTTPException(404, "User not found")
     return RedirectResponse("/settings", status_code=303)
 
@@ -3437,13 +3501,17 @@ async def settings_add_user(
 
 @app.post("/settings/users/password")
 async def settings_change_own_password(
+    request: Request,
     user: Annotated[TokenClaims, Depends(require_auth)],
     current_password: Annotated[str, Form()],
     new_password: Annotated[str, Form()],
 ):
     """Change the caller's password after verifying the current password.
 
+    Every other session of the account ends; this one continues.
+
     Args:
+        request: Request whose session is renewed.
         user: Authenticated account claims.
         current_password: Current account password.
         new_password: Replacement password.
@@ -3456,18 +3524,24 @@ async def settings_change_own_password(
         current_password=current_password,
     ):
         raise HTTPException(400, "Current password is incorrect")
-    return {"status": "ok"}
+    response = JSONResponse({"status": "ok"})
+    _start_session(request, response, user["sub"])
+    return response
 
 
 @app.post("/settings/users/password/{target_user}")
 async def settings_change_password(
+    request: Request,
     target_user: str,
     user: Annotated[TokenClaims, Depends(require_auth)],
     new_password: Annotated[str, Form()],
 ):
     """Change a password for the account owner or an administrator.
 
+    Every session of the account ends, but the caller's own.
+
     Args:
+        request: Request whose session is renewed when the caller is the owner.
         target_user: Account whose password is replaced.
         user: Authenticated caller claims.
         new_password: Replacement password.
@@ -3479,7 +3553,10 @@ async def settings_change_password(
         raise HTTPException(400, "Password must be at least 8 characters")
     if not auth.change_password(target_user, new_password):
         raise HTTPException(404, "User not found")
-    return {"status": "ok"}
+    response = JSONResponse({"status": "ok"})
+    if target_user == current_user:
+        _start_session(request, response, current_user)
+    return response
 
 
 @app.post("/settings/users/admin/{target_user}")
@@ -3488,9 +3565,19 @@ async def settings_set_admin(
     user: Annotated[TokenClaims, Depends(require_admin)],
     admin: Annotated[str, Form()] = "",
 ):
-    """Set admin status for a user."""
+    """Set admin status for a user; the last administrator stays one.
+
+    Args:
+        target_user: Account to update.
+        user: Authenticated administrator claims.
+        admin: "on" to grant administrator access, else revoke it.
+    """
     del user
-    if not auth.set_admin(target_user, admin == "on"):
+    try:
+        changed = auth.set_admin(target_user, admin == "on")
+    except auth.LastAdminError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not changed:
         raise HTTPException(404, "User not found")
     return {"status": "ok"}
 
@@ -3519,6 +3606,24 @@ async def settings_set_api_key(
         keys.pop(service, None)
     settings["api_keys"] = keys
     save_server_settings(settings)
+    return {"status": "ok"}
+
+
+@app.post("/settings/home-networks")
+async def settings_set_home_networks(
+    user: Annotated[TokenClaims, Depends(require_admin)],
+    networks: Annotated[str, Form()] = "",
+):
+    """Name the home network LAN-only users must be on; none for the private ranges.
+
+    Args:
+        user: Authenticated administrator claims.
+        networks: CIDRs separated by commas or spaces.
+    """
+    del user
+    named = networks.replace(",", " ").split()
+    if not auth.set_home_networks(named):
+        raise HTTPException(400, f"Not a network in: {', '.join(named)}")
     return {"status": "ok"}
 
 
@@ -3794,7 +3899,7 @@ async def _series_versions(
     shown_data: ProviderRecord,
     username: str,
 ) -> list[Version]:
-    """Every listing of the series on show the user may see, newest first; none if one."""
+    """Every listing of the series on show the user may see, newest first."""
     if shown is None:
         return []
     unavailable = _unavailable_groups(username)
@@ -3808,8 +3913,6 @@ async def _series_versions(
         ),
         key=_listing_order,
     )
-    if len(listings) < 2:
-        return []
 
     def details(listing: ProviderRecord) -> ProviderRecord:
         if listing is shown:
@@ -3917,10 +4020,12 @@ async def _save_category_filter(
     return {"status": "ok"}
 
 
-def _name_matcher(q: str, *, regex: bool) -> Callable[[str], bool]:
-    """Build a case-insensitive name predicate for search."""
+def _name_matcher(q: str, *, regex: bool, whole: bool) -> Callable[[str], bool]:
+    """Build a case-insensitive name predicate for search; ``whole``: one name of a list."""
     if not regex:
         q_lower = q.lower()
+        if whole:
+            return lambda names: any(n.strip().lower() == q_lower for n in names.split(","))
         return lambda name: q_lower in name.lower()
     try:
         pattern = re.compile(q, re.IGNORECASE)
@@ -4036,24 +4141,27 @@ def _store_cached_series_data() -> bool:
 
 # ``field:word`` and ``field:"a phrase"`` limit a term to one field; the rest of ``q``
 # is one term that any field may match.
-def _search_terms(q: str) -> list[tuple[str, str]]:
-    """``q`` as (field, text) terms, all of which a result must match."""
+# A quoted field value is a whole name, as a credit's link sends it; unquoted, part of a
+# name matches.
+def _search_terms(q: str) -> list[tuple[str, str, bool]]:
+    """``q`` as (field, text, whole) terms, all of which a result must match."""
     fielded = re.compile(
-        r"\b(title|cast|role|director|writer|composer|network|country|language|year|genre|imdb):"
+        r"\b(title|cast|role|director|writer|composer|network|country|language|year|genre|imdb):"  # pragma: no mutate[case-insensitive]
         r'(?:"([^"]*)"|(\S+))',
         re.IGNORECASE,
     )
     terms = [
-        (str(m[1]).lower(), str(m[2] if m[2] is not None else m[3])) for m in fielded.finditer(q)
+        (str(m[1]).lower(), str(m[2] if m[2] is not None else m[3]), m[2] is not None)
+        for m in fielded.finditer(q)
     ]
     rest = fielded.sub(" ", q).strip().strip('"')
-    return [*terms, ("any", rest)] if rest or not terms else terms
+    return [*terms, ("any", rest, False)] if rest or not terms else terms
 
 
 # Movies and series add IMDb's credits to the provider's. A ``limit`` of 0 keeps all.
 def _matching_names(
     records: list[ProviderRecord],
-    terms: list[tuple[str, str]],
+    terms: list[tuple[str, str, bool]],
     limit: int,
     *,
     regex: bool,
@@ -4075,14 +4183,14 @@ def _matching_names(
         "language": (("language",), ()),
     }
     # Year, genre, and IMDb rating terms read what cards show; live channels have none.
-    facts = [(field, text) for field, text in terms if field not in fields]
+    facts = [term for term in terms if term[0] not in fields]
     if facts and not imdb_credits:
         return []
     # Each term: its predicate, the titles its IMDb credits match, its record fields.
     checks: list[tuple[Callable[[str], bool], set[str], tuple[str, ...]]] = []
-    for field, text in terms:
+    for field, text, whole in terms:
         if field in fields:
-            match = _name_matcher(text, regex=regex)
+            match = _name_matcher(text, regex=regex, whole=whole)
             roles, own = fields[field]
             credited = (
                 imdb.matching_keys(match, roles=roles) if imdb_credits and roles != () else set()
@@ -4093,7 +4201,8 @@ def _matching_names(
         if any(credited for _, credited, _ in checks)
         else [None] * len(records)
     )
-    ranks = imdb.rankings(records) if facts else [imdb.Ranking(0.0, 0, 0)] * len(records)
+    # Only fact terms read a title's ranking; without them none is looked up.
+    ranks = imdb.rankings(records) if facts else []
     matched = sorted(
         (
             records[i]
@@ -4102,7 +4211,10 @@ def _matching_names(
                 key in credited or any(match(text_field(records[i], f)) for f in own)
                 for match, credited, own in checks
             )
-            and all(_fact_matches(f, text, ranks[i], records[i], regex=regex) for f, text in facts)
+            and all(
+                _fact_matches(f, text, ranks[i], records[i], regex=regex, whole=whole)
+                for f, text, whole in facts
+            )
         ),
         key=lambda r: text_field(r, "name").lower(),
     )
@@ -4118,10 +4230,11 @@ def _fact_matches(
     record: ProviderRecord,
     *,
     regex: bool,
+    whole: bool,
 ) -> bool:
     """Whether a title's year, genre, or IMDb rating matches a search term's ``text``."""
     if field == "genre":
-        return _name_matcher(text, regex=regex)(",".join(_genres(rank, record)))
+        return _name_matcher(text, regex=regex, whole=whole)(",".join(_genres(rank, record)))
     number = r"\d+(?:\.\d+)?"
     bounds = re.fullmatch(rf"({number})(?:(?:-|\.\.)({number}))?", text)
     if bounds is None:
@@ -5122,7 +5235,12 @@ def _payload_viewer(user: TokenClaims) -> str | None:
 def _fetch_logo(url: str, timeout: int = 3, *, max_size: int = 1024 * 1024) -> tuple[bytes, str]:
     """Fetch logo synchronously. Returns (data, content_type)."""
 
-    with safe_urlopen(url, timeout=timeout) as resp:
+    # Providers name logos, so a logo may not point the server inward.
+    with safe_urlopen(
+        url,
+        timeout=timeout,
+        allow_address=functools.partial(proxy.allowed_address, lan=False),
+    ) as resp:
         content_type = resp.headers.get("Content-Type", "")
         if not content_type.startswith("image/"):
             raise ValueError("URL is not an image")
@@ -5715,6 +5833,156 @@ def _imdb_url(found: imdb.Info | None) -> str:
     if found is None or not found["imdb_id"].startswith("tt"):
         return ""
     return f"https://www.imdb.com/title/{found['imdb_id']}/"
+
+
+# Whoever creates the first account is its administrator; on an install reachable from
+# the internet, that must not be the first stranger to visit.
+def _require_home(request: Request) -> None:
+    """Refuse a fresh install's setup from outside the home network."""
+    if not auth.is_home_address(_client_address(request)):
+        raise HTTPException(403, "Finish setting up neTV from your home network")
+
+
+def _is_https(request: Request) -> bool:
+    return (
+        request.url.scheme == "https"
+        or "https" in request.headers.get("x-forwarded-proto", "").lower()
+        or "https" in request.headers.get("x-forwarded-scheme", "").lower()
+    )
+
+
+def _start_session(request: Request, response: Response, username: str) -> None:
+    """Sign ``username`` in on ``response``, for their current password."""
+    response.set_cookie(
+        "token",
+        create_token({"sub": username}),
+        httponly=True,
+        samesite="strict",
+        max_age=86_400 * 7,
+        secure=_is_https(request),
+    )
+
+
+def _direct_path(ref: str, url: str) -> str:
+    """Where a client plays ``url`` through this server, never from the provider."""
+    if url.startswith("/"):
+        return url
+    path = parse.urlparse(url).path
+    suffix = pathlib.PurePosixPath(path).suffix.lower()
+    live = "live/" if "/live/" in path else ""
+    return f"/direct/{ref}/{live}stream{suffix if suffix in _MEDIA_SUFFIXES else ''}"
+
+
+def _issued_url(ref: str, username: str) -> str:
+    """The upstream URL of a ref the server issued to ``username``."""
+    target = auth.stream_ref_target(ref)
+    if target is None or target.username != username:
+        raise HTTPException(403, "This stream link is not valid. Reload the player page.")
+    return target.url
+
+
+def _stream_ref(username: str, url: str, source_id: str) -> str:
+    """``auth.stream_ref`` for a URL the server chose, marked when it is a home stream."""
+    return _stream_refs(username, [(url, source_id)])[0]
+
+
+def _stream_refs(username: str, streams: list[tuple[str, str]]) -> list[str]:
+    """``_stream_ref`` for each (url, source_id), resolving each host and reading the account once."""
+    home: dict[tuple[str, str], bool] = {}
+    issuers = {lan: auth.stream_ref_issuer(username, lan=lan) for lan in (False, True)}
+    refs = []
+    for url, source_id in streams:
+        key = (parse.urlparse(url).hostname or "", source_id)
+        if key not in home:
+            home[key] = proxy.home_stream(url, source_id)
+        refs.append(issuers[home[key]](url))
+    return refs
+
+
+def _require_visible_source(username: str, url: str, source_id: str = "") -> None:
+    """Refuse a stream from a source the user may not see, though a ref was issued before."""
+    hidden = _hidden_sources(username)
+    if hidden and (
+        source_id in hidden
+        or any(
+            s.id in hidden and s.type == "xtream" and _is_xtream_source_url(url, s)
+            for s in get_sources()
+        )
+    ):
+        raise HTTPException(403, "Access to this source is restricted")
+
+
+# These need no cookie (a TV fetches them), so their unguessable names are the only key;
+# the owner's account must still exist and, if LAN-only, be home.
+def _require_session_user(session_id: str, user: TokenClaims) -> None:
+    """Refuse a session to anyone who neither started it nor was handed it."""
+    if ffmpeg_session.user_session(session_id, user["sub"]) is None:
+        raise HTTPException(404, "Session not found")
+
+
+def _require_owner_here(request: Request, owner: str) -> None:
+    """Refuse playback files to a client the files' owner could not sign in from."""
+    if not auth.allowed_from(owner, _client_address(request)):
+        raise HTTPException(403, "This stream is not available from here")
+
+
+def _delete_user(username: str) -> bool:
+    try:
+        return auth.delete_user(username)
+    except auth.LastAdminError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+# Relay its body, or rewrite its playlist to relay each entry.
+async def _relay_direct(
+    target: auth.StreamTarget,
+    byte_range: str,
+    limits: proxy.RelayLimits,
+) -> Response:
+    """Fetch ``target``'s URL."""
+    if not await asyncio.to_thread(proxy.allowed_upstream, target.url, lan=target.lan):
+        raise HTTPException(403, "This stream is not available from here")
+    try:
+        # Each connection, redirects' included, dials only an address that passed.
+        upstream = await asyncio.to_thread(
+            functools.partial(
+                safe_urlopen,
+                target.url,
+                30,
+                cache.get_user_agent(),
+                {"Range": byte_range} if byte_range else None,
+                allow_address=functools.partial(proxy.allowed_address, lan=target.lan),
+            ),
+        )
+    except OSError as exc:
+        log.warning("Direct stream upstream failed (%s)", type(exc).__name__)
+        raise HTTPException(502, "Unable to connect to upstream stream") from exc
+    content_type = upstream.headers.get("Content-Type") or ""
+    if "mpegurl" not in content_type.lower() and not target.url.lower().split("?")[0].endswith(
+        ".m3u8",
+    ):
+        return await proxy.relay_response(
+            upstream,
+            on_close=lambda: limits.release(target.username),
+        )
+    # A playlist names more upstream URLs: each becomes a relayed one in turn.
+    with upstream:
+        # A playlist is kilobytes; 4 MiB bounds what a broken upstream can make us hold.
+        text = (await asyncio.to_thread(upstream.read, 4 << 20)).decode(errors="replace")
+    issue = await asyncio.to_thread(auth.stream_ref_issuer, target.username, lan=target.lan)
+    try:
+        playlist = proxy.rewrite_playlist(
+            text,
+            upstream.url or target.url,
+            lambda entry: _direct_path(issue(entry), entry),
+        )
+    except ValueError as exc:
+        raise HTTPException(502, "Upstream playlist is not usable") from exc
+    return Response(
+        playlist,
+        media_type="application/vnd.apple.mpegurl",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 if __name__ == "__main__":

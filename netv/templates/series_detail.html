@@ -27,9 +27,10 @@
     <p id="plot" class="col-span-2 sm:col-span-1 sm:col-start-2 text-gray-300">{{ series.info.plot }}</p>
     {% endif %}
   </div><!-- end header -->
-  {# Credits, versions, trailer: the header's width, so all share one right edge. #}
+  {# Credits and trailer: the header's width, so all share one right edge. #}
   <div id="details" class="max-w-3xl flex flex-col gap-6 mb-6">
     {% from "_people.html" import people %}
+    {% from "_versions.html" import sources %}
     <dl id="credits" class="grid grid-cols-[auto_1fr] gap-x-3 text-sm">
       {{ people('Genre', 'genre', shown.genres) }}
       {{ people('Network', 'network', networks) }}
@@ -39,9 +40,8 @@
       {{ people('Cast', 'cast', cast) }}
       {{ people('Country', 'country', countries) }}
       {{ people('Language', 'language', languages) }}
+      {{ sources(versions) }}
     </dl>
-    {% from "_versions.html" import versions_list %}
-    {{ versions_list(versions) }}
     {% from "_trailer.html" import trailer %}
     {{ trailer(series.info.youtube_trailer) }}
   </div><!-- end details -->
@@ -54,7 +54,7 @@
   {% for season_num, episodes in seasons.items() %}
   <div class="mb-6">
     <h3 class="text-xl font-semibold mb-3">Season {{ season_num }}</h3>
-    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3 pr-1">
+    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3 pr-1" data-nav-main>
       {% for ep in episodes %}
       <a href="/play/series/{{ ep.id }}?series_id={{ series_id }}&ext={{ ep.container_extension or 'mkv' }}"
          class="bg-gray-800 rounded-lg p-3 hover:ring-2 hover:ring-blue-500 focus:ring-2 focus:ring-blue-500 focusable transition-all"

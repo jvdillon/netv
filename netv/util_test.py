@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from http.client import HTTPMessage
-from typing import TypedDict
+from typing import TypedDict, cast
 from urllib import error, request
 
 import io
+import ipaddress
 import json
 import logging
 import pathlib
+import socket
+import ssl
 
 from treekle import MutablePlainTree
 
@@ -235,6 +239,116 @@ class TestSafeRedirectHandler:
     def test_handler_rejects_other_schemes(self, newurl: str):
         with pytest.raises(error.URLError, match="Unsafe redirect scheme"):
             _redirect(util._SafeRedirectHandler(), newurl)
+
+
+def _answers(*addresses: str) -> Callable[..., list[tuple[object, ...]]]:
+    """A resolver giving each address in turn, as DNS rebinding answers change."""
+    remaining = list(addresses)
+
+    def getaddrinfo(
+        host: str,
+        port: int,
+        *args: object,
+        **kwargs: object,
+    ) -> list[tuple[object, ...]]:
+        del host, args, kwargs
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (remaining.pop(0), port))]
+
+    return getaddrinfo
+
+
+class _Dialed(Exception):
+    """Stops a fetch at its dial, recording where it went."""
+
+
+def _record_dials(
+    monkeypatch: pytest.MonkeyPatch,
+    answers: Callable[..., object],
+) -> list[tuple[str, int]]:
+    dialed: list[tuple[str, int]] = []
+
+    def create_connection(address: tuple[str, int], *args: object, **kwargs: object) -> object:
+        del args, kwargs
+        dialed.append(address)
+        raise _Dialed
+
+    monkeypatch.setattr(socket, "getaddrinfo", answers)
+    monkeypatch.setattr(socket, "create_connection", create_connection)
+    return dialed
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_a_vetted_fetch_dials_the_address_it_vetted(monkeypatch: pytest.MonkeyPatch, scheme: str):
+    # The first answer is public and vetted; a rebinding second answer, 127.0.0.1,
+    # is never asked for: the dial goes to the address that was checked.
+    dialed = _record_dials(monkeypatch, _answers("93.184.216.34", "127.0.0.1"))
+    with pytest.raises(_Dialed):
+        util.safe_urlopen(f"{scheme}://rebind.example/x", allow_address=lambda ip: ip.is_global)
+    assert dialed == [("93.184.216.34", 80 if scheme == "http" else 443)]
+
+
+def test_a_vetted_fetch_refuses_an_address_the_caller_does_not_allow(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    dialed = _record_dials(monkeypatch, _answers("127.0.0.1"))
+    with pytest.raises(error.URLError) as refused:
+        util.safe_urlopen("http://internal.example:8000/x", allow_address=lambda ip: ip.is_global)
+    assert isinstance(refused.value.reason, util.RefusedAddress)
+    assert dialed == []
+
+
+def test_a_vetted_fetch_judges_an_ipv4_mapped_answer_as_ipv4(monkeypatch: pytest.MonkeyPatch):
+    dialed = _record_dials(monkeypatch, _answers("::ffff:93.184.216.34"))
+    with pytest.raises(_Dialed):
+        util.safe_urlopen(
+            "http://mapped.example/x",
+            allow_address=lambda ip: isinstance(ip, ipaddress.IPv4Address),
+        )
+    assert dialed == [("::ffff:93.184.216.34", 80)]
+
+
+def test_a_vetted_https_fetch_still_checks_the_name_s_certificate(monkeypatch: pytest.MonkeyPatch):
+    wrapped: list[str | None] = []
+    # A real TCP socket: the connection sets TCP options on it.
+    listener = socket.create_server(("127.0.0.1", 0))
+    sock = socket.create_connection(listener.getsockname())
+
+    class Context:
+        check_hostname = True
+
+        def wrap_socket(self, raw: object, *, server_hostname: str | None) -> object:
+            assert raw is sock
+            wrapped.append(server_hostname)
+            return raw
+
+    def create_connection(address: tuple[str, int], *args: object, **kwargs: object) -> object:
+        del address, args, kwargs
+        return sock
+
+    monkeypatch.setattr(socket, "getaddrinfo", _answers("93.184.216.34"))
+    monkeypatch.setattr(socket, "create_connection", create_connection)
+    connection = util._PinnedHTTPSConnection(
+        "secure.example",
+        allow_address=lambda ip: True,
+        timeout=5,
+        context=cast(ssl.SSLContext, Context()),
+    )
+    connection.connect()
+    # SNI and certificate checks use the name, not the address dialed.
+    assert wrapped == ["secure.example"]
+    sock.close()
+    listener.close()
+
+
+def test_safe_urlopen_pins_connections_only_when_asked(monkeypatch: pytest.MonkeyPatch):
+    web = testing.FakeWeb({"http://x/1": testing.FakeResponse(b"ok")})
+    testing.install_web(monkeypatch, web, util)
+    util.safe_urlopen("http://x/1").close()
+    util.safe_urlopen("http://x/1", allow_address=lambda ip: True).close()
+    plain, pinned = (tuple(type(h) for h in fetch.handlers) for fetch in web.fetches)
+    assert plain == (util._SafeRedirectHandler,)
+    # Redirects go back through the same handlers, so every hop is vetted too.
+    assert pinned == (util._SafeRedirectHandler, util._PinnedHTTPHandler, util._PinnedHTTPSHandler)
 
 
 def test_redact_url_credentials():

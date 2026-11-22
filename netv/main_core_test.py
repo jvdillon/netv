@@ -9,6 +9,7 @@ from urllib import parse
 
 import asyncio
 import html
+import ipaddress
 import json
 import logging
 import math
@@ -19,6 +20,8 @@ import time
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.requests import Request
+from starlette.types import Scope
 from treekle import json_loads
 
 import pytest
@@ -34,6 +37,7 @@ from netv import (
     imdb,
     m3u as m3u_module,
     main,
+    proxy,
     testing,
     util,
 )
@@ -77,7 +81,7 @@ def prestarts(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 def web(monkeypatch: pytest.MonkeyPatch) -> testing.FakeWeb:
     """The internet as seen by provider, guide and playlist fetches."""
     fake = testing.FakeWeb()
-    testing.install_web(monkeypatch, fake, util, ffmpeg_command)
+    testing.install_web(monkeypatch, fake, util)
     return fake
 
 
@@ -546,6 +550,24 @@ def test_guide_page_loads_file_cache(api: TestClient, guide_db: None) -> None:
     assert cache.get_cache().get("live_streams", [{}])[0]["name"] == "CachedCNN"
 
 
+def test_guide_rows_are_as_tall_as_the_virtual_guide_places_them(
+    api: TestClient,
+    guide_db: None,
+) -> None:
+    del guide_db
+    cache.save_file_cache("live_data", _LIVE_FILE_CACHE)
+    page = api.get("/guide?cats=1").text
+    # The virtual guide places row N at N row heights down; a row drawn even a
+    # pixel taller (its border) drifts the last of 300 rows off screen.
+    desktop = re.search(r"rowHeight: (\d+),", page)
+    mobile = re.search(r"rowHeightMobile: (\d+),", page)
+    assert desktop is not None and mobile is not None
+    assert re.search(rf"\.guide-row \{{[^}}]*\bheight: {desktop[1]}px;", page)
+    narrow = re.search(r"@media \(max-width: 511px\) \{(.*?)\n\}", page, re.DOTALL)
+    assert narrow is not None
+    assert f".guide-row {{ height: {mobile[1]}px; }}" in narrow.group(1)
+
+
 def test_guide_rows_api_loads_file_cache(api: TestClient) -> None:
     cache.save_file_cache("live_data", _LIVE_FILE_CACHE)
     resp = api.get("/api/guide/rows?cats=1")
@@ -761,7 +783,18 @@ def test_series_detail_offers_each_listing(api: TestClient, web: testing.FakeWeb
         ("17001", "", f"Updated {datetime.fromtimestamp(1):%b %-d, %Y}"),
     ]
     assert 'href="/series/16486"' in page
-    assert "data-version" not in api.get("/series/7").text
+    credits = re.search(r'<dl id="credits".*?</dl>', page, re.DOTALL)
+    assert credits is not None and ">Source<" in credits.group(0)
+    # A series with one listing still says where it comes from.
+    web.routes[_api_url("http://x", "get_series_info", series_id="7")] = testing.FakeResponse(
+        b'{"info": {"name": "Homeland"}, "episodes": {}}',
+    )
+    assert re.findall(
+        r'data-version="(\d+)"( aria-current="true")?>',
+        api.get("/series/7").text,
+    ) == [
+        ("7", ' aria-current="true"'),
+    ]
     # A series missing from the catalog has no other listings to offer.
     web.routes[_api_url("http://x", "get_series_info", series_id="999")] = testing.FakeResponse(
         b'{"info": {"name": "Gone"}, "episodes": {}}',
@@ -1376,8 +1409,11 @@ def test_detail_pages_name_the_composer(api: TestClient, web: testing.FakeWeb) -
             "/search?q=language%3A%22English%22",
             "/search?q=language%3A%22Spanish%22",
         ],
+        # Where it comes from: the provider listing on show.
+        "Source": ["/movie/5"],
     }
-    assert "<dt" not in api.get("/movie/6").text
+    # Without credits, only where it comes from.
+    assert re.findall(r"<dt[^>]*>(\w+)</dt>", api.get("/movie/6").text) == ["Source"]
     # Each name is a finger's height to tap on a phone, not a 19px line of text.
     link = re.search(r'<a href="/search\?q=writer%3A[^>]*>', page)
     assert link is not None and "inline-block py-1" in link.group(0)
@@ -1435,7 +1471,8 @@ def test_series_pages_name_the_network(api: TestClient, web: testing.FakeWeb) ->
     assert "Drama / Sci-Fi" not in page
     assert 'href="/search?q=country%3A%22United%20States%22"' in page
     assert 'href="/search?q=language%3A%22English%22"' in page
-    assert "<dt" not in api.get("/series/6").text
+    # Without credits, only where it comes from.
+    assert re.findall(r"<dt[^>]*>(\w+)</dt>", api.get("/series/6").text) == ["Source"]
 
 
 @pytest.mark.usefixtures("imdb_index")
@@ -2054,7 +2091,8 @@ def test_player_movie_resumes_watch_position(api: TestClient, web: testing.FakeW
     auth.set_user_limits("testuser", None, ["cat:other"])
     resp = api.get("/play/movie/9?ext=mkv")
     assert resp.status_code == 200
-    assert 'rawUrl: "http://x/movie/u/p/9.mkv"' in resp.text
+    assert testing.played_url(resp.text) == "http://x/movie/u/p/9.mkv"
+    assert "/u/p/" not in resp.text
     assert "serverResumePosition: 42.5" in resp.text
 
 
@@ -2083,7 +2121,7 @@ def test_player_series_strips_year_from_name(api: TestClient, web: testing.FakeW
     auth.set_user_limits("testuser", None, ["movies:s1"])
     resp = api.get("/play/series/11?series_id=5&ext=mkv")
     assert resp.status_code == 200
-    assert 'rawUrl: "http://x/series/u/p/11.mkv"' in resp.text
+    assert testing.played_url(resp.text) == "http://x/series/u/p/11.mkv"
     assert 'seriesName: "Great Show"' in resp.text
     assert "/play/series/12?series_id=5\\u0026ext=mp4" in resp.text
 
@@ -2149,6 +2187,25 @@ def test_player_live_playlist_stream_transcodes_with_source_and_guide(
     assert prestarts == ["http://m/1.ts"]
     assert "deinterlaceFallback: true" in resp.text
     assert ">Breaking</div>" in resp.text
+
+
+def test_player_plays_a_home_lineup_s_tuner_on_the_home_network(
+    api: TestClient,
+    guide_db: None,
+) -> None:
+    del guide_db
+    tuner = "http://192.168.1.87:5004/auto/v5.1"
+    _set_sources(
+        {"id": "t", "name": "Tuner", "type": "m3u", "url": "http://192.168.1.24/lineup.m3u"},
+    )
+    cache.get_cache()["live_streams"] = [
+        {"stream_id": "t_5", "name": "KPIX", "source_id": "t", "direct_url": tuner},
+    ]
+    resp = api.get("/play/live/t_5")
+    assert resp.status_code == 200
+    ref = re.search(r'streamRef: "([^"]+)"', resp.text)
+    assert ref is not None
+    assert auth.stream_ref_target(ref[1]) == ("testuser", tuner, True)
 
 
 def test_player_missing_stream(api: TestClient, guide_db: None) -> None:
@@ -2239,8 +2296,14 @@ def test_movie_detail_offers_each_version(api: TestClient, web: testing.FakeWeb)
     assert sorted(web.urls) == sorted(
         _api_url("http://x", "get_vod_info", vod_id=v) for v in ("1", "2")
     )
-    # A movie with one version offers no choice.
-    assert "data-version" not in api.get("/movie/4").text
+    # Sources are a row of the credits table, there for a movie with one as well.
+    credits = re.search(r'<dl id="credits".*?</dl>', page, re.DOTALL)
+    assert credits is not None and ">Source<" in credits.group(0)
+    assert 'data-version="1"' in credits.group(0)
+    lone = api.get("/movie/4").text
+    assert re.findall(r'data-version="(\d+)"( aria-current="true")?>', lone) == [
+        ("4", ' aria-current="true"'),
+    ]
 
 
 def test_stream_redirect_without_xtream(api: TestClient) -> None:
@@ -2254,11 +2317,191 @@ def test_stream_redirect_hidden_source(api: TestClient) -> None:
     assert _client("viewer").get("/stream/movie/1").status_code == 403
 
 
-def test_stream_redirect_to_provider(api: TestClient) -> None:
-    _set_sources({**_XTREAM, "url": "http://up"})
+@pytest.mark.parametrize(("server", "home"), [("http://up", False), ("http://192.168.1.9", True)])
+def test_stream_redirect_goes_through_the_server(api: TestClient, server: str, home: bool) -> None:
+    _set_sources({**_XTREAM, "url": server})
     resp = api.get("/stream/movie/1?ext=mkv", follow_redirects=False)
     assert resp.status_code == 302
-    assert resp.headers["location"] == "http://up/movie/u/p/1.mkv"
+    # Never to the provider: its URL carries the provider's account and password.
+    location = resp.headers["location"]
+    assert location.startswith("/direct/") and location.endswith("/stream.mkv")
+    # A panel an admin set up on the home network may be reached there.
+    assert auth.stream_ref_target(location.split("/")[2]) == (
+        "testuser",
+        f"{server}/movie/u/p/1.mkv",
+        home,
+    )
+
+
+def _direct(owner: str, url: str, source_id: str = "") -> str:
+    return main._direct_path(main._stream_ref(owner, url, source_id), url)
+
+
+def test_direct_play_relays_the_provider_with_ranges(
+    api: TestClient,
+    web: testing.FakeWeb,
+) -> None:
+    del api
+    url = "http://up/movie/u/p/9.mkv"
+    web.routes[url] = testing.FakeResponse(
+        b"bytes",
+        status=206,
+        headers={
+            "Content-Type": "video/x-matroska",
+            "Content-Length": "5",
+            "Content-Range": "bytes 10-14/100",
+            "Accept-Ranges": "bytes",
+        },
+    )
+    path = _direct("testuser", url)
+    assert path.endswith("/stream.mkv")
+    # The ref is the key, so an external player without the cookie plays it too.
+    resp = TestClient(main.app).get(path, headers={"Range": "bytes=10-14"})
+    assert resp.status_code == 206
+    assert resp.content == b"bytes"
+    assert resp.headers["content-range"] == "bytes 10-14/100"
+    assert resp.headers["accept-ranges"] == "bytes"
+    assert resp.headers["content-type"] == "video/x-matroska"
+    [fetch] = web.fetches
+    assert fetch.headers["Range"] == "bytes=10-14"
+    # Live streams keep the path the player recognizes as live.
+    assert _direct("testuser", "http://up/live/u/p/7.ts").endswith("/live/stream.ts")
+    assert _direct("testuser", "http://tuner/auto/v5.1").endswith("/stream")
+    # The server's own recordings need no relay.
+    assert _direct("testuser", "/handoff/abc/stream.m3u8") == "/handoff/abc/stream.m3u8"
+
+
+def test_direct_play_rewrites_playlists_to_point_back_through_the_server(
+    api: TestClient,
+    web: testing.FakeWeb,
+) -> None:
+    del api
+    url = "http://up/live/u/p/1.m3u8"
+    playlist = (
+        '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n#EXTINF:6,\nseg1.ts\n'
+        "#EXTINF:6,\nhttp://cdn/u/p/seg2.ts\n"
+    )
+    # The provider redirected: relative entries resolve against where it ended up.
+    web.routes[url] = testing.FakeResponse(
+        playlist.encode(),
+        headers={"Content-Type": "application/vnd.apple.mpegurl"},
+        url="http://edge/tok/1.m3u8",
+    )
+    resp = TestClient(main.app).get(_direct("testuser", url))
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/vnd.apple.mpegurl"
+    text = resp.text
+    assert not {"up", "cdn", "edge", "tok"} & set(re.split(r"[/\"\n]", text))
+    entries = [line for line in text.splitlines() if line and not line.startswith("#")]
+    key = re.search(r'URI="([^"]+)"', text)
+    assert key is not None
+    targets = [auth.stream_ref_target(e.split("/")[2]) for e in [key.group(1), *entries]]
+    assert targets == [
+        ("testuser", "http://edge/tok/key.bin", False),
+        ("testuser", "http://edge/tok/seg1.ts", False),
+        ("testuser", "http://cdn/u/p/seg2.ts", False),
+    ]
+    assert text.startswith("#EXTM3U\n") and "#EXTINF:6," in text
+
+
+def test_direct_play_keeps_a_provider_s_playlist_out_of_the_home_network(
+    api: TestClient,
+    web: testing.FakeWeb,
+) -> None:
+    del api
+    url = "http://up/live/u/p/1.m3u8"
+    internal = [
+        "http://127.0.0.1:8000/settings",
+        "http://169.254.169.254/latest/",
+        "http://10.0.0.5/",
+    ]
+    playlist = "#EXTM3U\n" + "".join(f"{u}\n" for u in [*internal, "http://8.8.8.8/seg.ts"])
+    web.routes[url] = testing.FakeResponse(
+        playlist.encode(),
+        headers={"Content-Type": "application/vnd.apple.mpegurl"},
+    )
+    for target in internal:
+        web.routes[target] = testing.FakeResponse(b"secret")
+    web.routes["http://8.8.8.8/seg.ts"] = testing.FakeResponse(b"ts")
+    client = TestClient(main.app)
+    text = client.get(_direct("testuser", url)).text
+    entries = [line for line in text.splitlines() if line and not line.startswith("#")]
+    # A stream from the internet may reach only the internet, never this server
+    # or the home network, whatever its playlist names.
+    assert [client.get(e).status_code for e in entries] == [403, 403, 403, 200]
+    assert not {f.url for f in web.fetches} & set(internal)
+    # Its connections, redirects' included, dial only an address vetted by that rule.
+    [*_, last] = web.fetches
+    pinned = [h for h in last.handlers if isinstance(h, util._PinnedHTTPHandler)]
+    assert len(pinned) == 1
+    vet = pinned[0]._connection.keywords["allow_address"]
+    assert not vet(ipaddress.ip_address("192.168.1.1")) and vet(ipaddress.ip_address("8.8.8.8"))
+    # A provider's channel list naming this server is no home stream either.
+    assert client.get(_direct("testuser", internal[0])).status_code == 403
+    # A tuner on the home network is the household's own, and plays when a source an
+    # admin set up on the home network lists it, whatever host that lineup is on.
+    tuner = "http://192.168.1.87:5004/auto/v5.1"
+    web.routes[tuner] = testing.FakeResponse(b"ts", headers={"Content-Type": "video/mp2t"})
+    _set_sources(
+        {"id": "t", "name": "Tuner", "type": "m3u", "url": "http://192.168.1.24/lineup.m3u"},
+        {"id": "p", "name": "Provider", "type": "m3u", "url": "http://8.8.8.8/list.m3u"},
+    )
+    assert client.get(_direct("testuser", tuner, "p")).status_code == 403
+    assert client.get(_direct("testuser", tuner, "t")).status_code == 200
+
+
+def test_direct_play_checks_access_limits_and_playlist_size(
+    api: TestClient,
+    web: testing.FakeWeb,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del api
+    url = "http://x/movie/u/p/9.mkv"
+    web.routes[url] = lambda: testing.FakeResponse(b"x")
+    # A source an admin hid from the viewer stops playing through refs issued before.
+    _set_sources({**_XTREAM, "users": ["someone"]})
+    auth.create_user("viewer", "password1")
+    assert TestClient(main.app).get(_direct("viewer", url)).status_code == 403
+    # Each viewer relays a few streams at once, not without end.
+    _set_sources(_XTREAM)
+    limits = cast(proxy.RelayLimits, main.app.state.relay_limits)
+    monkeypatch.setattr(limits, "max_per_owner", 0)
+    assert TestClient(main.app).get(_direct("viewer", url)).status_code == 429
+    monkeypatch.setattr(limits, "max_per_owner", 4)
+    assert TestClient(main.app).get(_direct("viewer", url)).status_code == 200
+    # Its slot is returned once the body is sent.
+    assert limits.active == {}
+    # A playlist too long to be real is refused, not grown several-fold in memory.
+    long = "http://up/live/u/p/2.m3u8"
+    web.routes[long] = testing.FakeResponse(
+        ("#EXTM3U\n" + "s.ts\n" * 20_001).encode(),
+        headers={"Content-Type": "application/vnd.apple.mpegurl"},
+    )
+    assert TestClient(main.app).get(_direct("viewer", long)).status_code == 502
+
+
+def test_direct_play_follows_its_owner_s_lan_rule_and_account(
+    api: TestClient,
+    web: testing.FakeWeb,
+) -> None:
+    del api
+    url = "http://up/movie/u/p/9.mkv"
+    web.routes[url] = lambda: testing.FakeResponse(b"x")
+    auth.create_user("kid", "password123")
+    auth.set_lan_only("kid", lan_only=True)
+    path = _direct("kid", url)
+    home = TestClient(main.app, client=("192.168.1.2", 5000))
+    away = TestClient(main.app, client=("8.8.8.8", 5000))
+    assert home.get(path).status_code == 200
+    assert away.get(path).status_code == 403
+    # A deleted account's links stop working, at home too.
+    auth.delete_user("kid")
+    assert home.get(path).status_code == 403
+    assert home.get("/direct/forged/stream.mkv").status_code == 403
+    # A provider that does not answer is a bad gateway, its URL kept out of the reply.
+    missing = _direct("testuser", "http://up/movie/u/p/404.mkv")
+    resp = home.get(missing)
+    assert resp.status_code == 502 and "up/" not in resp.text
 
 
 # =============================================================================
@@ -2281,8 +2524,8 @@ def _limited_source(tmp_path: Path) -> None:
 
 
 def _start(url: str, **params: str) -> dict[str, str]:
-    """Query for /transcode/start with the token a player page gives ``testuser``."""
-    return {"url": url, "url_token": auth.stream_url_token("testuser", url), **params}
+    """Query for /transcode/start with the ref a player page gives ``testuser``."""
+    return {"ref": auth.stream_ref("testuser", url), **params}
 
 
 def test_transcode_start_enforces_source_limit(
@@ -2351,6 +2594,46 @@ def test_transcode_seek_and_progress(
     assert progress.json() == {"segment_count": 2, "duration": 6.0}
 
 
+def test_a_stranger_cannot_seek_follow_or_stop_a_session(
+    api: TestClient,
+    tmp_path: Path,
+    sessions: dict[str, TranscodeSession],
+) -> None:
+    del api
+    process = testing.FakeProcess(exit_code=None)
+    sessions["abc"] = _session(tmp_path / "abc", is_vod=True, last_access=0.0)
+    sessions["abc"]["process"] = process
+    auth.create_user("eve", "password123")
+    eve = _client("eve")
+    refused = [
+        eve.get("/transcode/seek/abc?time=10"),
+        eve.get("/transcode/progress/abc"),
+        eve.delete("/transcode/abc"),
+        eve.post("/transcode/abc/stop"),
+    ]
+    assert [(r.status_code, r.json()) for r in refused] == [
+        (404, {"detail": "Session not found"}),
+    ] * 4
+    assert "seek_offset" not in sessions["abc"]
+    assert process.returncode is None
+
+
+def test_a_guest_of_a_shared_movie_follows_it_but_cannot_force_it_closed(
+    api: TestClient,
+    tmp_path: Path,
+    sessions: dict[str, TranscodeSession],
+) -> None:
+    del api
+    process = testing.FakeProcess(exit_code=None)
+    sessions["abc"] = _session(tmp_path / "abc", is_vod=True, last_access=0.0)
+    sessions["abc"].update(process=process, guests=frozenset({"eve"}))
+    auth.create_user("eve", "password123")
+    eve = _client("eve")
+    assert eve.get("/transcode/progress/abc").json() == {"segment_count": 0, "duration": 0.0}
+    assert eve.delete("/transcode/abc?force=true").status_code == 404
+    assert process.returncode is None
+
+
 def test_transcode_file_rejects_dotted_name(api: TestClient) -> None:
     assert api.get("/transcode/abc/x..m3u8").status_code == 400
 
@@ -2381,6 +2664,32 @@ def test_transcode_file_serves_segment_to_chromecast(
     assert sessions["abc"].get("last_access", 0.0) > 0.0
 
 
+def test_playback_files_follow_their_owner_s_lan_rule(
+    api: TestClient,
+    tmp_path: Path,
+    sessions: dict[str, TranscodeSession],
+) -> None:
+    del api
+    auth.create_user("kid", "password123")
+    auth.set_lan_only("kid", lan_only=True)
+    sessions["abc"] = _session(tmp_path / "abc", username="kid")
+    (tmp_path / "abc" / "seg1.ts").write_bytes(b"\x47")
+    (tmp_path / "abc" / "sub0.vtt").write_text("WEBVTT\n\n")
+    home = TestClient(main.app, client=("192.168.1.30", 5000))
+    away = TestClient(main.app, client=("8.8.8.8", 5000))
+    # Session files need no cookie (a TV fetches them), so the owner's rule holds here.
+    for path in ("/transcode/abc/seg1.ts", "/subs/abc/sub0.vtt"):
+        assert home.get(path).status_code == 200, path
+        assert away.get(path).status_code == 403, path
+        # Nor does polling from away keep the session alive.
+    last = sessions["abc"].get("last_access", 0.0)
+    away.get("/transcode/abc/seg1.ts")
+    assert sessions["abc"].get("last_access", 0.0) == last
+    # A deleted account's sessions play nowhere.
+    auth.delete_user("kid")
+    assert home.get("/transcode/abc/seg1.ts").status_code == 403
+
+
 def test_subtitle_file_rejects_dotted_name(api: TestClient) -> None:
     assert api.get("/subs/abc/x..vtt").status_code == 400
 
@@ -2391,10 +2700,12 @@ def _subtitle(
     directory: Path,
 ) -> tuple[bytes, list[float]]:
     """Serve ``sub0.vtt`` from a session in ``directory``; return it and the sleeps."""
+    auth.create_user("testuser", "testpass123")
     sessions["abc"] = _session(directory)
     clock = testing.FakeClock()
     testing.install_clock(monkeypatch, clock, main)
-    response = asyncio.run(main.subtitle_file("abc", "sub0.vtt"))
+    scope: Scope = {"type": "http", "method": "GET", "headers": [], "client": ("10.0.0.2", 1)}
+    response = asyncio.run(main.subtitle_file(Request(scope), "abc", "sub0.vtt"))
     assert response.headers["access-control-allow-origin"] == "*"
     return bytes(response.body), clock.sleeps
 
@@ -2440,8 +2751,14 @@ def test_transcode_clear_refuses_cast_url(
         name="TV",
     )
     monkeypatch.setattr(chromecast.manager, "_sessions", {"testuser": casting})
-    resp = api.delete("/transcode-clear", params={"url": "http://up/x"})
+    resp = api.delete(
+        "/transcode-clear",
+        params={"ref": auth.stream_ref("testuser", "http://up/x")},
+    )
     assert resp.status_code == 409
+    # Only the viewer a stream was issued to may clear it.
+    other = api.delete("/transcode-clear", params={"ref": auth.stream_ref("other", "http://up/x")})
+    assert other.status_code == 403
 
 
 def test_transcode_clear_stops_cached_session(
@@ -2453,7 +2770,10 @@ def test_transcode_clear_stops_cached_session(
     sessions["sid"] = _session(tmp_path / "sid", url="http://up/x", is_vod=True)
     urls = {"http://up/x": "sid"}
     monkeypatch.setattr(ffmpeg_session, "_url_to_session", urls)
-    resp = api.delete("/transcode-clear", params={"url": "http://up/x"})
+    resp = api.delete(
+        "/transcode-clear",
+        params={"ref": auth.stream_ref("testuser", "http://up/x")},
+    )
     assert resp.json() == {"status": "cleared", "session_id": "sid"}
     assert sessions == {}
     assert urls == {}

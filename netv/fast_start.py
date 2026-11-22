@@ -8,6 +8,7 @@ import pathlib
 import re
 import time
 
+from netv import proxy
 from netv.cache import HwAccel
 from netv.ffmpeg_command import (
     PASSTHROUGH_AUDIO_CODECS,
@@ -78,17 +79,25 @@ def is_hls_url(url: str) -> bool:
     return path.endswith((".m3u8", ".m3u"))
 
 
-def source_command(url: str, user_agent: str | None) -> list[str]:
+def source_command(url: str, user_agent: str | None, source_id: str) -> list[str]:
     """Remux an HLS source into the single MPEG-TS byte stream the relay reads.
 
     Args:
         url: HLS media playlist URL.
         user_agent: User-Agent for upstream requests, or None for ffmpeg's.
+        source_id: The configured source that listed it; "" for none.
 
     Returns:
         cmd: FFmpeg arguments writing MPEG-TS to stdout.
     """
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", *http_reconnect_args(url, max_delay=5)]
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *proxy.ffmpeg_input_args(url, source_id),
+        *http_reconnect_args(url, max_delay=5),
+    ]
     if user_agent is not None:
         cmd += ["-user_agent", user_agent]
     return [
@@ -144,6 +153,7 @@ def encoder_command(
         allow_upscale=allow_upscale,
         source=source,
         audio_passthrough=audio_passthrough,
+        input_args=(),
     )
     cmd[cmd.index("-i") : cmd.index("-i")] = ["-f", "mpegts"]
     cmd[cmd.index("-probesize") + 1] = "5000000"
@@ -211,6 +221,7 @@ def recorder_command(
         None,
         True,
         allow_upscale=False,
+        input_args=(),
     )
     # Stop reading when the program ends; ffmpeg then closes the playlist.
     cmd[cmd.index("-i") : cmd.index("-i")] = ["-f", "mpegts", "-t", str(int(seconds))]

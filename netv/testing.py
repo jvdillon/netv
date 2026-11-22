@@ -30,9 +30,11 @@ import asyncio
 import hashlib
 import importlib
 import inspect
+import ipaddress
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -40,6 +42,8 @@ import time
 from pychromecast.error import PyChromecastError
 
 import pytest
+
+from netv import auth
 
 
 _T = TypeVar("_T")
@@ -1163,6 +1167,67 @@ def install_launcher(
         module: neTV module whose ``asyncio`` global to replace.
     """
     _override(monkeypatch, module, "asyncio", asyncio, create_subprocess_exec=launcher)
+
+
+def address_vets(
+    fetch: Fetch,
+) -> list[Callable[[ipaddress.IPv4Address | ipaddress.IPv6Address], bool]]:
+    """The ``allow_address`` rules ``fetch``'s pinned HTTP and HTTPS handlers dial by.
+
+    Args:
+        fetch: A fetch ``FakeWeb`` recorded.
+
+    Returns:
+        vets: One per pinned handler; none for an unpinned fetch.
+    """
+    return [
+        keywords["allow_address"]
+        for handler in fetch.handlers
+        if isinstance(
+            keywords := getattr(getattr(handler, "_connection", None), "keywords", None),
+            dict,
+        )
+    ]
+
+
+def dials_only_the_internet(fetch: Fetch) -> bool:
+    """Whether ``fetch`` pinned its connections to internet addresses.
+
+    Args:
+        fetch: A fetch ``FakeWeb`` recorded.
+
+    Returns:
+        pinned: True when its handlers vet each dial, refusing loopback and the
+            home network and allowing a public address.
+    """
+    vets = address_vets(fetch)
+    return len(vets) == 2 and all(
+        vet(ipaddress.ip_address("8.8.8.8"))
+        and not vet(ipaddress.ip_address("127.0.0.1"))
+        and not vet(ipaddress.ip_address("192.168.1.1"))
+        for vet in vets
+    )
+
+
+def played_url(page: str) -> str:
+    """The upstream URL a player page plays, which the page itself never shows.
+
+    Args:
+        page: A player page's HTML.
+
+    Returns:
+        url: What its stream ref and relayed path both name.
+    """
+    ref = re.search(r'streamRef: "([^"]+)"', page)
+    direct = re.search(r'directUrl: "/direct/([^"/]+)/', page)
+    if ref is None or direct is None:
+        raise ValueError("Not a player page: no streamRef or directUrl")
+    target = auth.stream_ref_target(ref.group(1))
+    if target is None or target != auth.stream_ref_target(direct.group(1)):
+        raise ValueError("The page's streamRef and directUrl name different streams")
+    if target[1] in page:
+        raise ValueError("The page shows the upstream URL")
+    return target[1]
 
 
 def install_web(monkeypatch: pytest.MonkeyPatch, web: FakeWeb, *modules: ModuleType) -> None:

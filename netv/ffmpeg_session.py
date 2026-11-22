@@ -35,6 +35,7 @@ import uuid
 
 from treekle import json_loads
 
+from netv import proxy
 from netv.cache import (
     HwAccel,
     ServerSettings,
@@ -157,6 +158,7 @@ class TranscodeSession(TypedDict, total=False):
     is_archive: bool
     request_url: str
     username: str
+    guests: frozenset[str]  # Other users a shared VOD session was handed to.
     source_id: str
     # Recovered pre-dict sessions stored bare stream indices.
     subtitles: list[StoredSubtitle | int]
@@ -189,6 +191,8 @@ class _FastLivePlan:
     """What a fast-start session reads and how each of its workers publishes it."""
 
     source_url: str
+    # The configured source that listed it, whose network its relay may reach.
+    source_id: str
     user_agent: str | None
     hw: HwAccel
     resolution: str
@@ -203,7 +207,7 @@ class _FastLivePlan:
         """A relay opening the session's one upstream connection."""
         # Wall-clock stats date the source: the first byte's time is its origin.
         return Relay(
-            functools.partial(_open_source, self.source_url, self.user_agent),
+            functools.partial(_open_source, self.source_url, self.user_agent, self.source_id),
             clock=time.time,
         )
 
@@ -519,7 +523,7 @@ async def record_live(
     else:
         source_url = await asyncio.to_thread(_relay_url, url, source_id)
         stream = Relay(
-            functools.partial(_open_source, source_url, get_user_agent()),
+            functools.partial(_open_source, source_url, get_user_agent(), source_id),
             clock=time.time,
         )
         await stream.start()
@@ -891,6 +895,7 @@ class _SessionSnapshot:
     duration: float
     audio_passthrough: bool = False
     username: str = ""
+    source_id: str = ""
 
 
 # ===========================================================================
@@ -1036,6 +1041,14 @@ def get_session(session_id: str) -> TranscodeSession | None:
         return None if session is None else session.copy()
 
 
+def user_session(session_id: str, username: str) -> TranscodeSession | None:
+    """A copy of the session ``username`` started or was handed, else None."""
+    session = get_session(session_id)
+    if session is None or username not in {session.get("username"), *session.get("guests", ())}:
+        return None
+    return session
+
+
 def touch_session(session_id: str) -> bool:
     """Record a session heartbeat.
 
@@ -1115,20 +1128,20 @@ def note_viewer(session_id: str, viewer: str) -> None:
             session["viewers"][viewer] = time.time()
 
 
-def get_session_progress(session_id: str) -> SessionProgress | None:
+def get_session_progress(session_id: str, username: str) -> SessionProgress | None:
     """Get transcode progress for a session, recording a heartbeat.
 
     Args:
         session_id: Session to inspect.
+        username: Viewer asking; another user's session reads as absent.
 
     Returns:
         progress: Segment count and duration of the selected playlist, or None.
     """
-    touch_session(session_id)
-
-    session = get_session(session_id)
+    session = user_session(session_id, username)
     if session is None:
         return None
+    touch_session(session_id)
     playlist_path = pathlib.Path(session["dir"]) / playlist_file(session)
     if not playlist_path.exists():
         return {"segment_count": 0, "duration": 0.0}
@@ -1162,6 +1175,7 @@ class _SeekSessionInfo:
     episode_id: int | None
     audio_passthrough: bool = False
     username: str = ""
+    source_id: str = ""
 
 
 async def seek_transcode(
@@ -1234,7 +1248,7 @@ async def seek_transcode(
         subtitle_file.unlink(missing_ok=True)
 
     # Resolve HLS master playlist to highest bandwidth variant.
-    url = await asyncio.to_thread(resolve_hls_master_playlist, info.url)
+    url = await asyncio.to_thread(resolve_hls_master_playlist, info.url, info.source_id)
 
     # Use probe_series if series_id, else probe_movies.
     if info.series_id is not None and info.series_id != 0:
@@ -1243,7 +1257,17 @@ async def seek_transcode(
         do_probe = settings["probe_movies"]
     if do_probe:
         media_info = _user_audio(
-            (await asyncio.to_thread(probe_media, url, info.series_id, info.episode_id))[0],
+            (
+                await asyncio.to_thread(
+                    functools.partial(
+                        probe_media,
+                        url,
+                        info.series_id,
+                        info.episode_id,
+                        source_id=info.source_id,
+                    ),
+                )
+            )[0],
             info.username,
         )
     else:
@@ -1277,6 +1301,7 @@ async def seek_transcode(
         get_user_agent(),
         None,
         audio_passthrough=info.audio_passthrough,
+        input_args=proxy.ffmpeg_input_args(url, info.source_id),
     )
     i_idx = cmd.index("-i")
     cmd.insert(i_idx, str(seek_time))
@@ -1285,7 +1310,8 @@ async def seek_transcode(
     main_output_idx = cmd.index("-max_delay")
     cmd.insert(main_output_idx, str(-seek_time))
     cmd.insert(main_output_idx, "-output_ts_offset")
-    cmd.extend(["-start_number", str(segment_num)])
+    # Before the playlist path: ffmpeg ignores options after its last output.
+    cmd[-1:-1] = ["-start_number", str(segment_num)]
 
     log.info(
         "Seek transcode %s to %.1fs (seg %d): %s",
@@ -1394,18 +1420,30 @@ def report_playback_health(
 
 # The read timeout turns a silent upstream into a relay end the watchdog acts on;
 # panels relaying HLS deliver TS in segment-sized bursts up to ~10 s apart.
-def _open_source(url: str, user_agent: str | None, timeout_sec: int = 30) -> Readable:
+def _open_source(
+    url: str,
+    user_agent: str | None,
+    source_id: str,
+    timeout_sec: int = 30,
+) -> Readable:
     """Open a session's one upstream connection: MPEG-TS directly, HLS through a remuxer."""
     if is_hls_url(url):
         # Ffmpeg reads the first-listed variant of a master playlist; pick the best one.
         # Resolved per connection: redirect targets carry tokens that expire.
         process = subprocess.Popen(
-            source_command(resolve_hls_master_playlist(url), user_agent),
+            source_command(resolve_hls_master_playlist(url, source_id), user_agent, source_id),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
+            env=proxy.ffmpeg_env(),
         )
         return _ProcessOutput(process=process, stdout=cast(io.BufferedReader, process.stdout))
-    return safe_urlopen(url, timeout_sec, user_agent)
+    # The provider's redirects may not point the stream at this server or the LAN.
+    return safe_urlopen(
+        url,
+        timeout_sec,
+        user_agent,
+        allow_address=proxy.address_rule(url, source_id),
+    )
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -1530,6 +1568,7 @@ async def _launch_ffmpeg(
             stdin=stdin,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
+            env=proxy.ffmpeg_env(),
         ),
     )
     try:
@@ -1863,6 +1902,7 @@ def _get_session_snapshot(session_id: str) -> _SessionSnapshot | None:
             duration=session.get("duration", 0),
             audio_passthrough=session.get("audio_passthrough", False),
             username=session.get("username", ""),
+            source_id=session.get("source_id", ""),
         )
 
 
@@ -2043,10 +2083,17 @@ async def _handle_existing_vod_session(
     log.info("Resuming session %s from %.1fs", existing_id, hls_duration)
 
     # Resolve HLS master playlist to highest bandwidth variant.
-    url = await asyncio.to_thread(resolve_hls_master_playlist, url)
+    url = await asyncio.to_thread(resolve_hls_master_playlist, url, snap.source_id)
 
     media_info = (
-        _user_audio((await asyncio.to_thread(probe_media, url, None, None, ""))[0], snap.username)
+        _user_audio(
+            (
+                await asyncio.to_thread(
+                    functools.partial(probe_media, url, source_id=snap.source_id),
+                )
+            )[0],
+            snap.username,
+        )
         if do_probe
         else None
     )
@@ -2062,13 +2109,15 @@ async def _handle_existing_vod_session(
         get_user_agent(),
         None,
         audio_passthrough=snap.audio_passthrough,
+        input_args=proxy.ffmpeg_input_args(url, snap.source_id),
     )
 
     i_idx = cmd.index("-i")
     cmd.insert(i_idx, str(hls_duration))
     cmd.insert(i_idx, "-ss")
     cmd[cmd.index("-hls_flags") + 1] += "+append_list"
-    cmd.extend(["-start_number", str(len(segments))])
+    # Before the playlist path: ffmpeg ignores options after its last output.
+    cmd[-1:-1] = ["-start_number", str(len(segments))]
 
     process = await _launch_ffmpeg(cmd)
     if not _update_session_process(existing_id, process):
@@ -2140,7 +2189,7 @@ async def _do_start_transcode(
     is_archive = _is_archive_url(url)
     request_url = url
     # Resolve HLS master playlist to highest bandwidth variant.
-    url = await asyncio.to_thread(resolve_hls_master_playlist, url)
+    url = await asyncio.to_thread(resolve_hls_master_playlist, url, source_id)
 
     settings = get_settings()
     hw = settings["transcode_hw"]
@@ -2152,11 +2201,14 @@ async def _do_start_transcode(
     subtitles: list[SubtitleStream] = []
     if do_probe:
         media_info, subtitles = await asyncio.to_thread(
-            probe_media,
-            url,
-            series_id,
-            episode_id,
-            series_name,
+            functools.partial(
+                probe_media,
+                url,
+                series_id,
+                episode_id,
+                series_name,
+                source_id=source_id,
+            ),
         )
         media_info = _user_audio(media_info, username)
         if media_info is not None:
@@ -2206,6 +2258,7 @@ async def _do_start_transcode(
         deinterlace_fallback,
         allow_upscale=not is_archive,
         audio_passthrough=audio_passthrough,
+        input_args=proxy.ffmpeg_input_args(url, source_id),
     )
     passthrough_used = uses_audio_passthrough(media_info, audio_passthrough)
     if old_seek_offset > 0:
@@ -2348,6 +2401,7 @@ def _get_seek_session_info(session_id: str) -> _SeekSessionInfo | None:
             episode_id=session.get("episode_id"),
             audio_passthrough=session.get("audio_passthrough", False),
             username=session.get("username", ""),
+            source_id=session.get("source_id", ""),
         )
 
 
@@ -2711,6 +2765,7 @@ async def _start_or_reuse(
             log.info("Found valid existing VOD session %s", existing.session_id)
             result = await _try_reuse_session(existing.session_id, url, content_type)
             if result:
+                _admit(existing.session_id, username)
                 return result
 
     if existing is not None:
@@ -2858,6 +2913,7 @@ async def _start_fast_live(
     try:
         plan = _FastLivePlan(
             source_url=await asyncio.to_thread(_relay_url, url, source_id),
+            source_id=source_id,
             user_agent=get_user_agent(),
             hw=settings["transcode_hw"],
             resolution=_live_resolution(settings, bandwidth_saver=bandwidth_saver),
@@ -3193,3 +3249,10 @@ def _audio_lang(username: str) -> str:
 def _user_audio(media_info: MediaInfo | None, username: str) -> MediaInfo | None:
     """``media_info`` playing the audio track in the user's preferred language."""
     return with_audio_language(media_info, _audio_lang(username))
+
+
+def _admit(session_id: str, username: str) -> None:
+    with _transcode_lock:
+        session = _transcode_sessions.get(session_id)
+        if session is not None:
+            session["guests"] = session.get("guests", frozenset()) | {username}

@@ -1,18 +1,14 @@
-{# The provider's listings of one movie or series, the one on show marked. #}
-{% macro versions_list(versions) %}
+{# The credits table's Source row: the provider's listings of one movie or series,
+   one per line, the one on show marked. #}
+{% macro sources(versions) %}
 {% if versions %}
-<div>
-  <h3 class="text-sm text-gray-500 pb-2">Versions</h3>
-  <div class="flex flex-col gap-1">
-    {% for v in versions %}
-    <a href="{{ v.href }}"
-       class="px-3 py-2 rounded text-sm focusable focus:outline-none focus:ring-2 focus:ring-blue-500
-              {% if v.current %}bg-blue-900/60 text-white{% else %}bg-gray-800 text-gray-300 hover:bg-gray-700{% endif %}"
-       tabindex="0" data-version="{{ v.id }}"{% if v.current %} aria-current="true"{% endif %}>
-      {{ v.label }}
-    </a>
-    {% endfor %}
-  </div>
-</div>
+<dt class="text-gray-500 py-1">Source</dt>
+<dd class="text-gray-400" data-nav="list">
+  {%- for v in versions %}
+  <a href="{{ v.href }}"
+     class="block w-fit py-1 rounded hover:text-blue-400 focusable focus:outline-none focus:ring-2 focus:ring-blue-500{% if v.current %} text-white{% endif %}"
+     tabindex="0" data-version="{{ v.id }}"{% if v.current %} aria-current="true"{% endif %}>{{ v.label }}</a>
+  {%- endfor %}
+</dd>
 {% endif %}
 {% endmacro %}

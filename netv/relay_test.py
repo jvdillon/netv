@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 
 import asyncio
+import threading
 
 import pytest
 import pytest_asyncio
@@ -443,6 +445,37 @@ async def test_closing_under_a_pending_read_is_a_clean_stop(
     await stream.wait_finished()
     assert stream.error is None
     await stream.close()
+
+
+@pytest.mark.asyncio
+async def test_a_relay_reads_on_its_own_thread_not_the_shared_pool(
+    clock: FakeClock,
+    upstream: FakeUpstream,
+):
+    # A server with few cores has a small default pool; a relay held its worker for
+    # the stream's life, so a few streams stalled every other to_thread call.
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
+    stream = _relay(upstream, clock)
+    await stream.start()
+    assert await asyncio.wait_for(asyncio.to_thread(upstream.reading.wait, 5), 5)
+    await stream.close()
+
+
+def test_a_relay_whose_loop_closes_stops_reading_and_closes_upstream(
+    clock: FakeClock,
+    upstream: FakeUpstream,
+):
+    loop = asyncio.new_event_loop()
+    stream = _relay(upstream, clock)
+    loop.run_until_complete(stream.start())
+    loop.run_until_complete(asyncio.to_thread(upstream.reading.wait, 5))
+    loop.close()
+    # Its thread finds no loop to deliver to: it stops, quietly, closing upstream.
+    upstream.feed(b"late")
+    for thread in threading.enumerate():
+        if thread.name == "relay":
+            thread.join(5)
+    assert upstream.closed
 
 
 @pytest.mark.asyncio

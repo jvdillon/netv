@@ -37,6 +37,7 @@ from netv import (
     main,
     main_test,
     playlists,
+    testing,
     util,
 )
 from netv.cache import SourceConfig
@@ -586,6 +587,8 @@ def test_fetch_logo_returns_image(web: FakeWeb):
     web.routes["http://x"] = FakeResponse(b"ok", headers={"Content-Type": "image/png"})
     assert main._fetch_logo("http://x") == (b"ok", "image/png")
     assert [(f.url, f.timeout) for f in web.fetches] == [("http://x", 3)]
+    # A provider names logos, so one may not point the server inward.
+    assert testing.dials_only_the_internet(web.fetches[0])
 
 
 @pytest.mark.parametrize(
@@ -1003,11 +1006,113 @@ def test_lan_only_users_sign_in_and_stay_signed_in_only_from_home(auth_client: T
         data={"username": "kid", "password": "password123"},
         follow_redirects=False,
     )
-    assert refused.headers["location"] == "/login?error=lan"
-    assert "Only from home" in away.get("/login?error=lan").text
+    wrong = away.post(
+        "/login",
+        data={"username": "kid", "password": "not-it-at-all"},
+        follow_redirects=False,
+    )
+    # From away, the right password gets the wrong one's answer: no confirmation.
+    assert refused.headers["location"] == wrong.headers["location"] == "/login?error=invalid"
+    assert refused.headers.get("set-cookie") is None
+    assert "works only at home" in away.get("/login?error=invalid").text
+    # And each counts toward the address's limit.
+    assert len(main._login_attempts["8.8.8.8"]) == 2
 
     assert auth_client.post("/settings/users/lan/kid").status_code == 200
     assert away.get("/settings", follow_redirects=False).status_code == 200
+
+
+def test_an_account_guessed_from_many_addresses_is_locked_only_from_away(
+    auth_client: TestClient,
+):
+    del auth_client
+    wrong = {"username": "testuser", "password": "wrong"}
+    for i in range(20):
+        TestClient(main.app, client=(f"8.8.{i}.1", 5000)).post("/login", data=wrong)
+    right = {"username": "testuser", "password": "testpass123"}
+    away = TestClient(main.app, client=("9.9.9.9", 5000))
+    # Twenty guesses at one account from away lock it from away, even with the password.
+    assert away.post("/login", data=right, follow_redirects=False).status_code == 429
+    # Its owner still signs in at home, so strangers cannot lock the owner out.
+    home = TestClient(main.app, client=("192.168.1.2", 5000))
+    assert home.post("/login", data=right, follow_redirects=False).headers["location"] == "/"
+    # And failures at home never count against it.
+    assert "account:testuser" in main._login_attempts
+    for _ in range(3):
+        home.post("/login", data=wrong)
+    assert len(main._login_attempts["account:testuser"]) == 20
+
+
+def test_admins_name_the_home_network(auth_client: TestClient):
+    saved = auth_client.post(
+        "/settings/home-networks",
+        data={"networks": "192.168.1.0/24, fd00::/8"},
+    )
+    assert saved.json() == {"status": "ok"}
+    assert auth.home_networks() == ["192.168.1.0/24", "fd00::/8"]
+    page = auth_client.get("/settings").text
+    assert re.search(r'<input[^>]*name="networks"[^>]*value="192\.168\.1\.0/24, fd00::/8"', page)
+    bad = auth_client.post("/settings/home-networks", data={"networks": "192.168.1.0/24 nope"})
+    assert bad.status_code == 400 and "nope" in bad.text
+    assert auth_client.post("/settings/home-networks", data={"networks": ""}).status_code == 200
+    assert auth.home_networks() == []
+    _login_as(viewer := TestClient(main.app), "viewer")
+    assert viewer.post("/settings/home-networks", data={"networks": "0.0.0.0/0"}).status_code == 403
+
+
+def test_a_fresh_install_is_set_up_only_from_home():
+    assert auth.is_setup_required()
+    away = TestClient(main.app, client=("8.8.8.8", 5000))
+    form = {"username": "admin", "password": "password123", "confirm": "password123"}
+    # The first account is the administrator, so a stranger must not make it.
+    refused = away.get("/setup")
+    assert refused.status_code == 403
+    assert refused.json() == {"detail": "Finish setting up neTV from your home network"}
+    assert away.post("/setup", data=form).status_code == 403
+    assert auth.is_setup_required()
+    home = TestClient(main.app, client=("192.168.1.20", 5000))
+    assert home.get("/setup").status_code == 200
+    assert home.post("/setup", data=form, follow_redirects=False).status_code == 303
+    assert auth.get_all_usernames() == ["admin"]
+
+
+def test_a_new_password_ends_every_other_session(auth_client: TestClient):
+    elsewhere = TestClient(main.app)
+    elsewhere.cookies.set("token", auth.create_token({"sub": "testuser"}))
+    assert elsewhere.get("/settings", follow_redirects=False).status_code == 200
+    changed = auth_client.post(
+        "/settings/users/password",
+        data={"current_password": "testpass123", "new_password": "newpass456"},
+    )
+    assert changed.json() == {"status": "ok"}
+    # A stolen cookie dies with the old password; the changer stays signed in.
+    assert elsewhere.get("/settings", follow_redirects=False).status_code == 303
+    assert auth_client.get("/settings", follow_redirects=False).status_code == 200
+    # Likewise through the per-user route, which also renews only its caller.
+    again = auth_client.post("/settings/users/password/testuser", data={"new_password": "third789"})
+    assert again.status_code == 200
+    assert auth_client.get("/settings", follow_redirects=False).status_code == 200
+    auth.create_user("bob", "password123")
+    bob = TestClient(main.app)
+    bob.cookies.set("token", auth.create_token({"sub": "bob"}))
+    reset = auth_client.post("/settings/users/password/bob", data={"new_password": "reset1234"})
+    assert reset.headers.get("set-cookie") is None
+    assert bob.get("/settings", follow_redirects=False).status_code == 303
+
+
+def test_the_last_admin_stays(auth_client: TestClient):
+    auth.create_user("kid", "password123")
+    auth.set_lan_only("kid", lan_only=True)
+    refused = auth_client.post("/settings/users/admin/testuser", data={})
+    assert refused.status_code == 400
+    assert "another user an admin" in refused.text
+    deleted = auth_client.post(
+        "/settings/users/delete/testuser",
+        data={"password": "testpass123"},
+        follow_redirects=False,
+    )
+    assert deleted.status_code == 400
+    assert auth.is_admin("testuser") and not auth.is_admin("kid")
 
 
 def test_set_user_limits(auth_client: TestClient):
@@ -1042,7 +1147,79 @@ def test_set_user_limits_validation(auth_client: TestClient, data: dict[str, str
 
 
 def test_name_matcher_invalid_regex_matches_nothing():
-    assert main._name_matcher("[", regex=True)("[") is False
+    assert main._name_matcher("[", regex=True, whole=False)("[") is False
+
+
+def test_name_matcher_ignores_case_and_a_whole_name_is_one_of_a_list():
+    assert main._name_matcher("PAC", regex=True, whole=False)("Al Pacino")
+    assert main._name_matcher("pac", regex=False, whole=False)("Al PACINO")
+    whole = main._name_matcher("Al Pacino", regex=False, whole=True)
+    assert whole("Robert De Niro, al pacino") and not whole("Al Pacinos")
+
+
+def test_search_terms_split_fields_from_plain_text():
+    assert main._search_terms('cast:pacino writer:"Ann W"') == [
+        ("cast", "pacino", False),
+        ("writer", "Ann W", True),
+    ]
+    # Plain text, quotes trimmed, joins the fields; with no field it is the term.
+    assert main._search_terms('cast:x "Xmen"') == [("cast", "x", False), ("any", "Xmen", False)]
+    assert main._search_terms("") == [("any", "", False)]
+
+
+def _search_record(name: str, **fields: str) -> ProviderRecord:
+    return {"name": name, **fields}
+
+
+def test_matching_names_sorts_by_name_and_keeps_at_most_the_limit(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    looked_up: list[str] = []
+
+    def resolved_keys(records: list[ProviderRecord]) -> list[str | None]:
+        looked_up.append("keys")
+        return [None] * len(records)
+
+    def rankings(records: list[ProviderRecord]) -> list[main.imdb.Ranking]:
+        looked_up.append("ranks")
+        return []
+
+    monkeypatch.setattr(main.imdb, "resolved_keys", resolved_keys)
+    monkeypatch.setattr(main.imdb, "rankings", rankings)
+    records = [
+        _search_record("b", director="Mann"),
+        _search_record("_c", director="Mann"),
+        _search_record("A", director="Mann"),
+        _search_record("d", director="Lean"),
+    ]
+    terms = [("director", "mann", False)]
+    found = main._matching_names(records, terms, 0, regex=False, imdb_credits=False)
+    # The provider's own director field counts; names sort without regard to case.
+    assert [r["name"] for r in found] == ["_c", "A", "b"]
+    assert len(main._matching_names(records, terms, 2, regex=False, imdb_credits=False)) == 2
+    # Nothing here needs IMDb: no title is resolved or ranked.
+    assert looked_up == []
+
+
+def test_fact_terms_read_ranges_and_regex_genres(monkeypatch: pytest.MonkeyPatch):
+    rank = main.imdb.Ranking(6.0, 1, 1999)
+
+    def rankings(records: list[ProviderRecord]) -> list[main.imdb.Ranking]:
+        return [rank] * len(records)
+
+    monkeypatch.setattr(main.imdb, "rankings", rankings)
+    record = _search_record("x", genre="Thriller")
+    assert main._fact_matches("imdb", "5-6", rank, record, regex=False, whole=False)
+    assert main._fact_matches("genre", "thr.ller", rank, record, regex=True, whole=False)
+    assert not main._fact_matches("genre", "thr.ller", rank, record, regex=False, whole=False)
+    found = main._matching_names(
+        [record],
+        [("genre", "^thr", False)],
+        0,
+        regex=True,
+        imdb_credits=True,
+    )
+    assert found == [record]
 
 
 class _FailingName(str):

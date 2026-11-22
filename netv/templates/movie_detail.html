@@ -29,9 +29,10 @@
     <p id="plot" class="col-span-2 sm:col-span-1 sm:col-start-2 text-gray-300">{{ movie.plot }}</p>
     {% endif %}
   </div><!-- end header -->
-  {# Credits, versions, trailer: the header's width, so all share one right edge. #}
+  {# Credits and trailer: the header's width, so all share one right edge. #}
   <div id="details" class="max-w-3xl flex flex-col gap-6 mb-6">
     {% from "_people.html" import people %}
+    {% from "_versions.html" import sources %}
     <dl id="credits" class="grid grid-cols-[auto_1fr] gap-x-3 text-sm">
       {{ people('Genre', 'genre', shown.genres if shown else []) }}
       {{ people('Director', 'director', directors) }}
@@ -40,9 +41,8 @@
       {{ people('Cast', 'cast', cast) }}
       {{ people('Country', 'country', countries) }}
       {{ people('Language', 'language', languages) }}
+      {{ sources(versions) }}
     </dl>
-    {% from "_versions.html" import versions_list %}
-    {{ versions_list(versions) }}
     {% from "_trailer.html" import trailer %}
     {{ trailer(movie.youtube_trailer) }}
   </div><!-- end details -->

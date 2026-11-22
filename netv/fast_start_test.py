@@ -15,7 +15,7 @@ from fastapi import HTTPException
 import pytest
 import pytest_asyncio
 
-from netv import cache, fast_start, ffmpeg_command, ffmpeg_session, util
+from netv import cache, fast_start, ffmpeg_command, ffmpeg_session, proxy, util
 from netv.cache import HwAccel
 from netv.ffmpeg_command import MediaInfo
 from netv.playback_policy import LiveRecoveryPolicy, PlaybackHealth, PlaybackPolicy
@@ -824,6 +824,7 @@ def fast_session(
     """A running fast-live session with a live worker; its relay never starts."""
     plan = ffmpeg_session._FastLivePlan(
         source_url="http://stream.test/live",
+        source_id="",
         user_agent=None,
         hw="software",
         resolution="720p" if bandwidth_saver else "1080p",
@@ -1081,15 +1082,19 @@ async def test_hls_sources_are_read_once_through_a_remuxer(
     configure(tmp_path)
     url = "https://provider/live.m3u8"
     web = FakeWeb({url: lambda: FakeResponse(b"#EXTM3U\n#EXTINF:6,\nsegment.ts\n")})
-    install_web(monkeypatch, web, ffmpeg_command)
+    install_web(monkeypatch, web, util)
     remuxers = PopenRecorder()
     install_subprocess(monkeypatch, ffmpeg_session, popen=remuxers)
     task = asyncio.create_task(ffmpeg_session.start_transcode(url))
     await until(lambda: bool(remuxers.started), task)
     [remuxer] = remuxers.started
     try:
-        assert remuxer.args == fast_start.source_command(url, cache.get_user_agent())
-        assert remuxer.options == {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE}
+        assert remuxer.args == fast_start.source_command(url, cache.get_user_agent(), "")
+        assert remuxer.options == {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "env": proxy.ffmpeg_env(),
+        }
         remuxer.stdout.feed(ts_source())
         await until(lambda: len(launcher.launches) == 1, task)
         media_playlist(output_dir(launcher, 0), "low", [1, 1])
@@ -1150,9 +1155,31 @@ async def test_xtream_live_is_read_as_one_mpegts_stream(
 
 
 def test_hls_source_command_remuxes_to_stdout():
-    url = "https://provider/live.m3u8"
-    cmd = fast_start.source_command(url, "agent/1")
-    assert cmd[cmd.index("-user_agent") + 1] == "agent/1"
+    cache.save_server_settings(
+        {
+            **cache.load_server_settings(),
+            "sources": [
+                {"id": "h", "name": "Home", "type": "m3u", "url": "http://192.168.1.50/l.m3u"},
+            ],
+        },
+    )
+    url = "http://192.168.1.50/live.m3u8"
+    cmd = fast_start.source_command(url, "agent/1", "h")
+    # Every playlist, segment and redirect it fetches goes through the egress proxy for
+    # its source; a dropped connection retries within 5 s.
+    egress = proxy.ffmpeg_input_args(url, "h")
+    reconnect = ffmpeg_command.http_reconnect_args(url, max_delay=5)
+    assert cmd[: 4 + len(egress) + len(reconnect) + 2] == [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *egress,
+        *reconnect,
+        "-user_agent",
+        "agent/1",
+    ]
+    assert egress[-1] == proxy.egress().url(lan=True) and reconnect[-1] == "5"
     assert cmd[cmd.index("-i") - 8 : cmd.index("-i") + 2] == [
         "-f",
         "hls",
@@ -1167,7 +1194,7 @@ def test_hls_source_command_remuxes_to_stdout():
     ]
     assert cmd[-9:] == ["-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-f", "mpegts", "pipe:1"]
     assert "-reconnect" in cmd
-    assert "-user_agent" not in fast_start.source_command(url, None)
+    assert "-user_agent" not in fast_start.source_command(url, None, "")
 
 
 @pytest.mark.asyncio

@@ -1,8 +1,22 @@
-// Keyboard navigation for 10-foot UI
+// Keyboard navigation for 10-foot UI: the one definition of what arrows do.
 (() => {
-  // Pages with custom arrow key handling
-  const customNavPages = ["/play/", "/guide"];
-  const hasCustomNav = customNavPages.some((p) => location.pathname.startsWith(p));
+  // A region whose items are not all in the page (the guide's virtual rows) or whose
+  // arrows mean something else (the player's seek and volume) moves focus itself:
+  // its move(current, event) returns true when it took the key, calling
+  // preventDefault itself if the browser's default should not run.
+  const regions = [];
+  window.netvNav = {
+    region(element, move) {
+      if (element) regions.push({ element, move });
+    },
+  };
+
+  function regionTook(current, e) {
+    return regions.some(
+      ({ element, move }) =>
+        (current === document.body || element.contains(current)) && move(current, e),
+    );
+  }
 
   // ============================================================
   // Focus Management
@@ -43,13 +57,14 @@
     return { items, index, cols };
   }
 
-  function focusAdjacentGrid(current, direction) {
+  // The item of the grid above or below (browse rows) nearest `current`'s column.
+  function adjacentGridItem(current, direction) {
     const grids = Array.from(document.querySelectorAll("main .grid")).filter((g) =>
       g.querySelector('[data-nav="grid"]'),
     );
     const index = grids.indexOf(current.closest(".grid"));
     const target = grids[direction === "down" ? index + 1 : index - 1];
-    if (index === -1 || !target) return false;
+    if (index === -1 || !target) return null;
     const x = current.getBoundingClientRect().left;
     let best = null;
     let bestDist = Infinity;
@@ -60,13 +75,7 @@
         bestDist = dist;
       }
     }
-    best.focus();
-    best.scrollIntoView({
-      block: "nearest",
-      inline: "nearest",
-      behavior: "smooth",
-    });
-    return true;
+    return best;
   }
 
   // The focusable whose center lies most nearly straight ahead in `direction`:
@@ -101,118 +110,146 @@
     return best;
   }
 
-  function moveFocus(direction) {
-    const current = document.activeElement;
-    const focusables = getFocusables();
-    const currentIndex = focusables.indexOf(current);
+  const OPPOSITE = { up: "down", down: "up", left: "right", right: "left" };
 
-    // In a list (data-nav="list"), Up/Down step through its items in order; its ends,
-    // and Left/Right, move on by position. Lists scroll in their own boxes, where
-    // position alone can land in a neighboring list.
+  // Where an arrow goes from `current`, or null to stay. One definition for every page:
+  // - a list (data-nav="list"): Up/Down step through its items in order;
+  // - a row (data-nav="row"): Left/Right step through its items in reading order,
+  //   across the lines it wraps onto; Up/Down leave it;
+  // - a grid of tiles: by row and column, then into the neighboring grid;
+  // - anything else: the nearest focusable that way.
+  // Only Left enters the sidebar, at the page's own link; nothing wraps.
+  function moveTarget(current, direction) {
+    const vertical = direction === "up" || direction === "down";
+    const forward = direction === "down" || direction === "right";
+    const focusables = getFocusables().filter(
+      (el) => direction === "left" || !el.closest("nav") || current?.closest("nav"),
+    );
+
     const list = current?.parentElement?.closest('[data-nav="list"]');
-    if (list && (direction === "up" || direction === "down")) {
+    if (list && vertical) {
       const items = getFocusables(list);
-      const next = items[items.indexOf(current) + (direction === "down" ? 1 : -1)];
-      if (next) {
-        next.focus();
-        next.scrollIntoView({ block: "nearest", behavior: "smooth" });
-        return true;
-      }
+      const next = items[items.indexOf(current) + (forward ? 1 : -1)];
+      if (next) return next;
     }
 
-    // Try grid navigation first
+    const row = current?.closest('[data-nav="row"]');
+    if (row && !vertical) {
+      const items = getFocusables(row);
+      const next = items[items.indexOf(current) + (forward ? 1 : -1)];
+      if (next) return next;
+    }
+
     const gridInfo = getGridInfo(current);
     if (gridInfo && gridInfo.cols > 1) {
       const { items, index, cols } = gridInfo;
-      let nextIndex = -1;
-
-      switch (direction) {
-        case "up":
-          nextIndex = index - cols;
-          break;
-        case "down":
-          nextIndex = index + cols;
-          break;
-        case "left":
-          nextIndex = index - 1;
-          break;
-        case "right":
-          nextIndex = index + 1;
-          break;
-      }
-
-      if (nextIndex >= 0 && nextIndex < items.length) {
-        items[nextIndex].focus();
-        items[nextIndex].scrollIntoView({
-          block: "nearest",
-          behavior: "smooth",
-        });
-        return true;
-      }
-      // At grid edge: step into the neighboring grid (browse rows), never wrap; with
-      // none there, move to whatever lies that way (the search form, the sidebar).
-      if (
-        (direction === "up" || direction === "down") &&
-        focusAdjacentGrid(current, direction)
-      ) {
-        return true;
+      const step = vertical ? cols : 1;
+      const next = items[index + (forward ? step : -step)];
+      if (next) return next;
+      if (vertical) {
+        const adjacent = adjacentGridItem(current, direction);
+        if (adjacent) return adjacent;
       }
     }
 
-    const nearest = nearestInDirection(current, focusables, direction);
-    if (nearest) {
-      nearest.focus();
-      nearest.scrollIntoView({
-        block: "nearest",
-        inline: "nearest",
-        behavior: "smooth",
-      });
-      return true;
-    }
+    const candidates =
+      row && vertical ? focusables.filter((el) => !row.contains(el)) : focusables;
+    const next = nearestInDirection(current, candidates, direction);
+    if (next?.closest("nav") && !current?.closest("nav"))
+      return sidebarLinks()[sidebarHome()];
+    return next;
+  }
 
-    // Linear navigation fallback
-    let nextElement = null;
-    if (direction === "up" || direction === "left") {
-      nextElement = focusables[currentIndex - 1];
-    } else {
-      nextElement = focusables[currentIndex + 1];
-    }
+  // The last move, so its opposite returns where it came from even when position
+  // alone would land elsewhere (leaving a long row, a grid's ragged edge).
+  let lastMove = null;
+  document.addEventListener("focusin", (e) => {
+    // Focus moved some other way (a click, the guide, the sidebar): forget it.
+    if (e.target !== lastMove?.to) lastMove = null;
+  });
 
-    if (nextElement) {
-      nextElement.focus();
-      nextElement.scrollIntoView({ block: "nearest", behavior: "smooth" });
-      return true;
+  function moveFocus(direction) {
+    const current = document.activeElement;
+    const back =
+      lastMove?.to === current &&
+      lastMove.direction === OPPOSITE[direction] &&
+      lastMove.from;
+    const next =
+      back?.isConnected && back.checkVisibility()
+        ? back
+        : moveTarget(current, direction);
+    if (!next) return false;
+    lastMove = { from: current, to: next, direction };
+    next.focus();
+    next.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" });
+    return true;
+  }
+
+  // ============================================================
+  // Sidebar
+  // ============================================================
+
+  // A page marks its content (guide rows, tiles, results, episodes) data-nav-main;
+  // its headers (categories, Now, Search, sorting) are a move Up from there.
+
+  // The content's first item, or where focus last was in it.
+  let lastMainFocus = null;
+  document.addEventListener("focusin", (e) => {
+    if (e.target.closest?.("[data-nav-main]")) lastMainFocus = e.target;
+  });
+
+  function mainContentItem() {
+    // Rows a page re-renders replace the element focus left.
+    if (lastMainFocus?.isConnected && lastMainFocus.checkVisibility())
+      return lastMainFocus;
+    for (const region of document.querySelectorAll("[data-nav-main]")) {
+      const first = getFocusables(region)[0];
+      if (first) return first;
     }
-    return false;
+    return null;
+  }
+
+  // The sidebar is a column of its own: Up/Down step through it and stop at its
+  // ends, Left stays, Right goes into the page's content.
+  const sidebarLinks = () => getFocusables(document.querySelector("nav") || undefined);
+  const sidebarHome = () =>
+    Math.max(
+      0,
+      sidebarLinks().findIndex((el) => el.classList.contains("active")),
+    );
+
+  function moveInSidebar(key) {
+    const links = sidebarLinks();
+    const i = links.indexOf(document.activeElement);
+    if (key === "ArrowUp" || key === "ArrowDown") {
+      links[i + (key === "ArrowDown" ? 1 : -1)]?.focus();
+    } else if (key === "ArrowRight") {
+      const item = mainContentItem();
+      if (item) item.focus({ preventScroll: true });
+      else focusPageStart();
+    }
   }
 
   // ============================================================
   // Initial Focus
   // ============================================================
 
+  // Priority: [autofocus] or [data-initial-focus] (a search field, Play, the selected
+  // guide category), the page's content, its first focusable. The page stays at its
+  // top: focus far down would scroll the title away.
+  function focusPageStart() {
+    const main = document.querySelector("main");
+    const start =
+      document.querySelector("[autofocus], [data-initial-focus]") ||
+      mainContentItem() ||
+      (main && getFocusables(main)[0]);
+    start?.focus({ preventScroll: true });
+  }
+
   function setInitialFocus() {
     // Skip if something is already focused (other than body)
     if (document.activeElement && document.activeElement !== document.body) return;
-
-    // Priority: [autofocus], [data-initial-focus], first grid item, first focusable in
-    // main. The page stays at its top: focus far down would scroll the title away.
-    const autofocus = document.querySelector("[autofocus], [data-initial-focus]");
-    if (autofocus) {
-      autofocus.focus({ preventScroll: true });
-      return;
-    }
-
-    const mainContent = document.querySelector("main");
-    if (!mainContent) return;
-
-    const gridItem = mainContent.querySelector('[data-nav="grid"]');
-    if (gridItem) {
-      gridItem.focus({ preventScroll: true });
-      return;
-    }
-
-    const firstFocusable = getFocusables(mainContent)[0];
-    if (firstFocusable) firstFocusable.focus({ preventScroll: true });
+    focusPageStart();
   }
 
   // ============================================================
@@ -245,6 +282,31 @@
   // ============================================================
 
   document.addEventListener("keydown", (e) => {
+    if (
+      e.target.closest?.("nav") &&
+      !e.altKey &&
+      ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)
+    ) {
+      e.preventDefault();
+      moveInSidebar(e.key);
+      return;
+    }
+    if (
+      !e.altKey &&
+      [
+        "ArrowUp",
+        "ArrowDown",
+        "ArrowLeft",
+        "ArrowRight",
+        "PageUp",
+        "PageDown",
+        "Home",
+        "End",
+      ].includes(e.key) &&
+      regionTook(document.activeElement, e)
+    ) {
+      return;
+    }
     const isInput = e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA";
     const isSelect = e.target.tagName === "SELECT";
 
@@ -274,8 +336,7 @@
         e.key === "ArrowDown" ||
         (e.key === "ArrowLeft" && (toggles || isSelect || atStart)) ||
         (e.key === "ArrowRight" && (toggles || isSelect || atEnd));
-      if (!leaves || e.target.tagName === "TEXTAREA" || hasCustomNav || e.altKey)
-        return;
+      if (!leaves || e.target.tagName === "TEXTAREA" || e.altKey) return;
       e.preventDefault();
       moveFocus(e.key.replace("Arrow", "").toLowerCase());
       return;
@@ -286,8 +347,8 @@
       case "ArrowDown":
       case "ArrowLeft":
       case "ArrowRight": {
-        // Skip if page has custom navigation or Alt pressed (browser nav)
-        if (hasCustomNav || e.altKey) return;
+        // Alt+arrow is the browser's back and forward.
+        if (e.altKey) return;
         e.preventDefault();
         const dir = e.key.replace("Arrow", "").toLowerCase();
         moveFocus(dir);

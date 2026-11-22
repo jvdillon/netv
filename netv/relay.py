@@ -321,7 +321,21 @@ class Relay:
             await self._finished.wait()
 
     async def _run(self, loop: asyncio.AbstractEventLoop) -> None:
-        await asyncio.to_thread(self._read_upstream, loop)
+        # Its own thread, held for the stream's life: on the shared pool, a few
+        # streams on a small server would stall every other to_thread call.
+        done = asyncio.Event()
+
+        def read() -> None:
+            try:
+                self._read_upstream(loop)
+                loop.call_soon_threadsafe(done.set)
+            except RuntimeError:
+                # The event loop closed under the stream (shutdown): the read stopped
+                # and closed upstream, and no one is left to tell.
+                return
+
+        threading.Thread(target=read, name="relay", daemon=True).start()
+        await done.wait()
 
     # The end goes through the same callback queue as the chunks: completion of
     # ``to_thread`` can overtake ``call_soon_threadsafe`` callbacks.

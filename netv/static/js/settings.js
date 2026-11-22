@@ -1149,6 +1149,23 @@
       form.querySelector(".api-key-remove")?.addEventListener("click", () => send(""));
     });
 
+    // The home network LAN-only users must be on.
+    const homeForm = document.getElementById("home-networks-form");
+    homeForm?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const resp = await fetch("/settings/home-networks", {
+        method: "POST",
+        body: new FormData(homeForm),
+      });
+      const msg = document.getElementById("home-networks-msg");
+      if (resp.ok) {
+        location.reload();
+      } else if (msg) {
+        msg.textContent = (await resp.json()).detail;
+        msg.classList.remove("hidden");
+      }
+    });
+
     // LAN-only toggles
     document.querySelectorAll(".lan-only-toggle").forEach((checkbox) => {
       checkbox.addEventListener("change", async function () {

@@ -74,6 +74,24 @@
 #cast-btn.active, #airplay-btn.active { background: #2563eb; }
 #cast-dialog::backdrop { background: rgba(0,0,0,0.7); }
 #cast-dialog { max-height: 90vh; overflow-y: auto; }
+/* Captions, drawn by player.js; each line is one row of the window. */
+#caption-overlay {
+  position: absolute;
+  left: 50%;
+  bottom: 12%;
+  transform: translateX(-50%);
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 25;
+}
+#caption-box .caption-line {
+  width: fit-content;
+  margin: 0 auto;
+  padding: 0 0.3em;
+  height: 1.35em;
+  line-height: 1.35em;
+  white-space: pre;
+}
 /* Seek input */
 #seek-container input {
   background: rgba(0,0,0,0.7);
@@ -85,7 +103,10 @@
 {% block content %}
   <!-- Video container with overlay controls - full frame -->
   <div class="h-full bg-black overflow-hidden relative" id="player-container">
-    <video id="video" class="w-full h-full bg-black" crossorigin="anonymous" x-webkit-airplay="allow"></video>
+    {# Focus starts on the video, so the player's keys work at once (not on its seek bar). #}
+    <video id="video" class="w-full h-full bg-black focus:outline-none" crossorigin="anonymous" x-webkit-airplay="allow"
+           tabindex="-1" data-initial-focus></video>
+    <div id="caption-overlay" class="hidden" aria-hidden="true"><div id="caption-box"></div></div>
 
     <!-- Title overlay -->
     <div id="info-overlay" class="player-controls absolute top-0 left-0 z-30 bg-black/50 rounded-br-lg pb-2 pt-2 px-3">
@@ -251,8 +272,9 @@
 {% block scripts %}
 <script>
 window.PLAYER_CONFIG = {
-  rawUrl: {{ raw_url | tojson }},
-  rawUrlToken: {{ raw_url_token | default('') | tojson }},
+  // The provider's URL stays on the server: this names it, and this plays it.
+  streamRef: {{ stream_ref | tojson }},
+  directUrl: {{ direct_url | tojson }},
   transcodeMode: {{ transcode_mode | tojson }},
   liveDvrMins: {{ live_dvr_mins | tojson }},
   captionsEnabled: {{ captions_enabled | tojson }},

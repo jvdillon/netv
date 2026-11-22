@@ -66,6 +66,7 @@ from netv.xtream import XtreamClient
         (
             _FastLivePlan(
                 source_url="url",
+                source_id="",
                 user_agent=None,
                 hw="software",
                 resolution="1080p",

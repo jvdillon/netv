@@ -22,7 +22,7 @@
   <section class="browse-row mb-6"
            {% if row.records is none %}data-src="{{ cards_url }}?category={{ row.category_id | urlencode }}&sort={{ current_sort | urlencode }}&limit={{ row_size }}"{% endif %}>
     <h3 class="text-lg font-semibold mb-2">{{ row.name }}</h3>
-    <div class="grid grid-flow-col auto-cols-[8rem] sm:auto-cols-[10rem] gap-2 sm:gap-3 overflow-x-auto pb-2 min-h-[14rem]">
+    <div class="grid grid-flow-col auto-cols-[8rem] sm:auto-cols-[10rem] gap-2 sm:gap-3 overflow-x-auto pb-2 min-h-[14rem]" data-nav-main>
       {% if row.records is not none %}{% with items = row.records %}{% include "_cards.html" %}{% endwith %}{% endif %}
       {% if row.category_id and row.total > row_size %}
       <a href="{{ base_url }}?category={{ row.category_id | urlencode }}&sort={{ current_sort | urlencode }}"
@@ -39,7 +39,7 @@
   {% endfor %}
   {% else %}
   <p class="text-sm text-gray-400 mb-2">{{ total }} titles</p>
-  <div id="browse-grid" class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-7 gap-2 sm:gap-3 pb-4"
+  <div id="browse-grid" class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-7 gap-2 sm:gap-3 pb-4" data-nav-main
        data-src="{{ cards_url }}?category={{ current_category | urlencode }}&sort={{ current_sort | urlencode }}&limit={{ page_size }}"
        data-offset="{{ items | length }}" data-total="{{ total }}">
     {% include "_cards.html" %}

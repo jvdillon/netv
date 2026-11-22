@@ -6,6 +6,7 @@ from types import CoroutineType
 from typing import cast
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -20,7 +21,7 @@ from fastapi import HTTPException
 import pytest
 import pytest_asyncio
 
-from netv import cache, fast_start, ffmpeg_command, ffmpeg_session, util
+from netv import cache, fast_start, ffmpeg_command, ffmpeg_session, proxy, testing, util
 from netv.fast_start import master_playlist
 from netv.fast_start_test import playlist
 from netv.ffmpeg_command import MediaInfo, SubtitleStream
@@ -182,7 +183,7 @@ def env(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> _Env:
     run = FakeRun()
     install_subprocess(monkeypatch, ffmpeg_command, run=run)
     web = FakeWeb()
-    install_web(monkeypatch, web, ffmpeg_command, util)
+    install_web(monkeypatch, web, util)
     clock = FakeClock(now=_NOW)
     install_clock(monkeypatch, clock, ffmpeg_session)
     launcher = ProcessLauncher(on_launch=_ffmpeg_output)
@@ -277,14 +278,20 @@ def _live(directory: pathlib.Path, url: str = "http://live") -> ffmpeg_session.T
     )
 
 
+def _save_sources(*sources: cache.SourceConfig) -> None:
+    cache.save_server_settings({**cache.load_server_settings(), "sources": list(sources)})
+
+
 def _plan(
     source_url: str = "http://live",
     *,
     hw: cache.HwAccel = "software",
     deinterlace: bool = False,
+    source_id: str = "",
 ) -> ffmpeg_session._FastLivePlan:
     return ffmpeg_session._FastLivePlan(
         source_url=source_url,
+        source_id=source_id,
         user_agent=None,
         hw=hw,
         resolution="1080p",
@@ -1241,8 +1248,8 @@ class TestGetSessionProgress:
             "#EXTM3U\n#EXTINF:3.0,\nseg0.ts\n#EXTINF:3.5,\nseg1.ts\n",
         )
         env.sessions["test"] = _live(tmp_path)
-        env.sessions["test"]["last_access"] = 0
-        assert ffmpeg_session.get_session_progress("test") == {
+        env.sessions["test"].update(last_access=0, username="alice")
+        assert ffmpeg_session.get_session_progress("test", "alice") == {
             "segment_count": 2,
             "duration": 6.5,
         }
@@ -1250,21 +1257,39 @@ class TestGetSessionProgress:
 
     def test_progress_no_playlist(self, env: _Env, tmp_path: pathlib.Path):
         env.sessions["test"] = _live(tmp_path)
-        assert ffmpeg_session.get_session_progress("test") == {
+        env.sessions["test"]["username"] = "alice"
+        assert ffmpeg_session.get_session_progress("test", "alice") == {
             "segment_count": 0,
             "duration": 0.0,
         }
 
     def test_progress_nonexistent_session(self):
-        assert ffmpeg_session.get_session_progress("nonexistent") is None
+        assert ffmpeg_session.get_session_progress("nonexistent", "alice") is None
+
+    def test_another_users_progress_reads_as_absent_and_keeps_no_heartbeat(
+        self,
+        env: _Env,
+        tmp_path: pathlib.Path,
+    ):
+        env.sessions["test"] = _live(tmp_path)
+        env.sessions["test"].update(last_access=0, username="alice")
+        assert ffmpeg_session.get_session_progress("test", "eve") is None
+        assert env.sessions["test"].get("last_access") == 0
 
     def test_progress_reads_the_fast_start_rendition(self, env: _Env, tmp_path: pathlib.Path):
         (tmp_path / "low.m3u8").write_text("#EXTINF:2.0,\nlow_0.ts\n")
         (tmp_path / "up.m3u8").write_text("#EXTINF:1.5,\nup_0.ts\n#EXTINF:1.5,\nup_1.ts\n")
         env.sessions["s"] = _fast_session(tmp_path)
-        assert ffmpeg_session.get_session_progress("s") == {"segment_count": 1, "duration": 2.0}
+        env.sessions["s"]["username"] = "alice"
+        assert ffmpeg_session.get_session_progress("s", "alice") == {
+            "segment_count": 1,
+            "duration": 2.0,
+        }
         env.sessions["s"]["rendition"] = "up"
-        assert ffmpeg_session.get_session_progress("s") == {"segment_count": 2, "duration": 3.0}
+        assert ffmpeg_session.get_session_progress("s", "alice") == {
+            "segment_count": 2,
+            "duration": 3.0,
+        }
 
 
 def test_clear_url_session(env: _Env):
@@ -1464,7 +1489,7 @@ def test_recovery_restores_probe_cache(env: _Env):
     }
     _vod_dir(env.root, "p", info)
     ffmpeg_session.cleanup_and_recover_sessions()
-    media, subs = ffmpeg_command.probe_media("http://m", 7, 8)
+    media, subs = ffmpeg_command.probe_media("http://m", 7, 8, source_id="")
     assert media is not None
     assert (media.video_codec, media.height, media.duration, media.interlaced) == (
         "hevc",
@@ -1474,7 +1499,7 @@ def test_recovery_restores_probe_cache(env: _Env):
     )
     assert subs == [SubtitleStream(index=2, lang="eng", name="")]
     assert [t.lang for t in media.audio_tracks] == ["eng"]
-    assert ffmpeg_command.probe_media("http://m") == (media, subs)
+    assert ffmpeg_command.probe_media("http://m", source_id="") == (media, subs)
     assert env.run.calls == []
 
 
@@ -1791,17 +1816,52 @@ async def test_start_replaces_own_movie_in_another_audio_language_at_its_positio
     env: _Env,
     tasks: BackgroundTasks,
     tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
 ):
     del tasks
     cache.save_server_settings({**cache.load_server_settings(), "probe_movies": False})
     _existing(env, tmp_path, "http://movie", username="alice")
     env.sessions["old"].update(seek_offset=30, audio_lang="fr", is_vod=True)
-    result = await ffmpeg_session.start_transcode("http://movie", "movie", username="alice")
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
+        result = await ffmpeg_session.start_transcode("http://movie", "movie", username="alice")
     sid = result["session_id"]
     assert set(env.sessions) == {sid}
     assert env.sessions[sid].get("audio_lang") == "en"
     (command,) = env.launcher.commands
     assert _option(command, "-ss") == "30"
+    assert "Restarting session old for audio language" in [r.getMessage() for r in caplog.records]
+
+
+@pytest.mark.asyncio
+async def test_start_reuses_own_movie_in_the_users_audio_language(
+    env: _Env,
+    tmp_path: pathlib.Path,
+):
+    _existing(env, tmp_path, "http://movie", username="alice")
+    env.sessions["old"].update(audio_lang="en", is_vod=True)
+    result = await ffmpeg_session.start_transcode("http://movie", "movie", username="alice")
+    assert result["session_id"] == "old"
+    assert env.launcher.commands == []
+
+
+@pytest.mark.asyncio
+async def test_start_replaces_own_plain_live_session_without_reusing_it(
+    env: _Env,
+    tasks: BackgroundTasks,
+    upstreams: FakeUpstreams,
+    tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    del tasks
+    env.run.program("ffprobe", Program(stdout=probed_video_json()))
+    _existing(env, tmp_path, "http://live", username="alice")
+    env.sessions["old"]["audio_lang"] = "fr"
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
+        result = await ffmpeg_session.start_transcode("http://live", username="alice")
+    assert result["session_id"] != "old"
+    assert len(upstreams.opened) == 1
+    about_old = [m for m in (r.getMessage() for r in caplog.records) if m.endswith(" old")]
+    assert about_old == ["Cleaning up invalid session old", "Stopped transcode session old"]
 
 
 @pytest.mark.asyncio
@@ -1873,6 +1933,22 @@ async def test_start_reuses_valid_session(
         "Found valid existing VOD session old",
         "Reusing active session old",
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_shared_vod_session_admits_only_those_it_was_handed_to(
+    env: _Env,
+    tmp_path: pathlib.Path,
+):
+    _existing(env, tmp_path, "http://movie", username="bob")
+    env.sessions["old"]["is_vod"] = True
+    assert ffmpeg_session.user_session("old", "alice") is None
+    result = await ffmpeg_session.start_transcode("http://movie", "movie", username="alice")
+    assert result["session_id"] == "old"
+    assert [
+        ffmpeg_session.user_session(session_id, name) is not None
+        for session_id, name in [("old", "alice"), ("old", "bob"), ("old", "eve"), ("gone", "bob")]
+    ] == [True, True, False, False]
 
 
 @pytest.mark.asyncio
@@ -1997,6 +2073,8 @@ async def test_start_retries_movie_with_a_stale_cached_probe(
     monkeypatch: pytest.MonkeyPatch,
 ):
     del tasks
+    # The retry probes because it is a movie, not because series are probed.
+    cache.save_server_settings({**cache.load_server_settings(), "probe_series": False})
     env.run.program("ffprobe", Program(stdout=_DOLBY_PROBE))
     stale = MediaInfo(video_codec="h264", audio_codec="aac", pix_fmt="yuv420p", height=720)
     ffmpeg_command.remember_probe("http://movie", stale)
@@ -2009,7 +2087,7 @@ async def test_start_retries_movie_with_a_stale_cached_probe(
     )
     assert env.sessions[result["session_id"]].get("audio_passthrough") is True
     assert len(launcher.commands) == 2
-    assert ffmpeg_command.probe_media("http://movie")[0] != stale
+    assert ffmpeg_command.probe_media("http://movie", source_id="")[0] != stale
 
 
 @pytest.mark.asyncio
@@ -2070,10 +2148,12 @@ async def test_start_retries_series_after_clearing_probe_cache(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("deinterlace", [False, True])
 async def test_retry_keeps_the_requested_deinterlacing(
     env: _Env,
     tasks: BackgroundTasks,
     monkeypatch: pytest.MonkeyPatch,
+    deinterlace: bool,
 ):
     del tasks
     cache.save_server_settings({**cache.load_server_settings(), "transcode_hw": "software"})
@@ -2089,12 +2169,14 @@ async def test_retry_keeps_the_requested_deinterlacing(
         "http://ep",
         "series",
         series_id=3,
-        deinterlace_fallback=False,
+        deinterlace_fallback=deinterlace,
     )
     assert env.sessions[result["session_id"]].get("series_id") == 3
     first, retried = launcher.commands
-    assert "yadif" not in _option(first, "-vf")
-    assert "yadif" not in _option(retried, "-vf")
+    assert ("yadif" in _option(first, "-vf"), "yadif" in _option(retried, "-vf")) == (
+        deinterlace,
+        deinterlace,
+    )
 
 
 @pytest.mark.asyncio
@@ -2250,6 +2332,9 @@ async def test_start_passes_viewer_choices_to_fast_start(env: _Env, fast_env: Ba
     )
     session = env.sessions[result["session_id"]]
     assert (session.get("username"), session.get("source_id")) == ("alice", "src")
+    # Its relay dials by its source's rule.
+    assert ffmpeg_session._is_fast_live(session)
+    assert session["plan"].source_id == "src"
     assert session.get("bandwidth_saver") is True
     assert session.get("audio_passthrough") is True
     (encoder,) = env.launcher.commands
@@ -2670,23 +2755,30 @@ async def test_fast_start_reads_the_best_variant_through_one_remuxer(
     monkeypatch: pytest.MonkeyPatch,
 ):
     del fast_env
-    master = "https://upstream.test/live/1.m3u8"
-    variant = "https://upstream.test/live/1_hi.m3u8"
+    # A home-network HLS source, so its remuxer may reach the home network.
+    _save_sources({"id": "h", "name": "Home", "type": "m3u", "url": "http://192.168.1.50/l.m3u"})
+    master = "http://192.168.1.50/live/1.m3u8"
+    variant = "http://192.168.1.50/live/1_hi.m3u8"
     env.web.routes[master] = FakeResponse(
         b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\n1_lo.m3u8\n"
         b"#EXT-X-STREAM-INF:BANDWIDTH=8000000\n1_hi.m3u8\n",
     )
     remuxers = PopenRecorder()
     install_subprocess(monkeypatch, ffmpeg_session, popen=remuxers)
-    task = asyncio.create_task(ffmpeg_session.start_transcode(master, "live"))
+    task = asyncio.create_task(ffmpeg_session.start_transcode(master, "live", source_id="h"))
     await until(lambda: remuxers.started)
     (remuxer,) = remuxers.started
     try:
         remuxer.stdout.feed(ts_source())
         result = await task
         assert env.web.urls == [master]
-        assert remuxer.args == fast_start.source_command(variant, cache.get_user_agent())
-        assert remuxer.options == {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE}
+        assert remuxer.args == fast_start.source_command(variant, cache.get_user_agent(), "h")
+        assert remuxer.args[remuxer.args.index("-http_proxy") + 1] == proxy.egress().url(lan=True)
+        assert remuxer.options == {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "env": proxy.ffmpeg_env(),
+        }
         session = env.sessions[result["session_id"]]
         assert ffmpeg_session._is_fast_live(session)
         # Each connection resolves anew: variant URLs carry tokens that expire.
@@ -2707,7 +2799,7 @@ def test_direct_sources_open_once_with_a_burst_tolerant_timeout(
     upstreams: FakeUpstreams,
 ):
     """Panels send TS in ~10 s segment bursts; 30 s of silence ends the relay for the watchdog."""
-    body = ffmpeg_session._open_source("http://live", "agent/1")
+    body = ffmpeg_session._open_source("http://live", "agent/1", "s")
     assert body is upstreams.opened[0]
     (fetch,) = env.web.fetches
     assert (fetch.url, fetch.timeout, fetch.headers) == (
@@ -2715,6 +2807,50 @@ def test_direct_sources_open_once_with_a_burst_tolerant_timeout(
         30,
         {"User-agent": "agent/1"},
     )
+    # A provider's redirect cannot point the stream at this server or the home network.
+    assert testing.dials_only_the_internet(fetch)
+
+
+@pytest.mark.asyncio
+async def test_a_tuner_a_home_lineup_lists_is_read_on_the_home_network(
+    env: _Env,
+    upstreams: FakeUpstreams,
+    recording_dir: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    tuner = "http://192.168.1.87:5004/auto/v5.1"
+
+    def tuned() -> FakeUpstream:
+        upstream = upstreams()
+        upstream.feed(ts_source())
+        return upstream
+
+    env.web.routes[tuner] = tuned
+    cache.save_server_settings(
+        {
+            **cache.load_server_settings(),
+            "sources": [
+                {
+                    "id": "t",
+                    "name": "Tuner",
+                    "type": "m3u",
+                    "url": "http://192.168.1.24/lineup.m3u",
+                },
+            ],
+        },
+    )
+    # A live session's relay, and a recording's, may dial the tuner.
+    stream = _plan(tuner, source_id="t").relay()
+    await stream.start()
+    await until(lambda: upstreams.opened)
+    await stream.close()
+    _relaunch(monkeypatch, [], error=OSError("no ffmpeg"))
+    with pytest.raises(OSError, match="no ffmpeg"):
+        await ffmpeg_session.record_live("alice", tuner, "t", str(recording_dir), 60)
+    assert len(env.web.fetches) == 2
+    for fetch in env.web.fetches:
+        vets = testing.address_vets(fetch)
+        assert vets and all(vet(ipaddress.ip_address("192.168.1.87")) for vet in vets)
 
 
 @pytest.mark.asyncio
@@ -3014,7 +3150,8 @@ async def test_seek_into_a_dead_transcode_restarts_ffmpeg(env: _Env, seek_dir: p
     result = await ffmpeg_session.seek_transcode("v", 4.0)
     assert result == {"ok": True, "segment": 1, "time": 4.0}
     (command,) = env.launcher.commands
-    assert command[-2:] == ["-start_number", "1"]
+    # Before the playlist: ffmpeg ignores options after its last output.
+    assert command[-3:-1] == ["-start_number", "1"] and command[-1].endswith("stream.m3u8")
 
 
 def _served(session_id: str, number: int) -> int:
@@ -3082,7 +3219,8 @@ async def test_seek_restarts_ffmpeg_at_target(env: _Env, seek_dir: pathlib.Path)
     assert command[i - 2 : i + 2] == ["-ss", "9.0", "-i", "http://movie"]
     delay = command.index("-max_delay")
     assert command[delay - 2 : delay] == ["-output_ts_offset", "-9.0"]
-    assert command[-2:] == ["-start_number", "3"]
+    # Before the playlist: ffmpeg ignores options after its last output.
+    assert command[-3:-1] == ["-start_number", "3"] and command[-1].endswith("stream.m3u8")
     assert command[command.index("-map") + 1] == "0:2"
     assert (seek_dir / "seg000.ts").exists()
     assert (seek_dir / "segxyz.ts").exists()
@@ -4070,9 +4208,11 @@ def test_dead_process_signals_are_noops():
 
 
 @pytest.mark.asyncio
-async def test_shared_ffmpeg_launcher(env: _Env):
+async def test_shared_ffmpeg_launcher(env: _Env, monkeypatch: pytest.MonkeyPatch):
     cmd = ["ffmpeg", "-i", "https://provider/live.ts", "/tmp/stream.m3u8"]
     env.launcher.on_launch = None
+    # A no_proxy variable would send matching hosts around the egress proxy.
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
     assert await ffmpeg_session._launch_ffmpeg(cmd) is env.launcher.processes[0]
     [launch] = env.launcher.launches
     assert launch.command == cmd
@@ -4080,7 +4220,9 @@ async def test_shared_ffmpeg_launcher(env: _Env):
         "stdin": asyncio.subprocess.DEVNULL,
         "stdout": asyncio.subprocess.DEVNULL,
         "stderr": asyncio.subprocess.PIPE,
+        "env": proxy.ffmpeg_env(),
     }
+    assert "no_proxy" not in proxy.ffmpeg_env()
 
 
 @pytest.mark.asyncio
@@ -4342,10 +4484,120 @@ async def test_existing_vod_resume_appends_to_playlist(env: _Env, vod_dir: pathl
     i = command.index("-i")
     assert command[i - 2 : i + 2] == ["-ss", "6.0", "-i", "http://movie"]
     assert _option(command, "-hls_flags") == "independent_segments+append_list"
-    assert command[-2:] == ["-start_number", "2"]
+    # Before the playlist: ffmpeg ignores options after its last output.
+    assert command[-3:-1] == ["-start_number", "2"] and command[-1].endswith("stream.m3u8")
     assert env.sessions["v"]["process"] is env.launcher.processes[0]
     assert [call[-1] for call in env.run.calls] == ["http://movie", "http://movie"]
     assert env.clock.sleeps == []
+
+
+# A home-network HLS movie: its master names the variant ffmpeg reads.
+_HOME_MOVIE = "http://192.168.1.50/movie/1.m3u8"
+_HOME_VARIANT = "http://192.168.1.50/movie/1_hd.m3u8"
+
+
+def _home_movie(env: _Env) -> None:
+    _save_sources({"id": "h", "name": "Home", "type": "m3u", "url": "http://192.168.1.50/l.m3u"})
+    env.web.routes[_HOME_MOVIE] = lambda: FakeResponse(
+        b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=9\n1_hd.m3u8\n",
+    )
+
+
+def _read_home(env: _Env) -> bool:
+    """Whether every fetch, probe and encoder reached the home movie by the home rule."""
+    home = proxy.egress().url(lan=True)
+    fetched = [fetch for fetch in env.web.fetches if fetch.url == _HOME_MOVIE]
+    return (
+        bool(fetched and env.run.calls and env.launcher.commands)
+        and all(
+            vet(ipaddress.ip_address("192.168.1.50"))
+            for fetch in fetched
+            for vet in testing.address_vets(fetch)
+        )
+        and all(
+            command[-1] == _HOME_VARIANT and _option(command, "-http_proxy") == home
+            for command in env.run.calls
+        )
+        and all(
+            _option(command, "-i") == _HOME_VARIANT and _option(command, "-http_proxy") == home
+            for command in env.launcher.commands
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_vod_start_reads_its_source_by_that_source_s_rule(
+    env: _Env,
+    tasks: BackgroundTasks,
+):
+    del tasks
+    _home_movie(env)
+    env.run.program("ffprobe", Program(stdout=_DOLBY_PROBE))
+    await ffmpeg_session.start_transcode(_HOME_MOVIE, "movie", source_id="h")
+    assert _read_home(env)
+
+
+@pytest.mark.asyncio
+async def test_a_seek_reads_its_source_by_that_source_s_rule(env: _Env, seek_dir: pathlib.Path):
+    _home_movie(env)
+    env.sessions["v"].update(url=_HOME_MOVIE, source_id="h")
+    (seek_dir / "session.json").write_text(json.dumps({"seek_offset": 0}))
+    await ffmpeg_session.seek_transcode("v", 9.0)
+    assert _read_home(env)
+
+
+@pytest.mark.asyncio
+async def test_a_resume_reads_its_source_by_that_source_s_rule(env: _Env, vod_dir: pathlib.Path):
+    del vod_dir
+    _home_movie(env)
+    env.sessions["v"].update(url=_HOME_MOVIE, source_id="h")
+    await ffmpeg_session._handle_existing_vod_session("v", _HOME_MOVIE, "software", True)
+    assert _read_home(env)
+
+
+def test_a_session_snapshot_carries_every_field_it_resumes_with(env: _Env, tmp_path: pathlib.Path):
+    process = FakeProcess(exit_code=None)
+    env.sessions["full"] = ffmpeg_session.TranscodeSession(
+        dir=str(tmp_path),
+        process=process,
+        url="http://movie",
+        is_vod=True,
+        seek_offset=12.5,
+        subtitles=[{"index": 2, "lang": "eng", "name": "English"}],
+        duration=99.0,
+        audio_passthrough=True,
+        username="alice",
+        source_id="h",
+        started=_NOW,
+    )
+    env.sessions["bare"] = ffmpeg_session.TranscodeSession(
+        dir=str(tmp_path),
+        process=None,
+        url="http://movie",
+        is_vod=True,
+        started=_NOW,
+    )
+    assert ffmpeg_session._get_session_snapshot("full") == ffmpeg_session._SessionSnapshot(
+        output_dir=str(tmp_path),
+        process=process,
+        seek_offset=12.5,
+        subtitles=[{"index": 2, "lang": "eng", "name": "English"}],
+        duration=99.0,
+        audio_passthrough=True,
+        username="alice",
+        source_id="h",
+    )
+    assert ffmpeg_session._get_session_snapshot("bare") == ffmpeg_session._SessionSnapshot(
+        output_dir=str(tmp_path),
+        process=None,
+        seek_offset=0,
+        subtitles=[],
+        duration=0,
+        audio_passthrough=False,
+        username="",
+        source_id="",
+    )
+    assert ffmpeg_session._get_session_snapshot("missing") is None
 
 
 @pytest.mark.asyncio

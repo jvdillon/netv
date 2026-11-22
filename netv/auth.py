@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Final, NotRequired, TypedDict
+from typing import Final, NamedTuple, NotRequired, TypedDict
 
+import base64
 import hashlib
 import hmac
 import ipaddress
@@ -13,7 +15,8 @@ import re
 import secrets
 import time
 
-from treekle import MutablePlainTree, from_plain, json_loads, mutable, to_plain
+from cryptography.fernet import Fernet, InvalidToken
+from treekle import MutablePlainTree, ReadError, from_plain, json_loads, mutable, to_plain
 
 from netv.util import atomic_write_json, data_dir, merge_unknown, read_json_object
 
@@ -51,6 +54,32 @@ class TokenClaims(TypedDict):
 
     sub: str
     exp: NotRequired[int]
+    pwd: NotRequired[str]  # Marks the password the session began with.
+
+
+class LastAdminError(ValueError):
+    """A change that would leave other accounts without an administrator."""
+
+
+# The home network: private, loopback, link-local, and unique-local ranges. Not
+# Python's is_private, which also counts routed tunnels (Teredo, 6to4) as private.
+_HOME_NETWORKS: Final = tuple(
+    ipaddress.ip_network(n)
+    for n in (
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+    )
+)
+
+_SESSION_SECONDS: Final = 86_400 * 7
+# PBKDF2-SHA256 iterations for new password hashes: OWASP's 2023 figure.
+_ROUNDS: Final = 600_000
 
 
 APP_DIR = _CWD
@@ -127,7 +156,7 @@ def delete_user(username: str) -> bool:
     if username not in users:
         return False
     del users[username]
-    _ensure_one_admin(users)
+    _require_an_admin(users)
     # Drop the user from source assignments so a future account with the same
     # name does not inherit access.
     sources = settings.get("sources", [])
@@ -151,13 +180,16 @@ def verify_password(username: str, password: str) -> bool:
     Returns:
         valid: Whether the account exists and the password matches.
     """
-    users = from_plain(
-        read_json_object(_get_settings_file()).get("users", {}),
-        dict[str, UserRecord],
-    )
-    stored = users[username]["password"] if username in users else _hash_password("dummy")
-    valid = _verify_hashed_password(password, stored)
-    return valid and username in users
+    settings = read_json_object(_get_settings_file())
+    users = from_plain(settings.get("users", {}), dict[str, UserRecord])
+    # An unknown name still costs one hash, so timing does not tell it apart.
+    stored = users[username]["password"] if username in users else _hash_password(password)
+    valid = _verify_hashed_password(password, stored) and username in users
+    # An older, cheaper hash is replaced the first time its password is given.
+    if valid and not stored.startswith(f"pbkdf2_sha256${_ROUNDS}$"):
+        users[username]["password"] = _hash_password(password)
+        _save_users(settings, users)
+    return valid
 
 
 def change_password(
@@ -222,7 +254,7 @@ def set_admin(username: str, admin: bool) -> bool:
     if username not in users:
         return False
     users[username]["admin"] = admin
-    _ensure_one_admin(users)
+    _require_an_admin(users)
     _save_users(settings, users)
     return True
 
@@ -332,21 +364,82 @@ def allowed_from(username: str, address: str) -> bool:
         address: The client's IP address, as the server sees it.
 
     Returns:
-        allowed: False only for a LAN-only account away from the home network.
+        allowed: False for an account that does not exist, and for a LAN-only
+            one away from the home network.
     """
-    record = from_plain(
-        read_json_object(_get_settings_file()).get("users", {}),
-        dict[str, UserRecord],
-    ).get(username)
-    if record is None or not record.get("lan_only", False):
-        return True
+    record = _user_record(username)
+    return record is not None and _allowed(record, address)
+
+
+def is_home_address(address: str) -> bool:
+    """Whether ``address`` is on the home network: private, loopback, or link-local.
+
+    Args:
+        address: An IP address as the server sees it.
+
+    Returns:
+        home: False for public addresses, carrier NAT, tunnels, and non-addresses.
+    """
     try:
         ip = ipaddress.ip_address(address)
     except ValueError:
         return False
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
-    return (ip.is_private and not ip.is_global) or ip.is_loopback or ip.is_link_local
+    named = [ipaddress.ip_network(n, strict=False) for n in home_networks()]
+    return any(ip in network for network in named or _HOME_NETWORKS)
+
+
+def home_networks() -> list[str]:
+    """The networks an admin named as home; empty for the private ranges."""
+    named = read_json_object(_get_settings_file()).get("home_networks", [])
+    return [str(n) for n in named] if isinstance(named, list) else []
+
+
+def set_home_networks(networks: list[str]) -> bool:
+    """Name the home network, as CIDRs; none for every private range.
+
+    A proxy on this host makes every request arrive from 127.0.0.1, which the
+    private ranges count as home; naming the LAN exactly keeps it away.
+
+    Args:
+        networks: CIDRs such as ``192.168.1.0/24``.
+
+    Returns:
+        saved: False, saving nothing, when any is not a network.
+    """
+    try:
+        for network in networks:
+            ipaddress.ip_network(network, strict=False)
+    except ValueError:
+        return False
+    settings = read_json_object(_get_settings_file())
+    settings["home_networks"] = list(networks)
+    atomic_write_json(_get_settings_file(), settings)
+    return True
+
+
+def session_user(token: str, address: str) -> TokenClaims | None:
+    """The claims of a session that is still good from ``address``.
+
+    Args:
+        token: Session token from the client.
+        address: The client's IP address, as the server sees it.
+
+    Returns:
+        claims: None for a forged or expired token, a deleted account, a password
+            changed since sign-in, or a LAN-only account away from home.
+    """
+    claims = verify_token(token)
+    if claims is None:
+        return None
+    record = _user_record(claims["sub"])
+    if record is None or not _allowed(record, address):
+        return None
+    mark = claims.get("pwd")
+    if mark is None or not hmac.compare_digest(mark, _password_mark(record["password"])):
+        return None
+    return claims
 
 
 _HEX_DIGITS = frozenset("0123456789abcdef")
@@ -377,9 +470,20 @@ def verify_logo_url_signature(url: str, signature: str) -> bool:
     return hmac.compare_digest(signature, logo_url_signature(url))
 
 
-def create_token(payload: TokenClaims, *, expiry_seconds: int = 86_400 * 7) -> str:
-    """Create a signed JWT-like token."""
+def create_token(payload: TokenClaims, *, expiry_seconds: int = _SESSION_SECONDS) -> str:
+    """Create a signed JWT-like token, marked with its account's current password.
+
+    Args:
+        payload: Claims to sign; ``sub`` names the account.
+        expiry_seconds: How long the token lasts.
+
+    Returns:
+        token: Hex-encoded claims and their HMAC-SHA256 signature.
+    """
     claims: TokenClaims = {**payload, "exp": int(time.time()) + expiry_seconds}
+    record = _user_record(payload["sub"])
+    if record is not None:
+        claims["pwd"] = _password_mark(record["password"])
     data = json.dumps(claims, separators=(",", ":")).encode()
     sig = hmac.new(_get_secret_key().encode(), data, hashlib.sha256).hexdigest()
     return f"{data.hex()}.{sig}"
@@ -398,7 +502,8 @@ def verify_token(token: str) -> TokenClaims | None:
         data_hex, sig = token.split(".")
         data = bytes.fromhex(data_hex)
         expected = hmac.new(_get_secret_key().encode(), data, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
+        # compare_digest raises TypeError for a non-ASCII signature.
+        if not hmac.compare_digest(sig.encode(), expected.encode()):
             return None
         payload = json_loads(data.decode(), TokenClaims)
     except (OSError, ValueError):
@@ -408,30 +513,80 @@ def verify_token(token: str) -> TokenClaims | None:
     return payload
 
 
-def stream_url_token(username: str, url: str) -> str:
-    """Token proving the server handed ``url`` to ``username`` on a player page.
+class StreamTarget(NamedTuple):
+    """What a ``stream_ref`` names."""
 
-    ``/transcode/start`` makes the server open the URL it is given, so it only
-    accepts URLs that come with this token. The data starts with a fixed label,
-    so it can never equal the JSON a session token signs.
+    username: str
+    url: str
+    lan: bool  # Whether the stream started on the home network.
+
+
+def stream_ref(username: str, url: str, *, lan: bool = False) -> str:
+    """An opaque reference to an upstream URL, issued to ``username``.
+
+    Upstream URLs carry the provider's account and password, so browsers get this
+    instead; the server alone turns it back into the URL. It is encrypted, not
+    just signed, and only this server can make one. Like a session, it ends when
+    its viewer's password changes or account goes.
 
     Args:
-        username: Viewer the URL was issued to.
-        url: Upstream media URL as the player page lists it.
+        username: Viewer the stream is issued to.
+        url: Upstream media URL.
+        lan: Whether the stream started on the home network.
 
     Returns:
-        token: Hex HMAC-SHA256 of the label, user and URL under the secret key.
+        ref: URL-safe text.
     """
-    data = f"stream-url\n{username}\n{url}".encode()
-    return hmac.new(_get_secret_key().encode(), data, hashlib.sha256).hexdigest()
+    return stream_ref_issuer(username, lan=lan)(url)
 
 
-def verify_stream_url_token(username: str, url: str, token: str) -> bool:
-    """Whether ``token`` is the stream URL token for this user and URL."""
-    # compare_digest raises on non-ASCII strings; anything but 64 hex digits is no token.
-    if not re.fullmatch(r"[0-9a-f]{64}", token):
-        return False
-    return hmac.compare_digest(token, stream_url_token(username, url))
+def stream_ref_issuer(username: str, *, lan: bool) -> Callable[[str], str]:
+    """``stream_ref`` for many URLs, such as a playlist's, reading the account once.
+
+    Args:
+        username: Viewer the streams are issued to.
+        lan: Whether the streams started on the home network.
+
+    Returns:
+        issue: Maps an upstream URL to its ref.
+    """
+    record = _user_record(username)
+    mark = "" if record is None else _password_mark(record["password"])
+    cipher = _stream_cipher()
+
+    def issue(url: str) -> str:
+        data = json.dumps([username, url, mark, lan], separators=(",", ":")).encode()
+        return cipher.encrypt(data).decode().rstrip("=")
+
+    return issue
+
+
+def stream_ref_target(ref: str) -> StreamTarget | None:
+    """What a ``stream_ref`` names, while it is still good.
+
+    Args:
+        ref: A reference from ``stream_ref``.
+
+    Returns:
+        target: None for a forged or expired reference, or one whose viewer's
+            account is gone or password changed since.
+    """
+    try:
+        padded = ref.encode("ascii") + b"=" * (-len(ref) % 4)
+        data = _stream_cipher().decrypt(padded, ttl=_SESSION_SECONDS)
+        # An earlier release's refs held fewer fields.
+        username, url, mark, lan = json_loads(data.decode(), tuple[str, str, str, bool])
+    except (InvalidToken, UnicodeEncodeError, ReadError):
+        return None
+    record = _user_record(username)
+    if record is None or not hmac.compare_digest(mark, _password_mark(record["password"])):
+        return None
+    return StreamTarget(username, url, lan)
+
+
+def _stream_cipher() -> Fernet:
+    key = hmac.new(_get_secret_key().encode(), b"stream-ref", hashlib.sha256).digest()
+    return Fernet(base64.urlsafe_b64encode(key))
 
 
 def _get_settings_file() -> Path:
@@ -467,20 +622,33 @@ def _get_secret_key() -> str:
     return key
 
 
-def _hash_password(password: str, salt: str | None = None) -> str:
-    """Hash password with salt using PBKDF2."""
+def _hash_password(password: str, salt: str | None = None, *, rounds: int = _ROUNDS) -> str:
+    """Hash a password with PBKDF2-SHA256, recording its cost beside its salt."""
     if salt is None:
         salt = secrets.token_hex(16)
-    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000)
-    return f"{salt}:{key.hex()}"
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), rounds)
+    return f"pbkdf2_sha256${rounds}${salt}${key.hex()}"
 
 
+# Hashes from before costs were recorded, ``<salt>:<key hex>``, used 100,000 rounds.
 def _verify_hashed_password(password: str, hashed: str) -> bool:
-    """Verify password against hash."""
-    if ":" not in hashed:
-        return False  # Invalid hash format.
-    salt, _ = hashed.split(":", 1)
-    return hmac.compare_digest(_hash_password(password, salt), hashed)
+    """Whether ``password`` matches ``hashed``, at the cost it records."""
+    parts = hashed.split("$")
+    legacy = re.fullmatch(r"([0-9a-f]+):[0-9a-f]+", hashed)
+    if len(parts) == 4 and parts[0] == "pbkdf2_sha256" and parts[1].isdigit():
+        expected = _hash_password(password, parts[2], rounds=int(parts[1]))
+    elif legacy is not None:
+        salt = legacy.group(1)
+        old = hashlib.pbkdf2_hmac(
+            "sha256",  # pragma: no mutate[case-insensitive]
+            password.encode(),
+            salt.encode(),
+            100_000,
+        )
+        expected = f"{salt}:{old.hex()}"
+    else:
+        return False
+    return hmac.compare_digest(expected, hashed)
 
 
 # Unknown keys survive both beside ``users`` and inside each user's record; a deleted
@@ -495,8 +663,27 @@ def _save_users(settings: dict[str, MutablePlainTree], users: dict[str, UserReco
     atomic_write_json(_get_settings_file(), settings)
 
 
-def _ensure_one_admin(users: dict[str, UserRecord]) -> None:
-    """Ensure at least one user is admin. Promotes first user if needed."""
-    if not users or any(u["admin"] for u in users.values()):
-        return
-    next(iter(users.values()))["admin"] = True
+def _require_an_admin(users: dict[str, UserRecord]) -> None:
+    """Refuse a change that leaves accounts without an administrator."""
+    if users and not any(u["admin"] for u in users.values()):
+        raise LastAdminError("Make another user an admin first")
+
+
+def _allowed(record: UserRecord, address: str) -> bool:
+    return not record.get("lan_only", False) or is_home_address(address)
+
+
+def _user_record(username: str) -> UserRecord | None:
+    return from_plain(
+        read_json_object(_get_settings_file()).get("users", {}),
+        dict[str, UserRecord],
+    ).get(username)
+
+
+def _password_mark(hashed: str) -> str:
+    """A mark of a stored password hash; a new password has a new mark."""
+    return hmac.new(
+        _get_secret_key().encode(),
+        b"session\n" + hashed.encode(),
+        hashlib.sha256,
+    ).hexdigest()

@@ -10,6 +10,7 @@ from urllib import error, request
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import os
 import pathlib
@@ -23,7 +24,7 @@ from pychromecast.error import PyChromecastError
 import pytest
 import uvicorn
 
-from netv import fast_start, testing, util
+from netv import auth, fast_start, testing, util
 
 
 @pytest.mark.asyncio
@@ -351,6 +352,35 @@ def test_web_routes_by_url_and_records_requests():
     assert web.fetches[0].headers == {"Accept": "*/*"}
     assert web.fetches[0].timeout == 3
     assert web.fetches[1].headers == {}
+
+
+def test_dials_only_the_internet_reads_a_fetch_s_pinned_handlers(monkeypatch: pytest.MonkeyPatch):
+    web = testing.FakeWeb({"http://x/": testing.FakeResponse(b"")})
+    testing.install_web(monkeypatch, web, util)
+    util.safe_urlopen("http://x/").close()
+    util.safe_urlopen("http://x/", allow_address=lambda ip: ip.is_global).close()
+    util.safe_urlopen("http://x/", allow_address=lambda ip: True).close()
+    assert [testing.dials_only_the_internet(f) for f in web.fetches] == [False, True, False]
+    # The HTTP and HTTPS handlers each carry the rule; an unpinned fetch has none.
+    assert [len(testing.address_vets(f)) for f in web.fetches] == [0, 2, 2]
+    [vet, _] = testing.address_vets(web.fetches[2])
+    assert vet(ipaddress.ip_address("192.168.1.87"))
+
+
+def test_played_url_reads_a_player_page_that_hides_it():
+    auth.create_user("ann", "pw")
+    url = "http://up/movie/u/p/9.mkv"
+    ref = auth.stream_ref("ann", url)
+    page = f'streamRef: "{ref}",\ndirectUrl: "/direct/{ref}/stream.mkv",'
+    assert testing.played_url(page) == url
+    # A page that shows the URL, or whose two refs disagree, fails.
+    with pytest.raises(ValueError, match="shows the upstream URL"):
+        testing.played_url(page + url)
+    other = auth.stream_ref("ann", "http://up/other.mkv")
+    with pytest.raises(ValueError, match="different streams"):
+        testing.played_url(page.replace(f"/direct/{ref}/", f"/direct/{other}/"))
+    with pytest.raises(ValueError, match="Not a player page"):
+        testing.played_url("no player here")
 
 
 def test_web_serves_safe_urlopen_with_its_checks(monkeypatch: pytest.MonkeyPatch):

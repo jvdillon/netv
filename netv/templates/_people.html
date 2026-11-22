@@ -4,7 +4,7 @@
 {% macro people(label, field, names) %}
 {% if names %}
 <dt class="text-gray-500 py-1">{{ label }}</dt>
-<dd class="text-gray-400">
+<dd class="text-gray-400" data-nav="row">
   {%- for name in names %}
   <span class="whitespace-nowrap"><a href="/search?q={{ (field ~ ':"' ~ name ~ '"') | urlencode }}" class="inline-block py-1 hover:text-blue-400 hover:underline focusable rounded focus:outline-none focus:ring-2 focus:ring-blue-500" tabindex="0">{{ name }}</a>{% if not loop.last %},{% endif %}</span>
   {%- endfor %}

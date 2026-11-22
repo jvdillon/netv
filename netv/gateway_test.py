@@ -8,6 +8,7 @@ from typing import Protocol, TypedDict, TypeVar
 from urllib import error, parse
 
 import asyncio
+import ipaddress
 import json
 import logging
 import runpy
@@ -383,6 +384,27 @@ def test_upscale_files_are_served_from_session(
     assert segment.headers["content-type"] == "video/mp2t"
     assert segment.content == b"video"
     assert sessions["session"].get("last_access", 0.0) > 0.0
+
+
+def test_upscale_files_follow_their_owner_s_lan_rule(
+    gateway_client: GatewayClient,
+    sessions: dict[str, TranscodeSession],
+    tmp_path: Path,
+):
+    del gateway_client
+    auth.set_lan_only("player", lan_only=True)
+    sessions["session"] = _session(tmp_path / "session", url=UPSTREAM)
+    sessions["session"]["last_access"] = 0.0
+    (tmp_path / "session" / "segment000.ts").write_bytes(b"video")
+    home = TestClient(gateway.app, client=("192.168.1.20", 5000))
+    away = TestClient(gateway.app, client=("8.8.8.8", 5000))
+    assert home.get("/upscale/session/segment000.ts").status_code == 200
+    # Started at home, it neither plays nor stays alive from away.
+    sessions["session"]["last_access"] = 0.0
+    assert away.get("/upscale/session/segment000.ts").status_code == 403
+    assert sessions["session"].get("last_access") == 0.0
+    auth.delete_user("player")
+    assert home.get("/upscale/session/segment000.ts").status_code == 403
 
 
 def test_user_category_restrictions_apply_to_gateway(gateway_client: GatewayClient):
@@ -769,6 +791,19 @@ def test_authenticator_admits_a_lan_only_user_only_from_home(monkeypatch: pytest
     # A success cached at home does not admit the same password from away.
     assert not asyncio.run(authenticator.verify(_request("8.8.8.8"), "u", "p"))
     assert not asyncio.run(authenticator.verify(_request(None), "u", "p"))
+    # Refused from away like a wrong password: it counts toward the limit, and the
+    # password is checked all the same, so timing does not mark LAN-only accounts.
+    checked: list[str] = []
+    real = auth.verify_password
+
+    def verify_password(username: str, password: str) -> bool:
+        checked.append(username)
+        return real(username, password)
+
+    monkeypatch.setattr(auth, "verify_password", verify_password)
+    assert not asyncio.run(authenticator.verify(_request("8.8.4.4"), "u", "p"))
+    assert checked == ["u"]
+    assert len(authenticator._failures["8.8.4.4"]) == 1
 
 
 def test_authenticator_evicts_oldest_success_entry_when_full(monkeypatch: pytest.MonkeyPatch):
@@ -792,17 +827,26 @@ def test_authenticator_bounds_failure_clients(monkeypatch: pytest.MonkeyPatch):
 
     assert list(authenticator._failures) == ["2.2.2.2"]
     assert len(authenticator._failures["2.2.2.2"]) == 2
-    assert len(authenticator._global_failures) == 3
+    assert len(authenticator._account_failures["u"]) == 3
 
 
-def test_authenticator_global_rate_limit(monkeypatch: pytest.MonkeyPatch):
+def test_authenticator_limits_an_account_guessed_from_away(monkeypatch: pytest.MonkeyPatch):
     _authenticator_user(monkeypatch)
-    authenticator = gateway.GatewayAuthenticator(max_global_login_failures=1)
-    asyncio.run(authenticator.verify(_request("1.1.1.1"), "u", "bad"))
-
+    auth.create_user("v", "q")
+    authenticator = gateway.GatewayAuthenticator(max_account_failures=2)
+    # Guesses from many addresses add up against the account they target.
+    for ip in ("1.1.1.1", "2.2.2.2"):
+        assert not asyncio.run(authenticator.verify(_request(ip), "u", "bad"))
     with pytest.raises(gateway.HTTPException) as exc_info:
-        asyncio.run(authenticator.verify(_request("2.2.2.2"), "u", "bad"))
+        asyncio.run(authenticator.verify(_request("3.3.3.3"), "u", "p"))
     assert exc_info.value.status_code == 429
+    # No one locks everyone out: other accounts sign in, and so does this one at home.
+    assert asyncio.run(authenticator.verify(_request("4.4.4.4"), "v", "q"))
+    assert asyncio.run(authenticator.verify(_request("192.168.1.5"), "u", "p"))
+    # Nor do failures at home count against the account.
+    for _ in range(3):
+        assert not asyncio.run(authenticator.verify(_request("192.168.1.6"), "v", "bad"))
+    assert asyncio.run(authenticator.verify(_request("5.5.5.5"), "v", "q"))
 
 
 @pytest.mark.parametrize("now", [0.0, 1000.0])
@@ -817,12 +861,12 @@ def test_authenticator_forgets_failures_outside_window(
         "1.1.1.1": [cutoff - 1, cutoff],
         "2.2.2.2": [cutoff - 1, cutoff, cutoff + 1],
     }
-    authenticator._global_failures = [cutoff - 1, cutoff]
+    authenticator._account_failures = {"u": [cutoff - 1, cutoff], "w": [cutoff + 1]}
 
     assert asyncio.run(authenticator.verify(_request("3.3.3.3"), "u", "p"))
 
     assert authenticator._failures == {"2.2.2.2": [cutoff + 1]}
-    assert authenticator._global_failures == []
+    assert authenticator._account_failures == {"w": [cutoff + 1]}
 
 
 def test_healthcheck_reports_upscale_mode(gateway_client: GatewayClient):
@@ -1297,13 +1341,15 @@ def test_proxy_url_forwards_length_and_encoding(web: testing.FakeWeb):
     web.routes["http://up"] = upstream
 
     async def proxy() -> tuple[StreamingResponse, list[object]]:
-        response = await gateway._proxy_url("http://up")
+        response = await gateway._proxy_url("http://up", "s")
         return response, [chunk async for chunk in response.body_iterator]
 
     response, body = asyncio.run(proxy())
 
     [fetch] = web.fetches
     assert (fetch.url, fetch.timeout, fetch.headers) == ("http://up", 30, {"User-agent": "agent/1"})
+    # A provider's redirect cannot turn the relay on this server or the home network.
+    assert testing.dials_only_the_internet(fetch)
     assert response.media_type == "video/mp2t"
     assert response.headers["content-length"] == "5"
     assert response.headers["content-encoding"] == "gzip"
@@ -1318,11 +1364,52 @@ def test_proxy_url_omits_absent_length_and_encoding(web: testing.FakeWeb):
         headers={"Content-Type": "video/x", "Content-Length": "", "Content-Encoding": ""},
     )
 
-    response = asyncio.run(gateway._proxy_url("http://up"))
+    response = asyncio.run(gateway._proxy_url("http://up", "s"))
 
     assert response.media_type == "video/x"
     assert "content-encoding" not in response.headers
     assert "content-length" not in response.headers
+
+
+@pytest.mark.parametrize(
+    ("lineup", "home"),
+    [("http://192.168.1.24/lineup.m3u", True), ("http://8.8.8.8/list.m3u", False)],
+)
+def test_live_stream_reaches_a_tuner_only_from_a_home_lineup(
+    gateway_client: GatewayClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    web: testing.FakeWeb,
+    lineup: str,
+    home: bool,
+):
+    client, snapshot = gateway_client
+    tuner = "http://192.168.1.87:5004/auto/v5.1"
+    web.routes[tuner] = testing.FakeResponse(b"ts", headers={"Content-Type": "video/mp2t"})
+    _set_sources(_source(), {"id": "t", "name": "Tuner", "type": "m3u", "url": lineup})
+    stream = GatewayStream(
+        local_id=42,
+        source_id="t",
+        source_type="m3u",
+        upstream_id="5.1",
+        direct_url=tuner,
+        access_group_ids=("src_1_news",),
+        public={**snapshot.streams[0].public, "stream_id": 42},
+    )
+    _serve_catalog(
+        monkeypatch,
+        tmp_path,
+        CatalogSnapshot(
+            categories=snapshot.categories,
+            category_access_ids=snapshot.category_access_ids,
+            streams=[stream],
+            streams_by_id={42: stream},
+        ),
+    )
+    assert client.get("/live/player/local-pass/42.ts").status_code == 200
+    [fetch] = web.fetches
+    vets = testing.address_vets(fetch)
+    assert vets and all(vet(ipaddress.ip_address("192.168.1.87")) is home for vet in vets)
 
 
 def _bare_stream(source_type: str, direct_url: str) -> GatewayStream:

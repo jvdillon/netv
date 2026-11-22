@@ -105,7 +105,7 @@
   {% if results %}
   <p class="text-sm text-gray-400 mb-3">{{ total }} result{{ '' if total == 1 else 's' }}{% if limit and total > limit %}, showing {{ limit }}{% endif %}</p>
   {# Channels, movies, and series together, in the chosen order. #}
-  <div id="results" class="grid grid-cols-[repeat(auto-fill,8rem)] sm:grid-cols-[repeat(auto-fill,10rem)] gap-2 sm:gap-3">
+  <div id="results" class="grid grid-cols-[repeat(auto-fill,8rem)] sm:grid-cols-[repeat(auto-fill,10rem)] gap-2 sm:gap-3" data-nav-main>
     {% with items = results, show_kind = true %}{% include "_cards.html" %}{% endwith %}
   </div>
   {% else %}

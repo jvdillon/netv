@@ -158,7 +158,7 @@
       liveReconnectTimer = null;
       if (castController?.active) return;
       if (isTranscoding || cfg.transcodeMode !== "never") startTranscode();
-      else playWithUrl(cfg.rawUrl);
+      else playWithUrl(cfg.directUrl);
     }, delay);
   }
 
@@ -314,6 +314,8 @@
     }
     const sizeMultiplier = parseFloat(size) || 1;
     const infoSize = `${2.5 * sizeMultiplier}vh`;
+    // The overlay draws captions; the browser's own drawing is kept only for its
+    // native fullscreen (iOS), where the overlay cannot show.
     style.textContent = `
       video::cue {
         color: ${color} !important;
@@ -322,9 +324,90 @@
         font-size: ${size} !important;
         font-family: ${font} !important;
       }
+      video.overlay-captions::cue {
+        color: transparent !important;
+        text-shadow: none !important;
+        background-color: transparent !important;
+      }
+      #caption-box .caption-line {
+        color: ${color};
+        text-shadow: ${shadow};
+        background-color: ${bg};
+        font-family: ${font};
+      }
+      #caption-overlay { font-size: calc(min(4.5vh, 3vw) * ${sizeMultiplier}); }
       #info-overlay { font-size: ${infoSize}; max-width: 50em; }
     `;
   }
+
+  // The browser draws each caption cue as one block, so every roll-up line redrew the
+  // whole block at once and the line being read leapt from the bottom row to the
+  // top. The overlay draws them as a TV does: a new line rolls in at the bottom and
+  // the lines above glide up one row.
+  const captionOverlay = document.getElementById("caption-overlay");
+  const captionBox = document.getElementById("caption-box");
+  const CAPTION_LINE_EM = 1.35;
+  const CAPTION_ROLL_MS = 250;
+  let shownCaption = [];
+
+  function showingCaptionLines() {
+    const lines = [];
+    for (const track of Array.from(video.textTracks)) {
+      if (track.mode !== "showing" || !track.activeCues) continue;
+      for (const cue of Array.from(track.activeCues)) {
+        // Subtitles may carry WebVTT tags (<i>); the overlay shows their text.
+        for (const line of cue.text.replace(/<[^>]*>/g, "").split("\n")) {
+          if (line.trim()) lines.push(line);
+        }
+      }
+    }
+    return lines;
+  }
+
+  function renderCaptions() {
+    const lines = showingCaptionLines();
+    // Rolled up one row: the screen as shown, less its top line, plus a new one.
+    const rolled =
+      lines.length > 1 &&
+      lines.length === shownCaption.length &&
+      lines.slice(0, -1).every((line, i) => line === shownCaption[i + 1]);
+    const drawn = rolled ? [shownCaption[0], ...lines] : lines;
+    captionBox.replaceChildren(
+      ...drawn.map((text) => {
+        const line = document.createElement("div");
+        line.className = "caption-line";
+        line.textContent = text;
+        return line;
+      }),
+    );
+    captionOverlay.style.height = `${lines.length * CAPTION_LINE_EM}em`;
+    captionOverlay.classList.toggle("hidden", lines.length === 0);
+    captionBox.style.transition = "none";
+    captionBox.style.transform = "translateY(0)";
+    if (rolled) {
+      // Start a frame later, so the browser draws the old position first.
+      requestAnimationFrame(() => {
+        captionBox.style.transition = `transform ${CAPTION_ROLL_MS}ms ease-out`;
+        captionBox.style.transform = `translateY(-${CAPTION_LINE_EM}em)`;
+      });
+    }
+    shownCaption = lines;
+  }
+
+  const watchedCaptionTracks = new WeakSet();
+  function watchCaptionTrack(track) {
+    if (watchedCaptionTracks.has(track)) return;
+    watchedCaptionTracks.add(track);
+    track.addEventListener("cuechange", renderCaptions);
+  }
+  video.classList.add("overlay-captions");
+  // iOS plays fullscreen in its own player, which shows only the browser's captions.
+  video.addEventListener("webkitbeginfullscreen", () => {
+    video.classList.remove("overlay-captions");
+  });
+  video.addEventListener("webkitendfullscreen", () => {
+    video.classList.add("overlay-captions");
+  });
 
   // With no language chosen, follow the browser's: broadcasts often carry a second
   // language (CC3), and whichever caption channel arrives first would otherwise win.
@@ -420,6 +503,7 @@
   // (the preferred one, or the viewer's pick) is left alone; with CC off it is a
   // pick from the browser's own caption menu, so CC turns on.
   video.textTracks.addEventListener("change", () => {
+    renderCaptions();
     const showing = Array.from(video.textTracks).filter(
       (t) => (t.kind === "subtitles" || t.kind === "captions") && t.mode === "showing",
     );
@@ -433,6 +517,7 @@
 
   video.textTracks.addEventListener("addtrack", (e) => {
     if (e.track.kind === "captions" || e.track.kind === "subtitles") {
+      watchCaptionTrack(e.track);
       applyCaptionsSetting();
       if (ccBtn.disabled) enableCcButton();
     }
@@ -517,7 +602,7 @@
     if (Math.abs(actualTime - lastSavedPosition) < 5) return;
     lastSavedPosition = actualTime;
     const data = JSON.stringify({
-      url: cfg.rawUrl,
+      ref: cfg.streamRef,
       position: actualTime,
       duration: totalDuration,
     });
@@ -1156,10 +1241,8 @@
       // Archived programs are finite and seekable, so they play like a movie
       const contentType = cfg.catchup ? "movie" : cfg.streamType;
       let url =
-        "/transcode/start?url=" +
-        encodeURIComponent(cfg.rawUrl) +
-        "&url_token=" +
-        encodeURIComponent(cfg.rawUrlToken || "") +
+        "/transcode/start?ref=" +
+        encodeURIComponent(cfg.streamRef) +
         "&content_type=" +
         contentType;
       if (cfg.seriesId) url += `&series_id=${cfg.seriesId}`;
@@ -1480,6 +1563,8 @@
   // ============================================================
 
   function setupKeyboardControls() {
+    // In the player, arrows seek and set the volume (below), not move focus.
+    window.netvNav.region(document.getElementById("player-container"), () => true);
     document.addEventListener("keydown", (e) => {
       if (castController?.active || document.getElementById("cast-dialog")?.open)
         return;
@@ -1907,7 +1992,7 @@
           await cleanupTranscode();
           isTranscoding = false;
           updateTranscodeCheck();
-          playWithUrl(cfg.rawUrl);
+          playWithUrl(cfg.directUrl);
         } catch (e) {
           console.error("[TC] Unable to stop transcode:", e);
           showError();
@@ -1923,7 +2008,7 @@
       video.src = "";
       error.classList.add("hidden");
       try {
-        await fetch(`/transcode-clear?url=${encodeURIComponent(cfg.rawUrl)}`, {
+        await fetch(`/transcode-clear?ref=${encodeURIComponent(cfg.streamRef)}`, {
           method: "DELETE",
         });
         await cleanupTranscode();
@@ -1950,14 +2035,16 @@
 
     document.getElementById("menu-url")?.addEventListener("click", () => {
       settingsMenu.classList.remove("open");
+      // This server's link: it relays the stream, keeping the provider's account private.
+      const link = new URL(cfg.directUrl, window.location.href).href;
       if (navigator.clipboard) {
-        navigator.clipboard.writeText(cfg.rawUrl).catch(fallback);
+        navigator.clipboard.writeText(link).catch(fallback);
       } else {
         fallback();
       }
       function fallback() {
         const ta = document.createElement("textarea");
-        ta.value = cfg.rawUrl;
+        ta.value = link;
         ta.style.position = "fixed";
         ta.style.opacity = "0";
         document.body.appendChild(ta);
@@ -1971,7 +2058,7 @@
       settingsMenu.classList.remove("open");
       video.pause();
       video.src = "";
-      window.location.href = `/playlist.xspf?url=${encodeURIComponent(cfg.rawUrl)}`;
+      window.location.href = `/playlist.xspf?ref=${encodeURIComponent(cfg.streamRef)}`;
     });
 
     // Fullscreen button
@@ -2334,7 +2421,7 @@
       if (event.persisted && transcodeSession.closed && !castController?.active) {
         transcodeSession.reopen();
         if (isTranscoding) startTranscode();
-        else playWithUrl(cfg.rawUrl);
+        else playWithUrl(cfg.directUrl);
       }
     });
 
@@ -2344,9 +2431,9 @@
       if (cfg.transcodeMode === "always") {
         startTranscode();
       } else if (cfg.transcodeMode === "never") {
-        playWithUrl(cfg.rawUrl);
+        playWithUrl(cfg.directUrl);
       } else {
-        playWithUrl(cfg.rawUrl, () => {
+        playWithUrl(cfg.directUrl, () => {
           error.classList.add("hidden");
           startTranscode();
         });
