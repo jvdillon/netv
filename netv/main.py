@@ -1149,6 +1149,7 @@ async def series_detail_page(
     networks = await asyncio.to_thread(imdb.credited, record, "network")
     countries = await asyncio.to_thread(imdb.credited, record, "country")
     languages = await asyncio.to_thread(imdb.credited, record, "language")
+    found = await asyncio.to_thread(imdb.info, record)
     versions = await _series_versions(cached_series, series_data, username)
     user_settings = load_user_settings(username)
     return TEMPLATES.TemplateResponse(
@@ -1166,6 +1167,7 @@ async def series_detail_page(
             "networks": networks,
             "countries": countries,
             "languages": languages,
+            "imdb_url": _imdb_url(found),
             "versions": versions,
             "cast": cast,
             "favorites": _page_favorites(user_settings),
@@ -1232,6 +1234,7 @@ async def movie_detail_page(
     composers: list[str] = []
     countries: list[str] = []
     languages: list[str] = []
+    found: imdb.Info | None = None
     if movie is not None:
         # Off the event loop: saving credits waits on a build's write.
         directors, cast = await asyncio.to_thread(
@@ -1246,6 +1249,7 @@ async def movie_detail_page(
         composers = await asyncio.to_thread(imdb.credited, movie, "composer")
         countries = await asyncio.to_thread(imdb.credited, movie, "country")
         languages = await asyncio.to_thread(imdb.credited, movie, "language")
+        found = await asyncio.to_thread(imdb.info, movie)
 
     user_settings = load_user_settings(username)
     return TEMPLATES.TemplateResponse(
@@ -1260,6 +1264,7 @@ async def movie_detail_page(
             "composers": composers,
             "countries": countries,
             "languages": languages,
+            "imdb_url": _imdb_url(found),
             "cast": cast,
             "favorites": _page_favorites(user_settings),
         },
@@ -5702,6 +5707,14 @@ def _shown_detail(record: ProviderRecord | None, details: ProviderRecord) -> Sho
         name=shown.name or text_field(details, "name"),
         poster=shown.poster or str(_first_present(details, "cover_big", "movie_image", "cover")),
     )
+
+
+def _imdb_url(found: imdb.Info | None) -> str:
+    """The title's IMDb page, or "" when IMDb does not list it."""
+    # A title saved with only the provider's credits has no IMDb id.
+    if found is None or not found["imdb_id"].startswith("tt"):
+        return ""
+    return f"https://www.imdb.com/title/{found['imdb_id']}/"
 
 
 if __name__ == "__main__":

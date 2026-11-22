@@ -1,0 +1,8 @@
+{# A detail page's rating; IMDb's opens the title's IMDb page in a new tab. #}
+{% macro rating(text, imdb_url) %}
+{% if text and imdb_url and text.startswith('IMDb') %}
+<a href="{{ imdb_url }}" target="_blank" rel="noopener" class="text-yellow-400 hover:underline focusable rounded focus:outline-none focus:ring-2 focus:ring-blue-500" tabindex="0">{{ text }}</a>
+{%- elif text %}
+<span class="text-yellow-400">{{ text }}</span>
+{%- endif %}
+{% endmacro %}

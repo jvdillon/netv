@@ -4,46 +4,47 @@
 {% block content %}
 <div class="flex flex-col min-w-0">
   {% if series.info %}
-  <div class="flex gap-2 sm:gap-6 mb-6">
+  {# On a phone the plot runs full width under the poster; wider, beside it. #}
+  <div class="grid grid-cols-[auto_1fr] gap-x-2 sm:gap-x-6 gap-y-4 mb-6 max-w-3xl">
     {% if shown.poster %}
-    <img id="cover" src="{{ shown.poster | logo_url }}" alt="" class="w-24 sm:w-36 lg:w-48 h-auto max-h-72 object-cover rounded-lg flex-shrink-0">
+    <img id="cover" src="{{ shown.poster | logo_url }}" alt="" class="w-24 sm:w-48 aspect-[2/3] self-start object-cover rounded-lg sm:row-span-2">
     {% endif %}
-    <div class="min-w-0 flex-1">
+    <div class="min-w-0 col-start-2">
       <h2 class="text-xl sm:text-3xl font-bold min-w-0 mb-2">{{ shown.name }}</h2>
       <div class="flex gap-4 text-gray-400 mb-3">
         {% if shown.year %}<span>{{ shown.year }}</span>{% endif %}
-        {% if shown.rating %}<span class="text-yellow-400">{{ shown.rating }}</span>{% endif %}
+        {% from "_rating.html" import rating %}{{ rating(shown.rating, imdb_url) }}
         {% if minutes_per_episode > 0 %}<span>{{ minutes_per_episode }} min/ep</span>{% endif %}
       </div>
-      <div class="flex gap-2 mb-4">
+      <div class="flex gap-2">
         <a href="?refresh=1" class="px-2 sm:px-4 py-1 sm:py-2 text-sm sm:text-base rounded bg-gray-700 hover:bg-gray-600 focusable" tabindex="0" title="Check for new episodes">↻</a>
         <button id="fav-btn" class="px-2 sm:px-4 py-1 sm:py-2 text-sm sm:text-base rounded bg-gray-700 hover:bg-gray-600 focusable" tabindex="0">
           ☆ Favorite
         </button>
       </div>
-
-      {% if series.info.plot %}
-      <p class="text-gray-300 mb-6 max-w-3xl">{{ series.info.plot }}</p>
-      {% endif %}
-
-      {% from "_people.html" import people %}
-      <dl class="grid grid-cols-[auto_1fr] gap-x-3 text-sm mb-4">
-        {{ people('Genre', 'genre', shown.genres) }}
-        {{ people('Network', 'network', networks) }}
-        {{ people('Director', 'director', directors) }}
-        {{ people('Writer', 'writer', writers) }}
-        {{ people('Composer', 'composer', composers) }}
-        {{ people('Cast', 'cast', cast) }}
-        {{ people('Country', 'country', countries) }}
-        {{ people('Language', 'language', languages) }}
-      </dl>
-
-      {% from "_versions.html" import versions_list %}
-      {{ versions_list(versions) }}
     </div>
+    {% if series.info.plot %}
+    <p id="plot" class="col-span-2 sm:col-span-1 sm:col-start-2 text-gray-300">{{ series.info.plot }}</p>
+    {% endif %}
   </div><!-- end header -->
-  {% from "_trailer.html" import trailer %}
-  {{ trailer(series.info.youtube_trailer) }}
+  {# Credits, versions, trailer: the header's width, so all share one right edge. #}
+  <div id="details" class="max-w-3xl flex flex-col gap-6 mb-6">
+    {% from "_people.html" import people %}
+    <dl id="credits" class="grid grid-cols-[auto_1fr] gap-x-3 text-sm">
+      {{ people('Genre', 'genre', shown.genres) }}
+      {{ people('Network', 'network', networks) }}
+      {{ people('Director', 'director', directors) }}
+      {{ people('Writer', 'writer', writers) }}
+      {{ people('Composer', 'composer', composers) }}
+      {{ people('Cast', 'cast', cast) }}
+      {{ people('Country', 'country', countries) }}
+      {{ people('Language', 'language', languages) }}
+    </dl>
+    {% from "_versions.html" import versions_list %}
+    {{ versions_list(versions) }}
+    {% from "_trailer.html" import trailer %}
+    {{ trailer(series.info.youtube_trailer) }}
+  </div><!-- end details -->
   {% endif %}
 
   <!-- Episodes by season -->

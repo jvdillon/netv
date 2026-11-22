@@ -1040,7 +1040,12 @@ def test_pages_show_one_rating_and_year_per_title(api: TestClient, web: testing.
     )
 
     def year_and_rating(page: str) -> list[str]:
-        found = re.finditer(r'<span(?: class="text-yellow-400")?>([^<]*)</span>', page)
+        # IMDb's rating is a link to its page; the provider's is plain text.
+        found = re.finditer(
+            r'<(?:span|a href="https://www\.imdb\.com/[^"]*"[^>]*)'
+            r'(?: class="text-yellow-400")?>([^<]*)</(?:span|a)>',
+            page,
+        )
         return [str(m.group(1)) for m in found][:2]
 
     # Detail pages, cards, and the player all show IMDb's rating and year.
@@ -1268,6 +1273,47 @@ def test_keyboard_focus_is_plainly_visible(api: TestClient) -> None:
     assert "outline: none" not in css
 
 
+def test_imdb_url_is_empty_without_an_imdb_id() -> None:
+    assert main._imdb_url(None) == ""
+    # Saved with only the provider's credits, a title has no IMDb page.
+    assert main._imdb_url({**_imdb_facts(7.0, 1, 1995), "imdb_id": ""}) == ""
+    assert main._imdb_url(_imdb_facts(7.0, 1, 1995)) == "https://www.imdb.com/title/tt1/"
+
+
+def _assert_header_resizes_smoothly(page: str) -> None:
+    """A detail page: the poster beside the title and buttons, then one column."""
+    cover = re.search(r'<img id="cover"[^>]*class="([^"]*)"', page)
+    assert cover is not None
+    # Rather than stretching to the text beside it and cropping to a strip.
+    assert {"aspect-[2/3]", "self-start", "object-cover"} <= set(cover.group(1).split())
+    top = page[page.index('id="cover"') : page.index("<!-- end header -->")]
+    rest = page[page.index("<!-- end header -->") :]
+    # The plot sits beside the poster, under the title and buttons.
+    assert "<h2" in top and 'id="fav-btn"' in top and 'id="plot"' not in rest
+    # On a phone the poster leaves too little room beside it, so the plot runs the
+    # full width under it; wider, it sits beside the poster under the buttons.
+    header = re.search(r'<div class="([^"]*)">\s*<img id="cover"', page)
+    assert header is not None and {"grid", "grid-cols-[auto_1fr]"} <= set(header.group(1).split())
+    assert "sm:row-span-2" in cover.group(1).split()
+    # Two poster sizes, one per layout: small on a phone, large beside the plot.
+    assert {"w-24", "sm:w-48"} <= set(cover.group(1).split())
+    assert not [c for c in cover.group(1).split() if c.startswith(("md:", "lg:", "xl:"))]
+    # The header and the credits below it share one right edge, so the plot and
+    # the credits end together; one gap between credits, versions, and trailer.
+    header = re.search(r'<div class="([^"]*)">\s*<img id="cover"', page)
+    assert header is not None and "max-w-3xl" in header.group(1).split()
+    column = re.search(
+        r'<div id="details" class="([^"]*)">(.*?)</div><!-- end details -->',
+        rest,
+        re.DOTALL,
+    )
+    assert column is not None
+    assert {"max-w-3xl", "flex", "flex-col", "gap-6"} <= set(column.group(1).split())
+    assert 'id="credits"' in column.group(2)
+    margins = re.findall(r'class="[^"]*\bm[tb]-\d', column.group(2))
+    assert not margins
+
+
 @pytest.mark.usefixtures("imdb_index")
 def test_detail_pages_name_the_composer(api: TestClient, web: testing.FakeWeb) -> None:
     _set_sources(_XTREAM)
@@ -1288,7 +1334,13 @@ def test_detail_pages_name_the_composer(api: TestClient, web: testing.FakeWeb) -
     )
     cache.get_cache().update(
         vod_streams=[
-            {"stream_id": 5, "name": "Heat", "tmdb": 5, "source_id": "s1"},
+            {
+                "stream_id": 5,
+                "name": "Heat",
+                "tmdb": 5,
+                "source_id": "s1",
+                "stream_icon": "http://img/heat.jpg",
+            },
             {"stream_id": 6, "name": "Ronin", "tmdb": 6, "source_id": "s1"},
         ],
     )
@@ -1296,9 +1348,21 @@ def test_detail_pages_name_the_composer(api: TestClient, web: testing.FakeWeb) -
         web.routes[_api_url("http://x", "get_vod_info", vod_id=stream_id)] = TimeoutError()
     # Linked like every credit, to a search for its own field.
     page = api.get("/movie/5").text
-    # Two columns: each label, then its names, which wrap in their own column
-    # rather than under the label.
-    credits = re.search(r'<dl class="grid grid-cols-\[auto_1fr\][^"]*">(.*?)</dl>', page, re.DOTALL)
+    # IMDb's rating opens the title's IMDb page, in a new tab.
+    rating = re.search(r'<a href="https://www\.imdb\.com/title/tt1/"([^>]*)>IMDb 7\.0</a>', page)
+    assert rating is not None
+    assert 'target="_blank"' in rating.group(1) and 'rel="noopener"' in rating.group(1)
+    # Under the poster and title, the page's full width, in two columns: each
+    # label, then its names, which wrap in their own column rather than under it.
+    assert page.index('id="cover"') < page.index("<!-- end header -->") < page.index('id="credits"')
+    credits = re.search(
+        r'<dl id="credits" class="grid grid-cols-\[auto_1fr\]([^"]*)">(.*?)</dl>',
+        page,
+        re.DOTALL,
+    )
+    assert credits is not None
+    _assert_header_resizes_smoothly(page)
+    credits = re.search(r'<dl id="credits"[^>]*>(.*?)</dl>', page, re.DOTALL)
     assert credits is not None
     rows = re.findall(r"<dt[^>]*>(\w+)</dt>\s*<dd[^>]*>(.*?)</dd>", credits.group(1), re.DOTALL)
     named = {label: re.findall(r'href="([^"]*)"', names) for label, names in rows}
@@ -1313,12 +1377,12 @@ def test_detail_pages_name_the_composer(api: TestClient, web: testing.FakeWeb) -
             "/search?q=language%3A%22Spanish%22",
         ],
     }
+    assert "<dt" not in api.get("/movie/6").text
     # Each name is a finger's height to tap on a phone, not a 19px line of text.
     link = re.search(r'<a href="/search\?q=writer%3A[^>]*>', page)
     assert link is not None and "inline-block py-1" in link.group(0)
     # A comma stays with the name before it; a line never starts with one.
     assert re.search(r'<span class="whitespace-nowrap"><a [^>]*>English</a>,</span>', page)
-    assert "<dt" not in api.get("/movie/6").text
 
 
 @pytest.mark.usefixtures("imdb_index")
@@ -1341,6 +1405,7 @@ def test_series_pages_name_the_network(api: TestClient, web: testing.FakeWeb) ->
                 "tmdb": 5,
                 "source_id": "s1",
                 "genre": "Drama / Sci-Fi & Fantasy, Action",
+                "cover": "http://img/got.jpg",
             },
             {"series_id": 6, "name": "Unaired", "tmdb": 6, "source_id": "s1"},
         ],
@@ -1352,12 +1417,14 @@ def test_series_pages_name_the_network(api: TestClient, web: testing.FakeWeb) ->
         )
     page = api.get("/series/5").text
     assert re.search(r"<dt[^>]*>Network</dt>", page)
+    _assert_header_resizes_smoothly(page)
     # The first episode takes focus without the browser's autofocus, which scrolled
     # the page past the title to show it.
     first = re.search(r'<a href="/play/series/11[^>]*>', page)
     assert first is not None
     assert "data-initial-focus" in first.group(0) and "autofocus" not in first.group(0)
     assert 'href="/search?q=network%3A%22HBO%22"' in page
+    assert re.search(r'<a href="https://www\.imdb\.com/title/tt1/"[^>]*>IMDb 9\.2</a>', page)
     # Without IMDb's genres, the provider's, one link each, not its "a / b" text.
     genre = re.search(r"<dt[^>]*>Genre</dt>\s*<dd[^>]*>(.*?)</dd>", page, re.DOTALL)
     assert genre is not None
@@ -1804,7 +1871,8 @@ def test_detail_pages_embed_the_trailer_paused(
         # details it crowded Play; as a column it moved as the window widened.
         holder = re.search(r'<div class="([^"]*)">\s*<iframe', page)
         assert holder is not None, path
-        assert {"w-full", "max-w-[40rem]", "mb-6"} <= set(holder.group(1).split()), path
+        # As wide as the column it sits in, like the header and credits above.
+        assert {"w-full", "aspect-video"} <= set(holder.group(1).split()), path
         assert not [
             c for c in holder.group(1).split() if c.startswith(("sm:", "md:", "lg:", "xl:"))
         ]
@@ -1943,6 +2011,12 @@ def test_movie_detail_merges_provider_info(api: TestClient, web: testing.FakeWeb
     assert stored is not None and stored[0] == info
     for text in ("Great plot", "Drama", "2001", "01:30"):
         assert text in resp.text
+    # A title IMDb lacks has no IMDb page to open.
+    assert "imdb.com" not in resp.text
+    # Under the poster on a phone, beside it from sm up.
+    plot = re.search(r'<p id="plot" class="([^"]*)">Great plot</p>', resp.text)
+    assert plot is not None
+    assert {"col-span-2", "sm:col-span-1", "sm:col-start-2"} <= set(plot.group(1).split())
     # Each credited name searches its own role; empty list entries are dropped.
     people = re.findall(r'<a href="/search\?q=([^"]*)"[^>]*>([^<]*)</a>', resp.text)
     assert [(parse.unquote(q), name) for q, name in people] == [
