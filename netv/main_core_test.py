@@ -935,7 +935,7 @@ def test_browse_sorts_by_imdb_rating_and_by_year(api: TestClient) -> None:
     assert _movie_links(by_imdb) == ["3", "2", "1", "5", "4"]
     assert 'value="imdb" selected' in by_imdb
     # Cards show the IMDb rating they sort by; unrated ones, the provider's.
-    shown = re.findall(r'<span class="text-yellow-400">([^<]*)<', by_imdb)
+    shown = re.findall(r'<span class="text-yellow-400 shrink-0">([^<]*)<', by_imdb)
     assert shown == ["IMDb 8.0", "IMDb 8.0", "IMDb 6.0", "★ 5.0", "★ 3.0"]
     # Newest year first; titles without one last.
     by_year = api.get("/api/vod/cards?category=1&sort=year").text
@@ -1049,7 +1049,7 @@ def test_pages_show_one_rating_and_year_per_title(api: TestClient, web: testing.
         return [str(m.group(1)) for m in found][:2]
 
     # Detail pages, cards, and the player all show IMDb's rating and year.
-    card = r'<span class="text-gray-400">([^<]*)</span><span class="text-yellow-400">([^<]*)<'
+    card = r'<span class="text-gray-400 shrink-0">([^<]*)</span><span class="text-yellow-400 shrink-0">([^<]*)<'
     assert year_and_rating(api.get("/movie/5").text) == ["1976", "IMDb 7.0"]
     assert re.findall(card, api.get("/search?q=spy&vod=true").text) == [("1976", "IMDb 7.0")]
     assert main._get_movie_player_info("5", "mkv").channel_name == "Spy (1976)"
@@ -1535,13 +1535,23 @@ def test_every_page_draws_a_title_with_one_card(api: TestClient) -> None:
     search = api.get("/search?q=h").text
     # Search's mix of kinds labels each card with its kind; that label is the only
     # difference from the same card elsewhere.
-    unlabeled = re.sub(r'<span class="text-gray-500" data-kind-label>[^<]*</span>', "", search)
+    unlabeled = re.sub(r'<span class="[^"]*" data-kind-label>[^<]*</span>', "", search)
     assert unlabeled != search
     movie, series = card(unlabeled, "movie", 1), card(unlabeled, "series", 2)
     # Favorites toggle from the card's own data, so no card repeats it in script;
     # every card can be dragged to a new place.
     for drawn in (movie, series):
         assert 'onclick="toggleFavorite(this)"' in drawn and 'draggable="true"' in drawn
+        # The year and rating stay whole on one line on a phone's narrow cards:
+        # "IMDb 8.0" never splits or clips; search's kind label gives way first.
+        facts = re.search(r'<div class="([^"]*)">(<span .*?)</div>', drawn)
+        assert facts is not None
+        assert {"whitespace-nowrap", "overflow-hidden"} <= set(facts.group(1).split())
+        spans = dict(re.findall(r'<span class="([^"]*)"[^>]*>([^<]*)</span>', facts.group(2)))
+        assert all("shrink-0" in c.split() for c in spans)
+    labeled = re.search(r'<span class="([^"]*)" data-kind-label>', search)
+    assert labeled is not None
+    assert {"min-w-0", "truncate"} <= set(labeled.group(1).split())
     movie_pages = (
         "/vod?sort=imdb",
         "/vod?category=1&sort=imdb",

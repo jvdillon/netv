@@ -604,6 +604,8 @@ class _ParsedEpg:
     channels: list[tuple[str, str, str | None]] = field(default_factory=list)  # `id`, name, icon.
     programs: list[ProgramRow] = field(default_factory=list)
     program_channel_ids: set[str] = field(default_factory=set)
+    # Feeds repeat programmes; a channel has one at a time, so its start names it.
+    program_starts: set[tuple[str, float]] = field(default_factory=set)
 
     def add(self, element: Element, source_id: str) -> None:
         """Record one top-level XMLTV element; anything but a channel or programme is ignored.
@@ -620,7 +622,8 @@ class _ParsedEpg:
             self.channels.append((ch_id, name, icon))
         elif element.tag == "programme":
             row = _program_row(element, source_id, self.program_channel_ids)
-            if row is not None:
+            if row is not None and (row[0], row[2]) not in self.program_starts:
+                self.program_starts.add((row[0], row[2]))
                 self.programs.append(row)
 
 

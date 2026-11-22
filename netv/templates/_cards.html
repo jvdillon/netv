@@ -22,7 +22,8 @@
     <div class="p-2">
       {# One-line title, and a fixed-height line below, keep every card one size. #}
       <div class="text-sm truncate">{{ shown.name }}</div>
-      <div class="text-xs mt-1 h-4 flex gap-2">{% if show_kind %}<span class="text-gray-500" data-kind-label>{{ {'movies': 'Movie', 'series': 'Series', 'live': 'Live'}[own] }}</span>{% endif %}<span class="text-gray-400">{{ shown.year or '' }}</span><span class="text-yellow-400">{{ shown.rating }}</span></div>
+      {# Year and rating always whole; on a narrow card the kind label gives way. #}
+      <div class="text-xs mt-1 h-4 flex gap-2 whitespace-nowrap overflow-hidden">{% if show_kind %}<span class="text-gray-500 min-w-0 truncate" data-kind-label>{{ {'movies': 'Movie', 'series': 'Series', 'live': 'Live'}[own] }}</span>{% endif %}<span class="text-gray-400 shrink-0">{{ shown.year or '' }}</span><span class="text-yellow-400 shrink-0">{{ shown.rating }}</span></div>
     </div>
   </a>
   {% if own != 'live' %}

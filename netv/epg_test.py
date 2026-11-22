@@ -656,6 +656,27 @@ class TestRefetch:
             ("d", "Gone"),
         ]
 
+    def test_a_feed_listing_a_programme_twice_stores_it_once(
+        self,
+        epg_db: None,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        url = "http://epg.example/guide.xml"
+        # Feeds repeat programmes, e.g. one straddling two of a grabber's windows.
+        _serve(
+            monkeypatch,
+            url,
+            _guide(
+                ("c", "12", "News"),
+                ("c", "12", "News"),
+                ("c", "13", "Next"),
+                ("d", "12", "News"),
+            ),
+        )
+        assert epg.fetch_epg(url, tmp_path, source_id="src1") == 3
+        assert _titles("src1") == [("c", "News"), ("c", "Next"), ("d", "News")]
+
     def test_one_of_a_source_s_guides_leaves_the_others_channels_alone(
         self,
         epg_db: None,
@@ -790,11 +811,12 @@ class TestFetchEpg:
         monkeypatch: pytest.MonkeyPatch,
     ):
         n = 3
-        prog = (
-            '<programme start="20241130120000 +0000" stop="20241130130000 +0000" channel="c">'
-            "<title>T</title></programme>"
+        progs = "".join(
+            '<programme start="20241130120000 +0000" stop="20241130130000 +0000"'
+            f' channel="c{i}"><title>T</title></programme>'
+            for i in range(n)
         )
-        _serve(monkeypatch, "http://epg.example/big.xml", f"<tv>{prog * n}</tv>".encode())
+        _serve(monkeypatch, "http://epg.example/big.xml", f"<tv>{progs}</tv>".encode())
 
         assert epg.fetch_epg("http://epg.example/big.xml", tmp_path) == n
         assert epg.get_program_count() == n
@@ -858,15 +880,17 @@ class TestStreaming:
         monkeypatch: pytest.MonkeyPatch,
     ):
         # Detail the guide does not store, such as credits, is most of a real feed.
-        credits = "<credits>" + "<actor>Someone Quite Famous</actor>" * 50 + "</credits>"
-        prog = (
-            '<programme start="20241130120000 +0000" stop="20241130130000 +0000" channel="c">'
-            f"<title>T</title>{credits}</programme>"
-        )
+        credits = "<credits>" + "<actor>Someone Quite Famous</actor>" * 100 + "</credits>"
         peaks: list[int] = []
         sizes: list[int] = []
         for n in (10, 40):
-            feed = f"<tv>{prog * n}</tv>".encode()
+            # One channel, a minute apart: distinct programmes, as a feed lists them.
+            progs = "".join(
+                f'<programme start="2024113012{i:02d}00 +0000" stop="2024113013{i:02d}00 +0000"'
+                f' channel="c"><title>T</title>{credits}</programme>'
+                for i in range(n)
+            )
+            feed = f"<tv>{progs}</tv>".encode()
             url = f"http://epg.example/{n}.xml.gz"
             _serve(monkeypatch, url, gzip.compress(feed, 1))
             tracemalloc.start()
@@ -887,11 +911,11 @@ class TestStreaming:
         monkeypatch: pytest.MonkeyPatch,
     ):
         prog = (
-            '<programme start="20241130120000 +0000" stop="20241130130000 +0000" channel="c">'
+            '<programme start="20241130120000 +0000" stop="20241130130000 +0000" channel="{}">'
             "<title>T</title></programme>"
         )
         # Both programmes stream through before the parse fails at the garbage.
-        body = f"<tv>{prog}{prog}<garbage & stuff</tv>"
+        body = f"<tv>{prog.format('c')}{prog.format('d')}<garbage & stuff</tv>"
         url = "http://epg.example/late.xml"
         web = _serve(monkeypatch, url, body.encode())
         count = epg.fetch_epg(url, tmp_path, timeout=7, source_id="src1", user_agent="UA/1")
