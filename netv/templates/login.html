@@ -11,7 +11,7 @@
     <h1 class="text-3xl font-bold text-center mb-8 text-blue-400">neTV</h1>
     {% if error %}
     <div class="mb-6 p-3 bg-red-900/50 border border-red-500 rounded text-red-200 text-center">
-      Invalid username or password
+      {% if error == 'lan' %}Only from home: this account works on the home network only{% else %}Invalid username or password{% endif %}
     </div>
     {% endif %}
     <form method="POST" action="/login" class="space-y-6">

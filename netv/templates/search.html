@@ -2,39 +2,88 @@
 {% block title %}Search - neTV{% endblock %}
 
 {% block content %}
-<div class="flex flex-col h-full min-h-0 min-w-0">
+<div class="flex flex-col min-w-0">
   <h2 class="text-xl sm:text-3xl font-bold mb-6">Search</h2>
 
   <form action="/search" method="GET" class="mb-8">
-    <div class="flex flex-wrap items-center gap-2 sm:gap-4 max-w-xl mb-3">
-      <input type="text" name="q" value="{{ query }}" placeholder="Search..."
-             class="flex-1 min-w-0 px-3 sm:px-6 py-2 sm:py-4 bg-gray-800 rounded-lg text-base sm:text-xl focus:ring-2 focus:ring-blue-500 focus:outline-none"
-             autofocus>
-      <label class="flex items-center gap-2 text-sm text-gray-400 cursor-pointer">
-        <input type="checkbox" name="regex" value="true" {% if regex %}checked{% endif %}
-               class="w-4 h-4 rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
-        Regex
-      </label>
+    <div class="flex items-center gap-2 max-w-3xl mb-4">
+      <div class="relative flex-1 min-w-0">
+        <input type="text" name="q" value="{{ query }}" placeholder="Search titles, people, roles…"
+               title="Fields: title: cast: role: director: writer: composer: network: country: language: year: genre: imdb: (press ? for help)"
+               class="w-full pl-4 pr-12 py-3 bg-gray-800 rounded-lg text-base sm:text-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+               autofocus>
+        <button type="button" aria-controls="search-help" title="Search fields (?)" onclick="toggleSearchHelp()"
+                class="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 rounded-full text-gray-400 hover:text-white hover:bg-gray-700 focusable">?</button>
+      </div>
+      {# Without it, Enter does nothing: the form has several text and number fields. #}
+      <button type="submit" class="px-5 py-3 rounded-lg bg-blue-600 hover:bg-blue-700 text-base sm:text-lg focusable">Search</button>
     </div>
-    <div class="flex items-center gap-4 text-sm">
-      <label class="flex items-center gap-2 text-gray-400 cursor-pointer">
+    {# What to search, and filters; year and IMDb apply to movies and series only. #}
+    <div class="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-gray-400 mb-2">
+      <label class="flex items-center gap-2 cursor-pointer">
         <input type="checkbox" name="live" value="true" {% if search_live %}checked{% endif %}
                class="w-4 h-4 rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
         Live TV
       </label>
-      <label class="flex items-center gap-2 text-gray-400 cursor-pointer">
+      <label class="flex items-center gap-2 cursor-pointer">
         <input type="checkbox" name="vod" value="true" {% if search_vod %}checked{% endif %}
                class="w-4 h-4 rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
         Movies
       </label>
-      <label class="flex items-center gap-2 text-gray-400 cursor-pointer">
+      <label class="flex items-center gap-2 cursor-pointer">
         <input type="checkbox" name="series" value="true" {% if search_series %}checked{% endif %}
                class="w-4 h-4 rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
         Series
       </label>
-      <label class="flex items-center gap-2 text-gray-400">
-        <span>Limit:</span>
-        <select name="limit" class="bg-gray-700 border-gray-600 rounded px-2 py-1 text-sm" onchange="this.form.submit()">
+      <label class="flex items-center gap-2 cursor-pointer">
+        <input type="checkbox" name="regex" value="true" {% if regex %}checked{% endif %}
+               class="w-4 h-4 rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
+        Regex
+      </label>
+      <label class="flex items-center gap-2">
+        <span>Year</span>
+        <input type="number" name="year_from" value="{{ filters.year_from if filters.year_from is not none else '' }}"
+               placeholder="from" min="1800" max="2100" onchange="this.form.submit()"
+               class="h-8 w-20 bg-gray-700 rounded px-2 text-sm">
+        <span>–</span>
+        <input type="number" name="year_to" value="{{ filters.year_to if filters.year_to is not none else '' }}"
+               placeholder="to" min="1800" max="2100" onchange="this.form.submit()"
+               class="h-8 w-20 bg-gray-700 rounded px-2 text-sm">
+      </label>
+      <label class="flex items-center gap-2">
+        <span>IMDb ≥</span>
+        <input type="number" name="min_imdb" value="{{ filters.min_imdb if filters.min_imdb is not none else '' }}"
+               min="0" max="10" step="0.1" onchange="this.form.submit()"
+               class="h-8 w-16 bg-gray-700 rounded px-2 text-sm">
+      </label>
+      {# The categories results fall in, one name across channels, movies, and series. #}
+      <label class="flex items-center gap-2">
+        <span>Category</span>
+        <select name="category" class="h-8 bg-gray-700 rounded px-2 text-sm max-w-[12rem]" onchange="this.form.submit()">
+          <option value="" {% if not filters.category %}selected{% endif %}>All</option>
+          {% for name in categories %}
+          <option value="{{ name }}" {% if filters.category == name %}selected{% endif %}>{{ name }}</option>
+          {% endfor %}
+          {% if filters.category and filters.category not in categories %}
+          <option value="{{ filters.category }}" selected>{{ filters.category }}</option>
+          {% endif %}
+        </select>
+      </label>
+    </div>
+    {# How results are listed. #}
+    <div class="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-gray-400">
+      <label class="flex items-center gap-2">
+        <span>Sort</span>
+        <select name="sort" class="h-8 bg-gray-700 rounded px-2 text-sm" onchange="this.form.submit()">
+          <option value="alpha" {% if sort == 'alpha' %}selected{% endif %}>A-Z</option>
+          <option value="imdb" {% if sort == 'imdb' %}selected{% endif %}>IMDb</option>
+          <option value="year" {% if sort == 'year' %}selected{% endif %}>Year</option>
+          <option value="newest" {% if sort == 'newest' %}selected{% endif %}>Newest</option>
+        </select>
+      </label>
+      <label class="flex items-center gap-2">
+        <span>Show</span>
+        <select name="limit" class="h-8 bg-gray-700 rounded px-2 text-sm" onchange="this.form.submit()">
           <option value="25" {% if limit == 25 %}selected{% endif %}>25</option>
           <option value="50" {% if limit == 50 %}selected{% endif %}>50</option>
           <option value="100" {% if limit == 100 %}selected{% endif %}>100</option>
@@ -45,105 +94,71 @@
     </div>
   </form>
 
-  <div class="flex-1 min-h-0 overflow-auto scroll-ring-safe">
+  <div class="scroll-ring-safe">
   {% if query %}
-  {% if results.live or results.vod or results.series %}
-  <div class="flex gap-4 mb-4 text-sm">
-    {% if results.live %}<a href="#live-results" class="text-blue-400 hover:underline">Live ({{ results.live|length }}{% if limit and results.live|length == limit %}+{% endif %})</a>{% endif %}
-    {% if results.vod %}<a href="#vod-results" class="text-blue-400 hover:underline">Movies ({{ results.vod|length }}{% if limit and results.vod|length == limit %}+{% endif %})</a>{% endif %}
-    {% if results.series %}<a href="#series-results" class="text-blue-400 hover:underline">Series ({{ results.series|length }}{% if limit and results.series|length == limit %}+{% endif %})</a>{% endif %}
+  {% if results %}
+  <p class="text-sm text-gray-400 mb-3">{{ total }} result{{ '' if total == 1 else 's' }}{% if limit and total > limit %}, showing {{ limit }}{% endif %}</p>
+  {# Channels, movies, and series together, in the chosen order. #}
+  <div id="results" class="grid grid-cols-[repeat(auto-fill,8rem)] sm:grid-cols-[repeat(auto-fill,10rem)] gap-2 sm:gap-3">
+    {% with items = results, show_kind = true %}{% include "_cards.html" %}{% endwith %}
   </div>
-  {% endif %}
-  <!-- Live results -->
-  {% if results.live %}
-  <div id="live-results" class="mb-8">
-    <h3 class="text-2xl font-semibold mb-4">Live Channels ({{ results.live|length }}{% if limit and results.live|length == limit %}+{% endif %})</h3>
-    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
-      {% for stream in results.live %}
-      <a href="/play/live/{{ stream.stream_id }}"
-         class="block bg-gray-800 rounded-lg p-4 hover:ring-2 hover:ring-blue-500 focus:ring-2 focus:ring-blue-500 focusable transition-all flex flex-col items-center"
-         tabindex="0" data-nav="grid">
-        {% if stream.stream_icon %}
-        <img data-src="{{ stream.stream_icon | logo_url }}" alt="" class="w-16 h-16 object-contain mb-2 lazy-img"
-             onerror="this.style.display='none'">
-        {% endif %}
-        <span class="text-center line-clamp-2">{{ stream.name }}</span>
-      </a>
-      {% endfor %}
-    </div>
-  </div>
-  {% endif %}
-
-  <!-- VOD results -->
-  {% if results.vod %}
-  <div id="vod-results" class="mb-8">
-    <h3 class="text-2xl font-semibold mb-4">Movies ({{ results.vod|length }}{% if limit and results.vod|length == limit %}+{% endif %})</h3>
-    <div class="grid grid-cols-[repeat(auto-fill,8rem)] sm:grid-cols-[repeat(auto-fill,10rem)] gap-2 sm:gap-3">
-      {% with items = results.vod %}{% include "_movie_cards.html" %}{% endwith %}
-    </div>
-  </div>
-  {% endif %}
-
-  <!-- Series results -->
-  {% if results.series %}
-  <div id="series-results" class="mb-8">
-    <h3 class="text-2xl font-semibold mb-4">Series ({{ results.series|length }}{% if limit and results.series|length == limit %}+{% endif %})</h3>
-    <div class="grid grid-cols-[repeat(auto-fill,8rem)] sm:grid-cols-[repeat(auto-fill,10rem)] gap-2 sm:gap-3">
-      {% with items = results.series %}{% include "_series_cards.html" %}{% endwith %}
-    </div>
-  </div>
-  {% endif %}
-
-  {% if not results.live and not results.vod and not results.series %}
+  {% else %}
   <p class="text-gray-400 text-xl">No results found for "{{ query }}"</p>
   {% endif %}
+  {% if hidden_by_filters %}
+  {% set cleared = request.query_params | dictsort | rejectattr(0, 'in', ['year_from', 'year_to', 'min_imdb', 'category']) | list %}
+  <p id="hidden-by-filters" class="mt-4 text-sm text-gray-400">{{ hidden_by_filters }} more hidden by your filters —
+    <a href="/search?{{ (cleared + [('year_from', ''), ('year_to', ''), ('min_imdb', ''), ('category', '')]) | urlencode }}"
+       class="text-blue-400 hover:underline focusable">Clear filters</a></p>
   {% endif %}
+  {% endif %}
+  </div>
+</div>
+
+<div id="search-help" class="hidden fixed inset-0 z-50 bg-black/70 items-center justify-center p-4"
+     role="dialog" aria-label="Search fields" onclick="if (event.target === this) toggleSearchHelp()">
+  <div class="bg-gray-800 rounded-lg p-6 max-w-lg w-full text-sm text-gray-300 shadow-xl">
+    <h3 class="text-lg font-semibold text-white mb-3">Search fields</h3>
+    <dl class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5">
+      <dt><code>title:heat</code></dt><dd>the movie or series name</dd>
+      <dt><code>cast:"al pacino"</code></dt><dd>an actor</dd>
+      <dt><code>role:"james bond"</code></dt><dd>a character</dd>
+      <dt><code>director:mann</code></dt><dd>a director</dd>
+      <dt><code>writer:nolan</code></dt><dd>a writer</dd>
+      <dt><code>composer:"john williams"</code></dt><dd>who scored it</dd>
+      <dt><code>network:hbo</code></dt><dd>where a series first aired</dd>
+      <dt><code>country:japan</code></dt><dd>where it was made</dd>
+      <dt><code>language:korean</code></dt><dd>its original language</dd>
+      <dt><code>year:1977</code></dt><dd>a year, or a range: <code>1970-1979</code></dd>
+      <dt><code>genre:horror</code></dt><dd>a genre</dd>
+      <dt><code>imdb:7</code></dt><dd>rated 7 or more, or a range: <code>7-8</code></dd>
+    </dl>
+    <p class="mt-4 text-gray-400">Quote phrases. Combine fields: <code>director:mann year:1990-1999</code>.
+      Words outside a field match any of them. Press <kbd>?</kbd> or <kbd>Esc</kbd> to close.</p>
   </div>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script>
-let favorites = {{ favorites | tojson }};
+window.favorites = {{ favorites | tojson }};
 
-window.onFavoritesChanged = function(changed) {
-  favorites = changed;
-  updateButtons();
-};
-
-// The shared cards call toggleFavorite: movie cards with an extension, series cards without.
-async function toggleFavorite(id, name, cover, ext) {
-  const kind = ext === undefined ? 'series' : 'movies';
-  id = String(id);
-  const entry = favorites[kind][id] ? null : kind === 'movies' ? { name, cover, ext } : { name, cover };
-  window.onFavoritesChanged(await setFavorite(kind, id, entry));
+function toggleSearchHelp(open) {
+  const help = document.getElementById('search-help');
+  const show = open ?? help.classList.contains('hidden');
+  help.classList.toggle('hidden', !show);
+  help.classList.toggle('flex', show);
 }
 
-function updateButtons() {
-  document.querySelectorAll('.fav-btn').forEach(btn => {
-    const card = btn.closest('.movie-card, .series-card');
-    const kind = card?.classList.contains('movie-card') ? 'movies' : 'series';
-    const id = card?.dataset.movieId ?? card?.dataset.seriesId;
-    btn.textContent = favorites[kind][id] ? '★' : '☆';
-    btn.classList.toggle('text-yellow-400', !!favorites[kind][id]);
-  });
-}
-
-updateButtons();
-
-// Lazy load images with Intersection Observer
-const scrollContainer = document.querySelector('.overflow-auto');
-const lazyObserver = new IntersectionObserver((entries) => {
-  entries.forEach(entry => {
-    if (entry.isIntersecting) {
-      const img = entry.target;
-      img.src = img.dataset.src;
-      img.classList.remove('lazy-img');
-      lazyObserver.unobserve(img);
-    }
-  });
-}, { root: scrollContainer, rootMargin: '200px' });
-
-document.querySelectorAll('.lazy-img').forEach(img => lazyObserver.observe(img));
+// As in Gmail, "?" opens the help, except while typing in a field.
+document.addEventListener('keydown', (event) => {
+  const typing = event.target.closest('input, textarea, select, [contenteditable]');
+  if (event.key === '?' && !typing) {
+    event.preventDefault();
+    toggleSearchHelp();
+  } else if (event.key === 'Escape') {
+    toggleSearchHelp(false);
+  }
+});
 </script>
 {% endblock %}

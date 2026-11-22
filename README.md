@@ -478,8 +478,10 @@ reachable by the player, set `NETV_GATEWAY_PUBLIC_URL` to the externally
 reachable gateway URL, such as `http://192.168.1.20:8100`.
 Use only a scheme, host, and optional port; path prefixes are not supported.
 Forwarded client addresses are trusted only from localhost by default. If a
-reverse proxy runs elsewhere, set `NETV_GATEWAY_TRUSTED_PROXIES` to its IP
-address or a comma-separated list of proxy IP addresses.
+reverse proxy runs elsewhere, set `NETV_GATEWAY_TRUSTED_PROXIES` (gateway) and
+`NETV_TRUSTED_PROXIES` (web app) to its IP address or a comma-separated list of
+proxy IP addresses. LAN-only users depend on this: netv judges "home" by the
+client address, so trust only proxies you run.
 
 For restricted users, the gateway hides uncategorized streams because they
 cannot be proven to belong to an allowed category.

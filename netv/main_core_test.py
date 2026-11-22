@@ -18,6 +18,7 @@ import time
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from treekle import json_loads
 
 import pytest
 
@@ -225,9 +226,13 @@ def test_lifespan_runs_workers_and_shuts_down(
     monkeypatch.setattr(main, "_shutdown_event", None)
     # Threads share the test's fake internet; spawned processes would not.
     built: list[list[ProviderRecord]] = []
+    tokens: list[str] = []
+    # A TMDB key, when the environment has one, reaches the build; none is needed.
+    monkeypatch.setenv("TMDB_API_KEY", "t.o.k")
 
-    def failing_build(records: list[ProviderRecord]) -> int:
+    def failing_build(records: list[ProviderRecord], *, tmdb_token: str) -> int:
         built.append(records)
+        tokens.append(tmdb_token)
         raise OSError("IMDb unreachable")
 
     monkeypatch.setattr(imdb, "build", failing_build)
@@ -335,6 +340,7 @@ def test_lifespan_runs_workers_and_shuts_down(
                 cache.get_cache()["vod_streams"] = [{"name": "Heat - 1995"}]
                 imdb_loop.run()
             assert built == [[{"name": "Heat - 1995"}]]
+            assert tokens == ["t.o.k"]
             viewer, recording = launcher.launches
             await recording.process.stdin.wait_for(len(testing.ts_source()))
             # The recording took over before shutdown, which would stop the viewer anyway.
@@ -552,6 +558,13 @@ def test_guide_rows_api_loads_file_cache(api: TestClient) -> None:
     assert (past_end["total"], past_end["rows"]) == (1, [])
 
 
+@pytest.fixture
+def imdb_index(guide_db: None) -> None:
+    """The IMDb index tables cards read their ratings from, in the per-test database."""
+    del guide_db
+    imdb.init()
+
+
 def _vod_streams() -> list[ProviderRecord]:
     return [
         # A rating below one sorts above an unparsable one, which counts as zero.
@@ -561,6 +574,7 @@ def _vod_streams() -> list[ProviderRecord]:
     ]
 
 
+@pytest.mark.usefixtures("imdb_index")
 def test_vod_page_loads_file_cache(api: TestClient) -> None:
     cats = [{"category_id": "1", "category_name": "Films"}]
     cache.save_file_cache("vod_data", {"cats": cats, "streams": _vod_streams()})
@@ -577,6 +591,7 @@ def test_vod_page_restricted(api: TestClient) -> None:
     assert api.get("/vod").status_code == 403
 
 
+@pytest.mark.usefixtures("imdb_index")
 def test_vod_page_applies_filter_and_sorts(api: TestClient) -> None:
     cache.get_cache().update(
         vod_categories=[
@@ -596,6 +611,7 @@ def test_vod_page_applies_filter_and_sorts(api: TestClient) -> None:
     assert newest.index("MovieBeta") < newest.index("MovieAlpha")
 
 
+@pytest.mark.usefixtures("imdb_index")
 def test_vod_browse_defers_rows_past_the_first_few(api: TestClient) -> None:
     cats: list[ProviderRecord] = [
         {"category_id": str(i), "category_name": f"Cat{i}"} for i in range(6)
@@ -611,6 +627,7 @@ def test_vod_browse_defers_rows_past_the_first_few(api: TestClient) -> None:
     assert "/api/vod/cards?category=5&sort=alpha&limit=20" in page
 
 
+@pytest.mark.usefixtures("imdb_index")
 def test_vod_browse_row_links_to_full_category(api: TestClient) -> None:
     films: list[ProviderRecord] = [
         {"stream_id": i, "name": f"F{i:02}", "category_id": "1"} for i in range(21)
@@ -628,6 +645,7 @@ def test_vod_browse_row_links_to_full_category(api: TestClient) -> None:
     assert 'data-total="21"' in full
 
 
+@pytest.mark.usefixtures("imdb_index")
 def test_vod_cards_returns_a_slice_of_one_category(api: TestClient) -> None:
     cache.get_cache().update(vod_categories=[], vod_streams=_vod_streams())
     resp = api.get("/api/vod/cards?category=1&sort=alpha&offset=1&limit=1")
@@ -638,6 +656,137 @@ def test_vod_cards_returns_a_slice_of_one_category(api: TestClient) -> None:
     assert api.get("/api/vod/cards?category=1&limit=999").status_code == 422
 
 
+def _heat_versions() -> list[ProviderRecord]:
+    """One movie the provider lists three times, under two spellings, and another."""
+    return [
+        {"stream_id": 1, "name": "Heat - 1995", "tmdb": 949, "category_id": "1", "added": "100"},
+        {"stream_id": 2, "name": "Heat (1995)", "tmdb": "949", "category_id": "1", "added": "300"},
+        {"stream_id": 3, "name": "Heat - 1995", "tmdb": 949, "category_id": "2", "added": "200"},
+        {"stream_id": 4, "name": "Ronin - 1998", "tmdb": 8195, "category_id": "1", "added": "50"},
+    ]
+
+
+def _movie_links(page: str) -> list[str]:
+    return [m.group(1) for m in re.finditer(r'href="/movie/(\d+)"', page)]
+
+
+def test_one_per_title_keeps_the_earliest_added_movie_then_lowest_id() -> None:
+    listings: list[ProviderRecord] = [
+        {"stream_id": 6, "name": "Heat - 1995", "tmdb": 949, "added": "7"},
+        {"stream_id": 5, "name": "Heat - 1995", "tmdb": 949, "added": "7"},
+        {"stream_id": 8, "name": "Heat - 1995", "tmdb": 949, "added": "7"},
+    ]
+    assert main._one_per_title(listings, per_category=False) == [listings[1]]
+    # When it was added counts before its id.
+    earlier: ProviderRecord = {"stream_id": 9, "name": "Heat - 1995", "tmdb": 949, "added": "6"}
+    assert main._one_per_title([*listings, earlier], per_category=False) == [earlier]
+
+
+def _house_of_cards() -> list[ProviderRecord]:
+    """One series the provider lists twice (as House of Cards is), and another."""
+    common: ProviderRecord = {"tmdb": "1425", "source_id": "s1", "releaseDate": "2013-02-01"}
+    july = int(datetime(2026, 7, 30, 12, tzinfo=timezone.utc).timestamp())
+    october = int(datetime(2026, 10, 9, 12, tzinfo=timezone.utc).timestamp())
+    return [
+        {
+            **common,
+            "series_id": 16_566,
+            "name": "House of Cards (US) (2013)",
+            "category_id": "1",
+            "last_modified": str(july),
+        },
+        {
+            **common,
+            "series_id": 16_486,
+            "name": "House of Cards",
+            "category_id": "2",
+            "last_modified": str(october),
+        },
+        {"series_id": 7, "name": "Homeland", "tmdb": "1407", "source_id": "s1", "category_id": "1"},
+    ]
+
+
+def test_one_per_title_keeps_the_most_recently_updated_series() -> None:
+    # A series listing gains episodes as it updates, so the newest has the most.
+    older, newer, other = _house_of_cards()
+    assert main._one_per_title([older, other, newer], per_category=False) == [newer, other]
+    tie: ProviderRecord = {**newer, "series_id": 16_999}
+    assert main._one_per_title([newer, tie], per_category=False) == [tie]
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_series_show_once_in_search_and_once_per_category(api: TestClient) -> None:
+    cache.get_cache().update(
+        live_streams=[],
+        vod_streams=[],
+        series_categories=[
+            {"category_id": "1", "category_name": "US"},
+            {"category_id": "2", "category_name": "Drama"},
+        ],
+        series=_house_of_cards(),
+    )
+    assert _series_links(api.get("/search?q=house&series=true&min_imdb=").text) == ["16486"]
+    assert _series_links(api.get("/series?category=1&sort=alpha").text) == ["7", "16566"]
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_series_detail_offers_each_listing(api: TestClient, web: testing.FakeWeb) -> None:
+    _set_sources(_XTREAM)
+    older, newer, other = _house_of_cards()
+    # Listings whose details cannot load: one from a source since removed, one whose
+    # provider times out. Each still says when it changed.
+    orphan: ProviderRecord = {
+        **older,
+        "series_id": 17_001,
+        "source_id": "gone",
+        "last_modified": "1",
+    }
+    slow: ProviderRecord = {**older, "series_id": 17_002, "last_modified": "2"}
+    cache.get_cache()["series"] = [older, newer, other, orphan, slow]
+    episodes = {"1": [{"id": "1", "episode_num": 1}, {"id": "2", "episode_num": 2}]}
+    for series_id, eps in (("16566", {"1": episodes["1"][:1]}), ("16486", episodes)):
+        web.routes[_api_url("http://x", "get_series_info", series_id=series_id)] = (
+            testing.FakeResponse(json.dumps({"info": {"name": "HoC"}, "episodes": eps}).encode())
+        )
+    web.routes[_api_url("http://x", "get_series_info", series_id="17002")] = TimeoutError()
+    page = api.get("/series/16566").text
+    versions = re.findall(r'data-version="(\d+)"( aria-current="true")?>\s*([^<]*?)\s*<', page)
+    # Newest first, as cards open it; each says when it last changed and how much it has.
+    stamp = f"{datetime.fromtimestamp(2):%b %-d, %Y}"
+    assert versions == [
+        ("16486", "", "Updated Oct 9, 2026 · 2 episodes"),
+        ("16566", ' aria-current="true"', "Updated Jul 30, 2026 · 1 episode"),
+        ("17002", "", f"Updated {stamp}"),
+        ("17001", "", f"Updated {datetime.fromtimestamp(1):%b %-d, %Y}"),
+    ]
+    assert 'href="/series/16486"' in page
+    assert "data-version" not in api.get("/series/7").text
+    # A series missing from the catalog has no other listings to offer.
+    web.routes[_api_url("http://x", "get_series_info", series_id="999")] = testing.FakeResponse(
+        b'{"info": {"name": "Gone"}, "episodes": {}}',
+    )
+    assert "data-version" not in api.get("/series/999").text
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_vod_browse_shows_each_movie_once_per_category(api: TestClient) -> None:
+    cache.get_cache().update(
+        vod_categories=[
+            {"category_id": "1", "category_name": "CatOne"},
+            {"category_id": "2", "category_name": "CatTwo"},
+        ],
+        vod_streams=_heat_versions(),
+    )
+    # The oldest version stands for the movie in each category that lists it: the
+    # provider's re-uploads are often dead (37 of 40 sampled), its originals rarely.
+    assert _movie_links(api.get("/vod?sort=alpha").text) == ["1", "4", "3"]
+    full = api.get("/vod?category=1&sort=alpha").text
+    assert 'data-total="2"' in full
+    assert _movie_links(full) == ["1", "4"]
+    assert _movie_links(api.get("/api/vod/cards?category=1&sort=newest").text) == ["1", "4"]
+
+
+@pytest.mark.usefixtures("imdb_index")
 def test_cards_load_file_caches(api: TestClient) -> None:
     cats = [{"category_id": "1", "category_name": "Films"}]
     cache.save_file_cache("vod_data", {"cats": cats, "streams": _vod_streams()})
@@ -679,6 +828,7 @@ def _series_list() -> list[ProviderRecord]:
     ]
 
 
+@pytest.mark.usefixtures("imdb_index")
 def test_series_page_loads_file_cache(api: TestClient) -> None:
     cats = [{"category_id": "1", "category_name": "Drama"}]
     cache.save_file_cache("series_data", {"cats": cats, "series": _series_list()})
@@ -713,6 +863,723 @@ def test_series_page_restricted(api: TestClient) -> None:
     assert api.get("/series").status_code == 403
 
 
+def _imdb_facts(rating: float, votes: int, year: int) -> imdb.Info:
+    return {
+        "imdb_id": "tt1",
+        "title": "",
+        "year": year,
+        "genres": [],
+        "runtime_min": 0,
+        "rating": rating,
+        "votes": votes,
+        "directors": [],
+        "writers": [],
+        "cast": [],
+        "characters": [],
+        "crew": {},
+    }
+
+
+def _ranked_catalog() -> tuple[list[ProviderRecord], list[ProviderRecord]]:
+    """Movies and series IMDb ranks; Delta and Epsilon it does not, nor their years."""
+    imdb.init()
+    imdb._write(
+        {
+            f"{kind}:tmdb:{n}": facts
+            for kind in ("movies", "series")
+            for n, facts in (
+                (1, _imdb_facts(6.0, 5, 1990)),
+                (2, _imdb_facts(8.0, 10, 2010)),
+                (3, _imdb_facts(8.0, 99, 2001)),
+            )
+        },
+        set(),
+    )
+    # The provider rates the titles IMDb does not.
+    titles = (
+        ("Alpha - 1990", ""),
+        ("Beta - 2010", ""),
+        ("Gamma - 2001", ""),
+        ("Delta", "3"),
+        ("Epsilon", "5"),
+    )
+    movies: list[ProviderRecord] = [
+        {"stream_id": n, "name": name, "tmdb": n, "category_id": "1", "rating": rating}
+        for n, (name, rating) in enumerate(titles, 1)
+    ]
+    series: list[ProviderRecord] = [
+        {"series_id": n, "name": name, "tmdb": n, "category_id": "1", "rating": rating}
+        for n, (name, rating) in enumerate(titles, 1)
+    ]
+    return movies, series
+
+
+def _series_links(page: str) -> list[str]:
+    return [m.group(1) for m in re.finditer(r'href="/series/(\d+)"', page)]
+
+
+@pytest.mark.usefixtures("guide_db")
+def test_browse_sorts_by_imdb_rating_and_by_year(api: TestClient) -> None:
+    movies, series = _ranked_catalog()
+    cats: list[ProviderRecord] = [{"category_id": "1", "category_name": "CatOne"}]
+    cache.get_cache().update(
+        vod_categories=cats,
+        vod_streams=movies,
+        series_categories=cats,
+        series=series,
+    )
+    # Best rated first, more votes breaking a tie; what IMDb has not rated last, by
+    # the provider's rating.
+    by_imdb = api.get("/vod?category=1&sort=imdb").text
+    assert _movie_links(by_imdb) == ["3", "2", "1", "5", "4"]
+    assert 'value="imdb" selected' in by_imdb
+    # Cards show the IMDb rating they sort by; unrated ones, the provider's.
+    shown = re.findall(r'<span class="text-yellow-400">([^<]*)<', by_imdb)
+    assert shown == ["IMDb 8.0", "IMDb 8.0", "IMDb 6.0", "★ 5.0", "★ 3.0"]
+    # Newest year first; titles without one last.
+    by_year = api.get("/api/vod/cards?category=1&sort=year").text
+    assert _movie_links(by_year) == ["2", "3", "1", "4", "5"]
+    assert _series_links(api.get("/series?category=1&sort=imdb").text) == ["3", "2", "1", "5", "4"]
+    assert _series_links(api.get("/series?category=1&sort=year").text) == ["2", "3", "1", "4", "5"]
+
+
+@pytest.mark.usefixtures("guide_db")
+def test_search_sorts_movies_and_series_before_limiting(api: TestClient) -> None:
+    movies, series = _ranked_catalog()
+    cache.get_cache().update(live_streams=[], vod_streams=movies, series=series)
+
+    # The limit applies to movies and series together, after one sort of them all.
+    by_imdb = api.get("/search?q=a&sort=imdb&limit=4").text
+    # The four best rated, not the first four by name.
+    assert (_movie_links(by_imdb), _series_links(by_imdb)) == (["3", "2"], ["3", "2"])
+    assert 'value="imdb" selected' in by_imdb
+    by_year = api.get("/search?q=a&sort=year&limit=4").text
+    assert (_movie_links(by_year), _series_links(by_year)) == (["2", "3"], ["2", "3"])
+    by_name = api.get("/search?q=a&sort=alpha&limit=4").text
+    assert (_movie_links(by_name), _series_links(by_name)) == (["1", "2"], ["1", "2"])
+    assert 'value="alpha" selected' in by_name
+    assert len(_movie_links(api.get("/search?q=a&sort=imdb&limit=1").text)) == 1
+
+
+@pytest.mark.usefixtures("guide_db")
+def test_sort_choice_is_remembered_across_search_and_browse(api: TestClient) -> None:
+    movies, series = _ranked_catalog()
+    cats: list[ProviderRecord] = [{"category_id": "1", "category_name": "CatOne"}]
+    cache.get_cache().update(
+        live_streams=[],
+        vod_categories=cats,
+        vod_streams=movies,
+        series_categories=cats,
+        series=series,
+    )
+    # Before any choice, search sorts by name and Browse All by IMDb rating.
+    assert _movie_links(api.get("/search?q=a").text) == ["1", "2", "4", "3"]
+    assert 'href="/vod?sort=imdb"' in api.get("/vod").text
+
+    api.get("/search?q=a&sort=year")
+
+    # Later searches and browsing use the choice until another is made.
+    assert cache.load_user_settings("testuser").get("results_sort") == "year"
+    assert _movie_links(api.get("/search?q=a").text) == ["2", "3", "1", "4"]
+    assert 'href="/series?sort=year"' in api.get("/series").text
+    api.get("/vod?category=1&sort=imdb")
+    assert 'value="imdb" selected' in api.get("/search?q=a").text
+    # A sort the pages do not offer is not remembered.
+    api.get("/vod?sort=bogus")
+    assert cache.load_user_settings("testuser").get("results_sort") == "imdb"
+    # "Rating" sorted by the provider's number, which no card shows. Old links and a
+    # remembered "rating" now mean the rating cards show.
+    api.get("/vod?category=1&sort=year")
+    by_old_link = api.get("/vod?category=1&sort=rating").text
+    assert _movie_links(by_old_link) == ["3", "2", "1", "5", "4"]
+    assert 'value="imdb" selected' in by_old_link
+    assert 'value="rating"' not in by_old_link
+    settings = cache.load_user_settings("testuser")
+    assert settings.get("results_sort") == "imdb"
+    settings["results_sort"] = "rating"
+    cache.save_user_settings("testuser", settings)
+    remembered = api.get("/search?q=a").text
+    assert 'value="imdb" selected' in remembered
+    assert _movie_links(remembered) == ["3", "2", "1", "4"]
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_pages_show_one_rating_and_year_per_title(api: TestClient, web: testing.FakeWeb) -> None:
+    _set_sources(_XTREAM)
+    imdb._write(
+        {
+            "movies:tmdb:5": _imdb_facts(7.0, 127_509, 1976),
+            "series:tmdb:6": _imdb_facts(8.5, 10, 2007),
+        },
+        set(),
+    )
+    rated: ProviderRecord = {
+        "stream_id": 5,
+        "name": "Spy - 1977",
+        "tmdb": 5,
+        "source_id": "s1",
+        "category_id": "1",
+        "rating": "6.82",
+    }
+    # IMDb knows nothing of this one, so its rating and year are the provider's.
+    unrated: ProviderRecord = {**rated, "stream_id": 7, "name": "Other - 1977", "tmdb": 7}
+    show: ProviderRecord = {"series_id": 6, "name": "Show", "tmdb": 6, "source_id": "s1"}
+    cache.get_cache().update(live_streams=[], vod_streams=[rated, unrated], series=[show])
+    for stream_id in ("5", "7"):
+        info = {"info": {"name": "Spy", "rating": "6.82", "releasedate": "1977-07-07"}}
+        web.routes[_api_url("http://x", "get_vod_info", vod_id=stream_id)] = testing.FakeResponse(
+            json.dumps(info).encode(),
+        )
+    series_info: ProviderRecord = {
+        "info": {"name": "Show", "rating": "6.1", "releaseDate": "2008-01-01"},
+        "episodes": {},
+    }
+    web.routes[_api_url("http://x", "get_series_info", series_id="6")] = testing.FakeResponse(
+        json.dumps(series_info).encode(),
+    )
+
+    def year_and_rating(page: str) -> list[str]:
+        found = re.finditer(r'<span(?: class="text-yellow-400")?>([^<]*)</span>', page)
+        return [str(m.group(1)) for m in found][:2]
+
+    # Detail pages, cards, and the player all show IMDb's rating and year.
+    card = r'<span class="text-gray-400">([^<]*)</span><span class="text-yellow-400">([^<]*)<'
+    assert year_and_rating(api.get("/movie/5").text) == ["1976", "IMDb 7.0"]
+    assert re.findall(card, api.get("/search?q=spy&vod=true").text) == [("1976", "IMDb 7.0")]
+    assert main._get_movie_player_info("5", "mkv").channel_name == "Spy (1976)"
+    assert year_and_rating(api.get("/series/6").text) == ["2007", "IMDb 8.5"]
+    assert main._get_series_player_info("1", 6, "")[0].channel_name == "Show (2007)"
+    # Without IMDb's, every page shows the provider's.
+    assert year_and_rating(api.get("/movie/7").text) == ["1977", "★ 6.8"]
+    assert re.findall(card, api.get("/search?q=other&vod=true").text) == [("1977", "★ 6.8")]
+    assert main._get_movie_player_info("7", "mkv").channel_name == "Spy (1977)"
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_detail_pages_and_favorites_use_the_cards_name_and_poster(
+    api: TestClient,
+    web: testing.FakeWeb,
+) -> None:
+    _set_sources(_XTREAM)
+    film: ProviderRecord = {
+        "stream_id": 5,
+        "name": "Film - 1999",
+        "source_id": "s1",
+        "stream_icon": "http://img/film-small.jpg",
+    }
+    show: ProviderRecord = {
+        "series_id": 6,
+        "name": "Show (2007)",
+        "source_id": "s1",
+        "cover": "http://img/show-small.jpg",
+    }
+    # Catalog records without a poster, whose provider details have one.
+    bare_film: ProviderRecord = {"stream_id": 7, "name": "Bare - 1999", "source_id": "s1"}
+    bare_show: ProviderRecord = {"series_id": 8, "name": "Plain Series", "source_id": "s1"}
+    cache.get_cache().update(
+        live_streams=[],
+        vod_streams=[film, bare_film],
+        series=[show, bare_show],
+    )
+    for stream_id in ("5", "7"):
+        details = {"info": {"name": "Film", "cover_big": f"http://img/big-{stream_id}.jpg"}}
+        web.routes[_api_url("http://x", "get_vod_info", vod_id=stream_id)] = testing.FakeResponse(
+            json.dumps(details).encode(),
+        )
+    for series_id in ("6", "8"):
+        series_details: ProviderRecord = {
+            "info": {"name": "Provider Show", "cover": f"http://img/big-{series_id}.jpg"},
+            "episodes": {},
+        }
+        web.routes[_api_url("http://x", "get_series_info", series_id=series_id)] = (
+            testing.FakeResponse(json.dumps(series_details).encode())
+        )
+
+    def card(kind: str, query: str) -> tuple[str, str]:
+        page = api.get(f"/search?q={query}&{kind}=true").text
+        found = re.search(rf'data-{kind}-name="([^"]*)"\s+data-{kind}-cover="([^"]*)"', page)
+        assert found is not None
+        return str(found.group(1)), str(found.group(2))
+
+    def detail(path: str) -> tuple[str, str]:
+        page = api.get(path).text
+        name = re.search(r'<h2 class="[^"]*">([^<]*)</h2>', page)
+        cover = re.search(r'<img id="cover" src="([^"]*)"', page)
+        assert name is not None and cover is not None
+        return str(name.group(1)), str(cover.group(1))
+
+    # The detail page, and so a favorite starred there, shows what the card shows.
+    film_card, show_card = card("movie", "film"), card("series", "show")
+    # Names lose their year suffix; pages show the year on its own.
+    assert detail("/movie/5") == film_card and film_card[0] == "Film"
+    assert "film-small.jpg" in film_card[1]
+    assert detail("/series/6") == show_card and show_card[0] == "Show"
+    assert "show-small.jpg" in show_card[1]
+    # The provider's poster fills in one the catalog lacks.
+    bare_name, bare_cover = detail("/movie/7")
+    assert bare_name == "Bare" and "big-7.jpg" in bare_cover
+    bare_name, bare_cover = detail("/series/8")
+    assert bare_name == "Plain Series" and "big-8.jpg" in bare_cover
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_search_and_detail_pages_scroll_whole(
+    api: TestClient,
+    web: testing.FakeWeb,
+) -> None:
+    _set_sources(_XTREAM)
+    cache.get_cache().update(
+        vod_streams=[{"stream_id": 7, "name": "Film", "source_id": "s1"}],
+        series=[{"series_id": 5, "name": "Show", "source_id": "s1"}],
+    )
+    web.routes[_api_url("http://x", "get_vod_info", vod_id="7")] = TimeoutError()
+    web.routes[_api_url("http://x", "get_series_info", series_id="5")] = testing.FakeResponse(
+        b'{"info": {"name": "Show"}, "episodes": {}}',
+    )
+    for path in ("/search", "/movie/7", "/series/5"):
+        page = api.get(path).text
+        outer = re.search(r'<main[^>]*>\s*<div class="([^"]*)"', page)
+        assert outer is not None, path
+        # The whole page scrolls at every size; held to the window height, its list
+        # scrolled in a box of its own, on phones a thin strip.
+        assert not [c for c in outer.group(1).split() if c.endswith("h-full")], path
+        assert re.findall(r'class="[^"]*overflow-auto[^"]*"', page) == [], path
+
+
+def _mixed_catalog() -> None:
+    """A channel, two movies, and a series that "heat" finds, in named categories."""
+    cache.get_cache().update(
+        live_categories=[{"category_id": "7", "category_name": "Action"}],
+        live_streams=[{"stream_id": 31, "name": "Heat TV", "category_ids": [7]}],
+        vod_categories=[
+            {"category_id": "1", "category_name": "Action"},
+            {"category_id": "2", "category_name": "Drama"},
+        ],
+        vod_streams=[
+            {"stream_id": 1, "name": "Heat - 1995", "category_id": "1", "added": "5"},
+            {"stream_id": 2, "name": "Heat Wave - 2001", "category_id": "2", "added": "9"},
+        ],
+        series_categories=[{"category_id": "3", "category_name": "Drama"}],
+        series=[
+            {"series_id": 4, "name": "Heatwave (2019)", "category_id": "3", "last_modified": "7"},
+        ],
+    )
+    imdb._write(
+        {
+            "movies:heat|1995": _imdb_facts(8.3, 1, 1995),
+            "movies:heatwave|2001": _imdb_facts(5.0, 1, 2001),
+            "series:heatwave|2019": _imdb_facts(7.0, 1, 2019),
+        },
+        set(),
+    )
+
+
+def _cards_shown(page: str) -> list[tuple[str, str, str]]:
+    """Each card's kind, id, and the kind label it shows, in page order."""
+    found = re.finditer(
+        r'<div class="(movie|series|live)-card[^>]*data-\1-id="(\d+)".*?data-kind-label>([^<]*)<',
+        page,
+        re.DOTALL,
+    )
+    return [(str(m[1]), str(m[2]), str(m[3])) for m in found]
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_search_lists_every_kind_in_one_grid(api: TestClient) -> None:
+    _mixed_catalog()
+    page = api.get("/search?q=heat&sort=alpha&min_imdb=").text
+    # One grid, one sort, one limit: each card says what it is.
+    assert page.count('<div id="results"') == 1 and 'id="vod-results"' not in page
+    assert _cards_shown(page) == [
+        ("movie", "1", "Movie"),
+        ("live", "31", "Live"),
+        ("movie", "2", "Movie"),
+        ("series", "4", "Series"),
+    ]
+    assert 'href="/play/live/31"' in page
+    # A channel has no IMDb rating or year, so those sorts put it last.
+    by_imdb = _cards_shown(api.get("/search?q=heat&sort=imdb").text)
+    assert [(k, i) for k, i, _ in by_imdb] == [
+        ("movie", "1"),
+        ("series", "4"),
+        ("movie", "2"),
+        ("live", "31"),
+    ]
+    by_newest = _cards_shown(api.get("/search?q=heat&sort=newest").text)
+    assert [i for _, i, _ in by_newest] == ["2", "4", "1", "31"]
+    assert len(_cards_shown(api.get("/search?q=heat&sort=alpha&limit=2").text)) == 2
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_search_filters_by_category_across_kinds_and_remembers_it(api: TestClient) -> None:
+    _mixed_catalog()
+    page = api.get("/search?q=heat&min_imdb=").text
+    # One list of the categories results fall in, same names merged.
+    select = re.search(r'<select name="category".*?</select>', page, re.DOTALL)
+    assert select is not None
+    options = re.findall(r'<option value="([^"]*)"[^>]*>[^<]*</option>', select.group(0))
+    assert options == ["", "Action", "Drama"]
+    drama = api.get("/search?q=heat&category=Drama&sort=alpha").text
+    assert [(k, i) for k, i, _ in _cards_shown(drama)] == [("movie", "2"), ("series", "4")]
+    # Remembered, like the year and IMDb filters, until cleared.
+    assert len(_cards_shown(api.get("/search?q=heat").text)) == 2
+    assert 'value="Drama" selected' in api.get("/search?q=heat").text
+    assert len(_cards_shown(api.get("/search?q=heat&category=").text)) == 4
+    # Only the kinds searched offer their categories.
+    live_only = api.get("/search?q=heat&live=true&category=").text
+    select = re.search(r'<select name="category".*?</select>', live_only, re.DOTALL)
+    assert select is not None and "Drama" not in select.group(0)
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_search_says_how_many_its_filters_hide(api: TestClient) -> None:
+    _mixed_catalog()
+    page = api.get("/search?q=heat&min_imdb=7.5").text
+    # Year and IMDb bounds judge movies and series; a channel always passes.
+    assert [(k, i) for k, i, _ in _cards_shown(page)] == [("movie", "1"), ("live", "31")]
+    note = re.search(r'id="hidden-by-filters"[^>]*>(.*?)</p>', page, re.DOTALL)
+    assert note is not None and "2 more hidden by your filters" in note.group(1)
+    link = re.search(r'id="hidden-by-filters".*?href="([^"]*)"', page, re.DOTALL)
+    assert link is not None
+    assert all(
+        f"{f}=&" in link.group(1) or link.group(1).endswith(f"{f}=")
+        for f in ("year_from", "year_to", "min_imdb", "category")
+    )
+    assert 'id="hidden-by-filters"' not in api.get("/search?q=heat&min_imdb=").text
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_keyboard_focus_is_plainly_visible(api: TestClient) -> None:
+    page = api.get("/search").text
+    style = re.search(r"<style>(.*?)</style>", page, re.DOTALL)
+    assert style is not None
+    css = re.sub(r"\s+", " ", style.group(1))
+    # A thin blue ring vanished on dark posters; one bold yellow outline marks the
+    # focused control everywhere, and inside cards, where nothing can cover or clip it.
+    assert ":focus-visible { outline: 3px solid #facc15; outline-offset: 2px; }" in css
+    assert '[data-nav="grid"]:focus-visible { outline-width: 4px; outline-offset: -4px; }' in css
+    assert "outline: none" not in css
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_detail_pages_name_the_composer(api: TestClient, web: testing.FakeWeb) -> None:
+    _set_sources(_XTREAM)
+    imdb._write(
+        {
+            "movies:tmdb:5": {
+                **_imdb_facts(7.0, 1, 1995),
+                "writers": ["Michael Mann"],
+                "crew": {
+                    "composer": ["Elliot Goldenthal"],
+                    "country": ["United States"],
+                    "language": ["English", "Spanish"],
+                },
+            },
+        },
+        set(),
+    )
+    cache.get_cache().update(
+        vod_streams=[
+            {"stream_id": 5, "name": "Heat", "tmdb": 5, "source_id": "s1"},
+            {"stream_id": 6, "name": "Ronin", "tmdb": 6, "source_id": "s1"},
+        ],
+    )
+    for stream_id in ("5", "6"):
+        web.routes[_api_url("http://x", "get_vod_info", vod_id=stream_id)] = TimeoutError()
+    # Linked like every credit, to a search for its own field.
+    page = api.get("/movie/5").text
+    assert '<span class="text-gray-500">Composer:</span>' in page
+    assert 'href="/search?q=composer%3A%22Elliot%20Goldenthal%22"' in page
+    assert '<span class="text-gray-500">Writer:</span>' in page
+    assert 'href="/search?q=writer%3A%22Michael%20Mann%22"' in page
+    assert '<span class="text-gray-500">Country:</span>' in page
+    assert 'href="/search?q=country%3A%22United%20States%22"' in page
+    assert '<span class="text-gray-500">Language:</span>' in page
+    assert 'href="/search?q=language%3A%22Spanish%22"' in page
+    # Each name is a finger's height to tap on a phone, not a 19px line of text.
+    link = re.search(r'<a href="/search\?q=writer%3A[^>]*>', page)
+    assert link is not None and "inline-block py-1" in link.group(0)
+    other = api.get("/movie/6").text
+    assert "Composer:" not in other and "Country:" not in other and "Language:" not in other
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_series_pages_name_the_network(api: TestClient, web: testing.FakeWeb) -> None:
+    _set_sources(_XTREAM)
+    imdb._write(
+        {
+            "series:tmdb:5": {
+                **_imdb_facts(9.2, 1, 2011),
+                "crew": {"network": ["HBO"], "country": ["United States"], "language": ["English"]},
+            },
+        },
+        set(),
+    )
+    cache.get_cache().update(
+        series=[
+            {"series_id": 5, "name": "Game of Thrones", "tmdb": 5, "source_id": "s1"},
+            {"series_id": 6, "name": "Unaired", "tmdb": 6, "source_id": "s1"},
+        ],
+    )
+    episodes = b'{"1": [{"id": "11", "episode_num": 1, "title": "Pilot"}]}'
+    for series_id in ("5", "6"):
+        web.routes[_api_url("http://x", "get_series_info", series_id=series_id)] = (
+            testing.FakeResponse(b'{"info": {"name": "Show"}, "episodes": ' + episodes + b"}")
+        )
+    page = api.get("/series/5").text
+    assert '<span class="text-gray-500">Network:</span>' in page
+    # The first episode takes focus without the browser's autofocus, which scrolled
+    # the page past the title to show it.
+    first = re.search(r'<a href="/play/series/11[^>]*>', page)
+    assert first is not None
+    assert "data-initial-focus" in first.group(0) and "autofocus" not in first.group(0)
+    assert 'href="/search?q=network%3A%22HBO%22"' in page
+    assert 'href="/search?q=country%3A%22United%20States%22"' in page
+    assert 'href="/search?q=language%3A%22English%22"' in page
+    other = api.get("/series/6").text
+    assert "Network:" not in other and "Country:" not in other and "Language:" not in other
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_search_page_explains_its_fields(api: TestClient) -> None:
+    page = api.get("/search").text
+    box = re.search(r'<input type="text" name="q"[^>]*title="([^"]*)"', page)
+    overlay = re.search(r'<div id="search-help".*?</div>\s*</div>', page, re.DOTALL)
+    assert box is not None and overlay is not None
+    fields = (
+        "title",
+        "cast",
+        "role",
+        "director",
+        "writer",
+        "composer",
+        "network",
+        "country",
+        "language",
+        "year",
+        "genre",
+        "imdb",
+    )
+    # Hovering the box names every field; the overlay shows how to use each.
+    assert all(f"{field}:" in box.group(1) for field in fields)
+    assert all(f"<code>{field}:" in overlay.group(0) for field in fields)
+    # A button opens it, and so does "?" typed outside a text field.
+    assert 'aria-controls="search-help"' in page
+    assert "event.key === '?'" in page
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_every_page_draws_a_title_with_one_card(api: TestClient) -> None:
+    heat: ProviderRecord = {
+        "stream_id": 1,
+        "name": "Heat - 1995",
+        "rating": "8",
+        "stream_icon": "http://img/heat.jpg",
+        "category_id": "1",
+        "container_extension": "mp4",
+    }
+    show: ProviderRecord = {
+        "series_id": 2,
+        "name": "Hshow (2001)",
+        "cover": "http://img/show.jpg",
+        "category_id": "1",
+        "plot": "Plot.",
+    }
+    cats: list[ProviderRecord] = [{"category_id": "1", "category_name": "One"}]
+    cache.get_cache().update(
+        live_streams=[],
+        vod_categories=cats,
+        vod_streams=[heat],
+        series_categories=cats,
+        series=[show],
+    )
+    settings = cache.load_user_settings("testuser")
+    settings["favorites"] = {
+        "movies": {
+            "1": {"name": "Heat", "cover": "", "ext": "mp4"},
+            # Gone from the catalog: its saved name, and no cover, since saved
+            # covers are never signed.
+            "9": {"name": "Gone", "cover": "http://img/gone.jpg", "ext": "mkv"},
+        },
+        "series": {"2": {"name": "Hshow", "cover": ""}},
+    }
+    cache.save_user_settings("testuser", settings)
+    server = cache.load_server_settings()
+    server["vod_order"] = ["9", "1"]
+    cache.save_server_settings(server)
+
+    def card(page: str, noun: str, item_id: int) -> str:
+        found = re.search(
+            rf'<div class="{noun}-card [^>]*data-{noun}-id="{item_id}".*?</button>\s*</div>',
+            page,
+            re.DOTALL,
+        )
+        assert found is not None, (noun, item_id)
+        return found.group(0)
+
+    search = api.get("/search?q=h").text
+    # Search's mix of kinds labels each card with its kind; that label is the only
+    # difference from the same card elsewhere.
+    unlabeled = re.sub(r'<span class="text-gray-500" data-kind-label>[^<]*</span>', "", search)
+    assert unlabeled != search
+    movie, series = card(unlabeled, "movie", 1), card(unlabeled, "series", 2)
+    # Favorites toggle from the card's own data, so no card repeats it in script;
+    # every card can be dragged to a new place.
+    for drawn in (movie, series):
+        assert 'onclick="toggleFavorite(this)"' in drawn and 'draggable="true"' in drawn
+    movie_pages = (
+        "/vod?sort=imdb",
+        "/vod?category=1&sort=imdb",
+        "/api/vod/cards?category=1&sort=imdb",
+        "/api/vod/favorites",
+    )
+    for path in movie_pages:
+        assert card(api.get(path).text, "movie", 1) == movie, path
+    series_pages = (
+        "/series?sort=imdb",
+        "/series?category=1&sort=imdb",
+        "/api/series/cards?category=1&sort=imdb",
+        "/api/series/favorites",
+    )
+    for path in series_pages:
+        assert card(api.get(path).text, "series", 2) == series, path
+    # Favorites keep the saved order.
+    favorites = api.get("/api/vod/favorites").text
+    assert re.findall(r'data-movie-id="(\d+)"', favorites) == ["9", "1"]
+    assert 'data-movie-name="Gone" data-movie-cover=""' in card(favorites, "movie", 9)
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_favorite_cards_load_the_catalog_after_a_restart(api: TestClient) -> None:
+    cache.save_file_cache("vod_data", {"cats": [], "streams": [{"stream_id": 1, "name": "Heat"}]})
+    cache.save_file_cache("series_data", {"cats": [], "series": [{"series_id": 2, "name": "Vice"}]})
+    settings = cache.load_user_settings("testuser")
+    settings["favorites"] = {
+        "movies": {"1": {"name": "Saved", "cover": "", "ext": "mkv"}},
+        "series": {"2": {"name": "Saved", "cover": ""}},
+    }
+    cache.save_user_settings("testuser", settings)
+    # The catalog's name, so the catalog was loaded, not only the saved favorite.
+    assert 'data-movie-name="Heat"' in api.get("/api/vod/favorites").text
+    assert 'data-series-name="Vice"' in api.get("/api/series/favorites").text
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_favorite_cards_respect_access(api: TestClient) -> None:
+    _set_sources(_XTREAM, {**_XTREAM, "id": "s2"})
+    cache.get_cache().update(
+        vod_streams=[
+            {"stream_id": 1, "name": "Heat", "source_id": "s1"},
+            {"stream_id": 2, "name": "Ronin", "source_id": "s2"},
+        ],
+    )
+    settings = cache.load_user_settings("testuser")
+    settings["favorites"] = {
+        "movies": {
+            "1": {"name": "Heat", "cover": "", "ext": "mkv"},
+            "2": {"name": "Ronin", "cover": "", "ext": "mkv"},
+        },
+        "series": {},
+    }
+    cache.save_user_settings("testuser", settings)
+    # A favorite from a source the user can no longer use is not shown.
+    auth.set_user_limits("testuser", None, ["movies:s1"])
+    shown = api.get("/api/vod/favorites").text
+    assert re.findall(r'data-movie-id="(\d+)"', shown) == ["2"]
+    auth.set_user_limits("testuser", None, ["movies:s1", "movies:s2"])
+    assert api.get("/api/vod/favorites").status_code == 403
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_cards_show_a_one_line_title_then_year_and_rating(api: TestClient) -> None:
+    rated: ProviderRecord = {"stream_id": 1, "name": "A - 1999", "rating": "7"}
+    long_name = "A " + "very long title " * 6
+    unrated: ProviderRecord = {"stream_id": 2, "name": long_name}
+    show: ProviderRecord = {"series_id": 3, "name": "A show (2001)", "plot": "Two go west."}
+    cache.get_cache().update(live_streams=[], vod_streams=[rated, unrated], series=[show])
+    page = api.get("/search?q=a&sort=alpha").text
+    # Hovering shows the whole title, its year and rating, and its description.
+    # Search sorts movies and series together, by name.
+    assert re.findall(r'data-nav="grid" title="([^"]*)"', page) == [
+        "A&#10;1999 · ★ 7.0",
+        "A show&#10;2001&#10;Two go west.",
+        long_name,
+    ]
+    cards = re.findall(
+        r'<div class="p-2[^"]*">\s*<div class="([^"]*)">([^<]*)</div>'
+        r'\s*<div class="([^"]*)"><span[^>]*data-kind-label>[^<]*</span>'
+        r"<span[^>]*>([^<]*)</span><span[^>]*>([^<]*)</span></div>",
+        page,
+    )
+    # The year leaves the name for the line below, beside the rating.
+    assert [(c[1], c[3], c[4]) for c in cards] == [
+        ("A", "1999", "★ 7.0"),
+        ("A show", "2001", ""),
+        (long_name, "", ""),
+    ]
+    # A long title is cut to one line, and the line below keeps its height when
+    # empty, so every card is one size.
+    assert len({(c[0], c[2]) for c in cards}) == 1
+    assert "truncate" in cards[0][0] and "h-4" in cards[0][2]
+
+
+def test_enter_submits_every_form_with_several_fields() -> None:
+    # Browsers ignore Enter in a form with several text-like fields and no submit
+    # button; the search form's year and IMDb fields once left typing a search dead.
+    templates = Path(main.__file__).parent / "templates"
+    checked: list[str] = []
+    for template in sorted(templates.glob("*.html")):
+        for form in re.findall(r"<form\b.*?</form>", template.read_text(), re.DOTALL):
+            fields = re.findall(
+                r'<input[^>]*type="(?:text|number|password|url|email|search)"',
+                form,
+            )
+            # settings.js saves each source field as it changes; Enter has nothing to submit.
+            if len(fields) < 2 or "source-edit-form" in form:
+                continue
+            checked.append(template.name)
+            assert re.search(r'<button[^>]*type="submit"', form), (template.name, form[:80])
+    assert checked == [
+        "login.html",
+        "player.html",
+        "search.html",
+        "settings.html",
+        "settings.html",
+        "setup.html",
+    ]
+
+
+@pytest.mark.usefixtures("guide_db")
+def test_search_filters_by_year_and_imdb_score_and_remembers_them(api: TestClient) -> None:
+    movies, series = _ranked_catalog()
+    cache.get_cache().update(live_streams=[], vod_streams=movies, series=series)
+
+    def shown(query: str) -> tuple[list[str], list[str]]:
+        page = api.get(f"/search?q=a&sort=alpha{query}").text
+        return _movie_links(page), _series_links(page)
+
+    # Bounds include their own year and score; a year filter leaves out titles
+    # without a known year.
+    assert shown("&year_from=2001&year_to=2005") == (["3"], ["3"])
+    assert shown("&year_from=&year_to=1990") == (["1"], ["1"])
+    # Filters persist: this keeps the year bound the last search set.
+    assert shown("&min_imdb=8") == ([], [])
+    # An emptied field clears that filter; an IMDb score leaves out the unrated.
+    assert shown("&year_from=&year_to=&min_imdb=8") == (["2", "3"], ["2", "3"])
+    assert cache.load_user_settings("testuser").get("search_filters") == {
+        "year_from": None,
+        "year_to": None,
+        "min_imdb": 8.0,
+    }
+    page = api.get("/search?q=a").text
+    assert (_movie_links(page), _series_links(page)) == (["2", "3"], ["2", "3"])
+    assert re.search(r'name="min_imdb"[^>]*value="8.0"', page)
+    assert re.search(r'name="year_from"[^>]*value=""', page)
+    assert api.get("/search?q=a&year_from=abc").status_code == 400
+    assert api.get("/search?q=a&min_imdb=nan").status_code == 400
+
+
+@pytest.mark.usefixtures("imdb_index")
 def test_series_page_applies_filter_category_and_sorts(api: TestClient) -> None:
     cache.get_cache().update(
         series_categories=[
@@ -801,9 +1668,176 @@ def test_series_detail_cleans_episode_metadata(api: TestClient, web: testing.Fak
     assert "Desc C" in resp.text
     assert "2019" in resp.text
     people = re.findall(r'<a href="/search\?q=([^"]*)"[^>]*>([^<]*)</a>', resp.text)
-    assert people == [("Ann%20Dir", "Ann Dir"), ("Cy%20Star", "Cy Star"), ("Di%20Lead", "Di Lead")]
+    # Each name searches its own role.
+    assert [(parse.unquote(q), name) for q, name in people] == [
+        ('director:"Ann Dir"', "Ann Dir"),
+        ('cast:"Cy Star"', "Cy Star"),
+        ('cast:"Di Lead"', "Di Lead"),
+    ]
     # Every name the page links is in the index search reads.
     assert imdb.matching_keys(lambda name: name == "Di Lead") == {"series:tmdb:77"}
+
+
+def test_seasons_read_both_shapes_providers_send() -> None:
+    first = {"id": "11", "season": 1, "episode_num": 1}
+    second = {"id": "21", "season": 2, "episode_num": 1}
+    keyed = json_loads(
+        json.dumps({"episodes": {"1": [first], "2": [second, "junk"], "3": None}}),
+        ProviderRecord,
+    )
+    # Columbo's provider sends a list of seasons; each episode names its own.
+    listed = json_loads(
+        json.dumps({"episodes": [[second], [first], None, ["junk"]]}),
+        ProviderRecord,
+    )
+    unnamed = json_loads(json.dumps({"episodes": [[{"id": "31"}]]}), ProviderRecord)
+    assert main._seasons(keyed) == {"1": [first], "2": [second]}
+    assert main._seasons(listed) == {"2": [second], "1": [first]}
+    # An episode that names no season takes its place in the list.
+    assert main._seasons(unnamed) == {"1": [{"id": "31"}]}
+    assert main._seasons({"episodes": "none"}) == main._seasons({}) == {}
+
+
+def test_templates_carry_the_app_filters_and_globals() -> None:
+    env = main._create_templates().env
+    # Edited templates show without a restart.
+    assert env.auto_reload is True
+    assert env.get_template("_cards.html").name == "_cards.html"
+    assert env.filters["logo_url"] is main._logo_url_filter
+    assert env.filters["rating"] is main._rating_filter
+    assert env.filters["youtube_id"] is main._youtube_id
+    assert env.globals["with_shown"] is main._shown
+    assert env.globals["get_content_access"] is main._get_content_access
+    assert env.globals["get_content_access_from_request"] is main._get_content_access_from_request
+
+
+@pytest.mark.parametrize(
+    ("trailer", "video"),
+    [
+        ("dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=3", "dQw4w9WgXcQ"),
+        ("https://youtu.be/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+        # Anything else could add its own embed options, such as autoplay.
+        ("dQw4w9WgXcQ?autoplay=1", None),
+        ("", None),
+    ],
+)
+@pytest.mark.usefixtures("imdb_index")
+def test_detail_pages_embed_the_trailer_paused(
+    api: TestClient,
+    web: testing.FakeWeb,
+    trailer: str,
+    video: str | None,
+) -> None:
+    _set_sources(_XTREAM)
+    cache.get_cache().update(
+        vod_streams=[{"stream_id": 7, "name": "Film", "source_id": "s1"}],
+        series=[{"series_id": 5, "name": "Show", "source_id": "s1"}],
+    )
+    web.routes[_api_url("http://x", "get_vod_info", vod_id="7")] = testing.FakeResponse(
+        json.dumps({"info": {"name": "Film", "youtube_trailer": trailer}}).encode(),
+    )
+    series: ProviderRecord = {"info": {"name": "Show", "youtube_trailer": trailer}, "episodes": {}}
+    web.routes[_api_url("http://x", "get_series_info", series_id="5")] = testing.FakeResponse(
+        json.dumps(series).encode(),
+    )
+    for path in ("/movie/7", "/series/5"):
+        page = api.get(path).text
+        frames = re.findall(r"<iframe[^>]*>", page)
+        if video is None:
+            assert frames == [], path
+            continue
+        [frame] = frames
+        # No autoplay: it waits, paused, for a click; and it loads only when near.
+        assert f'src="https://www.youtube-nocookie.com/embed/{video}"' in frame, path
+        assert 'loading="lazy"' in frame and "autoplay" not in frame.split("allow=")[0], path
+        assert "youtube.com/watch" not in page, path
+        # One place at every width: its own row under the poster and details. Inside the
+        # details it crowded Play; as a column it moved as the window widened.
+        holder = re.search(r'<div class="([^"]*)">\s*<iframe', page)
+        assert holder is not None, path
+        assert {"w-full", "max-w-[40rem]", "mb-6"} <= set(holder.group(1).split()), path
+        assert not [
+            c for c in holder.group(1).split() if c.startswith(("sm:", "md:", "lg:", "xl:"))
+        ]
+        assert page.index("<!-- end header -->") < page.index("<iframe"), path
+    # The Favorite button keeps one label, so toggling it never resizes the row.
+    for path in ("/movie/7", "/series/5"):
+        page = api.get(path).text
+        assert re.search(r'id="fav-btn"[^>]*>\s*☆ Favorite\s*<', page), path
+        assert "isFav ? '★ Favorite' : '☆ Favorite'" in page, path
+    # Title, then its year, rating and length, then Play and Favorite, then the rest:
+    # the buttons no longer split a title from its facts.
+    for path, first in (("/movie/7", 'href="/play/movie/7'), ("/series/5", 'href="?refresh=1"')):
+        page = api.get(path).text
+        facts = page.index('<div class="flex gap-4 text-gray-400')
+        assert page.index("</h2>") < facts < page.index(first) < page.index('id="fav-btn"'), path
+        assert page.index('id="fav-btn"') < page.index("<!-- end header -->"), path
+
+
+@pytest.mark.usefixtures("imdb_index")
+@pytest.mark.parametrize(
+    ("run_time", "durations", "shown"),
+    [
+        # Locke & Key's provider says "0" while its episodes run 57 and 50 minutes.
+        ("0", [3420, 3015, None], "54 min/ep"),
+        ("45", [], "45 min/ep"),
+        # Any length counts, however short; only a missing or zero one is skipped.
+        ("0", [1, 119], "1 min/ep"),
+        ("0", [0], None),
+        (None, [], None),
+    ],
+)
+def test_series_detail_shows_the_average_episode_length(
+    api: TestClient,
+    web: testing.FakeWeb,
+    run_time: str | None,
+    durations: list[int | None],
+    shown: str | None,
+) -> None:
+    _set_sources(_XTREAM)
+    cache.get_cache()["series"] = [{"series_id": 5, "name": "Show", "source_id": "s1"}]
+    episodes = [
+        {"id": str(i), "episode_num": i, "info": {} if d is None else {"duration_secs": d}}
+        for i, d in enumerate(durations, 1)
+    ]
+    series = {"info": {"name": "Show", "episode_run_time": run_time}, "episodes": {"1": episodes}}
+    web.routes[_api_url("http://x", "get_series_info", series_id="5")] = testing.FakeResponse(
+        json.dumps(series).encode(),
+    )
+    lengths = re.findall(r"<span>([^<]*min/ep)</span>", api.get("/series/5").text)
+    assert lengths == ([] if shown is None else [shown])
+
+
+@pytest.mark.usefixtures("imdb_index")
+def test_series_with_listed_seasons_plays_and_shows(api: TestClient, web: testing.FakeWeb) -> None:
+    _set_sources(_XTREAM)
+    cache.get_cache()["series"] = [{"series_id": 5, "name": "Columbo", "source_id": "s1"}]
+    series = json_loads(
+        json.dumps(
+            {
+                "info": {"name": "Columbo"},
+                "episodes": [
+                    [{"id": "11", "season": 1, "episode_num": 1, "title": "Murder by the Book"}],
+                    [{"id": "21", "season": 2, "episode_num": 1, "title": "Etude in Black"}],
+                ],
+            },
+        ),
+        ProviderRecord,
+    )
+    web.routes[_api_url("http://x", "get_series_info", series_id="5")] = testing.FakeResponse(
+        json.dumps(series).encode(),
+    )
+    page = api.get("/series/5")
+    assert page.status_code == 200
+    assert re.findall(r"Season (\d+)", page.text) == ["1", "2"]
+    assert ">Murder by the Book<" in page.text and ">Etude in Black<" in page.text
+    _, next_url = main._get_series_player_info("11", 5, "")
+    assert next_url == "/play/series/21?series_id=5&ext=mkv"
+    assert main._episode_labels(series) == {
+        11: "S01E01 Murder by the Book",
+        21: "S02E01 Etude in Black",
+    }
 
 
 def test_movie_detail_loads_vod_and_restricts(api: TestClient) -> None:
@@ -853,16 +1887,19 @@ def test_movie_detail_merges_provider_info(api: TestClient, web: testing.FakeWeb
     assert resp.status_code == 200
     stored = cache.load_file_cache("vod_info_s1_7")
     assert stored is not None and stored[0] == info
-    for text in ("Great plot", "Drama", "2001", "01:30", "yt123"):
+    for text in ("Great plot", "Drama", "2001", "01:30"):
         assert text in resp.text
-    # Each credited name searches for itself; empty list entries are dropped.
+    # Each credited name searches its own role; empty list entries are dropped.
     people = re.findall(r'<a href="/search\?q=([^"]*)"[^>]*>([^<]*)</a>', resp.text)
-    assert people == [
-        ("Dir", "Dir"),
-        ("Actor%20A", "Actor A"),
-        ("B%C3%A9%20%26%20Co", "Bé &amp; Co"),
+    assert [(parse.unquote(q), name) for q, name in people] == [
+        ('director:"Dir"', "Dir"),
+        ('cast:"Actor A"', "Actor A"),
+        ('cast:"Bé & Co"', "Bé &amp; Co"),
     ]
     assert imdb.matching_keys(lambda name: name == "Bé & Co") == {"movies:tmdb:55"}
+    # Following a name's link finds the movie it was clicked on.
+    for q, _ in people:
+        assert _movie_links(api.get(f"/search?q={q}&vod=true").text) == ["7"]
 
 
 # =============================================================================
@@ -882,6 +1919,7 @@ def test_player_movie_resumes_watch_position(api: TestClient, web: testing.FakeW
     assert "serverResumePosition: 42.5" in resp.text
 
 
+@pytest.mark.usefixtures("imdb_index")
 def test_player_series_strips_year_from_name(api: TestClient, web: testing.FakeWeb) -> None:
     _set_sources(_XTREAM)
     cache.get_cache()["series"] = [{"series_id": 5, "source_id": "s1"}]
@@ -1019,6 +2057,51 @@ def test_search_loads_data_and_applies_filters(api: TestClient) -> None:
     assert cache.get_cache().get("live_streams") == live
     assert cache.get_cache().get("vod_streams") == vod
     assert cache.get_cache().get("series") == series
+
+
+@pytest.mark.usefixtures("guide_db")
+def test_search_lists_each_movie_once(api: TestClient) -> None:
+    imdb.init()
+    cache.get_cache().update(live_streams=[], vod_streams=_heat_versions(), series=[])
+    # Search is not by category, so a movie listed in two shows once, as its oldest.
+    assert _movie_links(api.get("/search?q=heat&vod=true").text) == ["1"]
+
+
+@pytest.mark.usefixtures("guide_db")
+def test_movie_detail_offers_each_version(api: TestClient, web: testing.FakeWeb) -> None:
+    imdb.init()
+    _set_sources(_XTREAM)
+    june = int(datetime(2026, 6, 10, 12, tzinfo=timezone.utc).timestamp())
+    may = int(datetime(2026, 5, 4, 12, tzinfo=timezone.utc).timestamp())
+    common: ProviderRecord = {"name": "Heat - 1995", "tmdb": 949, "source_id": "s1"}
+    cache.get_cache()["vod_streams"] = [
+        {**common, "stream_id": 1, "added": str(may), "container_extension": "mkv"},
+        {**common, "stream_id": 2, "added": str(june), "container_extension": "mp4"},
+        {**common, "stream_id": 3, "added": str(june + 1), "source_id": "hidden"},
+        {"stream_id": 4, "name": "Ronin - 1998", "tmdb": 8195, "source_id": "s1"},
+    ]
+    auth.set_user_limits("testuser", None, ["movies:hidden"])
+    info = {"info": {"bitrate": 10_750, "duration": "01:38:47"}}
+    web.routes[_api_url("http://x", "get_vod_info", vod_id="1")] = testing.FakeResponse(
+        json.dumps(info).encode(),
+    )
+    web.routes[_api_url("http://x", "get_vod_info", vod_id="2")] = TimeoutError()
+
+    page = api.get("/movie/1").text
+
+    # Oldest first, as cards open it; the one on show is marked; a version the user may
+    # not see is left out; one whose details fail to load shows what the catalog says.
+    versions = re.findall(r'data-version="(\d+)"( aria-current="true")?>\s*([^<]*?)\s*<', page)
+    assert versions == [
+        ("1", ' aria-current="true"', "Added May 4, 2026 · MKV · 10.8 Mbps · 01:38:47"),
+        ("2", "", "Added Jun 10, 2026 · MP4"),
+    ]
+    assert "/play/movie/1?ext=mkv" in page
+    assert sorted(web.urls) == sorted(
+        _api_url("http://x", "get_vod_info", vod_id=v) for v in ("1", "2")
+    )
+    # A movie with one version offers no choice.
+    assert "data-version" not in api.get("/movie/4").text
 
 
 def test_stream_redirect_without_xtream(api: TestClient) -> None:

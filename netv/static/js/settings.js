@@ -44,10 +44,44 @@
   // Drag-Drop Helper
   // ============================================================
 
+  // The list a chip moves to: the other matched list nearest it in the page, as each
+  // user's pair of group lists sits in that user's section.
+  function otherList(list, containerSelector) {
+    const depth = (el) => {
+      let n = 0;
+      for (let p = el; p; p = p.parentElement) n++;
+      return n;
+    };
+    let best = null;
+    let bestDepth = -1;
+    for (const other of document.querySelectorAll(containerSelector)) {
+      if (other === list) continue;
+      let shared = other.parentElement;
+      while (shared && !shared.contains(list)) shared = shared.parentElement;
+      if (shared && depth(shared) > bestDepth) {
+        best = other;
+        bestDepth = depth(shared);
+      }
+    }
+    return best;
+  }
+
   function setupDragDrop(containerSelector, chipSelector, onDrop) {
     let draggedChip = null;
 
     document.querySelectorAll(chipSelector).forEach((chip) => {
+      // Keyboard: arrows reach the chip, Enter moves it to the other list.
+      chip.tabIndex = 0;
+      chip.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter") return;
+        e.preventDefault();
+        e.stopPropagation();
+        const target = otherList(chip.parentElement, containerSelector);
+        if (!target) return;
+        target.appendChild(chip);
+        chip.focus();
+        onDrop?.(target, chip);
+      });
       chip.addEventListener("dragstart", (e) => {
         draggedChip = chip;
         e.dataTransfer.effectAllowed = "move";
@@ -78,6 +112,7 @@
     });
 
     document.querySelectorAll(containerSelector).forEach((container) => {
+      container.dataset.nav = "list";
       container.addEventListener("dragover", (e) => {
         e.preventDefault();
         e.dataTransfer.dropEffect = "move";
@@ -1092,6 +1127,43 @@
           else this.checked = !this.checked;
         } catch (e) {
           console.error("Admin toggle failed:", e);
+          this.checked = !this.checked;
+        }
+      });
+    });
+
+    // API keys: save, or remove with an empty key.
+    document.querySelectorAll(".api-key-form").forEach((form) => {
+      async function send(key) {
+        const body = new FormData();
+        body.append("service", form.dataset.service);
+        body.append("key", key);
+        const resp = await fetch("/settings/api-keys", { method: "POST", body });
+        if (resp.ok) location.reload();
+      }
+      form.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const key = form.elements.key.value.trim();
+        if (key) send(key);
+      });
+      form.querySelector(".api-key-remove")?.addEventListener("click", () => send(""));
+    });
+
+    // LAN-only toggles
+    document.querySelectorAll(".lan-only-toggle").forEach((checkbox) => {
+      checkbox.addEventListener("change", async function () {
+        const username = this.closest("[data-username]")?.dataset.username;
+        if (!username) return;
+        const form = new FormData();
+        if (this.checked) form.append("lan_only", "on");
+        try {
+          const resp = await fetch(`/settings/users/lan/${username}`, {
+            method: "POST",
+            body: form,
+          });
+          if (!resp.ok) this.checked = !this.checked;
+        } catch (e) {
+          console.error("LAN-only toggle failed:", e);
           this.checked = !this.checked;
         }
       });

@@ -1,27 +1,25 @@
 {% extends "base.html" %}
-{% block title %}{{ series.info.name if series.info else 'Series' }} - neTV{% endblock %}
+{% block title %}{{ shown.name or 'Series' }} - neTV{% endblock %}
 
 {% block content %}
-<div class="flex flex-col md:h-full min-h-0 min-w-0">
+<div class="flex flex-col min-w-0">
   {% if series.info %}
   <div class="flex gap-2 sm:gap-6 mb-6">
-    {% if series.info.cover %}
-    <img id="cover" src="{{ series.info.cover | logo_url }}" alt="" class="w-24 sm:w-36 lg:w-48 h-auto max-h-72 object-cover rounded-lg flex-shrink-0">
+    {% if shown.poster %}
+    <img id="cover" src="{{ shown.poster | logo_url }}" alt="" class="w-24 sm:w-36 lg:w-48 h-auto max-h-72 object-cover rounded-lg flex-shrink-0">
     {% endif %}
     <div class="min-w-0 flex-1">
-      <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
-        <h2 class="text-xl sm:text-3xl font-bold min-w-0">{{ series.info.name }}</h2>
-        <div class="flex gap-2 flex-shrink-0">
-          <a href="?refresh=1" class="px-2 sm:px-4 py-1 sm:py-2 text-sm sm:text-base rounded bg-gray-700 hover:bg-gray-600 focusable" tabindex="0" title="Check for new episodes">↻</a>
-          <button id="fav-btn" class="px-2 sm:px-4 py-1 sm:py-2 text-sm sm:text-base rounded bg-gray-700 hover:bg-gray-600 focusable" tabindex="0">
-            ☆ Add to Favorites
-          </button>
-        </div>
+      <h2 class="text-xl sm:text-3xl font-bold min-w-0 mb-2">{{ shown.name }}</h2>
+      <div class="flex gap-4 text-gray-400 mb-3">
+        {% if shown.year %}<span>{{ shown.year }}</span>{% endif %}
+        {% if shown.rating %}<span class="text-yellow-400">{{ shown.rating }}</span>{% endif %}
+        {% if minutes_per_episode > 0 %}<span>{{ minutes_per_episode }} min/ep</span>{% endif %}
       </div>
-      <div class="flex gap-4 text-gray-400 mb-4">
-        {% if series.info.year %}<span>{{ series.info.year }}</span>{% endif %}
-        {% if series.info.rating %}<span class="text-yellow-400">★ {{ series.info.rating | rating }}/10</span>{% endif %}
-        {% if series.info.episode_run_time %}<span>{{ series.info.episode_run_time }} min/ep</span>{% endif %}
+      <div class="flex gap-2 mb-4">
+        <a href="?refresh=1" class="px-2 sm:px-4 py-1 sm:py-2 text-sm sm:text-base rounded bg-gray-700 hover:bg-gray-600 focusable" tabindex="0" title="Check for new episodes">↻</a>
+        <button id="fav-btn" class="px-2 sm:px-4 py-1 sm:py-2 text-sm sm:text-base rounded bg-gray-700 hover:bg-gray-600 focusable" tabindex="0">
+          ☆ Favorite
+        </button>
       </div>
 
       {% if series.info.genre %}
@@ -33,25 +31,35 @@
       {% endif %}
 
       {% from "_people.html" import people %}
-      {{ people('Director', directors, 'mb-1') }}
-      {{ people('Cast', cast, 'mb-4') }}
+      {{ people('Network', 'network', networks, 'mb-1') }}
+      {{ people('Director', 'director', directors, 'mb-1') }}
+      {{ people('Writer', 'writer', writers, 'mb-1') }}
+      {{ people('Composer', 'composer', composers, 'mb-1') }}
+      {{ people('Cast', 'cast', cast, 'mb-1') }}
+      {{ people('Country', 'country', countries, 'mb-1') }}
+      {{ people('Language', 'language', languages, 'mb-4') }}
+
+      {% from "_versions.html" import versions_list %}
+      {{ versions_list(versions) }}
     </div>
-  </div>
+  </div><!-- end header -->
+  {% from "_trailer.html" import trailer %}
+  {{ trailer(series.info.youtube_trailer) }}
   {% endif %}
 
   <!-- Episodes by season -->
-  <div class="flex-1 min-h-0 md:overflow-auto scroll-ring-safe">
-  {% if series.episodes %}
+  <div class="scroll-ring-safe">
+  {% if seasons %}
   {% set ns = namespace(first_ep=true) %}
-  {% for season_num, episodes in series.episodes.items() %}
+  {% for season_num, episodes in seasons.items() %}
   <div class="mb-6">
     <h3 class="text-xl font-semibold mb-3">Season {{ season_num }}</h3>
     <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3 pr-1">
       {% for ep in episodes %}
       <a href="/play/series/{{ ep.id }}?series_id={{ series_id }}&ext={{ ep.container_extension or 'mkv' }}"
          class="bg-gray-800 rounded-lg p-3 hover:ring-2 hover:ring-blue-500 focus:ring-2 focus:ring-blue-500 focusable transition-all"
-         tabindex="0" data-nav="grid" {% if ns.first_ep %}autofocus{% set ns.first_ep = false %}{% endif %}
-         title="{{ series.info.name if series.info else '' }} — S{{ '%02d' | format(season_num | int) }}E{{ '%02d' | format(ep.episode_num | int) }} — {{ ep.title }}{% if ep.description %}&#10;{{ ep.description }}{% elif ep.plot %}&#10;{{ ep.plot }}{% endif %}">
+         tabindex="0" data-nav="grid" {% if ns.first_ep %}data-initial-focus{% set ns.first_ep = false %}{% endif %}
+         title="{{ shown.name }} — S{{ '%02d' | format(season_num | int) }}E{{ '%02d' | format(ep.episode_num | int) }} — {{ ep.title }}{% if ep.description %}&#10;{{ ep.description }}{% elif ep.plot %}&#10;{{ ep.plot }}{% endif %}">
         <div class="font-medium">E{{ ep.episode_num }}</div>
         <div class="text-sm text-gray-400 line-clamp-1">{{ ep.title }}</div>
       </a>
@@ -68,33 +76,36 @@
 
 {% block scripts %}
 <script>
-let favorites = {{ favorites | tojson }};
+window.favorites = {{ favorites | tojson }};
 const SERIES_ID = {{ series_id | string | tojson }};
-const SERIES_NAME = {{ (series.info.name if series.info else "") | tojson }};
+const SERIES_NAME = {{ shown.name | tojson }};
 const SERIES_COVER = document.getElementById('cover')?.getAttribute('src') ?? "";
 
 window.onFavoritesChanged = function(changed) {
-  favorites = changed;
+  window.favorites = changed;
   updateButton();
+  window.updateFavoriteButtons();
 };
 
-async function toggleFavorite() {
+// Not "toggleFavorite": that global is the cards' own.
+async function toggleThisFavorite() {
   if (!SERIES_ID) return;
-  const entry = favorites.series[SERIES_ID] ? null : { name: SERIES_NAME, cover: SERIES_COVER };
+  const entry = window.favorites.series[SERIES_ID] ? null : { name: SERIES_NAME, cover: SERIES_COVER };
   window.onFavoritesChanged(await setFavorite('series', SERIES_ID, entry));
 }
 
 function updateButton() {
   const btn = document.getElementById('fav-btn');
-  const isFav = !!favorites.series[SERIES_ID];
-  btn.innerHTML = isFav ? '★ In Favorites' : '☆ Add to Favorites';
+  const isFav = !!window.favorites.series[SERIES_ID];
+  // Only the star changes, so the button keeps its width and nothing beside it moves.
+  btn.textContent = isFav ? '★ Favorite' : '☆ Favorite';
   btn.classList.toggle('bg-yellow-600', isFav);
   btn.classList.toggle('hover:bg-yellow-700', isFav);
   btn.classList.toggle('bg-gray-700', !isFav);
   btn.classList.toggle('hover:bg-gray-600', !isFav);
 }
 
-document.getElementById('fav-btn').addEventListener('click', toggleFavorite);
+document.getElementById('fav-btn').addEventListener('click', toggleThisFavorite);
 updateButton();
 </script>
 {% endblock %}

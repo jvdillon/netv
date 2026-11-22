@@ -1,0 +1,33 @@
+{# The one card every page draws a channel, movie, or series with. Needs items; kind
+   names theirs when all are one kind, else each record's own is read. show_kind
+   labels each card with what it is, for search's mix of kinds. #}
+{% for record, shown in with_shown(items) %}
+{% set own = kind if kind is defined else ('series' if record.series_id is defined else ('live' if record.netv_kind == 'live' else 'movies')) %}
+{% set noun = {'movies': 'movie', 'series': 'series', 'live': 'live'}[own] %}
+{% set item_id = record.series_id if own == 'series' else record.stream_id %}
+{% set href = '/play/live/' ~ item_id if own == 'live' else '/' ~ noun ~ '/' ~ item_id %}
+{% set cover = shown.poster | logo_url %}
+{% set meta = [shown.year, shown.rating] | select | join(' · ') %}
+<div class="{{ noun }}-card relative group" draggable="true" data-{{ noun }}-id="{{ item_id }}" data-{{ noun }}-name="{{ shown.name }}" data-{{ noun }}-cover="{{ cover }}"{% if own == 'movies' %} data-movie-ext="{{ record.container_extension or 'mkv' }}"{% endif %}>
+  <a href="{{ href }}"
+     class="block bg-gray-800 rounded-lg overflow-hidden hover:ring-2 hover:ring-blue-500 focus:ring-2 focus:ring-blue-500 focusable transition-all"
+     tabindex="0" data-nav="grid" title="{{ shown.name }}{% if meta %}&#10;{{ meta }}{% endif %}{% if record.plot %}&#10;{{ record.plot }}{% endif %}">
+    <div class="aspect-[2/3] bg-gray-700{% if own == 'live' %} flex items-center justify-center p-4{% endif %}">
+      {% if shown.poster %}
+      {# A channel's logo is drawn whole; a poster fills the card. #}
+      <img src="{{ cover }}" alt="" class="w-full {% if own == 'live' %}h-auto max-h-full object-contain{% else %}h-full object-cover{% endif %}" loading="lazy"
+           onerror="this.style.display='none'">
+      {% endif %}
+    </div>
+    <div class="p-2">
+      {# One-line title, and a fixed-height line below, keep every card one size. #}
+      <div class="text-sm truncate">{{ shown.name }}</div>
+      <div class="text-xs mt-1 h-4 flex gap-2">{% if show_kind %}<span class="text-gray-500" data-kind-label>{{ {'movies': 'Movie', 'series': 'Series', 'live': 'Live'}[own] }}</span>{% endif %}<span class="text-gray-400">{{ shown.year or '' }}</span><span class="text-yellow-400">{{ shown.rating }}</span></div>
+    </div>
+  </a>
+  {% if own != 'live' %}
+  <button type="button" class="fav-btn absolute top-2 right-2 w-8 h-8 rounded-full bg-black/50 text-xl opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity z-10 focusable"
+          onclick="toggleFavorite(this)">☆</button>
+  {% endif %}
+</div>
+{% endfor %}

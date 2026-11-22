@@ -170,6 +170,9 @@ class GatewayAuthenticator:
 
     async def verify(self, request: Request, username: str, password: str) -> bool:
         client_ip = request.client.host if request.client else "unknown"
+        # Before the cache: a password accepted at home is no key from away.
+        if not await asyncio.to_thread(auth.allowed_from, username, client_ip):
+            return False
         fingerprint = self._fingerprint(username, password)
         now = time.monotonic()
         with self._lock:

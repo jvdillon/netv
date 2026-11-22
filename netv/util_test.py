@@ -362,6 +362,14 @@ def test_safe_urlopen_uses_safe_opener(
     )
 
 
+def test_safe_urlopen_sends_extra_headers(monkeypatch: pytest.MonkeyPatch):
+    web = testing.FakeWeb({"https://example.com/x": testing.FakeResponse(b"ok")})
+    testing.install_web(monkeypatch, web, util)
+    util.safe_urlopen("https://example.com/x", headers={"Authorization": "Bearer t"})
+    [fetch] = web.fetches
+    assert fetch.headers == {"User-agent": "VLC/3.0.20 LibVLC/3.0.20", "Authorization": "Bearer t"}
+
+
 if __name__ == "__main__":
     from codedoctor.lib.testing.runner import test_main
 

@@ -26,6 +26,7 @@ from typing import (
     TYPE_CHECKING,
     Annotated,
     Literal,
+    NamedTuple,
     NotRequired,
     Protocol,
     TypedDict,
@@ -73,6 +74,7 @@ from netv import (
 from netv.auth import TokenClaims, create_token, verify_password, verify_token
 from netv.cache import (
     AVAILABLE_ENCODERS,
+    SearchFilters,
     Source,
     UserSettings,
     clamp_live_dvr_mins,
@@ -156,6 +158,8 @@ def _create_templates() -> Jinja2Templates:
     templates.env.auto_reload = True
     templates.env.filters["logo_url"] = _logo_url_filter
     templates.env.filters["rating"] = _rating_filter
+    templates.env.globals["with_shown"] = _shown
+    templates.env.filters["youtube_id"] = _youtube_id
     templates.env.globals["get_content_access"] = _get_content_access
     templates.env.globals["get_content_access_from_request"] = _get_content_access_from_request
     return templates
@@ -274,7 +278,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             loaded = movies is not None and series is not None
             if movies is not None and series is not None and imdb.is_stale(max_age_sec=7 * 86_400):
                 try:
-                    imdb.build([*movies, *series])
+                    # TMDB only fills in networks Wikidata lacks; no key is needed.
+                    imdb.build([*movies, *series], tmdb_token=_tmdb_token())
                 except Exception:
                     log.exception("IMDb index build failed")
             # Each minute until the catalog loads, then hourly; fresh indexes are skipped.
@@ -492,7 +497,16 @@ def get_current_user(request: Request) -> TokenClaims | None:
     token = request.cookies.get("token")
     if token is None or token == "":
         return None
-    return verify_token(token)
+    claims = verify_token(token)
+    # A LAN-only user's session, started at home, does not work from away.
+    if claims is not None and not auth.allowed_from(claims["sub"], _client_address(request)):
+        return None
+    return claims
+
+
+def _client_address(request: Request) -> str:
+    """The client's IP address; uvicorn takes it from a trusted proxy's header."""
+    return request.client.host if request.client else ""
 
 
 def require_auth(request: Request) -> TokenClaims:
@@ -599,6 +613,8 @@ async def login(
     if not verify_password(username, password):
         _login_attempts.setdefault(ip, []).append(time.time())
         return RedirectResponse("/login?error=invalid", status_code=303)
+    if not auth.allowed_from(username, _client_address(request)):
+        return RedirectResponse("/login?error=lan", status_code=303)
     token = create_token({"sub": username})
     response = RedirectResponse("/", status_code=303)
     is_secure = (
@@ -940,24 +956,24 @@ class _Catalog:
     """One browsable catalog: where it is cached and how it renders."""
 
     group: Literal["movies", "series"]
+    id_field: Literal["stream_id", "series_id"]
     newest_field: str
     template: str
-    cards_template: str
     cards_url: str
 
 
 _MOVIES = _Catalog(
     group="movies",
+    id_field="stream_id",
     newest_field="added",
     template="vod.html",
-    cards_template="_movie_cards.html",
     cards_url="/api/vod/cards",
 )
 _SERIES = _Catalog(
     group="series",
+    id_field="series_id",
     newest_field="last_modified",
     template="series.html",
-    cards_template="_series_cards.html",
     cards_url="/api/series/cards",
 )
 
@@ -1004,6 +1020,16 @@ async def vod_cards(
     return _browse_cards(request, user.get("sub", ""), _MOVIES, category, sort, offset, limit)
 
 
+@app.get("/api/vod/favorites", response_class=HTMLResponse)
+async def vod_favorite_cards(
+    request: Request,
+    user: Annotated[TokenClaims, Depends(require_auth)],
+):
+    if "vod_streams" not in get_cache():
+        await asyncio.to_thread(_store_cached_vod_data)
+    return await asyncio.to_thread(_favorite_cards, request, user.get("sub", ""), _MOVIES)
+
+
 @app.get("/series", response_class=HTMLResponse)
 async def series_page(
     request: Request,
@@ -1037,6 +1063,16 @@ async def series_cards(
     if "series" not in get_cache():
         await asyncio.to_thread(_store_cached_series_data)
     return _browse_cards(request, user.get("sub", ""), _SERIES, category, sort, offset, limit)
+
+
+@app.get("/api/series/favorites", response_class=HTMLResponse)
+async def series_favorite_cards(
+    request: Request,
+    user: Annotated[TokenClaims, Depends(require_auth)],
+):
+    if "series" not in get_cache():
+        await asyncio.to_thread(_store_cached_series_data)
+    return await asyncio.to_thread(_favorite_cards, request, user.get("sub", ""), _SERIES)
 
 
 @app.get("/series/{series_id}", response_class=HTMLResponse)
@@ -1091,13 +1127,13 @@ async def series_detail_page(
     release_date = info.get("releaseDate")
     if not _present(info.get("year")) and isinstance(release_date, str) and release_date:
         info["year"] = release_date[:4]
+    seasons = _seasons(series_data)
     # Strip redundant series title and episode numbers from episode titles.
-    for season_eps in record_field(series_data, "episodes").values():
-        if isinstance(season_eps, list):
-            for ep in season_eps:
-                if isinstance(ep, dict):
-                    _clean_episode(ep)
+    for season_eps in seasons.values():
+        for ep in season_eps:
+            _clean_episode(ep)
 
+    shown = await asyncio.to_thread(_shown_detail, cached_series, info)
     record = cached_series if cached_series is not None else {**info, "series_id": series_id}
     # Off the event loop: saving credits waits on a build's write.
     directors, cast = await asyncio.to_thread(
@@ -1108,14 +1144,29 @@ async def series_detail_page(
             cast=text_field(info, "cast"),
         ),
     )
+    writers = await asyncio.to_thread(imdb.credited, record, "writer")
+    composers = await asyncio.to_thread(imdb.credited, record, "composer")
+    networks = await asyncio.to_thread(imdb.credited, record, "network")
+    countries = await asyncio.to_thread(imdb.credited, record, "country")
+    languages = await asyncio.to_thread(imdb.credited, record, "language")
+    versions = await _series_versions(cached_series, series_data, username)
     user_settings = load_user_settings(username)
     return TEMPLATES.TemplateResponse(
         request,
         "series_detail.html",
         {
             "series": series_data,
+            "seasons": seasons,
+            "minutes_per_episode": _minutes_per_episode(seasons, info),
             "series_id": series_id,
+            "shown": shown,
             "directors": directors,
+            "writers": writers,
+            "composers": composers,
+            "networks": networks,
+            "countries": countries,
+            "languages": languages,
+            "versions": versions,
             "cast": cast,
             "favorites": _page_favorites(user_settings),
         },
@@ -1138,13 +1189,49 @@ async def movie_detail_page(
 
     vod_streams = get_cache().get("vod_streams", [])
     movie = next((m for m in vod_streams if m.get("stream_id") == stream_id), None)
+    versions: list[Version] = []
+    shown: Shown | None = None
     if movie is not None:
-        source_id = text_field(movie, "source_id")
-        if f"movies:{source_id}" in _unavailable_groups(username):
+        unavailable = _unavailable_groups(username)
+        if f"movies:{text_field(movie, 'source_id')}" in unavailable:
             raise HTTPException(403, "Access to this movie is restricted")
-        movie = await _with_vod_details(movie, source_id, stream_id)
+        title = imdb.same_title(movie)
+        listings = sorted(
+            (
+                m
+                for m in vod_streams
+                if imdb.same_title(m) == title
+                and f"movies:{text_field(m, 'source_id')}" not in unavailable
+            ),
+            key=_listing_order,
+        )
+        # Each version's details tell them apart (bitrate, length); all load at once.
+        detailed = await asyncio.gather(
+            *(
+                _with_vod_details(m, text_field(m, "source_id"), _int_value(m.get("stream_id")))
+                for m in listings
+            ),
+        )
+        catalog_movie = movie
+        movie = detailed[listings.index(movie)]
+        # Off the event loop: the rating and year are read from the database.
+        shown = await asyncio.to_thread(_shown_detail, catalog_movie, movie)
+        if len(detailed) > 1:
+            versions = [
+                {
+                    "id": _int_value(d.get("stream_id")),
+                    "href": f"/movie/{_int_value(d.get('stream_id'))}",
+                    "label": _version_label(d),
+                    "current": d is movie,
+                }
+                for d in detailed
+            ]
     directors: list[str] = []
     cast: list[str] = []
+    writers: list[str] = []
+    composers: list[str] = []
+    countries: list[str] = []
+    languages: list[str] = []
     if movie is not None:
         # Off the event loop: saving credits waits on a build's write.
         directors, cast = await asyncio.to_thread(
@@ -1155,6 +1242,10 @@ async def movie_detail_page(
                 cast=text_field(movie, "cast"),
             ),
         )
+        writers = await asyncio.to_thread(imdb.credited, movie, "writer")
+        composers = await asyncio.to_thread(imdb.credited, movie, "composer")
+        countries = await asyncio.to_thread(imdb.credited, movie, "country")
+        languages = await asyncio.to_thread(imdb.credited, movie, "language")
 
     user_settings = load_user_settings(username)
     return TEMPLATES.TemplateResponse(
@@ -1162,11 +1253,26 @@ async def movie_detail_page(
         "movie_detail.html",
         {
             "movie": movie,
+            "shown": shown,
+            "versions": versions,
             "directors": directors,
+            "writers": writers,
+            "composers": composers,
+            "countries": countries,
+            "languages": languages,
             "cast": cast,
             "favorites": _page_favorites(user_settings),
         },
     )
+
+
+class Version(TypedDict):
+    """One of the provider's listings of a movie or series, as its page offers it."""
+
+    id: int
+    href: str
+    label: str
+    current: bool
 
 
 class GuideHorizon(TypedDict):
@@ -1564,6 +1670,7 @@ async def search_page(
     vod: bool = False,
     series: bool = False,
     limit: int = 100,
+    sort: str | None = None,
 ):
     results: dict[str, list[ProviderRecord]] = {"live": [], "vod": [], "series": []}
 
@@ -1575,7 +1682,7 @@ async def search_page(
         # Limit regex length to prevent ReDoS.
         if regex and len(q) > 100:
             raise HTTPException(400, "Regex pattern too long")
-        match_fn = _name_matcher(q, regex=regex)
+        terms = _search_terms(q)
 
         # Load live data (run in thread to avoid blocking)
         if live:
@@ -1585,10 +1692,12 @@ async def search_page(
                     get_cache()["live_categories"] = cats
                     get_cache()["live_streams"] = streams
                     get_cache()["epg_urls"] = epg_urls
+            # All matches: the limit applies after every kind is merged and sorted.
             results["live"] = _matching_names(
                 get_cache().get("live_streams", []),
-                match_fn,
-                limit,
+                terms,
+                0,
+                regex=regex,
                 imdb_credits=False,
             )
 
@@ -1599,13 +1708,15 @@ async def search_page(
                 with get_cache_lock():
                     get_cache()["vod_categories"] = vod_cats
                     get_cache()["vod_streams"] = vod_streams
-            # Off the event loop: the credits query reads the database.
+            # Off the event loop: the credits query reads the database. All matches,
+            # since the limit applies after the requested sort.
             results["vod"] = await asyncio.to_thread(
                 functools.partial(
                     _matching_names,
                     get_cache().get("vod_streams", []),
-                    match_fn,
-                    limit,
+                    terms,
+                    0,
+                    regex=regex,
                     imdb_credits=True,
                 ),
             )
@@ -1617,13 +1728,15 @@ async def search_page(
                 with get_cache_lock():
                     get_cache()["series_categories"] = series_cats
                     get_cache()["series"] = series_list
-            # Off the event loop: the credits query reads the database.
+            # Off the event loop: the credits query reads the database. All matches,
+            # since the limit applies after the requested sort.
             results["series"] = await asyncio.to_thread(
                 functools.partial(
                     _matching_names,
                     get_cache().get("series", []),
-                    match_fn,
-                    limit,
+                    terms,
+                    0,
+                    regex=regex,
                     imdb_credits=True,
                 ),
             )
@@ -1659,6 +1772,7 @@ async def search_page(
     if vod_filter:
         vod_filter_set = set(vod_filter)
         results["vod"] = [s for s in results["vod"] if str(s.get("category_id")) in vod_filter_set]
+    results["vod"] = _one_per_title(results["vod"], per_category=False)
 
     series_filter = user_settings.get("series_filter", [])
     if series_filter:
@@ -1666,19 +1780,51 @@ async def search_page(
         results["series"] = [
             s for s in results["series"] if str(s.get("category_id")) in series_filter_set
         ]
+    results["series"] = _one_per_title(results["series"], per_category=False)
 
+    # Choices made here persist; a search that makes none reuses the last ones.
+    _remember_sort(username, user_settings, _sort_choice(sort))
+    chosen_sort = _sort_choice(user_settings.get("results_sort", "alpha"))
+    saved_filters = user_settings.get("search_filters")
+    filters = _search_filters(request.query_params, saved_filters)
+    if filters != (saved_filters or _search_filters({}, None)):
+        user_settings["search_filters"] = filters
+        save_user_settings(username, user_settings)
+
+    # Channels, movies, and series in one list. A channel is tagged so its card
+    # knows it; a copy, since the record is the shared catalog's.
+    found = [
+        *({**s, "netv_kind": "live"} for s in results["live"]),
+        *results["vod"],
+        *results["series"],
+    ]
+    names = _category_names_by_kind()
+    categories = sorted({n for record in found for n in _record_categories(record, names)})
+    chosen = filters.get("category")
+    in_category = [r for r in found if chosen is None or chosen in _record_categories(r, names)]
+    # Year and IMDb bounds judge what IMDb dates and rates; channels always pass.
+    titles = [r for r in in_category if r.get("netv_kind") != "live"]
+    # Off the event loop: filtering and sorting by IMDb read the database.
+    kept = await asyncio.to_thread(_within_filters, titles, filters)
+    shown = [r for r in in_category if r.get("netv_kind") == "live"] + kept
+    ordered = await asyncio.to_thread(_sorted_records, shown, chosen_sort, "")
     content_access = _get_content_access(username)
     return TEMPLATES.TemplateResponse(
         request,
         "search.html",
         {
             "query": q,
-            "results": results,
+            "results": ordered[:limit] if limit else ordered,
+            "total": len(ordered),
+            "hidden_by_filters": len(found) - len(shown),
+            "categories": categories,
             "regex": regex,
             "search_live": live,
             "search_vod": vod and content_access["movies"],
             "search_series": series and content_access["series"],
             "limit": limit,
+            "sort": chosen_sort,
+            "filters": filters,
             "favorites": _page_favorites(user_settings),
             "content_access": content_access,
         },
@@ -2060,6 +2206,8 @@ async def settings_page(request: Request, user: Annotated[TokenClaims, Depends(r
         {
             # Server settings.
             "sources": server_settings["sources"],
+            # Which keys are saved, never the keys.
+            "api_keys_saved": sorted(server_settings.get("api_keys", {})),
             "transcode_mode": server_settings["transcode_mode"],
             "transcode_hw": server_settings["transcode_hw"],
             "max_resolution": server_settings.get("max_resolution", "1080p"),
@@ -3242,6 +3390,7 @@ async def settings_add_user(
     admin: Annotated[str, Form()] = "",
     max_streams_per_source: Annotated[str | None, Form()] = None,
     unavailable_groups: Annotated[str | None, Form()] = None,
+    lan_only: Annotated[str, Form()] = "",
 ):
     """Add a new user.
 
@@ -3250,6 +3399,7 @@ async def settings_add_user(
         username: New account name.
         password: New account password.
         admin: Form checkbox granting administrator access.
+        lan_only: Form checkbox limiting the account to the home network.
         max_streams_per_source: Optional encoded source stream limits.
         unavailable_groups: Optional encoded restricted group identifiers.
     """
@@ -3262,6 +3412,8 @@ async def settings_add_user(
     if username in auth.get_all_usernames():
         raise HTTPException(400, "User already exists")
     auth.create_user(username, password, admin=admin == "on")
+    if lan_only == "on":
+        auth.set_lan_only(username, lan_only=True)
     # Apply limits if provided; malformed limits are ignored.
     parsed_max_streams: dict[str, int] | None = None
     if max_streams_per_source is not None and max_streams_per_source:
@@ -3338,6 +3490,46 @@ async def settings_set_admin(
     return {"status": "ok"}
 
 
+@app.post("/settings/api-keys")
+async def settings_set_api_key(
+    user: Annotated[TokenClaims, Depends(require_admin)],
+    service: Annotated[str, Form()],
+    key: Annotated[str, Form()] = "",
+):
+    """Save another service's key, or remove it when ``key`` is empty.
+
+    Args:
+        user: Authenticated administrator claims.
+        service: The service the key is for; only "tmdb" so far.
+        key: The key; empty or blank removes the saved one.
+    """
+    del user
+    if service != "tmdb":
+        raise HTTPException(400, f"Unknown service: {service}")
+    settings = load_server_settings()
+    keys = settings.get("api_keys", {})
+    if key.strip():
+        keys[service] = key.strip()
+    else:
+        keys.pop(service, None)
+    settings["api_keys"] = keys
+    save_server_settings(settings)
+    return {"status": "ok"}
+
+
+@app.post("/settings/users/lan/{target_user}")
+async def settings_set_lan_only(
+    target_user: str,
+    user: Annotated[TokenClaims, Depends(require_admin)],
+    lan_only: Annotated[str, Form()] = "",
+):
+    """Limit a user to the home network, or lift the limit."""
+    del user
+    if not auth.set_lan_only(target_user, lan_only=lan_only == "on"):
+        raise HTTPException(404, "User not found")
+    return {"status": "ok"}
+
+
 @app.post("/settings/users/limits/{target_user}")
 async def settings_set_user_limits(
     target_user: str,
@@ -3386,6 +3578,56 @@ def _logo_url_filter(url: str) -> str:
     source = parsed.netloc.split(":")[0] if parsed.netloc else "external"
     sig = auth.logo_url_signature(url)
     return f"/api/logo?source={parse.quote(source)}&url={parse.quote(url)}&sig={sig}"
+
+
+def _ranked(records: list[ProviderRecord]) -> list[tuple[ProviderRecord, imdb.Ranking]]:
+    """Each record with its IMDb ranking."""
+    ranks = imdb.rankings(records)
+    return [(record, ranks[i]) for i, record in enumerate(records)]
+
+
+class Shown(NamedTuple):
+    """A title as every page shows it."""
+
+    rating: str  # "IMDb 7.0"; the provider's "★ 6.8" when IMDb has none; or "".
+    year: int  # 0 when unknown.
+    name: str
+    poster: str  # Its image URL, as the provider gives it; or "".
+
+
+# Cards, detail pages, and the player all show these, read from the catalog record
+# that sorting and filtering read too; a page's richer provider details could
+# otherwise show a second rating or year for one title.
+def _shown(records: list[ProviderRecord]) -> list[tuple[ProviderRecord, Shown]]:
+    """Each catalog record with the rating and year pages show for it."""
+    shown: list[tuple[ProviderRecord, Shown]] = []
+    for record, rank in _ranked(records):
+        provider = _safe_float(record.get("rating"))
+        if rank.rating:
+            rating = f"IMDb {_rating_filter(rank.rating)}"
+        else:
+            rating = f"★ {_rating_filter(provider)}" if provider else ""
+        poster = text_field(record, "stream_icon") or text_field(record, "cover")
+        # Pages show the year on its own, so not as the name's " - 1977" suffix too.
+        name = text_field(record, "name")
+        titled = imdb.title_year(name)
+        title = name if titled is None else titled[0]
+        shown.append((record, Shown(rating, rank.year, title, poster)))
+    return shown
+
+
+# Providers send a bare id or a watch or short link. Anything else is dropped, since
+# extra text in an embed URL could add options such as autoplay.
+def _youtube_id(trailer: MutablePlainTree) -> str:
+    """The YouTube video id a provider's trailer field names, or ""."""
+    found = re.fullmatch(
+        r"(?:https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/))?([\w-]{11})(?:[&?#].*)?",
+        str(trailer).strip(),
+    )
+    # A bare id has nothing after it; only a link carries its own query.
+    if found is None or ("://" not in found.group(0) and found.group(0) != found.group(1)):
+        return ""
+    return str(found.group(1))
 
 
 # Text that is not a number shows as sent.
@@ -3514,7 +3756,9 @@ def main() -> int:
         log_config=None,  # Preserve our basicConfig.
         timeout_graceful_shutdown=5,
         proxy_headers=True,
-        forwarded_allow_ips="*",
+        # Only a trusted proxy may name the client: anyone else could claim a home
+        # address and pass a LAN-only check, or dodge the login rate limit.
+        forwarded_allow_ips=os.environ.get("NETV_TRUSTED_PROXIES", "127.0.0.1"),
         ssl_certfile=ssl_certfile,
         ssl_keyfile=ssl_keyfile,
     )
@@ -3529,6 +3773,74 @@ class Flags(Protocol):
     https: str | None
     cert: str | None
     key: str | None
+
+
+async def _series_versions(
+    shown: ProviderRecord | None,
+    shown_data: ProviderRecord,
+    username: str,
+) -> list[Version]:
+    """Every listing of the series on show the user may see, newest first; none if one."""
+    if shown is None:
+        return []
+    unavailable = _unavailable_groups(username)
+    title = imdb.same_title(shown)
+    listings = sorted(
+        (
+            s
+            for s in get_cache().get("series", [])
+            if imdb.same_title(s) == title
+            and f"series:{text_field(s, 'source_id')}" not in unavailable
+        ),
+        key=_listing_order,
+    )
+    if len(listings) < 2:
+        return []
+
+    def details(listing: ProviderRecord) -> ProviderRecord:
+        if listing is shown:
+            return shown_data
+        source_id = text_field(listing, "source_id")
+        client = get_xtream_client_by_source(source_id)
+        series_id = _int_value(listing.get("series_id"))
+        if client is None:
+            return {}
+        try:
+            return get_cached_info(
+                f"series_info_{source_id}_{series_id}",
+                lambda: client.get_series_info(series_id),
+            )
+        except (error.URLError, TimeoutError):
+            # Its catalog entry still dates it.
+            return {}
+
+    # Each listing's details count its episodes; all load at once.
+    detailed = await asyncio.gather(*(asyncio.to_thread(details, s) for s in listings))
+    versions: list[Version] = []
+    for listing, data in zip(listings, detailed, strict=True):
+        series_id = _int_value(listing.get("series_id"))
+        parts: list[str] = []
+        if updated := _int_value(listing.get("last_modified")):
+            parts.append(f"Updated {datetime.fromtimestamp(updated):%b %-d, %Y}")
+        if count := sum(len(eps) for eps in _seasons(data).values()):
+            parts.append(f"{count} episode{'' if count == 1 else 's'}")
+        versions.append(
+            {
+                "id": series_id,
+                "href": f"/series/{series_id}",
+                "label": " · ".join(parts),
+                "current": listing is shown,
+            },
+        )
+    return versions
+
+
+def _tmdb_token() -> str:
+    """The TMDB key: the environment's ``TMDB_API_KEY``, else Settings', else none."""
+    return os.environ.get("TMDB_API_KEY") or load_server_settings().get("api_keys", {}).get(
+        "tmdb",
+        "",
+    )
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -3708,27 +4020,105 @@ def _store_cached_series_data() -> bool:
     return True
 
 
+# ``field:word`` and ``field:"a phrase"`` limit a term to one field; the rest of ``q``
+# is one term that any field may match.
+def _search_terms(q: str) -> list[tuple[str, str]]:
+    """``q`` as (field, text) terms, all of which a result must match."""
+    fielded = re.compile(
+        r"\b(title|cast|role|director|writer|composer|network|country|language|year|genre|imdb):"
+        r'(?:"([^"]*)"|(\S+))',
+        re.IGNORECASE,
+    )
+    terms = [
+        (str(m[1]).lower(), str(m[2] if m[2] is not None else m[3])) for m in fielded.finditer(q)
+    ]
+    rest = fielded.sub(" ", q).strip().strip('"')
+    return [*terms, ("any", rest)] if rest or not terms else terms
+
+
 # Movies and series add IMDb's credits to the provider's. A ``limit`` of 0 keeps all.
 def _matching_names(
     records: list[ProviderRecord],
-    match_fn: Callable[[str], bool],
+    terms: list[tuple[str, str]],
     limit: int,
     *,
+    regex: bool,
     imdb_credits: bool,
 ) -> list[ProviderRecord]:
-    """Records whose name or credited people match, sorted by name, at most ``limit``."""
-    credited = imdb.matching_keys(match_fn) if imdb_credits else set()
-    keys = imdb.resolved_keys(records) if credited else [None] * len(records)
+    """Records matching every search term, sorted by name, at most ``limit``."""
+    # Each field: the IMDb credits it reads (None: all, empty: none), and the
+    # record's own fields.
+    fields: dict[str, tuple[tuple[str, ...] | None, tuple[str, ...]]] = {
+        "any": (None, ("name", "cast", "director")),
+        "title": ((), ("name",)),
+        "cast": (("cast",), ("cast",)),
+        "role": (("character",), ()),
+        "director": (("director",), ("director",)),
+        "writer": (("writer",), ()),
+        "composer": (("composer",), ()),
+        "network": (("network",), ()),
+        "country": (("country",), ()),
+        "language": (("language",), ()),
+    }
+    # Year, genre, and IMDb rating terms read what cards show; live channels have none.
+    facts = [(field, text) for field, text in terms if field not in fields]
+    if facts and not imdb_credits:
+        return []
+    # Each term: its predicate, the titles its IMDb credits match, its record fields.
+    checks: list[tuple[Callable[[str], bool], set[str], tuple[str, ...]]] = []
+    for field, text in terms:
+        if field in fields:
+            match = _name_matcher(text, regex=regex)
+            roles, own = fields[field]
+            credited = (
+                imdb.matching_keys(match, roles=roles) if imdb_credits and roles != () else set()
+            )
+            checks.append((match, credited, own))
+    keys = (
+        imdb.resolved_keys(records)
+        if any(credited for _, credited, _ in checks)
+        else [None] * len(records)
+    )
+    ranks = imdb.rankings(records) if facts else [imdb.Ranking(0.0, 0, 0)] * len(records)
     matched = sorted(
         (
-            r
-            for r, key in zip(records, keys, strict=True)
-            if key in credited
-            or any(match_fn(text_field(r, f)) for f in ("name", "cast", "director"))
+            records[i]
+            for i, key in enumerate(keys)
+            if all(
+                key in credited or any(match(text_field(records[i], f)) for f in own)
+                for match, credited, own in checks
+            )
+            and all(_fact_matches(f, text, ranks[i], records[i], regex=regex) for f, text in facts)
         ),
         key=lambda r: text_field(r, "name").lower(),
     )
     return matched[:limit] if limit else matched
+
+
+# A year is ``1977`` or a range, ``1970-1979`` or ``1970..1979``; a rating is a least
+# one, ``7``, or a range, ``7-8``; a genre matches like any name.
+def _fact_matches(
+    field: str,
+    text: str,
+    rank: imdb.Ranking,
+    record: ProviderRecord,
+    *,
+    regex: bool,
+) -> bool:
+    """Whether a title's year, genre, or IMDb rating matches a search term's ``text``."""
+    if field == "genre":
+        # IMDb's genres, else the provider's.
+        genres = ",".join(rank.genres) or text_field(record, "genre")
+        return _name_matcher(text, regex=regex)(genres)
+    number = r"\d+(?:\.\d+)?"
+    bounds = re.fullmatch(rf"({number})(?:(?:-|\.\.)({number}))?", text)
+    if bounds is None:
+        return False
+    low = float(bounds[1])
+    if field == "year":
+        high = float(bounds[2] or bounds[1])
+        return bool(rank.year) and low <= rank.year <= high
+    return rank.rating >= low and (bounds[2] is None or rank.rating <= float(bounds[2]))
 
 
 def _clean_episode(ep: ProviderRecord) -> None:
@@ -3786,6 +4176,7 @@ async def _with_vod_details(
         "rating": info.get("rating", ""),
         "year": release[:4] if isinstance(release, str) and release else "",
         "duration": info.get("duration", ""),
+        "bitrate": info.get("bitrate", ""),
         "cover_big": _first_present(info, "cover_big", "movie_image"),
         "youtube_trailer": info.get("youtube_trailer", ""),
     }
@@ -4396,8 +4787,7 @@ def _get_movie_player_info(stream_id: str, ext: str) -> PlayerInfo:
     m = record_field(movie, "info")
     if m:
         name = m.get("name", "")
-        year_value = m.get("year")
-        year = str(year_value if _present(year_value) else m.get("releasedate", ""))[:4]
+        year = _shown_detail(cached_movie, m).year
         info = replace(
             info,
             channel_name=f"{name} ({year})" if year else str(name),
@@ -4414,6 +4804,7 @@ def _get_series_player_info(
     """Get player info for series episode. Returns (info, next_episode_url)."""
     # Find series in cache to get its source_id.
     source_id = ""
+    cached_series: ProviderRecord | None = None
     if series_id is not None and series_id != 0:
         cached_series = next(
             (s for s in get_cache().get("series", []) if str(s.get("series_id")) == str(series_id)),
@@ -4452,15 +4843,13 @@ def _get_series_player_info(
     series_info = record_field(series, "info")
     if series_info:
         name = series_info.get("name", "")
-        year = series_info.get("year")
-        info = replace(info, channel_name=f"{name} ({year})" if _present(year) else str(name))
+        year = _shown_detail(cached_series, series_info).year
+        info = replace(info, channel_name=f"{name} ({year})" if year else str(name))
 
     # Build flat list of all episodes in order (season, episode)
     all_episodes: list[tuple[int, ProviderRecord]] = []
-    seasons = record_field(series, "episodes")
-    for season_num, eps in sorted(seasons.items(), key=lambda x: int(x[0])):
-        season_eps = [ep for ep in eps if isinstance(ep, dict)] if isinstance(eps, list) else []
-        for ep in sorted(season_eps, key=lambda e: _int_value(e.get("episode_num"))):
+    for season_num, eps in sorted(_seasons(series).items(), key=lambda x: int(x[0])):
+        for ep in sorted(eps, key=lambda e: _int_value(e.get("episode_num"))):
             all_episodes.append((int(season_num), ep))
 
     # Find current episode and next.
@@ -4761,12 +5150,47 @@ def _enrich_probe_cache_stats(
     return enriched
 
 
+# Providers often send an ``episode_run_time`` of "0" while each episode has its length.
+def _minutes_per_episode(seasons: dict[str, list[ProviderRecord]], info: ProviderRecord) -> int:
+    """A series' episode length in minutes: its episodes' average, else the provider's."""
+    seconds = [
+        length
+        for episodes in seasons.values()
+        for ep in episodes
+        if (length := _int_value(record_field(ep, "info").get("duration_secs"))) > 0
+    ]
+    if seconds:
+        return round(sum(seconds) / len(seconds) / 60)
+    return _int_value(info.get("episode_run_time"))
+
+
+# Most send a map keyed by season. Some send a list of seasons (PHP writes an array
+# keyed 0..n-1 as a JSON list); each episode names its season, and one that does not
+# takes its place in the list.
+def _seasons(series: ProviderRecord) -> dict[str, list[ProviderRecord]]:
+    """A series' episodes by season number, whichever shape the provider sent."""
+    raw = series.get("episodes")
+    if isinstance(raw, dict):
+        groups = list(raw.items())
+    elif isinstance(raw, list):
+        groups = [(str(i + 1), eps) for i, eps in enumerate(raw)]
+    else:
+        return {}
+    seasons: dict[str, list[ProviderRecord]] = {}
+    for key, eps in groups:
+        for ep in eps if isinstance(eps, list) else []:
+            if isinstance(ep, dict):
+                season = key if isinstance(raw, dict) else text_field(ep, "season") or key
+                seasons.setdefault(season, []).append(ep)
+    return seasons
+
+
 def _episode_labels(series: ProviderRecord) -> dict[int, str]:
     """Map each episode id to an ``SxxEyy Title`` label."""
     labels: dict[int, str] = {}
-    for season_num, eps in record_field(series, "episodes").items():
-        for ep in eps if isinstance(eps, list) else []:
-            if not isinstance(ep, dict) or not _present(ep.get("id")):
+    for season_num, eps in _seasons(series).items():
+        for ep in eps:
+            if not _present(ep.get("id")):
                 continue
             title = re.sub(r"^S\d+E\d+\s*-\s*", "", text_field(ep, "title"))
             if " - " in title:
@@ -4887,10 +5311,34 @@ def _catalog_records(
         cats, items = store.get("series_categories", []), store.get("series", [])
         wanted = settings.get("series_filter", [])
     unavailable = _unavailable_groups(username)
-    return (
-        [c for c in cats if _browsable(c, catalog.group, unavailable, wanted)],
-        [i for i in items if _browsable(i, catalog.group, unavailable, wanted)],
-    )
+    browsable = [i for i in items if _browsable(i, catalog.group, unavailable, wanted)]
+    browsable = _one_per_title(browsable, per_category=True)
+    return [c for c in cats if _browsable(c, catalog.group, unavailable, wanted)], browsable
+
+
+def _one_per_title(
+    records: list[ProviderRecord],
+    *,
+    per_category: bool,
+) -> list[ProviderRecord]:
+    """Each movie or series once, as its preferred listing, where first listed."""
+    kept: dict[tuple[str, str | bool], ProviderRecord] = {}
+    for record in records:
+        key = (imdb.same_title(record), per_category and str(record.get("category_id")))
+        best = kept.get(key)
+        # Replacing a value keeps its key's place, so the title stays where first listed.
+        kept[key] = record if best is None else min(best, record, key=_listing_order)
+    return list(kept.values())
+
+
+# A movie's oldest listing comes first: the provider's re-uploads are often dead (of 40
+# sampled titles listed twice, the newer failed with HTTP 400 for 37, the older for 2).
+# A series' newest comes first: a listing gains episodes as it updates.
+def _listing_order(record: ProviderRecord) -> tuple[int, int]:
+    """Orders a title's listings, preferred first; ties go to the lower, or newer, id."""
+    if "series_id" in record:
+        return -_int_value(record.get("last_modified")), -_int_value(record.get("series_id"))
+    return _int_value(record.get("added")), _int_value(record.get("stream_id"))
 
 
 def _browsable(
@@ -4905,6 +5353,8 @@ def _browsable(
     return not wanted or str(record.get("category_id")) in wanted
 
 
+# An empty ``newest_field`` dates each record by its own kind's field, for search's mix
+# of kinds: a series by when it last changed, anything else by when added.
 def _sorted_records(
     records: list[ProviderRecord],
     sort: str | None,
@@ -4913,11 +5363,32 @@ def _sorted_records(
     """``records`` in browse order; an unknown sort keeps provider order."""
     if sort == "alpha":
         return sorted(records, key=lambda r: text_field(r, "name").lower())
-    if sort == "rating":
-        return sorted(records, key=lambda r: _safe_float(r.get("rating")), reverse=True)
     if sort == "newest":
-        return sorted(records, key=lambda r: _int_value(r.get(newest_field)), reverse=True)
+
+        def added(record: ProviderRecord) -> int:
+            field = newest_field or ("last_modified" if "series_id" in record else "added")
+            return _int_value(record.get(field))
+
+        return sorted(records, key=added, reverse=True)
+    if sort == "imdb":
+        # The provider's rating orders what IMDb has not rated.
+        return _sorted_by_ranking(
+            records,
+            lambda rank, r: (rank.rating, rank.votes, _safe_float(r.get("rating"))),
+        )
+    if sort == "year":
+        return _sorted_by_ranking(records, lambda rank, _: (rank.year,))
     return records
+
+
+def _sorted_by_ranking(
+    records: list[ProviderRecord],
+    key: Callable[[imdb.Ranking, ProviderRecord], tuple[float, ...]],
+) -> list[ProviderRecord]:
+    """``records`` highest ``key`` first, of each IMDb ranking and record; ties keep order."""
+    ranks = imdb.rankings(records)
+    order = sorted(range(len(records)), key=lambda i: key(ranks[i], records[i]), reverse=True)
+    return [records[i] for i in order]
 
 
 def _in_category(records: list[ProviderRecord], category: int) -> list[ProviderRecord]:
@@ -4968,6 +5439,21 @@ def _browse_rows(
     return rows
 
 
+def _sort_choice(sort: str | None) -> str | None:
+    """``sort`` as the pages now name it."""
+    # "rating" sorted by the provider's number, which no card shows; links and
+    # settings saved before it went still name it.
+    return "imdb" if sort == "rating" else sort
+
+
+def _remember_sort(username: str, settings: UserSettings, sort: str | None) -> None:
+    """Save ``sort`` as the user's choice, if it is one the pages offer and is new."""
+    # The sorts the Movies, Series and Search pages offer.
+    if sort in {"alpha", "imdb", "year", "newest"} and settings.get("results_sort") != sort:
+        settings["results_sort"] = sort
+        save_user_settings(username, settings)
+
+
 def _browse_page(
     request: Request,
     username: str,
@@ -4983,11 +5469,15 @@ def _browse_page(
     content_access = _get_content_access(username)
     if not content_access[catalog.group]:
         raise HTTPException(403, f"Access to {catalog.group} is restricted")
+    sort = _sort_choice(sort)
+    _remember_sort(username, user_settings, sort)
     cats, items = _catalog_records(catalog, username, user_settings)
     context: dict[str, object] = {
         "categories": cats,
         "current_category": category,
         "current_sort": sort,
+        # Browse All opens with the user's last sort.
+        "remembered_sort": _sort_choice(user_settings.get("results_sort", "imdb")),
         "favorites": _page_favorites(user_settings),
         "content_access": content_access,
         "cards_url": catalog.cards_url,
@@ -5018,11 +5508,51 @@ def _browse_cards(
     if not _get_content_access(username)[catalog.group]:
         raise HTTPException(403, f"Access to {catalog.group} is restricted")
     _, items = _catalog_records(catalog, username, load_user_settings(username))
-    members = _sorted_records(_in_category(items, category), sort, catalog.newest_field)
+    members = _sorted_records(
+        _in_category(items, category),
+        _sort_choice(sort),
+        catalog.newest_field,
+    )
     return TEMPLATES.TemplateResponse(
         request,
-        catalog.cards_template,
-        {"items": members[offset : offset + limit]},
+        "_cards.html",
+        {"items": members[offset : offset + limit], "kind": catalog.group},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _favorite_cards(request: Request, username: str, catalog: _Catalog) -> HTMLResponse:
+    """The user's favorites as cards, in the saved order."""
+    if not _get_content_access(username)[catalog.group]:
+        raise HTTPException(403, f"Access to {catalog.group} is restricted")
+    saved = load_user_settings(username).get("favorites", {}).get(catalog.group, {})
+    server = load_server_settings()
+    if catalog.group == "movies":
+        records, saved_order = get_cache().get("vod_streams", []), server.get("vod_order", [])
+    else:
+        records, saved_order = get_cache().get("series", []), server.get("series_order", [])
+    listed = {
+        text_field(r, catalog.id_field): r
+        for r in records
+        if text_field(r, catalog.id_field) in saved
+    }
+    order = [i for i in saved_order if i in saved]
+    unavailable = _unavailable_groups(username)
+    items: list[ProviderRecord] = []
+    for fid in [*order, *(i for i in saved if i not in order)]:
+        record = listed.get(fid)
+        if record is None:
+            # Gone from the catalog: its saved name, without its saved cover, which
+            # is never signed.
+            entry = saved[fid]
+            name = entry.get("name") if isinstance(entry, dict) else None
+            items.append({catalog.id_field: fid, "name": str(name or fid)})
+        elif _browsable(record, catalog.group, unavailable, []):
+            items.append(record)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "_cards.html",
+        {"items": items, "kind": catalog.group},
         headers={"Cache-Control": "no-store"},
     )
 
@@ -5078,6 +5608,93 @@ class _FavoriteUpdate(TypedDict):
     kind: Literal["movies", "series"]
     id: str
     entry: dict[str, MutablePlainTree] | None  # None removes the favorite.
+
+
+def _version_label(movie: ProviderRecord) -> str:
+    """What tells a movie's listings apart: when added, file type, bitrate, length."""
+    parts: list[str] = []
+    added = _int_value(movie.get("added"))
+    if added:
+        parts.append(f"Added {datetime.fromtimestamp(added):%b %-d, %Y}")
+    if extension := text_field(movie, "container_extension"):
+        parts.append(extension.upper())
+    # Providers report bitrate in kbit/s.
+    if kbps := _safe_float(movie.get("bitrate")):
+        parts.append(f"{kbps / 1000:.1f} Mbps")
+    if duration := text_field(movie, "duration"):
+        parts.append(duration)
+    return " · ".join(parts)
+
+
+# An empty field clears its filter.
+def _search_filters(params: Mapping[str, str], saved: SearchFilters | None) -> SearchFilters:
+    """The filters a search applies: each sent field, else the saved one."""
+    filters: SearchFilters = {**(saved or {"year_from": None, "year_to": None, "min_imdb": None})}
+    if "category" in params:
+        filters["category"] = params["category"] or None
+    try:
+        for name in ("year_from", "year_to"):
+            if name in params:
+                filters[name] = int(params[name]) if params[name] else None
+        if "min_imdb" in params:
+            score = float(params["min_imdb"]) if params["min_imdb"] else None
+            if score is not None and not math.isfinite(score):
+                raise ValueError(score)
+            filters["min_imdb"] = score
+    except ValueError as exc:
+        raise HTTPException(400, f"Invalid search filter: {exc}") from exc
+    return filters
+
+
+def _category_names_by_kind() -> dict[str, dict[str, str]]:
+    """Each kind's category names by id: "live", "movies", "series"."""
+    store = get_cache()
+    return {
+        kind: {text_field(c, "category_id"): text_field(c, "category_name") for c in categories}
+        for kind, categories in (
+            ("live", store.get("live_categories", [])),
+            ("movies", store.get("vod_categories", [])),
+            ("series", store.get("series_categories", [])),
+        )
+    }
+
+
+def _record_categories(record: ProviderRecord, names: Mapping[str, Mapping[str, str]]) -> set[str]:
+    """The names of the categories a channel, movie, or series is listed in."""
+    if record.get("netv_kind") == "live":
+        kind = "live"
+    else:
+        kind = "series" if "series_id" in record else "movies"
+    ids = [str(c) for c in list_field(record, "category_ids")] or [
+        text_field(record, "category_id"),
+    ]
+    return {names[kind][i] for i in ids if i in names[kind]}
+
+
+def _within_filters(records: list[ProviderRecord], filters: SearchFilters) -> list[ProviderRecord]:
+    """``records`` inside ``filters``; a bound leaves out titles it cannot judge."""
+    year_from, year_to, min_imdb = filters["year_from"], filters["year_to"], filters["min_imdb"]
+    return [
+        record
+        for record, rank in _ranked(records)
+        if (year_from is None or rank.year >= year_from)
+        # A year of 0 is unknown, not before every year_to.
+        and (year_to is None or (rank.year and rank.year <= year_to))
+        and (min_imdb is None or rank.rating >= min_imdb)
+    ]
+
+
+# Its provider ``details`` fill in a year, name, or poster neither IMDb nor the
+# catalog has; a record gone from the catalog has only those.
+def _shown_detail(record: ProviderRecord | None, details: ProviderRecord) -> Shown:
+    """What a detail page or the player shows for catalog ``record``."""
+    shown = Shown("", 0, "", "") if record is None else _shown([record])[0][1]
+    year = str(_first_present(details, "year", "releasedate"))[:4]
+    return shown._replace(
+        year=shown.year or (int(year) if year.isdigit() else 0),
+        name=shown.name or text_field(details, "name"),
+        poster=shown.poster or str(_first_present(details, "cover_big", "movie_image", "cover")),
+    )
 
 
 if __name__ == "__main__":

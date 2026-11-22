@@ -8,10 +8,11 @@ runtimes, ratings, and full credits. Only titles in the catalog are kept, in
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set
-from concurrent.futures import ProcessPoolExecutor
-from typing import ParamSpec, TypedDict, TypeVar, cast
-from urllib import parse
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from typing import NamedTuple, NotRequired, ParamSpec, TypedDict, TypeVar, cast
+from urllib import error, parse
 
 import functools
 import gzip
@@ -48,7 +49,20 @@ class Info(TypedDict):
     directors: list[str]
     writers: list[str]
     cast: list[str]
+    characters: list[str]  # Who the cast play, so "James Bond" finds the Bond films.
     crew: dict[str, list[str]]
+
+
+class Ranking(NamedTuple):
+    """How a catalog title ranks and filters: IMDb's rating, votes, year, and genres.
+
+    Numbers are 0 and genres empty when unknown.
+    """
+
+    rating: float
+    votes: int
+    year: int
+    genres: tuple[str, ...] = ()
 
 
 def title_year(name: str) -> tuple[str, int] | None:
@@ -105,6 +119,10 @@ def init() -> None:
         CREATE INDEX IF NOT EXISTS idx_imdb_credits_name ON imdb_credits(name_id);
         CREATE TABLE IF NOT EXISTS imdb_builds (built_ts REAL NOT NULL);
     """)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(imdb_builds)")}
+    if "format" not in columns:
+        # Builds from before ``format`` existed count as format 1.
+        conn.execute("ALTER TABLE imdb_builds ADD COLUMN format INTEGER NOT NULL DEFAULT 1")
     conn.commit()
 
 
@@ -120,7 +138,10 @@ def is_stale(*, max_age_sec: float) -> bool:
     built = _optional_float(
         db.connection()
         .execute(
-            "SELECT MAX(built_ts) FROM imdb_builds",  # pragma: no mutate[case-insensitive]
+            # Builds in an older format are rebuilt: 2 added characters; 3 series'
+            # composers and networks; 4 merged rebranded networks (HBO Max is HBO); 5
+            # retried TMDB lookups, which a dropped connection had emptied.
+            "SELECT MAX(built_ts) FROM imdb_builds WHERE format = 6",  # pragma: no mutate[case-insensitive]
         )
         .fetchone()[0],
     )
@@ -133,22 +154,57 @@ def resolved_keys(records: Sequence[ProviderRecord]) -> list[str | None]:
     return [next((k for k in _catalog_keys(r) if k in present), None) for r in records]
 
 
-def matching_keys(match: Callable[[str], bool]) -> set[str]:
+def rankings(records: Sequence[ProviderRecord]) -> list[Ranking]:
+    """Return each record's IMDb rating, votes, and year; its own year where IMDb has none.
+
+    Args:
+        records: Provider movies and series.
+
+    Returns:
+        ranked: One ``Ranking`` per record, in order.
+    """
+    conn = db.connection()
+    built = _optional_float(
+        conn.execute(
+            "SELECT MAX(built_ts) FROM imdb_builds",  # pragma: no mutate[case-insensitive]
+        ).fetchone()[0],
+    )
+    by_key = _rankings_by_key(_database_file(conn), built)
+    ranked: list[Ranking] = []
+    for record in records:
+        found = next((by_key[k] for k in _catalog_keys(record) if k in by_key), None)
+        own = _catalog_title(record)
+        year = 0 if own is None else own[2]
+        ranked.append(
+            Ranking(0.0, 0, year) if found is None else found._replace(year=found.year or year),
+        )
+    return ranked
+
+
+def matching_keys(
+    match: Callable[[str], bool],
+    *,
+    roles: Sequence[str] | None = None,
+) -> set[str]:
     """Return the index keys of titles crediting anyone whose name ``match`` accepts.
 
     Args:
-        match: Predicate on a person's name, run once per distinct name.
+        match: Predicate on a person's or character's name, run once per distinct name.
+        roles: Credits that count, such as ``("cast",)``; None counts every credit.
 
     Returns:
         keys: Index keys, as ``resolved_keys`` gives them.
     """
     conn = db.connection()
     # The file, plus a build's time and the newest saved name, identify the names.
-    file = str(conn.execute("PRAGMA database_list").fetchone()[2])
     built, max_id = conn.execute(
         "SELECT (SELECT MAX(built_ts) FROM imdb_builds), (SELECT MAX(id) FROM imdb_names)",  # pragma: no mutate[case-insensitive]
     ).fetchone()
-    names = _all_names(file, _optional_float(built), None if max_id is None else int(max_id))
+    names = _all_names(
+        _database_file(conn),
+        _optional_float(built),
+        None if max_id is None else int(max_id),
+    )
     matched = [(i,) for i, name in names if match(name)]
     conn.execute(
         "CREATE TEMP TABLE IF NOT EXISTS matched_names (id INTEGER PRIMARY KEY)",  # pragma: no mutate[case-insensitive]
@@ -160,10 +216,10 @@ def matching_keys(match: Callable[[str], bool]) -> set[str]:
             matched,
         )
         rows = conn.execute(
-            "SELECT DISTINCT title_key FROM imdb_credits"  # pragma: no mutate[case-insensitive]
+            "SELECT DISTINCT title_key, role FROM imdb_credits"  # pragma: no mutate[case-insensitive]
             " WHERE name_id IN (SELECT id FROM matched_names)",  # pragma: no mutate[case-insensitive]
         ).fetchall()
-    return {str(row[0]) for row in rows}
+    return {str(key) for key, role in rows if roles is None or role in roles}
 
 
 def info(record: ProviderRecord) -> Info | None:
@@ -207,6 +263,46 @@ def credits(record: ProviderRecord, *, directors: str, cast: str) -> tuple[list[
     return provided
 
 
+def credited(record: ProviderRecord, role: str) -> list[str]:
+    """Return whom the index credits in ``role`` on a catalog movie or series.
+
+    Args:
+        record: Provider movie or series.
+        role: "director", "writer", "cast", "character", or a crew role such as
+            "composer" or a series' "network".
+
+    Returns:
+        names: In billing order; empty when the index lacks the title or the role.
+    """
+    found = info(record)
+    if found is None:
+        return []
+    listed = {
+        "director": found["directors"],
+        "writer": found["writers"],
+        "cast": found["cast"],
+        "character": found["characters"],
+    }
+    return listed.get(role, found["crew"].get(role, []))
+
+
+def same_title(record: ProviderRecord) -> str:
+    """Return a key that catalog records listing the same movie or series share.
+
+    Providers list some titles more than once, as uploads months apart or under a
+    second spelling. The TMDB id identifies a title; without one, its title and year.
+
+    Args:
+        record: Provider movie or series.
+
+    Returns:
+        key: Equal for every listing of one title.
+    """
+    by_id, by_title = _catalog_keys(record)
+    kind = "series" if "series_id" in record else "movies"
+    return by_id or by_title or f"{kind}:name:{text_field(record, 'name').casefold()}"
+
+
 def people(found: Info) -> list[str]:
     """Return everyone credited on a title, cast first."""
     return [*found["cast"], *found["directors"], *found["writers"]] + [
@@ -219,6 +315,8 @@ def build(
     *,
     base_url: str = "https://datasets.imdbws.com",
     sparql_url: str = "https://query.wikidata.org/sparql",
+    tmdb_api: str = "https://api.themoviedb.org/3",
+    tmdb_token: str = "",
 ) -> int:
     """Replace the index with what IMDb knows of every catalog movie and series.
 
@@ -228,10 +326,15 @@ def build(
     Parsing is CPU-bound, so files that do not depend on each other are read in
     parallel processes.
 
+    IMDb's datasets name no networks, so a series' come from Wikidata, and, only
+    for series Wikidata lacks and only given a key, from TMDB.
+
     Args:
         records: Provider movies and series.
         base_url: Where IMDb's ``*.tsv.gz`` datasets are served.
         sparql_url: Wikidata's SPARQL endpoint.
+        tmdb_api: TMDB's API.
+        tmdb_token: A TMDB read-access token or API key; empty skips TMDB.
 
     Returns:
         count: Catalog titles the index describes.
@@ -250,6 +353,7 @@ def build(
     spawn = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(max_workers=2, mp_context=spawn) as executor:
         pending_ratings = executor.submit(_ratings, base_url)
+        pending_networks = executor.submit(_networks, sparql_url)
         by_tmdb = executor.submit(_tmdb_to_imdb, sparql_url).result()
         mapped = {k: by_tmdb[k] for k, _ in keys if k is not None and k in by_tmdb}
         scanned = executor.submit(_scan_basics, base_url, wanted, set(mapped.values()))
@@ -268,9 +372,35 @@ def build(
             if key is not None and key in chosen
         }
         kept = {chosen[k]: basics[chosen[k]] for k in needed}
-        crew = executor.submit(_crew, base_url, kept)
-        cast_ids, roles = executor.submit(_billing, base_url, kept).result()
-        infos = _infos(base_url, kept, ratings, crew.result(), (cast_ids, roles))
+        # Network-bound and slow, so it runs alongside the CPU-bound reads below.
+        with ThreadPoolExecutor(max_workers=1) as asker:
+            pending_locales = asker.submit(_locales, sparql_url, set(kept))
+            crew = executor.submit(_crew, base_url, kept)
+            episodes = executor.submit(_episodes, base_url, set(kept)).result()
+            billing = executor.submit(_billing, base_url, kept, episodes).result()
+            locales = pending_locales.result()
+        networks = pending_networks.result()
+        # Series Wikidata names no network for, by their TMDB id; TMDB fills in last.
+        unaired: dict[str, str] = {}
+        for by_id, by_title in keys:
+            tconst = chosen.get(by_id or "") or chosen.get(by_title or "")
+            if (
+                by_id is not None
+                and by_id.startswith("series:tmdb:")
+                and tconst in kept
+                and tconst not in networks
+            ):
+                unaired[by_id.removeprefix("series:tmdb:")] = tconst
+        if tmdb_token and unaired:
+            found = _tmdb_networks(tmdb_api, tmdb_token, set(unaired))
+            networks |= {unaired[tmdb_id]: names for tmdb_id, names in found.items() if names}
+        # Wikidata may give a TV film a broadcaster; only series list networks.
+        series = {t for t, row in kept.items() if row[1] in ("tvSeries", "tvMiniSeries")}
+        extra = {t: dict(found) for t, found in locales.items()}
+        for tconst, names in networks.items():
+            if tconst in series:
+                extra.setdefault(tconst, {})["network"] = names
+        infos = _infos(base_url, kept, ratings, crew.result(), billing, extra)
     # A record IMDb now describes drops the credits its detail page saved.
     superseded = {k for pair in keys if not needed.isdisjoint(pair) for k in pair if k is not None}
     _write({key: infos[chosen[key]] for key in needed}, superseded)
@@ -306,6 +436,7 @@ def _info_at(conn: sqlite3.Connection, key: str) -> Info | None:
         directors=credits.pop("director", []),
         writers=credits.pop("writer", []),
         cast=credits.pop("cast", []),
+        characters=credits.pop("character", []),
         crew=credits,
     )
 
@@ -331,11 +462,13 @@ def _add(key: str, title: str, directors: list[str], cast: list[str]) -> None:
             ((name,) for name in names),
         )
         ids = {
-            str(name): int(name_id)
-            for name, name_id in conn.execute(
-                f"SELECT name, id FROM imdb_names WHERE name IN ({','.join('?' * len(names))})",  # noqa: S608 -- Only placeholders are interpolated.
-                names,
+            name: int(
+                conn.execute(
+                    "SELECT id FROM imdb_names WHERE name = ?",  # pragma: no mutate[case-insensitive]
+                    (name,),
+                ).fetchone()[0],
             )
+            for name in names
         }
         conn.executemany(
             "INSERT INTO imdb_credits VALUES (?, ?, ?, ?)",  # pragma: no mutate[case-insensitive]
@@ -358,13 +491,17 @@ def _write(index: Mapping[str, Info], superseded: Set[str]) -> None:
     )
     provided = [key for key in saved if key not in index and key not in superseded]
     index = {**{k: found for k in provided if (found := _info_at(conn, k))}, **index}
-    names = sorted({name for found in index.values() for name in people(found)})
+    # Characters share the names table, so search matches them as it does people.
+    names = sorted(
+        {name for found in index.values() for name in [*people(found), *found["characters"]]},
+    )
     name_ids = {name: i for i, name in enumerate(names)}
     credits = [
         (key, role, billing, name_ids[name])
         for key, found in index.items()
         for role, credited in (
             ("cast", found["cast"]),
+            ("character", found["characters"]),
             ("director", found["directors"]),
             ("writer", found["writers"]),
             *found["crew"].items(),
@@ -397,7 +534,8 @@ def _write(index: Mapping[str, Info], superseded: Set[str]) -> None:
             ((i, n) for n, i in name_ids.items()),
         )
         conn.executemany("INSERT INTO imdb_credits VALUES (?, ?, ?, ?)", credits)
-        conn.execute("INSERT INTO imdb_builds VALUES (?)", (time.time(),))
+        # The format ``is_stale`` checks for.
+        conn.execute("INSERT INTO imdb_builds VALUES (?, 6)", (time.time(),))
 
 
 def _catalog_keys(record: ProviderRecord) -> tuple[str | None, str | None]:
@@ -414,8 +552,9 @@ def _catalog_keys(record: ProviderRecord) -> tuple[str | None, str | None]:
 @functools.lru_cache(maxsize=1 << 17)
 def _keys(kind: str, tmdb: str, name: str, aired: str) -> tuple[str | None, str | None]:
     found = _title_and_year(name, aired)
+    # Providers send 0 for an unknown id; as a key it would join unrelated titles.
     return (
-        f"{kind}:tmdb:{tmdb}" if tmdb.isdigit() else None,
+        f"{kind}:tmdb:{tmdb}" if tmdb.isdigit() and int(tmdb) > 0 else None,
         None if found is None else f"{kind}:{title_key(*found)}",
     )
 
@@ -426,6 +565,34 @@ def _all_names(file: str, built: float | None, max_id: int | None) -> list[tuple
     del file, built, max_id
     rows = db.connection().execute("SELECT id, name FROM imdb_names")
     return [(int(row[0]), str(row[1])) for row in rows]
+
+
+def _database_file(conn: sqlite3.Connection) -> str:
+    """The open database's file, which with a build time identifies an index version."""
+    return str(
+        conn.execute(
+            "PRAGMA database_list",  # pragma: no mutate[case-insensitive]
+        ).fetchone()[2],
+    )
+
+
+# Sorting reads every title's ranking; each build's load once. Credits saved between
+# builds add only titles without a rating or year, which rank as absent ones do.
+@functools.lru_cache(maxsize=1)
+def _rankings_by_key(file: str, built: float | None) -> dict[str, Ranking]:
+    del file, built
+    rows = db.connection().execute(
+        "SELECT key, rating, votes, year, genres FROM imdb_titles",  # pragma: no mutate[case-insensitive]
+    )
+    return {
+        str(key): Ranking(
+            float(rating),
+            int(votes),
+            int(year),
+            tuple(filter(None, str(genres).split(","))),
+        )
+        for key, rating, votes, year, genres in rows
+    }
 
 
 def _catalog_title(record: ProviderRecord) -> tuple[str, str, int] | None:
@@ -506,6 +673,170 @@ def _tmdb_query_url(sparql_url: str) -> str:
     return f"{sparql_url}?format=json&query={parse.quote(query)}"
 
 
+def _networks_query_url(sparql_url: str) -> str:
+    """The Wikidata query naming each TV series' original broadcasters by IMDb id."""
+    query = (
+        "SELECT ?imdb (SAMPLE(?name) AS ?network) WHERE {"
+        " ?i wdt:P4983 []; wdt:P345 ?imdb; wdt:P449 ?n."
+        ' OPTIONAL { ?n wdt:P1813 ?short FILTER(LANG(?short) = "en") }'
+        ' OPTIONAL { ?n rdfs:label ?label FILTER(LANG(?label) = "en") }'
+        " BIND(COALESCE(?short, ?label) AS ?name) FILTER(BOUND(?name))"
+        " } GROUP BY ?imdb ?n"
+    )
+    return f"{sparql_url}?format=json&query={parse.quote(query)}"
+
+
+class _NetworkBinding(TypedDict):
+    imdb: _Value
+    network: _Value
+
+
+class _NetworkBindings(TypedDict):
+    bindings: list[_NetworkBinding]
+
+
+class _NetworkResult(TypedDict):
+    results: _NetworkBindings
+
+
+def _networks(sparql_url: str) -> dict[str, list[str]]:
+    """Map each IMDb id to its series' networks; empty when Wikidata is unreachable."""
+    try:
+        agent = "neTV (https://github.com/jvdillon/netv)"
+        with safe_urlopen(_networks_query_url(sparql_url), timeout=120, user_agent=agent) as resp:
+            rows = json_loads(resp.read(), _NetworkResult)["results"]["bindings"]
+    except (OSError, ValueError) as exc:  # URLError is an OSError; ReadError a ValueError.
+        log.warning("Wikidata networks unavailable: %s", exc)
+        return {}
+    networks: dict[str, list[str]] = {}
+    for row in rows:
+        named = networks.setdefault(row["imdb"]["value"], [])
+        network = _network_name(row["network"]["value"])
+        if network not in named:
+            named.append(network)
+    return networks
+
+
+def _locale_query_url(sparql_url: str, ids: Sequence[str]) -> str:
+    """The Wikidata query naming the country of origin and original language of ``ids``."""
+    values = " ".join(f'"{i}"' for i in ids)
+    query = (
+        f"SELECT ?imdb ?country ?language WHERE {{ VALUES ?imdb {{ {values} }} ?i wdt:P345 ?imdb."
+        ' OPTIONAL { ?i wdt:P495 ?c. ?c rdfs:label ?country FILTER(LANG(?country) = "en") }'
+        ' OPTIONAL { ?i wdt:P364 ?l. ?l rdfs:label ?language FILTER(LANG(?language) = "en") } }'
+    )
+    return f"{sparql_url}?format=json&query={parse.quote(query)}"
+
+
+class _LocaleBinding(TypedDict):
+    imdb: _Value
+    country: NotRequired[_Value]
+    language: NotRequired[_Value]
+
+
+class _LocaleBindings(TypedDict):
+    bindings: list[_LocaleBinding]
+
+
+class _LocaleResult(TypedDict):
+    results: _LocaleBindings
+
+
+# Wikidata times out on every title at once, so ids go in batches, a few at a time; a
+# batch that fails costs only its own titles.
+def _locales(
+    sparql_url: str,
+    ids: Set[str],
+    *,
+    batch: int = 300,
+) -> dict[str, dict[str, list[str]]]:
+    """Map each IMDb id to its "country" and "language" names, as Wikidata gives them."""
+    ordered = sorted(ids)
+    chunks = [ordered[i : i + batch] for i in range(0, len(ordered), batch)]
+    found: dict[str, dict[str, list[str]]] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for rows in pool.map(functools.partial(_locale_batch, sparql_url), chunks):
+            for row in rows:
+                for role, value in (
+                    ("country", row.get("country")),
+                    ("language", row.get("language")),
+                ):
+                    if value is not None:
+                        named = found.setdefault(row["imdb"]["value"], {}).setdefault(role, [])
+                        if value["value"] not in named:
+                            named.append(value["value"])
+    return found
+
+
+def _locale_batch(sparql_url: str, ids: list[str]) -> list[_LocaleBinding]:
+    """One batch of ``_locales``' answer; none when Wikidata fails it."""
+    try:
+        url = _locale_query_url(sparql_url, ids)
+        agent = "neTV (https://github.com/jvdillon/netv)"
+        with safe_urlopen(url, timeout=120, user_agent=agent) as resp:
+            return json_loads(resp.read(), _LocaleResult)["results"]["bindings"]
+    except (OSError, ValueError) as exc:  # URLError is an OSError; ReadError a ValueError.
+        log.warning("Wikidata countries and languages unavailable for %d titles: %s", len(ids), exc)
+        return []
+
+
+def _network_name(name: str) -> str:
+    """One service under its rebrands is one network, so a search for it finds all."""
+    return {"HBO Max": "HBO", "Max": "HBO"}.get(name, name)
+
+
+class _TmdbNetwork(TypedDict):
+    name: str
+
+
+class _TmdbShow(TypedDict):
+    networks: list[_TmdbNetwork]
+
+
+def _tmdb_networks(api_url: str, token: str, tmdb_ids: Set[str]) -> dict[str, list[str]]:
+    """Map each TMDB TV id to its networks; empty when TMDB refuses or is unreachable."""
+
+    def one(tmdb_id: str) -> tuple[str, list[str]]:
+        # A long read-access token goes in a header; a short v3 key in the query.
+        headers: dict[str, str] = {}
+        if "." in token:
+            url, headers = f"{api_url}/tv/{tmdb_id}", {"Authorization": f"Bearer {token}"}
+        else:
+            url = f"{api_url}/tv/{tmdb_id}?api_key={parse.quote(token)}"
+        for _ in range(3):
+            try:
+                with safe_urlopen(url, timeout=30, headers=headers) as resp:
+                    show = json_loads(resp.read(), _TmdbShow)
+            except error.HTTPError as exc:
+                # A catalog may name an entry TMDB has since removed; a refused key
+                # stops the whole lookup; being slowed down (429) or a server
+                # error is tried again.
+                if exc.code == 404:
+                    return tmdb_id, []
+                if exc.code in (401, 403):
+                    raise
+            except OSError:
+                # A dropped connection (TMDB resets some under load) is tried again.
+                continue
+            else:
+                names = list(dict.fromkeys(_network_name(n["name"]) for n in show["networks"]))
+                return tmdb_id, names
+        return tmdb_id, []
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            return dict(pool.map(one, sorted(tmdb_ids)))
+    except (OSError, ValueError) as exc:  # URLError is an OSError; ReadError a ValueError.
+        log.warning("TMDB networks unavailable: %s", exc)
+        return {}
+
+
+@_retried
+def _episodes(base_url: str, series: Set[str]) -> dict[str, str]:
+    """Map each episode of ``series`` to its series' IMDb id."""
+    return {row[0]: row[1] for row in _rows(f"{base_url}/title.episode.tsv.gz") if row[1] in series}
+
+
 class _Value(TypedDict):
     value: str
 
@@ -556,23 +887,27 @@ def _crew(base_url: str, basics: Mapping[str, list[str]]) -> dict[str, tuple[lis
     }
 
 
+# Each title's ``extra`` names by role (a series' network, a country, a language) are
+# credited like its crew, so search finds them as names.
 def _infos(
     base_url: str,
     basics: Mapping[str, list[str]],
     ratings: Mapping[str, tuple[float, int]],
     crew: Mapping[str, tuple[list[str], list[str]]],
-    billing: tuple[dict[str, list[str]], dict[str, dict[str, list[str]]]],
+    billing: _Billing,
+    extra: Mapping[str, Mapping[str, list[str]]],
 ) -> dict[str, Info]:
     """Describe each chosen title, naming the people its credits list by id."""
-    cast_ids, roles = billing
     everyone = {p for d, w in crew.values() for p in (*d, *w)}
-    everyone |= {p for ids in cast_ids.values() for p in ids}
-    everyone |= {p for by_role in roles.values() for ids in by_role.values() for p in ids}
+    everyone |= {p for ids in billing.cast.values() for p in ids}
+    everyone |= {p for by_role in billing.roles.values() for ids in by_role.values() for p in ids}
     names = {row[0]: row[1] for row in _rows(f"{base_url}/name.basics.tsv.gz", everyone)}
     infos: dict[str, Info] = {}
     for tconst, row in basics.items():
         directors, writers = crew.get(tconst, ([], []))
         rating, votes = ratings.get(tconst, (0.0, 0))
+        credited = {role: _names(ids, names) for role, ids in billing.roles.get(tconst, {}).items()}
+        credited |= extra.get(tconst, {})
         infos[tconst] = Info(
             imdb_id=tconst,
             title=row[2],
@@ -583,31 +918,58 @@ def _infos(
             votes=votes,
             directors=_names(directors, names),
             writers=_names(writers, names),
-            cast=_names(cast_ids.get(tconst, []), names),
-            crew={role: _names(ids, names) for role, ids in roles.get(tconst, {}).items()},
+            cast=_names(billing.cast.get(tconst, []), names),
+            characters=billing.characters.get(tconst, []),
+            crew=credited,
         )
     return infos
 
 
+class _Billing(NamedTuple):
+    """Each title's top-billed cast ids, the characters they play, other principals."""
+
+    cast: dict[str, list[str]]
+    characters: dict[str, list[str]]
+    roles: dict[str, dict[str, list[str]]]
+
+
+# IMDb credits a series' composers on its episodes rather than the series, so a series
+# without its own takes the three its ``episodes`` credit most.
 @_retried
 def _billing(
     base_url: str,
     basics: Mapping[str, list[str]],
-) -> tuple[dict[str, list[str]], dict[str, dict[str, list[str]]]]:
-    """Return each title's top-billed cast and its other principals by role."""
-    billed: dict[str, list[tuple[int, str]]] = {}
+    episodes: Mapping[str, str],
+) -> _Billing:
+    """Read each title's top-billed cast, their characters, and its other principals."""
+    billed: dict[str, list[tuple[int, str, list[str]]]] = {}
     roles: dict[str, dict[str, list[str]]] = {}
-    for row in _rows(f"{base_url}/title.principals.tsv.gz", basics):
-        if row[3] in ("actor", "actress", "self"):
-            billed.setdefault(row[0], []).append((int(row[1]), row[2]))
+    scored: dict[str, Counter[str]] = {}
+    for row in _rows(f"{base_url}/title.principals.tsv.gz", {*basics, *episodes}):
+        if row[0] in episodes:
+            if row[3] == "composer":
+                scored.setdefault(episodes[row[0]], Counter())[row[2]] += 1
+        elif row[3] in ("actor", "actress", "self"):
+            played = [] if row[5] == r"\N" else json_loads(row[5], list[str])
+            billed.setdefault(row[0], []).append((int(row[1]), row[2], played))
         # The crew file already lists directors and writers; archive footage is reused.
         elif row[3] not in {"director", "writer", "archive_footage", "archive_sound"}:
             roles.setdefault(row[0], {}).setdefault(row[3], []).append(row[2])
-    # A series bills one actor once per character, so names repeat.
-    cast_ids = {
-        t: list(dict.fromkeys(p for _, p in sorted(found)))[:10] for t, found in billed.items()
-    }
-    return cast_ids, roles
+    cast: dict[str, list[str]] = {}
+    characters: dict[str, list[str]] = {}
+    for tconst, found in billed.items():
+        # A series bills one actor once per character, so names repeat.
+        top = list(dict.fromkeys(p for _, p, _ in sorted(found)))[:10]
+        cast[tconst] = top
+        characters[tconst] = list(
+            dict.fromkeys(c for _, p, played in sorted(found) if p in top for c in played),
+        )
+    for series, counts in scored.items():
+        roles.setdefault(series, {}).setdefault(
+            "composer",
+            [person for person, _ in counts.most_common(3)],
+        )
+    return _Billing(cast, characters, roles)
 
 
 def _rows(url: str, keep: Iterable[str] = ()) -> Iterator[list[str]]:

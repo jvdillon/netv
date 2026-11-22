@@ -1373,6 +1373,14 @@ class TestGuide:
         assert "CNN" not in resp.text
 
 
+@pytest.fixture
+def imdb_index(guide_db: None) -> None:
+    """The IMDb index tables cards read their ratings from, in the per-test database."""
+    del guide_db
+    imdb.init()
+
+
+@pytest.mark.usefixtures("imdb_index")
 class TestVod:
     """Tests for VOD page."""
 
@@ -1455,6 +1463,7 @@ class TestVod:
         assert resp.text.index("Poor") < resp.text.index("Unrated")
 
 
+@pytest.mark.usefixtures("imdb_index")
 class TestSeries:
     """Tests for series page."""
 
@@ -1489,11 +1498,6 @@ class TestSeries:
 @pytest.mark.usefixtures("imdb_index")
 class TestSearch:
     """Tests for search page."""
-
-    @pytest.fixture
-    def imdb_index(self, guide_db: None) -> None:
-        del guide_db
-        imdb.init()
 
     def test_search_page_renders(self, auth_client: TestClient):
         cache_module.get_cache()["live_streams"] = []
@@ -1553,25 +1557,48 @@ class TestSearch:
         cache_module.get_cache()["live_streams"] = [{"stream_id": 9, "name": "Mann TV - 1995"}]
         cache_module.get_cache()["vod_streams"] = [
             {"stream_id": 1, "name": "Heat - 1995", "container_extension": "mkv"},
-            {"stream_id": 2, "name": "Ronin - 1998", "container_extension": "mkv"},
+            # IMDb does not know Ronin; its year and genre are the provider's.
+            {
+                "stream_id": 2,
+                "name": "Ronin - 1998",
+                "genre": "Thriller",
+                "container_extension": "mkv",
+            },
         ]
         cache_module.get_cache()["series"] = [
-            {"series_id": 3, "name": "Miami Vice (1984)", "cast": "Don Johnson"},
+            # IMDb's genre wins over the provider's.
+            {"series_id": 3, "name": "Miami Vice (1984)", "cast": "Don Johnson", "genre": "Comedy"},
         ]
         heat: imdb.Info = {
             "imdb_id": "tt1",
             "title": "Heat",
             "year": 1995,
-            "genres": [],
+            "genres": ["Crime", "Thriller"],
             "runtime_min": 0,
-            "rating": 0.0,
-            "votes": 0,
+            "rating": 8.3,
+            "votes": 1,
             "directors": ["Michael Mann"],
-            "writers": [],
+            "writers": ["Ann Writer"],
             "cast": ["Al Pacino"],
-            "crew": {},
+            "characters": ["Vincent Hanna"],
+            "crew": {
+                "composer": ["Elliot Goldenthal"],
+                "producer": ["Art Linson"],
+                "country": ["United States"],
+                "language": ["English", "Spanish"],
+            },
         }
-        vice: imdb.Info = {**heat, "directors": ["Mann"]}
+        vice: imdb.Info = {
+            **heat,
+            "year": 1984,
+            "genres": ["Drama"],
+            "rating": 6.0,
+            "directors": ["Mann"],
+            "writers": [],
+            "cast": [],
+            "characters": [],
+            "crew": {"network": ["NBC"]},
+        }
         index = {
             f"movies:{imdb.title_key('Heat', 1995)}": heat,
             f"series:{imdb.title_key('Miami Vice', 1984)}": vice,
@@ -1580,11 +1607,57 @@ class TestSearch:
         }
         imdb._write(index, set())
 
-        by_director = auth_client.get("/search?q=mann").text
-        assert "Heat - 1995" in by_director and "Miami Vice" in by_director
-        assert "Ronin" not in by_director and "Mann TV" in by_director
-        assert "Heat - 1995" in auth_client.get("/search?q=pacino&vod=true").text
+        def names(q: str) -> set[str]:
+            page = auth_client.get("/search", params={"q": q}).text
+            found = {str(n) for n in re.findall(r'data-(?:movie|series)-name="([^"]*)"', page)}
+            if "Mann TV" in page:
+                found.add("Mann TV")
+            return found
+
+        assert names("mann") == {"Heat", "Miami Vice", "Mann TV"}
+        assert names("pacino") == {"Heat"}
+        # A character's name finds the title too, as "james bond" finds the Bond films.
+        assert names("vincent hanna") == {"Heat"}
         assert "Mann TV" not in auth_client.get("/search?q=pacino&live=true").text
+
+        # A field limits a term to titles, or to one kind of credit.
+        assert names('role:"vincent hanna"') == {"Heat"}
+        assert names('character:"vincent hanna"') == set()
+        assert names('cast:"vincent hanna"') == set()
+        assert names("cast:pacino") == {"Heat"}
+        assert names("director:pacino") == set()
+        # Provider credits count for their own field.
+        assert names('cast:"don johnson"') == {"Miami Vice"}
+        assert names("writer:johnson") == set()
+        assert names("writer:ann") == {"Heat"}
+        assert names("composer:goldenthal") == {"Heat"}
+        assert names("composer:linson") == set()
+        assert names("network:nbc") == {"Miami Vice"}
+        # A network is a name like any credit, so plain text finds it too.
+        assert names("nbc") == {"Miami Vice"}
+        assert names('country:"united states"') == {"Heat"}
+        assert names("language:spanish") == {"Heat"}
+        assert names("language:english country:france") == set()
+        assert names("title:heat") == {"Heat"}
+        assert names("title:mann") == {"Mann TV"}
+        # Terms combine; text outside any field matches every field, as before.
+        assert names("director:mann title:vice") == {"Miami Vice"}
+        assert names("Director:Mann vice") == {"Miami Vice"}
+        assert names('"mann"') == {"Heat", "Miami Vice", "Mann TV"}
+        # An unknown field is plain text.
+        assert names("plot:mann") == set()
+        # Year, genre, and IMDb rating are the ones cards show; live channels have none.
+        assert names("year:1995") == {"Heat"}
+        assert names("year:1998") == {"Ronin"}
+        assert names("year:1980-1990") == {"Miami Vice"}
+        assert names("year:1984..1995") == {"Heat", "Miami Vice"}
+        assert names("year:soon") == set()
+        assert names("genre:thriller") == {"Heat", "Ronin"}
+        assert names("genre:comedy") == set()
+        assert names("Genre:drama mann") == {"Miami Vice"}
+        assert names("imdb:8.3") == {"Heat"}
+        assert names("imdb:5-7") == {"Miami Vice"}
+        assert names("imdb:high") == set()
 
     def test_search_rejects_long_regex(self, auth_client: TestClient):
         cache_module.get_cache()["live_streams"] = []

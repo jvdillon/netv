@@ -207,6 +207,7 @@ class TestUserLimits:
                 "admin": True,
                 "max_streams_per_source": {"s": 2},
                 "unavailable_groups": [],
+                "lan_only": False,
             },
         ]
 
@@ -326,6 +327,38 @@ class TestSecretKey:
         key = auth._get_secret_key()
         auth._get_settings_file().write_text("{}")
         assert auth._get_secret_key() == key
+
+
+@pytest.mark.usefixtures("auth_module")
+def test_a_lan_only_user_is_allowed_only_from_private_addresses():
+    # Before any account exists there is no one to limit.
+    assert not auth._get_settings_file().exists()
+    assert not auth.set_lan_only("kid", lan_only=True)
+    auth.create_user("admin", "pw")
+    auth.create_user("kid", "pw")
+    # Anyone not marked LAN-only is allowed from anywhere.
+    assert auth.allowed_from("kid", "8.8.8.8")
+    assert auth.set_lan_only("kid", lan_only=True)
+    assert not auth.set_lan_only("ghost", lan_only=True)
+    for home in (
+        "192.168.1.5",
+        "10.0.0.2",
+        "172.16.4.4",
+        "127.0.0.1",
+        "::1",
+        "fd00::7",
+        "fe80::1",
+        "169.254.3.3",
+        "::ffff:192.168.1.9",
+    ):
+        assert auth.allowed_from("kid", home), home
+    # CGNAT (100.64/10) is a carrier's network, not the home's.
+    for away in ("8.8.8.8", "2001:4860::8888", "100.64.0.1", "::ffff:8.8.8.8", "testclient", ""):
+        assert not auth.allowed_from("kid", away), away
+    assert auth.allowed_from("admin", "8.8.8.8")
+    assert [u["lan_only"] for u in auth.get_users_with_admin()] == [False, True]
+    assert auth.set_lan_only("kid", lan_only=False)
+    assert auth.allowed_from("kid", "8.8.8.8")
 
 
 @pytest.mark.usefixtures("auth_module")

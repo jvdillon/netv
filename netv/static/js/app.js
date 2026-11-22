@@ -11,9 +11,12 @@
   function getFocusables(container = document) {
     return Array.from(
       container.querySelectorAll(
-        'a[href]:not([disabled]), button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex="0"], .focusable',
+        'a[href]:not([disabled]), button:not([disabled]), input:not([disabled]), select:not([disabled]), summary, [tabindex="0"], .focusable',
       ),
-    ).filter((el) => el.offsetParent !== null); // visible only
+    ).filter((el) =>
+      // Shown only: a collapsed <details> hides all but its summary.
+      el.checkVisibility ? el.checkVisibility() : el.offsetParent !== null,
+    );
   }
 
   function getGridInfo(element) {
@@ -66,10 +69,56 @@
     return true;
   }
 
+  // The focusable whose center lies most nearly straight ahead in `direction`:
+  // distance along it, plus twice the sideways offset, so a control in line beats a
+  // nearer one off to the side. Card stars are left to "f".
+  function nearestInDirection(current, focusables, direction) {
+    if (!current || current === document.body) return null;
+    const from = current.getBoundingClientRect();
+    const cx = from.left + from.width / 2;
+    const cy = from.top + from.height / 2;
+    let best = null;
+    let bestScore = Infinity;
+    for (const el of focusables) {
+      if (el === current || el.classList.contains("fav-btn") || current.contains(el))
+        continue;
+      const r = el.getBoundingClientRect();
+      const dx = r.left + r.width / 2 - cx;
+      const dy = r.top + r.height / 2 - cy;
+      const ahead = { up: -dy, down: dy, left: -dx, right: dx }[direction];
+      const aside =
+        direction === "up" || direction === "down" ? Math.abs(dx) : Math.abs(dy);
+      // Ahead means past the current element's edge, not merely offset by a pixel.
+      const edge =
+        direction === "up" || direction === "down" ? from.height / 2 : from.width / 2;
+      if (ahead <= edge * 0.5) continue;
+      const score = ahead + 2 * aside;
+      if (score < bestScore) {
+        best = el;
+        bestScore = score;
+      }
+    }
+    return best;
+  }
+
   function moveFocus(direction) {
     const current = document.activeElement;
     const focusables = getFocusables();
     const currentIndex = focusables.indexOf(current);
+
+    // In a list (data-nav="list"), Up/Down step through its items in order; its ends,
+    // and Left/Right, move on by position. Lists scroll in their own boxes, where
+    // position alone can land in a neighboring list.
+    const list = current?.parentElement?.closest('[data-nav="list"]');
+    if (list && (direction === "up" || direction === "down")) {
+      const items = getFocusables(list);
+      const next = items[items.indexOf(current) + (direction === "down" ? 1 : -1)];
+      if (next) {
+        next.focus();
+        next.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        return true;
+      }
+    }
 
     // Try grid navigation first
     const gridInfo = getGridInfo(current);
@@ -100,10 +149,25 @@
         });
         return true;
       }
-      // At grid edge: step into the neighboring grid (browse rows), never wrap.
-      if (direction === "up" || direction === "down") {
-        return focusAdjacentGrid(current, direction);
+      // At grid edge: step into the neighboring grid (browse rows), never wrap; with
+      // none there, move to whatever lies that way (the search form, the sidebar).
+      if (
+        (direction === "up" || direction === "down") &&
+        focusAdjacentGrid(current, direction)
+      ) {
+        return true;
       }
+    }
+
+    const nearest = nearestInDirection(current, focusables, direction);
+    if (nearest) {
+      nearest.focus();
+      nearest.scrollIntoView({
+        block: "nearest",
+        inline: "nearest",
+        behavior: "smooth",
+      });
+      return true;
     }
 
     // Linear navigation fallback
@@ -130,10 +194,11 @@
     // Skip if something is already focused (other than body)
     if (document.activeElement && document.activeElement !== document.body) return;
 
-    // Priority: [autofocus], first grid item, first focusable in main
-    const autofocus = document.querySelector("[autofocus]");
+    // Priority: [autofocus], [data-initial-focus], first grid item, first focusable in
+    // main. The page stays at its top: focus far down would scroll the title away.
+    const autofocus = document.querySelector("[autofocus], [data-initial-focus]");
     if (autofocus) {
-      autofocus.focus();
+      autofocus.focus({ preventScroll: true });
       return;
     }
 
@@ -142,12 +207,12 @@
 
     const gridItem = mainContent.querySelector('[data-nav="grid"]');
     if (gridItem) {
-      gridItem.focus();
+      gridItem.focus({ preventScroll: true });
       return;
     }
 
     const firstFocusable = getFocusables(mainContent)[0];
-    if (firstFocusable) firstFocusable.focus();
+    if (firstFocusable) firstFocusable.focus({ preventScroll: true });
   }
 
   // ============================================================
@@ -158,34 +223,11 @@
     const el = document.activeElement;
     if (!el) return false;
 
-    // Check for movie card
-    const movieCard = el.closest(".movie-card");
-    if (movieCard) {
-      const btn = movieCard.querySelector(".fav-btn, .fav-btn-movie");
-      if (btn) {
-        btn.click();
-        return true;
-      }
-    }
-
-    // Check for series card
-    const seriesCard = el.closest(".series-card");
-    if (seriesCard) {
-      const btn = seriesCard.querySelector(".fav-btn, .fav-btn-series");
-      if (btn) {
-        btn.click();
-        return true;
-      }
-    }
-
-    // Check for favorites tile (in favorites view)
-    const tile = el.closest(".vod-tile, .series-tile");
-    if (tile) {
-      const btn = tile.querySelector("button");
-      if (btn) {
-        btn.click();
-        return true;
-      }
+    // A card from _cards.html; a channel's card has no star.
+    const card = el.closest(".movie-card, .series-card, .live-card");
+    if (card) {
+      card.querySelector(".fav-btn")?.click();
+      return true;
     }
 
     // Check for detail page favorite button
@@ -206,28 +248,36 @@
     const isInput = e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA";
     const isSelect = e.target.tagName === "SELECT";
 
-    // Input field handling
-    if (isInput) {
+    // Arrows and Enter alone reach and operate every control. In a field that takes
+    // text, Left/Right move the caret and Up/Down leave; checkboxes and selects
+    // take every arrow as movement, and Enter ticks a box or opens a select's list.
+    if (isInput || isSelect) {
       if (e.key === "Escape") {
         e.target.blur();
         return;
       }
-      // Allow down arrow to escape search input
-      if (e.key === "ArrowDown" && e.target.type === "text") {
-        const mainContent = document.querySelector("main");
-        const firstResult = mainContent?.querySelector('[data-nav="grid"]');
-        if (firstResult) {
-          e.preventDefault();
-          firstResult.focus();
-          return;
-        }
+      const toggles = e.target.type === "checkbox" || e.target.type === "radio";
+      if (e.key === "Enter" && (toggles || isSelect)) {
+        e.preventDefault();
+        if (isSelect) e.target.showPicker?.();
+        else e.target.click();
+        return;
       }
-      // Let other keys work normally in inputs
-      return;
-    }
-
-    // Select handling - let arrows work for options
-    if (isSelect && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+      // Left/Right leave a text field once the caret is at that end of the text; a
+      // number field has no caret to move.
+      const t = e.target;
+      const caret = typeof t.selectionStart === "number" && t.type !== "number";
+      const atStart = !caret || (t.selectionStart === 0 && t.selectionEnd === 0);
+      const atEnd = !caret || t.selectionStart === t.value.length;
+      const leaves =
+        e.key === "ArrowUp" ||
+        e.key === "ArrowDown" ||
+        (e.key === "ArrowLeft" && (toggles || isSelect || atStart)) ||
+        (e.key === "ArrowRight" && (toggles || isSelect || atEnd));
+      if (!leaves || e.target.tagName === "TEXTAREA" || hasCustomNav || e.altKey)
+        return;
+      e.preventDefault();
+      moveFocus(e.key.replace("Arrow", "").toLowerCase());
       return;
     }
 
@@ -262,6 +312,8 @@
 
       case "f":
       case "F":
+        // Ctrl+F and the like belong to the browser (Find).
+        if (e.ctrlKey || e.metaKey || e.altKey) break;
         if (toggleFocusedFavorite()) {
           e.preventDefault();
         }

@@ -32,6 +32,7 @@ from netv import (
     epg,
     ffmpeg_command,
     handoff,
+    imdb,
     m3u as m3u_module,
     main,
     main_test,
@@ -857,12 +858,15 @@ def test_add_user_with_limits(auth_client: TestClient):
             "username": " carol ",
             "password": "password123",
             "admin": "on",
+            "lan_only": "on",
             "max_streams_per_source": '{"s1": 2}',
             "unavailable_groups": '["cat:1"]',
         },
     )
     assert response.json() == {"status": "ok"}
     assert auth.is_admin("carol")
+    assert not auth.allowed_from("carol", "8.8.8.8")
+    assert 'name="lan_only"' in auth_client.get("/settings").text
     limits = auth.get_user_limits("carol")
     assert limits["max_streams_per_source"] == {"s1": 2}
     assert limits["unavailable_groups"] == ["cat:1"]
@@ -917,6 +921,88 @@ def test_set_admin(auth_client: TestClient):
     assert auth_client.post("/settings/users/admin/bob", data={"admin": "on"}).status_code == 200
     assert auth.is_admin("bob")
     assert auth_client.post("/settings/users/admin/ghost").status_code == 404
+
+
+def test_api_keys_are_set_by_admins_and_never_shown(auth_client: TestClient):
+    assert auth_client.post(
+        "/settings/api-keys",
+        data={"service": "tmdb", "key": "s.e.c"},
+    ).json() == {
+        "status": "ok",
+    }
+    assert cache_module.load_server_settings().get("api_keys") == {"tmdb": "s.e.c"}
+    page = auth_client.get("/settings").text
+    section = re.search(r'<div id="api-keys".*?</details>', page, re.DOTALL)
+    assert section is not None
+    assert "TMDB" in section.group(0) and "Saved" in section.group(0)
+    # The key itself never leaves the server, on the page or through the settings API.
+    assert "s.e.c" not in page
+    assert "s.e.c" not in auth_client.get("/api/settings").text
+    assert (
+        auth_client.post("/settings/api-keys", data={"service": "imdb", "key": "x"}).status_code
+        == 400
+    )
+    # An empty key removes it.
+    auth_client.post("/settings/api-keys", data={"service": "tmdb", "key": " "})
+    assert cache_module.load_server_settings().get("api_keys") == {}
+    assert "Not set" in auth_client.get("/settings").text
+    auth.create_user("viewer", "password123")
+    viewer = TestClient(main.app)
+    viewer.cookies.set("token", auth.create_token({"sub": "viewer"}))
+    assert (
+        viewer.post("/settings/api-keys", data={"service": "tmdb", "key": "x"}).status_code == 403
+    )
+    assert 'id="api-keys"' not in viewer.get("/settings").text
+
+
+def test_tmdb_token_prefers_the_environment(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("TMDB_API_KEY", raising=False)
+    assert main._tmdb_token() == ""
+    cache_module.save_server_settings(
+        {**cache_module.load_server_settings(), "api_keys": {"tmdb": "saved"}},
+    )
+    assert main._tmdb_token() == "saved"
+    monkeypatch.setenv("TMDB_API_KEY", "from-env")
+    assert main._tmdb_token() == "from-env"
+
+
+def test_lan_only_users_sign_in_and_stay_signed_in_only_from_home(auth_client: TestClient):
+    auth.create_user("kid", "password123")
+    # Only an admin marks a user LAN-only.
+    kid = TestClient(main.app, client=("192.168.1.20", 5000))
+    kid.cookies.set("token", auth.create_token({"sub": "kid"}))
+    assert kid.post("/settings/users/lan/kid", data={"lan_only": "on"}).status_code == 403
+    assert auth_client.post("/settings/users/lan/kid", data={"lan_only": "on"}).status_code == 200
+    assert auth_client.post("/settings/users/lan/ghost").status_code == 404
+    page = auth_client.get("/settings").text
+    assert re.search(
+        r'<details[^>]*data-username="kid".*?class="lan-only-toggle[^>]*checked',
+        page,
+        re.DOTALL,
+    )
+
+    # From home: signed in, and able to sign in again.
+    assert kid.get("/settings", follow_redirects=False).status_code == 200
+    login = kid.post(
+        "/login",
+        data={"username": "kid", "password": "password123"},
+        follow_redirects=False,
+    )
+    assert login.headers["location"] == "/"
+    # From away: a session started at home stops working, and signing in is refused.
+    away = TestClient(main.app, client=("8.8.8.8", 5000))
+    away.cookies.set("token", auth.create_token({"sub": "kid"}))
+    assert away.get("/settings", follow_redirects=False).headers["location"].startswith("/login")
+    refused = away.post(
+        "/login",
+        data={"username": "kid", "password": "password123"},
+        follow_redirects=False,
+    )
+    assert refused.headers["location"] == "/login?error=lan"
+    assert "Only from home" in away.get("/login?error=lan").text
+
+    assert auth_client.post("/settings/users/lan/kid").status_code == 200
+    assert away.get("/settings", follow_redirects=False).status_code == 200
 
 
 def test_set_user_limits(auth_client: TestClient):
@@ -1525,7 +1611,9 @@ def test_movie_player_info_without_client():
         ({}, "", ""),
     ],
 )
+@pytest.mark.usefixtures("guide_db")
 def test_movie_player_info(web: FakeWeb, movie: ProviderRecord, name: str, desc: str):
+    imdb.init()
     cache_module.get_cache()["vod_streams"] = [{"stream_id": 5, "source_id": "s1"}]
     _use_sources(
         _source("s0", "xtream", url="http://zero"),
@@ -1589,6 +1677,7 @@ def test_series_player_info_without_series_id(web: FakeWeb, series_id: int | Non
         ("101", "S10E01 -- Last", "", None),
     ],
 )
+@pytest.mark.usefixtures("guide_db")
 def test_series_player_info_episodes(
     web: FakeWeb,
     stream_id: str,
@@ -1596,6 +1685,7 @@ def test_series_player_info_episodes(
     desc: str,
     next_url: str | None,
 ):
+    imdb.init()
     cache_module.get_cache()["series"] = [{"series_id": 1, "source_id": "s1"}]
     _use_sources(
         _source("s0", "xtream", url="http://zero"),
@@ -1679,14 +1769,14 @@ def test_fetch_all_epg_caps_its_workers(
     [
         (error.URLError("down"), "", False),
         # A provider answer without info is used once, never cached.
-        (_json({}), "", False),
-        (_json({"info": {"name": "Untimed"}}), "Untimed", True),
-        (_json({"info": {"plot": "Unnamed"}}), "", True),
+        ({}, "", False),
+        ({"info": {"name": "Untimed"}}, "Untimed", True),
+        ({"info": {"plot": "Unnamed"}}, "", True),
     ],
 )
 def test_series_player_info_partial_data(
     web: FakeWeb,
-    route: FakeResponse | Exception,
+    route: dict[str, object] | Exception,
     name: str,
     cached: bool,
     caplog: pytest.LogCaptureFixture,
@@ -1694,7 +1784,8 @@ def test_series_player_info_partial_data(
     cache_module.get_cache().pop("series", None)
     _use_sources(_source("s0", "xtream", url="http://x"))
     url = _api("http://x", "get_series_info", series_id=9)
-    web.routes[url] = route
+    # A fresh response each run: a body is read once, and a test may run twice.
+    web.routes[url] = route if isinstance(route, Exception) else _json(route)
     with caplog.at_level(logging.WARNING, logger="netv.main"):
         info, next_url = main._get_series_player_info("1", 9, "")
     assert info == PlayerInfo(url="http://x/series/u/p/1.mkv", channel_name=name)
@@ -2005,9 +2096,16 @@ def _run_cli(
 
 def test_cli_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_logging: None):
     del root_logging
+    monkeypatch.delenv("NETV_TRUSTED_PROXIES", raising=False)
     options = _run_cli([], tmp_path, monkeypatch)
     assert options["port"] == 8000
     assert options["host"] == "0.0.0.0"
+    # A forwarded address is believed only from a proxy on this machine: from anyone
+    # else, "X-Forwarded-For: 192.168.1.5" would pass a LAN-only check.
+    assert options["proxy_headers"] is True
+    assert options["forwarded_allow_ips"] == "127.0.0.1"
+    monkeypatch.setenv("NETV_TRUSTED_PROXIES", "10.0.0.2")
+    assert _run_cli([], tmp_path, monkeypatch)["forwarded_allow_ips"] == "10.0.0.2"
     assert options["log_level"] == "info"
     assert options["access_log"] is False
     assert options["ssl_certfile"] is None

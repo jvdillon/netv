@@ -25,7 +25,7 @@
         Favorites
       </a>
       {% else %}
-      <a href="/vod?sort=rating" class="px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 focusable" tabindex="0">
+      <a href="/vod?sort={{ remembered_sort }}" class="px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 focusable" tabindex="0">
         Browse All
       </a>
       {% endif %}
@@ -33,7 +33,7 @@
   </div>
 
   {% if current_sort %}
-  {% with base_url = "/vod", cards_template = "_movie_cards.html" %}{% include "_browse.html" %}{% endwith %}
+  {% with base_url = "/vod", kind = "movies" %}{% include "_browse.html" %}{% endwith %}
   {% else %}
   <!-- Favorites view -->
   <div id="favorites-section" class="flex-1 min-h-0 overflow-auto scroll-ring-safe">
@@ -56,9 +56,8 @@ window.FAVORITES_CONFIG = {
   type: 'movies',
   favorites: {{ favorites | tojson }},
   cardClass: 'movie-card',
-  tileClass: 'vod-tile',
-  detailUrl: '/movie/',
   baseUrl: '/vod',
+  favoritesUrl: '/api/vod/favorites',
   orderKey: 'vod_order',
   isBrowseView: {{ (current_sort is not none) | tojson }}
 };

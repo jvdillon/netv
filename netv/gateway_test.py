@@ -761,6 +761,16 @@ def test_authenticator_evicts_expired_success_entries(monkeypatch: pytest.Monkey
     assert authenticator._success_cache[fingerprint] == 1030.0
 
 
+def test_authenticator_admits_a_lan_only_user_only_from_home(monkeypatch: pytest.MonkeyPatch):
+    _authenticator_user(monkeypatch)
+    auth.set_lan_only("u", lan_only=True)
+    authenticator = gateway.GatewayAuthenticator()
+    assert asyncio.run(authenticator.verify(_request("192.168.1.20"), "u", "p"))
+    # A success cached at home does not admit the same password from away.
+    assert not asyncio.run(authenticator.verify(_request("8.8.8.8"), "u", "p"))
+    assert not asyncio.run(authenticator.verify(_request(None), "u", "p"))
+
+
 def test_authenticator_evicts_oldest_success_entry_when_full(monkeypatch: pytest.MonkeyPatch):
     _authenticator_user(monkeypatch)
     authenticator = gateway.GatewayAuthenticator(max_auth_cache_entries=2)

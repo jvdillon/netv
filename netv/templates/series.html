@@ -25,7 +25,7 @@
         Favorites
       </a>
       {% else %}
-      <a href="/series?sort=rating" class="px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 focusable" tabindex="0">
+      <a href="/series?sort={{ remembered_sort }}" class="px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 focusable" tabindex="0">
         Browse All
       </a>
       {% endif %}
@@ -33,7 +33,7 @@
   </div>
 
   {% if current_sort %}
-  {% with base_url = "/series", cards_template = "_series_cards.html" %}{% include "_browse.html" %}{% endwith %}
+  {% with base_url = "/series", kind = "series" %}{% include "_browse.html" %}{% endwith %}
   {% else %}
   <!-- Favorites view -->
   <div id="favorites-section" class="flex-1 min-h-0 overflow-auto scroll-ring-safe">
@@ -56,9 +56,8 @@ window.FAVORITES_CONFIG = {
   type: 'series',
   favorites: {{ favorites | tojson }},
   cardClass: 'series-card',
-  tileClass: 'series-tile',
-  detailUrl: '/series/',
   baseUrl: '/series',
+  favoritesUrl: '/api/series/favorites',
   orderKey: 'series_order',
   isBrowseView: {{ (current_sort is not none) | tojson }}
 };

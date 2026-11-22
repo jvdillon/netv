@@ -8,8 +8,10 @@
   <script src="https://unpkg.com/htmx.org@2.0.4"></script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
   <style>
-    /* Focus styles */
-    a:focus, button:focus, .focusable:focus { outline: none; }
+    /* Keyboard focus: one bold outline everywhere. On cards it is drawn inside,
+       over the poster, where a dark image cannot hide it nor a row clip it. */
+    :focus-visible { outline: 3px solid #facc15; outline-offset: 2px; }
+    [data-nav="grid"]:focus-visible { outline-width: 4px; outline-offset: -4px; }
     .nav-link:focus, .nav-link.active {
       background-color: rgb(59 130 246);
     }
@@ -82,6 +84,7 @@
   </div>
 
   <script src="/static/js/app.js"></script>
+  <script src="/static/js/cards.js"></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

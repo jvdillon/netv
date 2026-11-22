@@ -7,6 +7,7 @@ from typing import Final, NotRequired, TypedDict
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import re
 import secrets
@@ -27,6 +28,7 @@ class UserRecord(TypedDict):
     admin: bool
     max_streams_per_source: NotRequired[dict[str, int]]
     unavailable_groups: NotRequired[list[str]]
+    lan_only: NotRequired[bool]  # Usable only from the home network.
 
 
 class UserLimits(TypedDict):
@@ -41,6 +43,7 @@ class UserSummary(UserLimits):
 
     username: str
     admin: bool
+    lan_only: bool
 
 
 class TokenClaims(TypedDict):
@@ -236,6 +239,7 @@ def get_users_with_admin() -> list[UserSummary]:
             "admin": d["admin"],
             "max_streams_per_source": d.get("max_streams_per_source", {}),
             "unavailable_groups": d.get("unavailable_groups", []),
+            "lan_only": d.get("lan_only", False),
         }
         for u, d in from_plain(
             read_json_object(_get_settings_file()).get("users", {}),
@@ -293,6 +297,56 @@ def set_user_limits(
         users[username]["unavailable_groups"] = unavailable_groups
     _save_users(settings, users)
     return True
+
+
+def set_lan_only(username: str, *, lan_only: bool) -> bool:
+    """Limit an account to the home network, or lift the limit.
+
+    Args:
+        username: Account to update.
+        lan_only: Whether the account may be used only from a private address.
+
+    Returns:
+        changed: Whether the account existed and was updated.
+    """
+    settings_file = _get_settings_file()
+    if not settings_file.exists():
+        return False
+    settings = read_json_object(settings_file)
+    users = from_plain(settings.get("users", {}), dict[str, UserRecord])
+    if username not in users:
+        return False
+    users[username]["lan_only"] = lan_only
+    _save_users(settings, users)
+    return True
+
+
+def allowed_from(username: str, address: str) -> bool:
+    """Whether ``username`` may sign in or stay signed in from ``address``.
+
+    A LAN-only account is allowed only from a private, loopback, or link-local
+    address. Carrier-grade NAT (100.64.0.0/10) is the carrier's, not the home's.
+
+    Args:
+        username: Account to check.
+        address: The client's IP address, as the server sees it.
+
+    Returns:
+        allowed: False only for a LAN-only account away from the home network.
+    """
+    record = from_plain(
+        read_json_object(_get_settings_file()).get("users", {}),
+        dict[str, UserRecord],
+    ).get(username)
+    if record is None or not record.get("lan_only", False):
+        return True
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return (ip.is_private and not ip.is_global) or ip.is_loopback or ip.is_link_local
 
 
 _HEX_DIGITS = frozenset("0123456789abcdef")

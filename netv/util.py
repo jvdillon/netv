@@ -224,7 +224,12 @@ def merge_unknown(
     return value
 
 
-def safe_urlopen(url: str, timeout: int = 30, user_agent: str | None = None) -> HTTPResponse:
+def safe_urlopen(
+    url: str,
+    timeout: int = 30,
+    user_agent: str | None = None,
+    headers: Mapping[str, str] | None = None,
+) -> HTTPResponse:
     """Open URL with safe redirect handling.
 
     Args:
@@ -232,6 +237,7 @@ def safe_urlopen(url: str, timeout: int = 30, user_agent: str | None = None) -> 
         timeout: Request timeout in seconds
         user_agent: User-Agent header to send. If None, uses a default VLC User-Agent
             to avoid being blocked by providers that reject Python's default.
+        headers: Other headers to send, such as an API's Authorization.
 
     Returns:
         response: Open HTTP response; the caller must close it.
@@ -240,7 +246,7 @@ def safe_urlopen(url: str, timeout: int = 30, user_agent: str | None = None) -> 
     if parsed.scheme not in ("http", "https"):
         raise error.URLError(f"Unsafe URL scheme: {parsed.scheme}")
     ua = "VLC/3.0.20 LibVLC/3.0.20" if user_agent is None or user_agent == "" else user_agent
-    req = request.Request(url, headers={"User-Agent": ua})
+    req = request.Request(url, headers={"User-Agent": ua, **(headers or {})})
     opener = request.build_opener(_SafeRedirectHandler())
     # Typeshed types ``open`` as Any; the scheme check above leaves only HTTP(S).
     return cast(HTTPResponse, opener.open(req, timeout=timeout))

@@ -79,6 +79,8 @@ class ServerSettings(TypedDict):
     sr_model: NotRequired[str]
     vod_order: NotRequired[list[str]]
     series_order: NotRequired[list[str]]
+    # Other services' keys by service, such as "tmdb"; never sent to a browser.
+    api_keys: NotRequired[dict[str, str]]
     # ``users`` and ``secret_key`` live in this file too; auth owns and writes them.
 
 
@@ -107,6 +109,17 @@ class UserSettings(TypedDict):
     series_filter: NotRequired[list[str]]
     guide_selected_cats: NotRequired[list[str] | None]  # None selects all channels.
     virtual_scroll: NotRequired[bool]
+    results_sort: NotRequired[str]  # Last sort chosen for movies, series and search.
+    search_filters: NotRequired[SearchFilters]
+
+
+class SearchFilters(TypedDict):
+    """Bounds on search results; None leaves that bound unset."""
+
+    year_from: int | None
+    year_to: int | None
+    min_imdb: float | None
+    category: NotRequired[str | None]  # A category name, matched across kinds.
 
 
 class MemoryCache(TypedDict, total=False):

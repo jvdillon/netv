@@ -1,0 +1,12 @@
+{# A title's trailer, embedded paused: it plays only when clicked. Its own row under
+   the poster and details, the same at every width. #}
+{% macro trailer(field) %}
+{% set video = field | youtube_id %}
+{% if video %}
+<div class="w-full max-w-[40rem] aspect-video mb-6">
+  <iframe src="https://www.youtube-nocookie.com/embed/{{ video }}" title="Trailer" loading="lazy"
+          class="w-full h-full rounded-lg" referrerpolicy="strict-origin-when-cross-origin"
+          allow="encrypted-media; picture-in-picture; fullscreen" allowfullscreen></iframe>
+</div>
+{% endif %}
+{% endmacro %}
