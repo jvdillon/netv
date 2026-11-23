@@ -2323,6 +2323,25 @@ def test_a_pretune_is_refused_where_playing_would_be(
     assert pretunes.tuned == []
 
 
+def test_a_home_only_account_cannot_pretune_from_away(
+    api: TestClient,
+    web: testing.FakeWeb,
+    pretunes: _Pretunes,
+) -> None:
+    link = _ota_channel()
+    _tuner_status(web, 0)
+    auth.create_user("kid", "password123")
+    assert api.post("/settings/users/lan/kid", data={"lan_only": "on"}).status_code == 200
+    away = TestClient(main.app, client=("8.8.8.8", 5000))
+    away.cookies.set("token", auth.create_token({"sub": "kid"}))
+    refused = [
+        away.post(f"/api/pretune/{link}", follow_redirects=False),
+        away.delete("/api/pretune", follow_redirects=False),
+    ]
+    assert [(r.status_code, r.headers["location"]) for r in refused] == [(303, "/login")] * 2
+    assert (pretunes.tuned, pretunes.released) == ([], [])
+
+
 def test_leaving_the_guide_releases_the_users_pretune(
     api: TestClient,
     pretunes: _Pretunes,
