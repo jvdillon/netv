@@ -2108,6 +2108,7 @@ async def test_start_reprobes_an_episode_the_series_probe_misfits(
     env: _Env,
     tasks: BackgroundTasks,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ):
     del tasks
     cache.save_server_settings({**cache.load_server_settings(), "probe_series": True})
@@ -2116,14 +2117,18 @@ async def test_start_reprobes_an_episode_the_series_probe_misfits(
     ffmpeg_command.restore_probe_cache_entry("http://ep1", typical, [], 3, 1)
     ffmpeg_command._series_probe_cache[3]["mru"] = 1
     launcher = _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
-    await ffmpeg_session.start_transcode(
-        "http://ep4",
-        "series",
-        series_id=3,
-        episode_id=4,
-        username="alice",
-        source_id="src",
-    )
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
+        await ffmpeg_session.start_transcode(
+            "http://ep4",
+            "series",
+            series_id=3,
+            episode_id=4,
+            username="alice",
+            source_id="src",
+        )
+    assert "Transcode failed on a cached probe, re-probing and retrying" in [
+        r.getMessage() for r in caplog.records
+    ]
     assert len(launcher.commands) == 2
     assert [call[-1] for call in env.run.calls if call[0] == "ffprobe"] == ["http://ep4"]
     series = ffmpeg_command._series_probe_cache[3]

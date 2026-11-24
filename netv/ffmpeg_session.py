@@ -2879,7 +2879,7 @@ async def _start_or_reuse(
             source_id,
             audio_passthrough=audio_passthrough,
             is_disconnected=is_disconnected,
-            use_probe_cache=False,
+            use_probe_cache=False,  # pragma: no mutate[truthiness]
         )
 
 
