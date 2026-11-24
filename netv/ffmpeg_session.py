@@ -78,7 +78,6 @@ from netv.ffmpeg_command import (
     get_settings,
     get_transcode_dir,
     has_cached_probe,
-    invalidate_probe,
     live_video_bitrates,
     probe_closed_captions,
     probe_media,
@@ -2232,6 +2231,7 @@ async def _do_start_transcode(
     *,
     playlist_wait_timeout_sec: float = 30.0,
     seek_wait_timeout_sec: float = 40.0,
+    use_probe_cache: bool = True,
 ) -> TranscodeResponse:
     """Start a VOD transcode (movies, series, catchup). Raises fastapi.HTTPException on failure."""
     is_archive = _is_archive_url(url)
@@ -2256,6 +2256,7 @@ async def _do_start_transcode(
                 episode_id,
                 series_name,
                 source_id=source_id,
+                use_cache=use_probe_cache,
             ),
         )
         media_info = _user_audio(media_info, username)
@@ -2844,8 +2845,9 @@ async def _start_or_reuse(
             min_segments=min_segments,
         )
 
-    # A cached probe makes the start fast; if the source changed since, ffmpeg rejects
-    # the stale facts, so re-probe and retry once.
+    # A cached probe makes the start fast; if the source changed since, or the episode
+    # differs from the series probe it shared, ffmpeg rejects the stale facts, so
+    # re-probe and retry once.
     probe_was_cached = has_cached_probe(url, series_id)
     try:
         return await _do_start_transcode(
@@ -2864,8 +2866,7 @@ async def _start_or_reuse(
     except fastapi.HTTPException:
         if not probe_was_cached:
             raise
-        log.info("Transcode failed, clearing probe cache and retrying")
-        invalidate_probe(url, series_id, episode_id)
+        log.info("Transcode failed on a cached probe, re-probing and retrying")
         return await _do_start_transcode(
             url,
             content_type,
@@ -2878,6 +2879,7 @@ async def _start_or_reuse(
             source_id,
             audio_passthrough=audio_passthrough,
             is_disconnected=is_disconnected,
+            use_probe_cache=False,
         )
 
 

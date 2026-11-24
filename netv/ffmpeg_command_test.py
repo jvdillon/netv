@@ -33,7 +33,6 @@ from netv.ffmpeg_command import (
     get_url_probe_cache_stats,
     has_cached_probe,
     http_reconnect_args,
-    invalidate_probe,
     invalidate_series_probe_cache,
     invalidate_url_probe_cache,
     limit_live_video_bitrate,
@@ -2370,7 +2369,7 @@ def test_master_playlist_without_variant_urls_returns_original(
 class TestProbeMediaSeriesCache:
     """Series/episode cache paths in probe_media."""
 
-    def test_exact_episode_hit_updates_mru_and_saves(self, fake_run: FakeRun, probe_state: Path):
+    def test_exact_episode_hit_keeps_mru(self, fake_run: FakeRun, probe_state: Path):
         info = _media_info()
         ffmpeg_command._series_probe_cache[7] = {
             "name": "S",
@@ -2378,13 +2377,37 @@ class TestProbeMediaSeriesCache:
             "episodes": {2: (time.time(), info, list[SubtitleStream]())},
         }
         assert probe_media("http://x", series_id=7, episode_id=2, source_id="") == (info, [])
-        saved_file = probe_state / "series_probe_cache.json"
-        assert json.loads(saved_file.read_text())["7"]["mru"] == 2
-        saved_file.unlink()
-        # Same MRU now: hit without another save.
-        assert probe_media("http://x", series_id=7, episode_id=2, source_id="") == (info, [])
-        assert not saved_file.exists()
+        assert ffmpeg_command._series_probe_cache[7].get("mru") == 1
+        assert not (probe_state / "series_probe_cache.json").exists()
         assert fake_run.calls == []
+
+    def test_uncached_probe_records_the_episode_and_keeps_mru(
+        self,
+        fake_run: FakeRun,
+        probe_state: Path,
+    ):
+        typical = _media_info(video_codec="typical")
+        ffmpeg_command._series_probe_cache[7] = {
+            "mru": 1,
+            "episodes": {1: (time.time(), typical, list[SubtitleStream]())},
+        }
+        ffmpeg_command._probe_cache["http://x"] = (0, typical, list[SubtitleStream]())
+        _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}})
+        info, _ = probe_media("http://x", series_id=7, episode_id=2, source_id="", use_cache=False)
+        assert info is not None and info.video_codec == "h264"
+        series = ffmpeg_command._series_probe_cache[7]
+        assert series["episodes"][2][1] is info
+        assert series.get("mru") == 1
+        # Episodes without their own probe still share the typical one.
+        assert probe_media("http://y", series_id=7, episode_id=3, source_id="")[0] is typical
+
+    def test_uncached_probe_replaces_a_url_probe(self, fake_run: FakeRun, probe_state: Path):
+        old = _media_info(video_codec="old")
+        ffmpeg_command._probe_cache["http://x"] = (0, old, list[SubtitleStream]())
+        _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}})
+        info, _ = probe_media("http://x", source_id="", use_cache=False)
+        assert info is not None and info.video_codec == "h264"
+        assert probe_media("http://x", source_id="")[0] is info
 
     def test_mru_fallback_hit(self, fake_run: FakeRun, probe_state: Path):
         info = _media_info()
@@ -2718,16 +2741,6 @@ class TestUrlProbeCachePersistence:
         ffmpeg_command.remember_probe("http://b", info)
         assert invalidate_url_probe_cache(["http://a", "http://missing"]) == 1
         assert list(json.loads((probe_state / "probe_cache.json").read_text())) == ["http://b"]
-        ffmpeg_command._series_probe_cache[7] = {
-            "episodes": {2: (1.0, info, list[SubtitleStream]())},
-            "mru": 2,
-        }
-        assert has_cached_probe("http://other", series_id=7)
-        invalidate_probe("http://b", series_id=7, episode_id=2)
-        assert json.loads((probe_state / "probe_cache.json").read_text()) == {}
-        assert not has_cached_probe("http://b", series_id=7)
-        invalidate_probe("http://gone")
-        assert ffmpeg_command._probe_cache == {}
 
 
 def test_url_probe_stats_list_recent_probes_first():

@@ -415,21 +415,6 @@ def has_cached_probe(url: str, series_id: int | None = None) -> bool:
         )
 
 
-def invalidate_probe(url: str, series_id: int | None = None, episode_id: int | None = None) -> None:
-    """Forget ``url``'s cached probe, and its episode's, so the next play re-probes.
-
-    Args:
-        url: Media URL.
-        series_id: Series of the episode, if any.
-        episode_id: Episode whose probe to drop with the series MRU.
-    """
-    with _probe_lock:
-        _probe_cache.pop(url, None)
-    if series_id is not None:
-        invalidate_series_probe_cache(series_id, episode_id)
-    _save_url_probe_cache()
-
-
 def remember_probe(url: str, media_info: MediaInfo | None) -> None:
     """Record ``media_info`` as ``url``'s latest probe, replacing any older one.
 
@@ -559,10 +544,12 @@ def probe_media(
     *,
     source_id: str,
     probe_timeout_sec: float = 30,
+    use_cache: bool = True,
 ) -> tuple[MediaInfo | None, list[SubtitleStream]]:
     """Probe media facts and text subtitle streams, using cached results.
 
     Cached probes never expire: a start that fails on one re-probes and replaces it.
+    An episode without its own probe shares its series' MRU episode's probe.
 
     Args:
         url: Media URL to probe.
@@ -571,55 +558,14 @@ def probe_media(
         series_name: Display name stored with new series entries.
         source_id: The configured source that listed ``url``; "" for none.
         probe_timeout_sec: Deadline for each ffprobe attempt.
+        use_cache: Answer from a cached probe when one applies.
 
     Returns:
         media_info: Probed media facts, or None when no video stream was found.
         subtitles: Extractable text subtitle streams.
     """
-    # Check series/episode cache first.
-    cache_hit_result: tuple[MediaInfo | None, list[SubtitleStream]] | None = None
-    save_mru = False
-    if series_id is not None:
-        with _probe_lock:
-            series_data = _series_probe_cache.get(series_id)
-            if series_data is not None:
-                episodes = series_data.get("episodes", {})
-                mru_eid = series_data.get("mru")
-                # Try exact episode first.
-                if episode_id is not None and episode_id in episodes:
-                    _, media_info, subtitles = episodes[episode_id]
-                    # Update MRU to this episode.
-                    if series_data.get("mru") != episode_id:
-                        series_data["mru"] = episode_id
-                        save_mru = True
-                    log.info(
-                        "Probe cache hit for series=%d episode=%d",
-                        series_id,
-                        episode_id,
-                    )
-                    cache_hit_result = (media_info, subtitles)
-                # Fall back to MRU if set.
-                elif mru_eid is not None and mru_eid in episodes:
-                    _, media_info, subtitles = episodes[mru_eid]
-                    log.info(
-                        "Probe cache hit for series=%d (fallback from mru=%d)",
-                        series_id,
-                        mru_eid,
-                    )
-                    cache_hit_result = (media_info, subtitles)
-        # Save MRU update outside the lock to avoid deadlock.
-        if save_mru:
-            _save_series_probe_cache()
-        if cache_hit_result is not None:
-            return cache_hit_result
-
-    # Check URL cache (for movies, or series cache miss)
-    with _probe_lock:
-        cached = _probe_cache.get(url)
-        if cached:
-            _, media_info, subtitles = cached
-            log.info("Probe cache hit for %s", url[:50])
-            return media_info, subtitles
+    if use_cache and (cached := _cached_probe(url, series_id, episode_id)) is not None:
+        return cached
     log.info(
         "Probe cache miss for %s (series=%s, episode=%s)",
         url[:50],
@@ -697,21 +643,19 @@ def probe_media(
                 _series_probe_cache[series_id] = {"name": series_name, "episodes": {}}
             elif not _series_probe_cache[series_id].get("name", "") and series_name:
                 _series_probe_cache[series_id]["name"] = series_name
+            series = _series_probe_cache[series_id]
             eid = episode_id if episode_id is not None else 0
-            _series_probe_cache[series_id].setdefault("episodes", {})[eid] = (
-                time.time(),
-                media_info,
-                subtitles,
-            )
-            # Set MRU to this episode.
-            old_mru = _series_probe_cache[series_id].get("mru")
-            _series_probe_cache[series_id]["mru"] = eid
+            episodes = series.setdefault("episodes", {})
+            episodes[eid] = (time.time(), media_info, subtitles)
+            # An episode probed because the shared probe misfit it must not become
+            # the shared probe, or every typical sibling would then fail once too.
+            if series.get("mru") not in episodes:
+                series["mru"] = eid
             log.info(
-                "Probe cached: series=%s episode=%s, mru changed from %s to %s",
+                "Probe cached: series=%s episode=%s mru=%s",
                 series_id,
                 eid,
-                old_mru,
-                eid,
+                series.get("mru"),
             )
     if series_id is not None:
         _save_series_probe_cache()
@@ -2000,6 +1944,32 @@ class _CachedSeries(TypedDict, total=False):
     name: str
     mru: int | None
     episodes: dict[str, _CachedEpisode]
+
+
+def _cached_probe(
+    url: str,
+    series_id: int | None,
+    episode_id: int | None,
+) -> tuple[MediaInfo | None, list[SubtitleStream]] | None:
+    """The episode's, its series MRU's, or ``url``'s cached probe; None when uncached."""
+    with _probe_lock:
+        if series_id is not None and (series := _series_probe_cache.get(series_id)):
+            episodes = series.get("episodes", {})
+            hit = episode_id if episode_id in episodes else series.get("mru")
+            if hit is not None and hit in episodes:
+                log.info(
+                    "Probe cache hit: series=%d episode=%s from=%d",
+                    series_id,
+                    episode_id,
+                    hit,
+                )
+                _, media_info, subtitles = episodes[hit]
+                return media_info, subtitles
+        cached = _probe_cache.get(url)
+    if cached is None:
+        return None
+    log.info("Probe cache hit for %s", url[:50])
+    return cached[1], cached[2]
 
 
 def _media_info_from_probe(

@@ -2104,11 +2104,40 @@ async def test_start_does_not_retry_a_freshly_probed_movie(
 
 
 @pytest.mark.asyncio
-async def test_start_retries_series_after_clearing_probe_cache(
+async def test_start_reprobes_an_episode_the_series_probe_misfits(
     env: _Env,
     tasks: BackgroundTasks,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+):
+    del tasks
+    cache.save_server_settings({**cache.load_server_settings(), "probe_series": True})
+    env.run.program("ffprobe", Program(stdout=_DOLBY_PROBE))
+    typical = MediaInfo(video_codec="h264", audio_codec="aac", pix_fmt="yuv420p", duration=1)
+    ffmpeg_command.restore_probe_cache_entry("http://ep1", typical, [], 3, 1)
+    ffmpeg_command._series_probe_cache[3]["mru"] = 1
+    launcher = _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
+    await ffmpeg_session.start_transcode(
+        "http://ep4",
+        "series",
+        series_id=3,
+        episode_id=4,
+        username="alice",
+        source_id="src",
+    )
+    assert len(launcher.commands) == 2
+    assert [call[-1] for call in env.run.calls if call[0] == "ffprobe"] == ["http://ep4"]
+    series = ffmpeg_command._series_probe_cache[3]
+    # The misfit is recorded as its own episode; others keep the typical probe.
+    assert series["episodes"][4][1] is not None
+    assert series["episodes"][4][1].height == 720
+    assert series.get("mru") == 1
+
+
+@pytest.mark.asyncio
+async def test_start_reprobes_a_stale_cached_episode(
+    env: _Env,
+    tasks: BackgroundTasks,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     del tasks
     cache.save_server_settings({**cache.load_server_settings(), "probe_series": True})
@@ -2117,17 +2146,16 @@ async def test_start_retries_series_after_clearing_probe_cache(
     ffmpeg_command.restore_probe_cache_entry("http://other", media, [], 3, 4)
     ffmpeg_command.restore_probe_cache_entry("http://other", media, [], 3, 5)
     launcher = _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-        result = await ffmpeg_session.start_transcode(
-            "http://ep",
-            "series",
-            series_id=3,
-            episode_id=4,
-            series_name="Show",
-            username="alice",
-            source_id="src",
-            audio_passthrough=True,
-        )
+    result = await ffmpeg_session.start_transcode(
+        "http://ep",
+        "series",
+        series_id=3,
+        episode_id=4,
+        series_name="Show",
+        username="alice",
+        source_id="src",
+        audio_passthrough=True,
+    )
     sid = result["session_id"]
     assert set(env.sessions) == {sid}
     session = env.sessions[sid]
@@ -2143,9 +2171,6 @@ async def test_start_retries_series_after_clearing_probe_cache(
     (series,) = ffmpeg_command.get_series_probe_cache_stats()
     assert series["name"] == "Show"
     assert sorted(episode["episode_id"] for episode in series["episodes"]) == [4, 5]
-    assert "Transcode failed, clearing probe cache and retrying" in [
-        r.getMessage() for r in caplog.records
-    ]
 
 
 @pytest.mark.asyncio
