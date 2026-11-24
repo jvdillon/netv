@@ -10,7 +10,9 @@
       "**/*.{ts,tsx,mts,cts,js,jsx,mjs,cjs,css}",
       "!**/third_party",
       "!**/vendor",
-      "!**/*.min.js"
+      "!**/*.min.js",
+      "!**/static/css/tailwind.css",
+      "!**/scripts/tailwind/input.css"
     ]
   },
   "formatter": {
