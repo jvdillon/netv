@@ -651,6 +651,43 @@ def test_rows_keep_wanted_ids_and_empty_last_fields(web: testing.FakeWeb):
     assert list(imdb._rows(f"{_BASE}/t.tsv.gz", ["a", "c"])) == [["a", "x", ""], ["c", "X"]]
 
 
+def test_rows_read_everything_given_none_and_nothing_given_an_empty_keep(web: testing.FakeWeb):
+    url = f"{_BASE}/t.tsv.gz"
+    body = gzip.compress(b"id\tv\na\t1\nb\t2\n")
+    web.routes[url] = lambda: testing.FakeResponse(body)
+    assert list(imdb._rows(url, None)) == [["a", "1"], ["b", "2"]]
+    assert list(imdb._rows(url)) == [["a", "1"], ["b", "2"]]
+    assert list(imdb._rows(url, {"b"})) == [["b", "2"]]
+    web.fetches.clear()
+    # Nothing wanted is not everything wanted; the file is not even opened.
+    assert list(imdb._rows(url, set())) == []
+    assert list(imdb._rows(url, iter(()))) == []
+    assert web.fetches == []
+
+
+def test_crew_billing_and_episodes_read_nothing_for_no_titles(web: testing.FakeWeb):
+    assert imdb._crew(_BASE, {}) == {}
+    assert imdb._episodes(_BASE, set()) == {}
+    billing = imdb._billing(_BASE, {}, {})
+    assert (billing.cast, billing.characters, billing.roles) == ({}, {}, {})
+    assert web.fetches == []
+
+
+def test_build_of_titles_imdb_lacks_writes_an_empty_index_without_reading_the_big_files(
+    web: testing.FakeWeb,
+):
+    records: list[ProviderRecord] = [
+        {"stream_id": 6, "name": "Unknown - 2000"},
+        {"series_id": 8, "name": "Undated", "release_date": ""},
+    ]
+    assert imdb.build(records, base_url=_BASE, sparql_url=_SPARQL) == 0
+    assert not imdb.is_stale(max_age_sec=60)
+    assert imdb.info(records[0]) is None
+    big = {f"{_BASE}/{name}.tsv.gz" for name in ("title.crew", "title.episode", "title.principals")}
+    big.add(f"{_BASE}/name.basics.tsv.gz")
+    assert big.isdisjoint(f.url for f in web.fetches)
+
+
 def test_credits_prefer_imdb_and_index_the_providers():
     imdb._write({"movies:tmdb:9": _HEAT}, set())
     heat: ProviderRecord = {"stream_id": 1, "name": "Heat - 1995", "tmdb": "9"}

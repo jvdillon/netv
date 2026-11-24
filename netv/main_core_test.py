@@ -398,6 +398,18 @@ def test_lifespan_runs_workers_and_shuts_down(
     assert chromecast.manager._stop.is_set()
 
 
+def test_the_catalog_is_ready_to_index_once_both_halves_load_with_a_title():
+    heat = {"name": "Heat - 1995"}
+    assert main._catalog_ready([heat], [])
+    assert main._catalog_ready([], [heat])
+    # A half-loaded catalog would index only its half.
+    assert not main._catalog_ready(None, [heat])
+    assert not main._catalog_ready([heat], None)
+    # An install with no source has an empty catalog, which IMDb has nothing to index.
+    assert not main._catalog_ready([], [])
+    assert not main._catalog_ready(None, None)
+
+
 def test_kill_orphaned_ffmpeg_tolerates_missing_pgrep(monkeypatch: pytest.MonkeyPatch) -> None:
     run = testing.FakeRun()
     testing.install_subprocess(monkeypatch, main, run=run)

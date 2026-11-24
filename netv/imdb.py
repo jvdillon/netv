@@ -834,6 +834,8 @@ def _tmdb_networks(api_url: str, token: str, tmdb_ids: Set[str]) -> dict[str, li
 @_retried
 def _episodes(base_url: str, series: Set[str]) -> dict[str, str]:
     """Map each episode of ``series`` to its series' IMDb id."""
+    if not series:
+        return {}
     return {row[0]: row[1] for row in _rows(f"{base_url}/title.episode.tsv.gz") if row[1] in series}
 
 
@@ -972,15 +974,20 @@ def _billing(
     return _Billing(cast, characters, roles)
 
 
-def _rows(url: str, keep: Iterable[str] = ()) -> Iterator[list[str]]:
-    """Stream a gzipped IMDb TSV, skipping its header and, given ``keep``, other ids."""
-    wanted = frozenset(keep)
+def _rows(url: str, keep: Iterable[str] | None = None) -> Iterator[list[str]]:
+    """Stream a gzipped IMDb TSV, skipping its header and, given ``keep``, other ids.
+
+    ``None`` keeps every row. An empty ``keep`` keeps none, so it reads nothing.
+    """
+    wanted = None if keep is None else frozenset(keep)
+    if wanted is not None and not wanted:
+        return
     with safe_urlopen(url, timeout=60) as resp, gzip.open(resp) as f:
         next(f)
         for raw in f:
             line = raw.decode()
             # Reading only the id first keeps the 100M-row principals file fast.
-            if wanted and line.partition("\t")[0] not in wanted:
+            if wanted is not None and line.partition("\t")[0] not in wanted:
                 continue
             yield line.rstrip("\n").split("\t")
 
