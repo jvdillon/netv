@@ -347,15 +347,23 @@ def load_all_live_data(
             def refresh() -> None:
                 try:
                     log.info("Refreshing live data in background")
-                    new_cats, new_streams, new_epg_urls = _fetch_all_live_data()
+                    new_cats, new_streams, new_epg_urls, failed = _fetch_all_live_data()
+                    if failed and not (new_cats or new_streams):
+                        log.warning("Live refresh fetched nothing; keeping cached channels")
+                        return
+                    epg_urls = new_epg_urls + [e for e in data["epg_urls"] if e[2] in failed]
                     save_file_cache(
                         "live_data",
-                        {"cats": new_cats, "streams": new_streams, "epg_urls": new_epg_urls},
+                        {
+                            "cats": new_cats + _kept_records(data["cats"], failed),
+                            "streams": new_streams + _kept_records(data["streams"], failed),
+                            "epg_urls": epg_urls,
+                        },
                     )
                     with _cache_lock:
                         _cache.pop("live_categories", None)
                         _cache.pop("live_streams", None)
-                        _cache["epg_urls"] = new_epg_urls
+                        _cache["epg_urls"] = epg_urls
                     log.info("Live data refreshed")
                 finally:
                     _refresh_in_progress.discard("live")
@@ -370,8 +378,9 @@ def load_all_live_data(
             data, _ = cached
             return data["cats"], data["streams"], data["epg_urls"]
         log.info("No live cache, fetching")
-        cats, streams, epg_urls = _fetch_all_live_data()
-        save_file_cache("live_data", {"cats": cats, "streams": streams, "epg_urls": epg_urls})
+        cats, streams, epg_urls, _ = _fetch_all_live_data()
+        if cats or streams:
+            save_file_cache("live_data", {"cats": cats, "streams": streams, "epg_urls": epg_urls})
         return cats, streams, epg_urls
 
 
@@ -403,8 +412,17 @@ def load_vod_data(
             def refresh() -> None:
                 try:
                     log.info("Refreshing VOD data in background")
-                    new_cats, new_streams = _fetch_vod_data()
-                    save_file_cache("vod_data", {"cats": new_cats, "streams": new_streams})
+                    new_cats, new_streams, failed = _fetch_vod_data()
+                    if failed and not (new_cats or new_streams):
+                        log.warning("VOD refresh fetched nothing; keeping cached movies")
+                        return
+                    save_file_cache(
+                        "vod_data",
+                        {
+                            "cats": new_cats + _kept_records(data["cats"], failed),
+                            "streams": new_streams + _kept_records(data["streams"], failed),
+                        },
+                    )
                     with _cache_lock:
                         _cache.pop("vod_categories", None)
                         _cache.pop("vod_streams", None)
@@ -422,7 +440,7 @@ def load_vod_data(
             data, _ = cached
             return data["cats"], data["streams"]
         log.info("No VOD cache, fetching")
-        cats, streams = _fetch_vod_data()
+        cats, streams, _ = _fetch_vod_data()
         if cats or streams:
             save_file_cache("vod_data", {"cats": cats, "streams": streams})
         return cats, streams
@@ -456,8 +474,17 @@ def load_series_data(
             def refresh() -> None:
                 try:
                     log.info("Refreshing series data in background")
-                    new_cats, new_series = _fetch_series_data()
-                    save_file_cache("series_data", {"cats": new_cats, "series": new_series})
+                    new_cats, new_series, failed = _fetch_series_data()
+                    if failed and not (new_cats or new_series):
+                        log.warning("Series refresh fetched nothing; keeping cached series")
+                        return
+                    save_file_cache(
+                        "series_data",
+                        {
+                            "cats": new_cats + _kept_records(data["cats"], failed),
+                            "series": new_series + _kept_records(data["series"], failed),
+                        },
+                    )
                     with _cache_lock:
                         _cache.pop("series_categories", None)
                         _cache.pop("series", None)
@@ -475,7 +502,7 @@ def load_series_data(
             data, _ = cached
             return data["cats"], data["series"]
         log.info("No series cache, fetching")
-        cats, series = _fetch_series_data()
+        cats, series, _ = _fetch_series_data()
         if cats or series:
             save_file_cache("series_data", {"cats": cats, "series": series})
         return cats, series
@@ -536,15 +563,22 @@ def _make_client(source: Source) -> XtreamClient:
     )
 
 
+def _kept_records(records: list[ProviderRecord], source_ids: set[str]) -> list[ProviderRecord]:
+    """The ``records`` from ``source_ids``: what a refresh keeps of sources that failed."""
+    return [r for r in records if r.get("source_id") in source_ids]
+
+
 def _fetch_all_live_data() -> tuple[
     list[ProviderRecord],
     list[ProviderRecord],
     list[tuple[str, int, str]],
+    set[str],
 ]:
-    """Fetch live categories/streams from all sources."""
+    """Fetch live categories/streams from all sources; also name the sources that failed."""
     all_categories: list[ProviderRecord] = []
     all_streams: list[ProviderRecord] = []
     epg_urls: list[tuple[str, int, str]] = []
+    failed: set[str] = set()
 
     for source in get_sources():
         try:
@@ -554,15 +588,17 @@ def _fetch_all_live_data() -> tuple[
             if epg_url is not None and epg_url and source.epg_enabled:
                 epg_urls.append((epg_url, timeout, source.id))
         except Exception as e:
+            failed.add(source.id)
             log.error("Error loading source %s: %s", source.name, e)
 
-    return all_categories, all_streams, epg_urls
+    return all_categories, all_streams, epg_urls, failed
 
 
-def _fetch_vod_data() -> tuple[list[ProviderRecord], list[ProviderRecord]]:
-    """Fetch VOD categories and streams from all Xtream sources."""
+def _fetch_vod_data() -> tuple[list[ProviderRecord], list[ProviderRecord], set[str]]:
+    """Fetch VOD categories and streams from all Xtream sources; name those that failed."""
     all_cats: list[ProviderRecord] = []
     all_streams: list[ProviderRecord] = []
+    failed: set[str] = set()
     for source in get_sources():
         if source.type != "xtream":
             continue
@@ -571,14 +607,16 @@ def _fetch_vod_data() -> tuple[list[ProviderRecord], list[ProviderRecord]]:
             all_cats.extend(cats)
             all_streams.extend(streams)
         except Exception as e:
+            failed.add(source.id)
             log.warning("Failed to fetch VOD from source %s: %s", source.id, e)
-    return all_cats, all_streams
+    return all_cats, all_streams, failed
 
 
-def _fetch_series_data() -> tuple[list[ProviderRecord], list[ProviderRecord]]:
-    """Fetch series categories and list from all Xtream sources."""
+def _fetch_series_data() -> tuple[list[ProviderRecord], list[ProviderRecord], set[str]]:
+    """Fetch series categories and list from all Xtream sources; name those that failed."""
     all_cats: list[ProviderRecord] = []
     all_series: list[ProviderRecord] = []
+    failed: set[str] = set()
     for source in get_sources():
         if source.type != "xtream":
             continue
@@ -594,8 +632,9 @@ def _fetch_series_data() -> tuple[list[ProviderRecord], list[ProviderRecord]]:
             all_cats.extend(cats)
             all_series.extend(series)
         except Exception as e:
+            failed.add(source.id)
             log.warning("Failed to fetch series from source %s: %s", source.id, e)
-    return all_cats, all_series
+    return all_cats, all_series, failed
 
 
 def _learn_live_ts(source_id: str, client: XtreamClient) -> bool:

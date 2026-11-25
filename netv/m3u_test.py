@@ -297,8 +297,9 @@ class TestAggregateSourceData:
         _serve(web, "https://m3u.example", playlist)
         m3u_cats, m3u_streams, _ = m3u.parse_m3u(playlist, "m3u")
 
-        cats, streams, epg_urls = m3u._fetch_all_live_data()
+        cats, streams, epg_urls, failed = m3u._fetch_all_live_data()
 
+        assert failed == set()
         assert cats == [{"category_id": "xtream_news", "source_id": "xtream"}, *m3u_cats]
         assert [s["stream_id"] for s in streams] == [1, 2, "m3u:live"]
         assert streams[0]["category_ids"] == ["xtream_news"]
@@ -331,7 +332,12 @@ class TestAggregateSourceData:
             },
             {"id": "working", "name": "EPG source", "type": "epg", "url": "https://epg.example"},
         )
-        assert m3u._fetch_all_live_data() == ([], [], [("https://epg.example", 120, "working")])
+        assert m3u._fetch_all_live_data() == (
+            [],
+            [],
+            [("https://epg.example", 120, "working")],
+            {"broken"},
+        )
         assert web.urls == [_api("https://offline.example", "get_live_categories")]
         assert "Error loading source Offline source" in caplog.text
 
@@ -351,8 +357,9 @@ class TestAggregateSourceData:
             _serve_xtream(web, "b", **vod),
         )
 
-        cats, streams = m3u._fetch_vod_data()
+        cats, streams, failed = m3u._fetch_vod_data()
 
+        assert failed == set()
         assert web.urls == [
             _api("https://a.example", "get_vod_categories", username="u", password="p"),
             _api("https://a.example", "get_vod_streams", username="u", password="p"),
@@ -379,7 +386,8 @@ class TestAggregateSourceData:
                 get_vod_streams=[{"stream_id": 1}],
             ),
         )
-        cats, streams = m3u._fetch_vod_data()
+        cats, streams, failed = m3u._fetch_vod_data()
+        assert failed == {"broken"}
         assert cats == [{"category_id": "films", "source_id": "working"}]
         assert streams == [{"stream_id": 1, "source_id": "working"}]
         assert "Failed to fetch VOD from source broken" in caplog.text
@@ -640,6 +648,63 @@ class TestLoadAllLiveData:
         assert m3u.get_refresh_in_progress() == set()
         assert caplog.messages == ["Refreshing live data in background", "Live data refreshed"]
 
+    @pytest.mark.parametrize("up_has_channels", [False, True])
+    def test_refresh_keeps_the_channels_of_a_source_that_failed(
+        self,
+        web: testing.FakeWeb,
+        threads: testing.ThreadRecorder,
+        up_has_channels: bool,
+    ):
+        up: list[ProviderRecord] = [{"stream_id": 7}] if up_has_channels else []
+        _configure(
+            _serve_xtream(web, "down"),
+            _serve_xtream(
+                web,
+                "up",
+                get_live_categories=[{"category_id": "x"}],
+                get_live_streams=up,
+            ),
+        )
+        old: m3u.LiveData = {
+            "cats": [{"category_id": "down_x", "source_id": "down"}],
+            "streams": [
+                {"stream_id": "down:1", "source_id": "down"},
+                {"stream_id": "up:gone", "source_id": "up"},
+            ],
+            "epg_urls": [("http://down-epg", 5, "down"), ("http://old", 5, "up")],
+        }
+        _write_cache("live_data", old, 0)
+        m3u.load_all_live_data()
+        assert threads.errors == []
+        saved = m3u.cached_live_data()
+        assert saved is not None
+        assert saved[0]["cats"] == [{"category_id": "up_x", "source_id": "up"}, old["cats"][0]]
+        assert [s["stream_id"] for s in saved[0]["streams"]] == [
+            *(s["stream_id"] for s in up),
+            "down:1",
+        ]
+        assert [e[2] for e in saved[0]["epg_urls"]] == ["up", "down"]
+        assert saved[0]["epg_urls"][1] == ("http://down-epg", 5, "down")
+
+    def test_refresh_with_every_source_down_keeps_the_channels(
+        self,
+        web: testing.FakeWeb,
+        threads: testing.ThreadRecorder,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        _configure(_serve_xtream(web, "down"))
+        old: m3u.LiveData = {
+            "cats": [{"category_id": "down_x", "source_id": "down"}],
+            "streams": [{"stream_id": "down:1", "source_id": "down"}],
+            "epg_urls": [("http://down-epg", 5, "down")],
+        }
+        _write_cache("live_data", old, 0)
+        m3u.load_all_live_data()
+        assert threads.errors == []
+        # Unsaved, so the next load retries instead of waiting out the TTL.
+        assert m3u.cached_live_data() == (old, 0)
+        assert "Live refresh fetched nothing; keeping cached channels" in caplog.messages
+
     def test_failed_refresh_clears_in_progress_flag(self, threads: testing.ThreadRecorder):
         _write_cache("live_data", _LIVE, 0)
         cache.SERVER_SETTINGS_FILE.write_text(json.dumps({"live_dvr_mins": "corrupt"}))
@@ -668,6 +733,25 @@ class TestLoadAllLiveData:
             "streams": new[1],
             "epg_urls": [["http://n", 9, "s"]],
         }
+
+    def test_nothing_fetched_is_not_cached(self, web: testing.FakeWeb):
+        _configure(_serve_xtream(web, "down"))
+        assert m3u.load_all_live_data() == ([], [], [])
+        assert not (cache.CACHE_DIR / "live_data.json").exists()
+
+    def test_categories_alone_are_cached(self, web: testing.FakeWeb):
+        _configure(
+            _serve_xtream(
+                web,
+                "a",
+                get_live_categories=[{"category_id": "x"}],
+                get_live_streams=[],
+            ),
+        )
+        m3u.load_all_live_data()
+        saved = m3u.cached_live_data()
+        assert saved is not None
+        assert saved[0]["cats"] == [{"category_id": "a_x", "source_id": "a"}]
 
     def test_cache_filled_while_waiting_for_lock(
         self,
@@ -731,6 +815,40 @@ class TestLoadVodData:
         assert m3u.get_refresh_in_progress() == set()
         assert len(threads.threads) == 1 and threads.errors == []
 
+    def test_refresh_keeps_the_movies_of_a_source_that_failed(
+        self,
+        web: testing.FakeWeb,
+        threads: testing.ThreadRecorder,
+    ):
+        _configure(
+            _serve_xtream(web, "down"),
+            _serve_xtream(web, "a", get_vod_categories=[{"n": 1}], get_vod_streams=[]),
+        )
+        old: m3u.VodData = {
+            "cats": [{"category_id": "c", "source_id": "down"}],
+            "streams": [{"stream_id": 9, "source_id": "down"}, {"stream_id": 8, "source_id": "a"}],
+        }
+        _write_cache("vod_data", old, 0)
+        m3u.load_vod_data()
+        assert threads.errors == []
+        assert _read_cache("vod_data") == {
+            "cats": [{"n": 1, "source_id": "a"}, old["cats"][0]],
+            "streams": [old["streams"][0]],
+        }
+
+    def test_refresh_with_every_source_down_keeps_the_movies(
+        self,
+        web: testing.FakeWeb,
+        threads: testing.ThreadRecorder,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        _configure(_serve_xtream(web, "down"))
+        _write_cache("vod_data", _VOD, 0)
+        m3u.load_vod_data()
+        assert threads.errors == []
+        assert m3u.cached_vod_data() == (_VOD, 0)
+        assert "VOD refresh fetched nothing; keeping cached movies" in caplog.messages
+
     def test_stale_cache_skips_refresh_already_running(self, threads: testing.ThreadRecorder):
         _write_cache("vod_data", _VOD, 0)
         m3u.get_refresh_in_progress().add("vod")
@@ -782,6 +900,40 @@ class TestLoadSeriesData:
         assert mem == {"epg_error": "kept"}
         assert m3u.get_refresh_in_progress() == set()
         assert len(threads.threads) == 1 and threads.errors == []
+
+    def test_refresh_keeps_the_series_of_a_source_that_failed(
+        self,
+        web: testing.FakeWeb,
+        threads: testing.ThreadRecorder,
+    ):
+        _configure(
+            _serve_xtream(web, "down"),
+            _serve_xtream(web, "a", get_series_categories=[], get_series=[{"n": 1}]),
+        )
+        old: m3u.SeriesData = {
+            "cats": [{"category_id": "c", "source_id": "down"}],
+            "series": [{"series_id": 1, "source_id": "down"}],
+        }
+        _write_cache("series_data", old, 0)
+        m3u.load_series_data()
+        assert threads.errors == []
+        assert _read_cache("series_data") == {
+            "cats": old["cats"],
+            "series": [{"n": 1, "source_id": "a"}, old["series"][0]],
+        }
+
+    def test_refresh_with_every_source_down_keeps_the_series(
+        self,
+        web: testing.FakeWeb,
+        threads: testing.ThreadRecorder,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        _configure(_serve_xtream(web, "down"))
+        _write_cache("series_data", _SERIES, 0)
+        m3u.load_series_data()
+        assert threads.errors == []
+        assert m3u.cached_series_data() == (_SERIES, 0)
+        assert "Series refresh fetched nothing; keeping cached series" in caplog.messages
 
     def test_stale_cache_skips_refresh_already_running(self, threads: testing.ThreadRecorder):
         _write_cache("series_data", _SERIES, 0)
@@ -853,7 +1005,8 @@ class TestFetchSeriesData:
                 get_series=[{"series_id": 5}],
             ),
         )
-        cats, series = m3u._fetch_series_data()
+        cats, series, failed = m3u._fetch_series_data()
+        assert failed == {"broken"}
         assert cats == [{"category_id": "1", "source_id": "ok"}]
         assert series == [{"series_id": 5, "source_id": "ok"}]
         assert "https://m" not in web.urls

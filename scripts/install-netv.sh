@@ -101,7 +101,10 @@ fi
 cat <<EOF | sudo tee /etc/systemd/system/netv.service
 [Unit]
 Description=NetV IPTV Server
-After=network.target
+# network.target does not wait for DNS or routes; starting before them makes every
+# provider fetch fail.
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
