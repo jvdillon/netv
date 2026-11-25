@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Final
 
 import re
 
@@ -11,7 +12,9 @@ from fastapi.testclient import TestClient
 from netv import main
 
 
-NETV_DIR = Path(__file__).parent
+_CWD: Final[Path] = Path(__file__).resolve().parent
+
+NETV_DIR = _CWD
 TEMPLATES_DIR = NETV_DIR / "templates"
 STYLESHEET = NETV_DIR / "static" / "css" / "tailwind.css"
 LINK = '<link rel="stylesheet" href="/static/css/tailwind.css">'
@@ -67,3 +70,9 @@ def test_standalone_pages_render_the_link() -> None:
         html = main.TEMPLATES.get_template(name).render()
         assert LINK in html, name
         assert "cdn.tailwindcss.com" not in html, name
+
+
+if __name__ == "__main__":
+    from codedoctor.lib.testing.runner import test_main
+
+    test_main(__file__)

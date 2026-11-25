@@ -1,0 +1,104 @@
+name: Tailwind Rebuild
+
+# Rebuilds netv/static/css/tailwind.css with scripts/build-tailwind.sh and, if the result
+# differs from what is committed, opens a pull request. Run it on demand, or let the weekly
+# schedule catch a rebuild that nobody did. The "Tailwind Check" workflow is what flags a stale
+# file on pull requests; this one fixes it.
+#
+# This never changes the Tailwind version. The version and its SHA-256 are pinned in
+# scripts/build-tailwind.sh, and bumping them is a deliberate edit: v4 changes the look.
+#
+# Network: github.com/tailwindlabs/tailwindcss releases only, via the script's hash-pinned
+# download. The build runs with a read-only token; a second job, the only one that can write,
+# applies the one changed file.
+#
+# Setup: Settings > Actions > General > "Allow GitHub Actions to create pull requests".
+# Pull requests opened with GITHUB_TOKEN do not start other workflows (CI will not run on
+# them) until a maintainer pushes to the branch or closes and reopens the PR. To have CI run
+# automatically, create the PR with a personal access token or GitHub App token instead.
+
+on:
+  schedule:
+    - cron: "41 5 * * 1" # Mondays, 05:41 UTC.
+  workflow_dispatch:
+
+concurrency:
+  group: tailwind-rebuild
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BRANCH: chore/tailwind-rebuild
+  OUTPUT: netv/static/css/tailwind.css
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.build.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rebuild tailwind.css
+        id: build
+        run: |
+          scripts/build-tailwind.sh
+          if git diff --quiet -- "$OUTPUT"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            mkdir -p "$RUNNER_TEMP/tailwind-rebuild"
+            git diff --binary -- "$OUTPUT" > "$RUNNER_TEMP/tailwind-rebuild/tailwind.patch"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload patch
+        if: steps.build.outputs.changed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tailwind-rebuild
+          path: ${{ runner.temp }}/tailwind-rebuild
+          if-no-files-found: error
+          retention-days: 7
+
+  # The only job with write access. It applies the patch, and nothing else, to a fresh checkout.
+  open-pr:
+    needs: rebuild
+    if: needs.rebuild.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # Credentials stay persisted because this job pushes. It uploads no artifact, so there
+      # is nothing for them to leak into.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 # zizmor: ignore[artipacked]
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tailwind-rebuild
+          path: ${{ runner.temp }}/tailwind-rebuild
+
+      - name: Commit and open the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          title="Rebuild tailwind.css"
+          body="The committed stylesheet differs from a fresh build with the pinned Tailwind version (see scripts/build-tailwind.sh). A template or script probably changed a class without a rebuild. This pull request only commits the rebuilt file."
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$BRANCH"
+          git apply --index --binary --include="$OUTPUT" "$RUNNER_TEMP/tailwind-rebuild/tailwind.patch"
+          git commit --message "$title" --message "$body"
+          git push --force origin "HEAD:refs/heads/$BRANCH"
+          if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            gh pr edit "$BRANCH" --title "$title" --body "$body"
+          else
+            gh pr create --head "$BRANCH" --base "$BASE" --title "$title" --body "$body"
+          fi

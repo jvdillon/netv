@@ -1,0 +1,60 @@
+name: Tailwind Check
+
+# netv/static/css/tailwind.css is built by scripts/build-tailwind.sh and committed. It goes
+# stale when a template or script adds, removes or renames a Tailwind class without a rebuild.
+# This check rebuilds it and fails if the committed file differs. To fix a failure, run
+#   scripts/build-tailwind.sh
+# and commit netv/static/css/tailwind.css, or run the "Tailwind Rebuild" workflow.
+#
+# The Tailwind version is pinned (with its SHA-256) in scripts/build-tailwind.sh. Bumping it
+# is a deliberate edit, not something this check does: v4 changes the look.
+#
+# Network: the script downloads the pinned binary from github.com/tailwindlabs/tailwindcss
+# releases and refuses it unless the SHA-256 matches. Nothing else is fetched.
+#
+# No actions/cache for the binary: the download is a single file, and a cached copy would
+# need re-verifying against the pinned hash, which costs more than the download.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "netv/templates/**"
+      - "netv/static/js/**"
+      - "netv/static/css/tailwind.css"
+      - "scripts/build-tailwind.sh"
+      - "scripts/tailwind/**"
+      - ".github/workflows/tailwind-check.yml"
+  push:
+    branches: [main]
+    paths:
+      - "netv/templates/**"
+      - "netv/static/js/**"
+      - "netv/static/css/tailwind.css"
+      - "scripts/build-tailwind.sh"
+      - "scripts/tailwind/**"
+      - ".github/workflows/tailwind-check.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rebuild tailwind.css
+        run: scripts/build-tailwind.sh
+
+      - name: Fail if tailwind.css is stale
+        run: |
+          if ! git diff --exit-code --stat -- netv/static/css/tailwind.css; then
+            echo "::error file=netv/static/css/tailwind.css::Stale. Run scripts/build-tailwind.sh and commit the result."
+            exit 1
+          fi
