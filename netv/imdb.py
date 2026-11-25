@@ -974,11 +974,9 @@ def _billing(
     return _Billing(cast, characters, roles)
 
 
+# ``None`` keeps every row. An empty ``keep`` keeps none, so it reads nothing.
 def _rows(url: str, keep: Iterable[str] | None = None) -> Iterator[list[str]]:
-    """Stream a gzipped IMDb TSV, skipping its header and, given ``keep``, other ids.
-
-    ``None`` keeps every row. An empty ``keep`` keeps none, so it reads nothing.
-    """
+    """Stream a gzipped IMDb TSV, skipping its header and, given ``keep``, other ids."""
     wanted = None if keep is None else frozenset(keep)
     if wanted is not None and not wanted:
         return
