@@ -2,8 +2,15 @@
 
 Served from `/static/vendor/` so the web UI loads without a third-party CDN.
 `netv/vendor_test.py` fails if a file stops matching its hash below.
-To upgrade, replace the file, update its row, and update the `<script>` tag in
+To upgrade by hand, replace the file, update its row, and update the `<script>` tag in
 `netv/templates/base.html`.
+
+`.github/workflows/vendor-refresh.yml` does this weekly and opens a pull request, using
+`scripts/vendor_refresh.py`. It stays within the current major version (htmx 2.x,
+hls.js 1.x) and verifies each tarball from registry.npmjs.org against npm's `dist.integrity`
+(sha512) before extracting it. Moving to a new major is a deliberate edit to `PACKAGES` in that
+script. Keep the file names and the row shape below: the script and `netv/vendor_test.py`
+both parse them.
 
 The files are the unmodified published builds. The minified builds carry no
 license header, so each library's license text sits beside them.
