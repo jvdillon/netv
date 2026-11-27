@@ -8,8 +8,8 @@ import pytest
 from netv.cache import Source
 from netv.chromecast import CastSession
 from netv.epg import Program
-from netv.ffmpeg_command import MediaInfo, SubtitleStream
-from netv.ffmpeg_session import (
+from netv.ffmpeg.probe import MediaInfo, SubtitleStream
+from netv.ffmpeg.transcode import (
     _FastLivePlan,
     _SeekSessionInfo,
     _SessionSnapshot,

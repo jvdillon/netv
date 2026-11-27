@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 
-from netv import ffmpeg_command
+from netv.ffmpeg import commands
 from netv.util import atomic_write_json
 
 
@@ -116,7 +116,7 @@ def load(users_dir: pathlib.Path) -> None:
 
 
 def recording_dir(recording_id: str) -> pathlib.Path:
-    return ffmpeg_command.get_transcode_dir() / f"netv_handoff_{recording_id}"
+    return commands.get_transcode_dir() / f"netv_handoff_{recording_id}"
 
 
 def recording_file(recording_id: str, filename: str) -> tuple[pathlib.Path, str] | None:
@@ -144,7 +144,7 @@ def cleanup_orphans() -> None:
     """Delete recordings no handoff refers to."""
     with _lock:
         known = {r.get("recording_id") for r in _records.values()}
-    for directory in ffmpeg_command.get_transcode_dir().glob("netv_handoff_*"):
+    for directory in commands.get_transcode_dir().glob("netv_handoff_*"):
         if directory.name.removeprefix("netv_handoff_") not in known:
             shutil.rmtree(directory, ignore_errors=True)
 

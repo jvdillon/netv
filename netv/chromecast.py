@@ -19,8 +19,8 @@ from pychromecast.discovery import CastBrowser, SimpleCastListener
 from pychromecast.error import PyChromecastError
 from zeroconf import Zeroconf
 
-from netv import ffmpeg_session
 from netv.cache import save_watch_position
+from netv.ffmpeg import transcode
 
 
 log = logging.getLogger(__name__)
@@ -170,7 +170,7 @@ class CastManager:
         host = lan_host(host)
         origin = media_origin(origin)
         with self._operations:
-            session = ffmpeg_session.get_session(session_id)
+            session = transcode.get_session(session_id)
             if session is None or session.get("username") != username:
                 raise HTTPException(
                     404,
@@ -192,7 +192,7 @@ class CastManager:
                 )
                 self._sessions[host] = record
             self._ensure_worker()
-            ffmpeg_session.touch_session(session_id)
+            transcode.touch_session(session_id)
             try:
                 cast = get_chromecast_from_host(
                     (host, 8009, UUID(int=0), None, host),
@@ -337,7 +337,7 @@ class CastManager:
             self.maintain_sessions()
 
     def _save_position(self, record: CastSession) -> None:
-        session = ffmpeg_session.get_session(record.session_id)
+        session = transcode.get_session(record.session_id)
         if session is None or not session.get("is_vod", False) or not record.cast:
             return
         status = record.cast.media_controller.status
@@ -359,7 +359,7 @@ class CastManager:
             records = list(self._sessions.values())
         for record in records:
             if record.starting:
-                ffmpeg_session.touch_session(record.session_id)
+                transcode.touch_session(record.session_id)
                 continue
             cast = record.cast
             if (
@@ -368,7 +368,7 @@ class CastManager:
                 and cast.media_controller.status.content_id == record.url
                 and cast.media_controller.status.player_state in ("PLAYING", "PAUSED", "BUFFERING")
             ):
-                ffmpeg_session.touch_session(record.session_id)
+                transcode.touch_session(record.session_id)
                 self._save_position(record)
             else:
                 log.info("Cast ended or disconnected: %s", record.host)

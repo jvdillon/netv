@@ -21,10 +21,12 @@ from fastapi import HTTPException
 import pytest
 import pytest_asyncio
 
-from netv import cache, fast_start, ffmpeg_command, ffmpeg_session, proxy, testing, util
-from netv.fast_start import master_playlist
-from netv.fast_start_test import playlist
-from netv.ffmpeg_command import MediaInfo, SubtitleStream
+from netv import cache, proxy, testing, util
+from netv.ffmpeg import commands, fast_start, probe, transcode
+from netv.ffmpeg.fast_start import master_playlist
+from netv.ffmpeg.fast_start_test import playlist
+from netv.ffmpeg.letterbox import DETECTION_FILE, CropBox
+from netv.ffmpeg.probe import MediaInfo, SubtitleStream
 from netv.playback_policy import LiveRecoveryPolicy, PlaybackHealth, PlaybackPolicy
 from netv.testing import (
     BackgroundTasks,
@@ -126,7 +128,7 @@ _DOLBY_PROBE = json.dumps(
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class _Env:
-    sessions: dict[str, ffmpeg_session.TranscodeSession]
+    sessions: dict[str, transcode.TranscodeSession]
     urls: dict[str, str]
     root: pathlib.Path
     launcher: ProcessLauncher
@@ -167,28 +169,28 @@ def _ffmpeg_output(command: list[str]) -> None:
 
 @pytest.fixture(autouse=True)
 def env(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> _Env:
-    sessions: dict[str, ffmpeg_session.TranscodeSession] = {}
+    sessions: dict[str, transcode.TranscodeSession] = {}
     urls: dict[str, str] = {}
-    monkeypatch.setattr(ffmpeg_session, "_transcode_sessions", sessions)
-    monkeypatch.setattr(ffmpeg_session, "_url_to_session", urls)
-    monkeypatch.setattr(ffmpeg_session, "_startup_guards", {})
-    monkeypatch.setattr(ffmpeg_session, "_recordings", set())
-    monkeypatch.setattr(ffmpeg_session, "_pretuned", {})
-    monkeypatch.setattr(ffmpeg_command, "_load_settings", cache.load_server_settings)
-    monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", None)
-    monkeypatch.setattr(ffmpeg_command, "_probe_cache", {})
-    monkeypatch.setattr(ffmpeg_command, "_series_probe_cache", {})
-    monkeypatch.setattr(ffmpeg_command, "_gpu_nvdec_codecs", set())
+    monkeypatch.setattr(transcode, "_transcode_sessions", sessions)
+    monkeypatch.setattr(transcode, "_url_to_session", urls)
+    monkeypatch.setattr(transcode, "_startup_guards", {})
+    monkeypatch.setattr(transcode, "_recordings", set())
+    monkeypatch.setattr(transcode, "_pretuned", {})
+    monkeypatch.setattr(commands, "_load_settings", cache.load_server_settings)
+    monkeypatch.setattr(commands, "_sr_engine_dir", None)
+    monkeypatch.setattr(probe, "_probe_cache", {})
+    monkeypatch.setattr(probe, "_series_probe_cache", {})
+    monkeypatch.setattr(commands, "_gpu_nvdec_codecs", set())
     root = tmp_path / "transcode"
     cache.save_server_settings({**cache.load_server_settings(), "transcode_dir": str(root)})
     run = FakeRun()
-    install_subprocess(monkeypatch, ffmpeg_command, run=run)
+    install_subprocess(monkeypatch, probe, commands, run=run)
     web = FakeWeb()
     install_web(monkeypatch, web, util)
     clock = FakeClock(now=_NOW)
-    install_clock(monkeypatch, clock, ffmpeg_session)
+    install_clock(monkeypatch, clock, transcode)
     launcher = ProcessLauncher(on_launch=_ffmpeg_output)
-    install_launcher(monkeypatch, launcher, ffmpeg_session)
+    install_launcher(monkeypatch, launcher, transcode)
     return _Env(
         sessions=sessions,
         urls=urls,
@@ -221,7 +223,7 @@ async def upstreams(env: _Env) -> AsyncIterator[FakeUpstreams]:
 @pytest.fixture
 def tasks(monkeypatch: pytest.MonkeyPatch) -> Iterator[BackgroundTasks]:
     background = BackgroundTasks()
-    monkeypatch.setattr(ffmpeg_session, "_spawn_background_task", background)
+    monkeypatch.setattr(transcode, "_spawn_background_task", background)
     yield background
     background.discard()
 
@@ -233,7 +235,7 @@ def _relaunch(
     error: OSError | None = None,
 ) -> ProcessLauncher:
     launcher = ProcessLauncher(processes, error=error, on_launch=_ffmpeg_output)
-    install_launcher(monkeypatch, launcher, ffmpeg_session)
+    install_launcher(monkeypatch, launcher, transcode)
     return launcher
 
 
@@ -269,8 +271,8 @@ async def until(condition: Callable[[], object]) -> None:
         await asyncio.sleep(0)
 
 
-def _live(directory: pathlib.Path, url: str = "http://live") -> ffmpeg_session.TranscodeSession:
-    return ffmpeg_session.TranscodeSession(
+def _live(directory: pathlib.Path, url: str = "http://live") -> transcode.TranscodeSession:
+    return transcode.TranscodeSession(
         dir=str(directory),
         process=FakeProcess(exit_code=None),
         started=_NOW,
@@ -289,8 +291,8 @@ def _plan(
     hw: cache.HwAccel = "software",
     deinterlace: bool = False,
     source_id: str = "",
-) -> ffmpeg_session._FastLivePlan:
-    return ffmpeg_session._FastLivePlan(
+) -> transcode._FastLivePlan:
+    return transcode._FastLivePlan(
         source_url=source_url,
         source_id=source_id,
         user_agent=None,
@@ -339,9 +341,9 @@ def test_the_live_encoder_acts_on_what_the_startup_probe_found(
 
     The source's deinterlace setting is off here: it applies only when no probe is had.
     """
-    monkeypatch.setattr(ffmpeg_command, "_gpu_nvdec_codecs", {"h264"})
+    monkeypatch.setattr(commands, "_gpu_nvdec_codecs", {"h264"})
     env.run.program("ffprobe", Program(stdout=probe_capture(capture)), when="-show_streams")
-    source = ffmpeg_command.probe_segment(str(tmp_path / "probe.ts"))
+    source = probe.probe_segment(str(tmp_path / "probe.ts"))
     assert source is not None
 
     cmd, role = _plan(hw=hw).worker(str(tmp_path), source, restarting=False)
@@ -367,14 +369,14 @@ def test_without_a_probe_the_source_setting_decides_deinterlacing(
 
 def _fast_session(
     directory: pathlib.Path,
-    process: ffmpeg_session.ManagedProcess | None = None,
+    process: transcode.ManagedProcess | None = None,
     *,
     live_recovery: LiveRecoveryPolicy | None = None,
     source_url: str = "http://live",
-) -> ffmpeg_session.FastLiveSession:
+) -> transcode.FastLiveSession:
     """A fast-start session whose relay is built but not started."""
     plan = _plan(source_url)
-    return ffmpeg_session.FastLiveSession(
+    return transcode.FastLiveSession(
         dir=str(directory),
         process=process,
         started=_NOW,
@@ -390,7 +392,7 @@ def _fast_session(
     )
 
 
-async def _receiving(session: ffmpeg_session.FastLiveSession) -> None:
+async def _receiving(session: transcode.FastLiveSession) -> None:
     """Start the session's relay and wait until it holds the upstream's first bytes."""
     await session["relay"].start()
     await session["relay"].wait_for_bytes(1)
@@ -411,19 +413,19 @@ class TestIsProcessAlive:
     """Tests for _is_process_alive."""
 
     def test_none_is_dead(self):
-        assert ffmpeg_session._is_process_alive(None) is False
+        assert transcode._is_process_alive(None) is False
 
     def test_dead_process_placeholder(self):
-        assert ffmpeg_session._is_process_alive(ffmpeg_session._DeadProcess()) is False
+        assert transcode._is_process_alive(transcode._DeadProcess()) is False
 
     def test_alive_process(self):
-        assert ffmpeg_session._is_process_alive(FakeProcess(exit_code=None)) is True
+        assert transcode._is_process_alive(FakeProcess(exit_code=None)) is True
 
     def test_dead_process(self):
-        assert ffmpeg_session._is_process_alive(FakeProcess(exited=True)) is False
+        assert transcode._is_process_alive(FakeProcess(exited=True)) is False
 
     def test_object_without_process_state_is_dead(self):
-        assert ffmpeg_session._is_process_alive(object()) is False
+        assert transcode._is_process_alive(object()) is False
 
 
 class TestCacheTimeouts:
@@ -431,11 +433,11 @@ class TestCacheTimeouts:
 
     def test_vod_cache_timeout_default(self):
         """VOD cache default is 60 min = 3600 sec."""
-        assert ffmpeg_session.get_vod_cache_timeout() == 3600
+        assert transcode.get_vod_cache_timeout() == 3600
 
     def test_vod_cache_timeout_custom(self):
         _save_settings_cache(vod_mins=30)
-        assert ffmpeg_session.get_vod_cache_timeout() == 1800
+        assert transcode.get_vod_cache_timeout() == 1800
 
 
 class TestIsSessionValid:
@@ -447,8 +449,8 @@ class TestIsSessionValid:
         *,
         alive: bool,
         age: float,
-    ) -> ffmpeg_session.TranscodeSession:
-        return ffmpeg_session.TranscodeSession(
+    ) -> transcode.TranscodeSession:
+        return transcode.TranscodeSession(
             process=FakeProcess(exit_code=None) if alive else FakeProcess(exited=True),
             started=_NOW - age,
             last_access=_NOW - age,
@@ -458,49 +460,49 @@ class TestIsSessionValid:
         )
 
     def test_active_process_with_recent_heartbeat(self, tmp_path: pathlib.Path):
-        assert ffmpeg_session.is_session_valid(self._session(tmp_path, alive=True, age=0)) is True
+        assert transcode.is_session_valid(self._session(tmp_path, alive=True, age=0)) is True
 
     def test_active_process_stale_heartbeat(self, tmp_path: pathlib.Path):
         session = self._session(tmp_path, alive=True, age=400)
-        assert ffmpeg_session.is_session_valid(session) is False
+        assert transcode.is_session_valid(session) is False
 
     def test_dead_process_vod_session_without_cache(self, tmp_path: pathlib.Path):
         _save_settings_cache(vod_mins=0)
         session = self._session(tmp_path, alive=False, age=0)
-        assert ffmpeg_session.is_session_valid(session) is False
+        assert transcode.is_session_valid(session) is False
 
     def test_dead_process_vod_session_within_cache(self, tmp_path: pathlib.Path):
         _save_settings_cache(vod_mins=60)
         session = self._session(tmp_path, alive=False, age=10)
-        assert ffmpeg_session.is_session_valid(session, heartbeat_timeout_sec=3600) is True
+        assert transcode.is_session_valid(session, heartbeat_timeout_sec=3600) is True
 
     def test_dead_process_vod_session_expired_cache(self, tmp_path: pathlib.Path):
         _save_settings_cache(vod_mins=1)
         session = self._session(tmp_path, alive=False, age=120)
-        assert ffmpeg_session.is_session_valid(session, heartbeat_timeout_sec=3600) is False
+        assert transcode.is_session_valid(session, heartbeat_timeout_sec=3600) is False
 
     def test_heartbeat_timeout_boundary(self, tmp_path: pathlib.Path):
         session = self._session(tmp_path, alive=True, age=30)
-        assert ffmpeg_session.is_session_valid(session) is True
+        assert transcode.is_session_valid(session) is True
         session["last_access"] = _NOW - 30.5
-        assert ffmpeg_session.is_session_valid(session) is False
+        assert transcode.is_session_valid(session) is False
 
     def test_missing_last_access_uses_started(self, tmp_path: pathlib.Path):
-        session = ffmpeg_session.TranscodeSession(
+        session = transcode.TranscodeSession(
             process=FakeProcess(exit_code=None),
             started=_NOW - 31,
             dir=str(tmp_path),
             url="http://stream.test/live",
         )
-        assert ffmpeg_session.is_session_valid(session) is False
+        assert transcode.is_session_valid(session) is False
         session["started"] = _NOW
-        assert ffmpeg_session.is_session_valid(session) is True
+        assert transcode.is_session_valid(session) is True
 
 
 def test_fast_start_session_with_recovery_stays_valid_without_process(tmp_path: pathlib.Path):
     session = _fast_session(tmp_path)
     session["fast_start"] = True
-    assert ffmpeg_session.is_session_valid(session) is True
+    assert transcode.is_session_valid(session) is True
 
 
 # =============================================================================
@@ -512,11 +514,11 @@ class TestStopSession:
     """Tests for stop_session."""
 
     def test_stop_nonexistent_session(self):
-        asyncio.run(ffmpeg_session.stop_session("nonexistent"))
+        asyncio.run(transcode.stop_session("nonexistent"))
 
     def test_stop_session_force(self, env: _Env, tmp_path: pathlib.Path):
         process = FakeProcess(exit_code=None)
-        env.sessions["s"] = ffmpeg_session.TranscodeSession(
+        env.sessions["s"] = transcode.TranscodeSession(
             process=process,
             dir=str(tmp_path),
             url="http://test",
@@ -524,7 +526,7 @@ class TestStopSession:
             started=_NOW,
         )
         env.urls["http://test"] = "s"
-        asyncio.run(ffmpeg_session.stop_session("s", force=True))
+        asyncio.run(transcode.stop_session("s", force=True))
         assert "s" not in env.sessions
         assert "http://test" not in env.urls
         assert process.signals == ["TERM"]
@@ -533,13 +535,13 @@ class TestStopSession:
     def test_stop_keeps_url_mapped_to_another_session(self, env: _Env, tmp_path: pathlib.Path):
         env.sessions["s"] = _live(tmp_path, url="http://test")
         env.urls["http://test"] = "newer"
-        asyncio.run(ffmpeg_session.stop_session("s", force=True))
+        asyncio.run(transcode.stop_session("s", force=True))
         assert env.urls == {"http://test": "newer"}
 
     def test_stop_skips_recently_accessed_session(self, env: _Env, tmp_path: pathlib.Path):
         """Seeking or another viewer touched the session within the last 5 s."""
         process = FakeProcess(exit_code=None)
-        env.sessions["s"] = ffmpeg_session.TranscodeSession(
+        env.sessions["s"] = transcode.TranscodeSession(
             process=process,
             dir=str(tmp_path),
             url="http://test",
@@ -547,14 +549,14 @@ class TestStopSession:
             last_access=_NOW - 4.9,
             started=_NOW,
         )
-        asyncio.run(ffmpeg_session.stop_session("s", force=False))
+        asyncio.run(transcode.stop_session("s", force=False))
         assert "s" in env.sessions
         assert process.returncode is None
 
     def test_stop_session_multi_user_grace_period(self, env: _Env, tmp_path: pathlib.Path):
         """Stopping session while another user watching should preserve session."""
         process = FakeProcess(exit_code=None)
-        env.sessions["s"] = ffmpeg_session.TranscodeSession(
+        env.sessions["s"] = transcode.TranscodeSession(
             process=process,
             dir=str(tmp_path),
             url="http://shared-stream",
@@ -562,8 +564,8 @@ class TestStopSession:
             last_access=_NOW - 10,
             started=_NOW,
         )
-        ffmpeg_session.touch_session("s")
-        asyncio.run(ffmpeg_session.stop_session("s", force=False))
+        transcode.touch_session("s")
+        asyncio.run(transcode.stop_session("s", force=False))
         assert "s" in env.sessions
         assert process.returncode is None
 
@@ -575,8 +577,8 @@ class TestStopSession:
     ):
         env.sessions["s"] = _live(tmp_path)
         env.sessions["s"]["is_vod"] = True
-        with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-            asyncio.run(ffmpeg_session.stop_session("s"))
+        with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
+            asyncio.run(transcode.stop_session("s"))
         assert "s" in env.sessions
         assert "Ignoring stop for recently-accessed session s" in caplog.messages
 
@@ -591,8 +593,8 @@ class TestStopSession:
         del session["last_access"]
         env.sessions["s"] = session
         env.urls["http://vod"] = "s"
-        with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-            asyncio.run(ffmpeg_session.stop_session("s"))
+        with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
+            asyncio.run(transcode.stop_session("s"))
         assert not env.sessions
         assert not env.urls
         assert "Stopped transcode session s" in caplog.messages
@@ -605,7 +607,7 @@ class TestStopSession:
     ):
         """Stop caches VOD session instead of removing it, even for one minute."""
         process = FakeProcess(exit_code=None)
-        env.sessions["s"] = ffmpeg_session.TranscodeSession(
+        env.sessions["s"] = transcode.TranscodeSession(
             process=process,
             dir=str(tmp_path),
             url="http://vod",
@@ -614,8 +616,8 @@ class TestStopSession:
             started=_NOW,
         )
         _save_settings_cache(vod_mins=1)
-        with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-            asyncio.run(ffmpeg_session.stop_session("s", force=False))
+        with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
+            asyncio.run(transcode.stop_session("s", force=False))
         assert "s" in env.sessions
         assert env.sessions["s"].get("last_access") == _NOW
         assert process.signals == ["TERM"]
@@ -626,7 +628,7 @@ class TestStopSession:
         _save_settings_cache(vod_mins=0)
         env.sessions["s"] = _live(tmp_path)
         env.sessions["s"].update(is_vod=True, last_access=_NOW - 10)
-        asyncio.run(ffmpeg_session.stop_session("s"))
+        asyncio.run(transcode.stop_session("s"))
         assert not env.sessions
         assert not tmp_path.exists()
 
@@ -645,7 +647,7 @@ async def test_stop_fast_session_cancels_the_watchdog_and_closes_the_relay(
     env.sessions["s"] = session
     await _receiving(session)
     session["subscription"] = session["relay"].subscribe(worker.stdin)
-    await ffmpeg_session.stop_session("s")
+    await transcode.stop_session("s")
     await asyncio.sleep(0)
     assert watchdog.cancelled()
     assert worker.signals == ["TERM"]
@@ -666,7 +668,7 @@ async def test_a_short_session_keeps_the_burst_gap_a_longer_one_learned(
     session["fast_start"] = True
     env.sessions["s"] = session
     await _receiving(session)
-    await ffmpeg_session.stop_session("s")
+    await transcode.stop_session("s")
     assert cache.relay_hints()["recurring_gaps"] == {"live": 9.5}
 
 
@@ -674,7 +676,7 @@ def _watched(
     env: _Env,
     directory: pathlib.Path,
     viewers: dict[str, float],
-) -> ffmpeg_session.FastLiveSession:
+) -> transcode.FastLiveSession:
     """A running fast-start session ``s`` whose pages last reported at ``viewers``."""
     session = _fast_session(directory, FakeProcess(exit_code=None))
     session.update(fast_start=True, viewers=viewers)
@@ -691,8 +693,8 @@ async def test_a_page_leaving_a_shared_session_keeps_it_for_the_others(
 ):
     """A reloaded page joins before its old page's stop arrives."""
     session = _watched(env, tmp_path, {"old": _NOW, "new": _NOW})
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-        await ffmpeg_session.stop_session("s", force=True, viewer="old")
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
+        await transcode.stop_session("s", force=True, viewer="old")
     assert env.sessions == {"s": session}
     assert session["viewers"] == {"new": _NOW}
     assert "Viewer left session s; 1 remain" in caplog.messages
@@ -707,8 +709,8 @@ async def test_the_last_viewer_leaving_stops_the_session_after_a_grace(
 ):
     """A reloaded page's old stop often lands before the new page asks again."""
     _watched(env, tmp_path, {"page": _NOW})
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-        await ffmpeg_session.stop_session("s", force=True, viewer="page")
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
+        await transcode.stop_session("s", force=True, viewer="page")
         assert "s" in env.sessions
         assert caplog.messages == ["Last viewer left session s"]
         await tasks.run_all()
@@ -720,7 +722,7 @@ async def test_the_last_viewer_leaving_stops_the_session_after_a_grace(
 
 @pytest.mark.asyncio
 async def test_a_session_already_gone_is_not_waited_on(env: _Env):
-    await ffmpeg_session.stop_when_unwatched("gone")
+    await transcode.stop_when_unwatched("gone")
     assert env.clock.now == _NOW
     assert not env.sessions
 
@@ -731,7 +733,7 @@ async def test_a_session_gone_during_the_grace_needs_no_stop(
     tmp_path: pathlib.Path,
 ):
     _watched(env, tmp_path, {})
-    grace = asyncio.ensure_future(ffmpeg_session.stop_when_unwatched("s"))
+    grace = asyncio.ensure_future(transcode.stop_when_unwatched("s"))
     asyncio.get_running_loop().call_soon(env.sessions.clear)
     await grace
     assert env.clock.now == _NOW + 10
@@ -744,10 +746,10 @@ async def test_a_page_joining_during_the_grace_ends_it_at_once(
     tmp_path: pathlib.Path,
 ):
     session = _watched(env, tmp_path, {})
-    grace = asyncio.ensure_future(ffmpeg_session.stop_when_unwatched("s"))
+    grace = asyncio.ensure_future(transcode.stop_when_unwatched("s"))
     # The join lands while the grace waits; the wait ends then, not 10 s later.
     loop = asyncio.get_running_loop()
-    loop.call_soon(ffmpeg_session._adaptive_session_response, "s")
+    loop.call_soon(transcode._adaptive_session_response, "s")
     await grace
     assert env.clock.now == _NOW
     assert env.sessions == {"s": session}
@@ -761,9 +763,9 @@ async def test_a_page_joining_within_the_grace_keeps_the_session(
     tmp_path: pathlib.Path,
 ):
     session = _watched(env, tmp_path, {"old": _NOW})
-    await ffmpeg_session.stop_session("s", force=True, viewer="old")
+    await transcode.stop_session("s", force=True, viewer="old")
     # A new page joins as start hands it the session.
-    response = ffmpeg_session._adaptive_session_response("s")
+    response = transcode._adaptive_session_response("s")
     assert session["viewers"] == {response.get("viewer_id"): _NOW}
     await tasks.run_all()
     assert env.sessions == {"s": session}
@@ -776,9 +778,9 @@ async def test_pages_silent_past_the_heartbeat_no_longer_hold_the_session(
     tmp_path: pathlib.Path,
 ):
     _watched(env, tmp_path, {"leaving": _NOW, "silent": _NOW - 30.5, "recent": _NOW - 30})
-    await ffmpeg_session.stop_session("s", force=True, viewer="leaving")
+    await transcode.stop_session("s", force=True, viewer="leaving")
     assert env.sessions["s"].get("viewers") == {"recent": _NOW - 30}
-    await ffmpeg_session.stop_session("s", force=True, viewer="unknown", heartbeat_timeout_sec=29)
+    await transcode.stop_session("s", force=True, viewer="unknown", heartbeat_timeout_sec=29)
     await tasks.run_all()
     assert not env.sessions
 
@@ -786,18 +788,18 @@ async def test_pages_silent_past_the_heartbeat_no_longer_hold_the_session(
 @pytest.mark.asyncio
 async def test_only_live_sessions_count_viewers(env: _Env, tmp_path: pathlib.Path):
     env.sessions["s"] = _live(tmp_path)
-    await ffmpeg_session.stop_session("s", force=True, viewer="page")
+    await transcode.stop_session("s", force=True, viewer="page")
     assert not env.sessions
 
 
 def test_a_reporting_page_counts_as_watching(env: _Env, tmp_path: pathlib.Path):
     session = _watched(env, tmp_path, {"page": _NOW - 20})
     env.clock.advance(5)
-    ffmpeg_session.note_viewer("s", "page")
-    ffmpeg_session.note_viewer("s", "")
-    ffmpeg_session.note_viewer("missing", "page")
+    transcode.note_viewer("s", "page")
+    transcode.note_viewer("s", "")
+    transcode.note_viewer("missing", "page")
     env.sessions["vod"] = _live(tmp_path)
-    ffmpeg_session.note_viewer("vod", "page")
+    transcode.note_viewer("vod", "page")
     assert session["viewers"] == {"page": _NOW + 5}
     assert "viewers" not in env.sessions["vod"]
 
@@ -810,8 +812,8 @@ async def test_a_report_landing_after_its_page_left_does_not_bring_it_back(
 ):
     """A page's last health report can be in flight when its stop arrives."""
     session = _watched(env, tmp_path, {"page": _NOW})
-    await ffmpeg_session.stop_session("s", force=True, viewer="page")
-    ffmpeg_session.note_viewer("s", "page")
+    await transcode.stop_session("s", force=True, viewer="page")
+    transcode.note_viewer("s", "page")
     assert session["viewers"] == {}
     await tasks.run_all()
     assert not env.sessions
@@ -840,11 +842,11 @@ async def test_a_blocking_reload_returns_once_the_segment_is_listed(
     playlist.write_text("#EXTM3U\n#EXTINF:1,\nlow_0.ts\n")
     sleeps = _Sleeps(lambda: playlist.write_text(playlist.read_text() + "#EXTINF:1,\nlow_1.ts\n"))
 
-    await ffmpeg_session.wait_for_segment("s", 1, sleep=sleeps)
+    await transcode.wait_for_segment("s", 1, sleep=sleeps)
 
     assert sleeps.calls == [0.02]
     # A listed segment returns at once.
-    await ffmpeg_session.wait_for_segment("s", 0, sleep=sleeps)
+    await transcode.wait_for_segment("s", 0, sleep=sleeps)
     assert sleeps.calls == [0.02]
 
 
@@ -853,10 +855,10 @@ async def test_a_blocking_reload_gives_up_after_its_timeout(env: _Env, tmp_path:
     env.sessions["s"] = _fast_session(tmp_path)
     (tmp_path / "low.m3u8").write_text("#EXTM3U\n#EXTINF:1,\nlow_0.ts\n")
     sleeps = _Sleeps()
-    await ffmpeg_session.wait_for_segment("s", 5, sleep=sleeps)
+    await transcode.wait_for_segment("s", 5, sleep=sleeps)
     assert sleeps.calls == [0.02] * 150
     # Unknown sessions have nothing to wait for.
-    await ffmpeg_session.wait_for_segment("missing", 0, sleep=sleeps)
+    await transcode.wait_for_segment("missing", 0, sleep=sleeps)
     assert len(sleeps.calls) == 150
 
 
@@ -868,7 +870,7 @@ async def test_watchdog_stopping_its_own_session_is_not_cancelled(
     finished = asyncio.Event()
 
     async def watchdog() -> None:
-        await ffmpeg_session.stop_session("s", force=True)
+        await transcode.stop_session("s", force=True)
         finished.set()
 
     env.sessions["s"] = _live(tmp_path)
@@ -887,7 +889,7 @@ class TestCleanupExpiredSessions:
         expired, valid = tmp_path / "expired", tmp_path / "valid"
         expired.mkdir()
         valid.mkdir()
-        env.sessions["expired"] = ffmpeg_session.TranscodeSession(
+        env.sessions["expired"] = transcode.TranscodeSession(
             process=FakeProcess(exited=True),
             dir=str(expired),
             url="http://expired",
@@ -895,7 +897,7 @@ class TestCleanupExpiredSessions:
             last_access=_NOW - 400,
         )
         env.sessions["valid"] = _live(valid, url="http://valid")
-        asyncio.run(ffmpeg_session.cleanup_expired_sessions())
+        asyncio.run(transcode.cleanup_expired_sessions())
         assert set(env.sessions) == {"valid"}
         assert not expired.exists()
         assert valid.exists()
@@ -905,7 +907,7 @@ class TestCleanupExpiredSessions:
 async def test_shutdown_cancels_tasks_and_kills_every_process(env: _Env, tmp_path: pathlib.Path):
     task = asyncio.create_task(_idle())
     first, second = FakeProcess(exit_code=None), FakeProcess(exit_code=None)
-    env.sessions["s"] = ffmpeg_session.TranscodeSession(
+    env.sessions["s"] = transcode.TranscodeSession(
         watchdog_task=task,
         process=first,
         dir=str(tmp_path),
@@ -914,7 +916,7 @@ async def test_shutdown_cancels_tasks_and_kills_every_process(env: _Env, tmp_pat
     )
     env.sessions["t"] = _live(tmp_path)
     env.sessions["t"]["process"] = second
-    await ffmpeg_session.shutdown()
+    await transcode.shutdown()
     await asyncio.sleep(0)
     assert task.cancelled()
     assert [p.returncode for p in (first, second)] == [-15, -15]
@@ -932,7 +934,7 @@ async def test_shutdown_closes_every_relay(
     session = _fast_session(tmp_path, worker)
     env.sessions["f"] = session
     await _receiving(session)
-    await ffmpeg_session.shutdown()
+    await transcode.shutdown()
     assert worker.signals == ["TERM"]
     assert upstreams.opened[0].closed
     assert session["relay"].finished
@@ -958,7 +960,7 @@ async def _viewer(
     env: _Env,
     tmp_path: pathlib.Path,
     username: str,
-) -> tuple[ffmpeg_session.FastLiveSession, FakeProcess]:
+) -> tuple[transcode.FastLiveSession, FakeProcess]:
     """A user's playing fast-start session of http://live, its worker fed by the relay."""
     directory = tmp_path / username
     directory.mkdir()
@@ -995,8 +997,8 @@ async def test_recording_takes_over_the_users_playing_session(
     (recording_dir / "ffmpeg.log").write_bytes(b"earlier\n")
     recorder = FakeProcess(stderr=[b"frame=1\n", b"frame=2\n"])
     launcher = _relaunch(monkeypatch, [recorder])
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-        recording = await ffmpeg_session.record_live(
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
+        recording = await transcode.record_live(
             "alice",
             "http://live",
             "src",
@@ -1014,24 +1016,24 @@ async def test_recording_takes_over_the_users_playing_session(
     assert not upstreams.opened[0].closed
     (launch,) = launcher.launches
     assert launch.options["stdin"] == asyncio.subprocess.PIPE
-    probe = recording_dir / "probe.ts"
-    assert probe.read_bytes() == ts_source()
+    sample = recording_dir / "probe.ts"
+    assert sample.read_bytes() == ts_source()
     assert launch.command == fast_start.recorder_command(
         str(recording_dir),
         cache.load_server_settings()["transcode_hw"],
         "1080p",
         "high",
         60,
-        ffmpeg_command.probe_segment(str(probe)),
+        probe.probe_segment(str(sample)),
     )
     # The recorder starts at the source's keyframe.
     await recorder.stdin.wait_for(len(ts_source()))
     assert bytes(recorder.stdin.written) == ts_source()
-    assert ffmpeg_session._recordings == {recording}
+    assert transcode._recordings == {recording}
     assert not recording.finished()
     await _finish_task(tasks).run()
     assert recording.finished()
-    assert not ffmpeg_session._recordings
+    assert not transcode._recordings
     assert (recording_dir / "ffmpeg.log").read_bytes() == b"earlier\nframe=1\nframe=2\n"
     # With its last subscriber gone, the released relay closes its upstream.
     await until(lambda: relay.finished and upstreams.opened[0].closed)
@@ -1054,8 +1056,8 @@ async def test_recording_without_a_session_opens_its_own_relay_and_stops_from_a_
     elsewhere["url"] = "http://other"
     recorder = FakeProcess(exit_code=None)
     _relaunch(monkeypatch, [recorder])
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-        recording = await ffmpeg_session.record_live(
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
+        recording = await transcode.record_live(
             "alice",
             "http://live",
             "src",
@@ -1090,11 +1092,11 @@ async def test_recording_launch_failure_closes_only_a_relay_it_opened(
         await _viewer(env, tmp_path, "alice")
     _relaunch(monkeypatch, [], error=OSError("no ffmpeg"))
     with pytest.raises(OSError, match="no ffmpeg"):
-        await ffmpeg_session.record_live("alice", "http://live", "src", str(recording_dir), 60)
+        await transcode.record_live("alice", "http://live", "src", str(recording_dir), 60)
     (upstream,) = upstreams.opened
     assert upstream.closed is not viewing
     assert set(env.sessions) == ({"alice"} if viewing else set())
-    assert not ffmpeg_session._recordings
+    assert not transcode._recordings
 
 
 @pytest.mark.asyncio
@@ -1109,8 +1111,8 @@ async def test_recording_guards_the_recorder_pipes(
     mute = FakeProcess(exit_code=None)
     _relaunch(monkeypatch, [deaf, mute])
     with pytest.raises(ValueError, match=r"^Expected process\.stdin is not None\.$"):
-        await ffmpeg_session.record_live("alice", "http://live", "src", str(recording_dir), 60)
-    await ffmpeg_session.record_live("alice", "http://live", "src", str(recording_dir), 60)
+        await transcode.record_live("alice", "http://live", "src", str(recording_dir), 60)
+    await transcode.record_live("alice", "http://live", "src", str(recording_dir), 60)
     mute.stderr = None
     with pytest.raises(ValueError, match=r"^Expected process\.stderr is not None\.$"):
         await _finish_task(tasks).run()
@@ -1127,19 +1129,19 @@ async def test_shutdown_stops_recordings_and_closes_their_relays(
     viewer, worker = await _viewer(env, tmp_path, "bob")
     recorder = FakeProcess(exit_code=None)
     _relaunch(monkeypatch, [recorder])
-    recording = await ffmpeg_session.record_live(
+    recording = await transcode.record_live(
         "alice",
         "http://live",
         "src",
         str(recording_dir),
         60,
     )
-    await ffmpeg_session.shutdown()
+    await transcode.shutdown()
     assert (recorder.signals, worker.signals) == (["TERM"], ["TERM"])
     assert recording.relay.finished
     assert viewer["relay"].finished
     assert [upstream.closed for upstream in upstreams.opened] == [True, True]
-    assert not ffmpeg_session._recordings
+    assert not transcode._recordings
     assert not env.sessions
 
 
@@ -1154,8 +1156,8 @@ def _owned(
     started: float,
     username: str = "",
     source_id: str = "",
-) -> ffmpeg_session.TranscodeSession:
-    return ffmpeg_session.TranscodeSession(
+) -> transcode.TranscodeSession:
+    return transcode.TranscodeSession(
         username=username,
         source_id=source_id,
         started=started,
@@ -1178,67 +1180,67 @@ def test_user_and_source_sessions_filter_and_sort_by_start(
     # Sessions recovered from before start times were recorded lack "started".
     monkeypatch.delitem(cast(Mapping[str, object], legacy), "started")
     env.sessions["z-legacy"] = legacy
-    assert [sid for sid, _ in ffmpeg_session.get_user_sessions("alice")] == [
+    assert [sid for sid, _ in transcode.get_user_sessions("alice")] == [
         "z-legacy",
         "m1",
         "a3",
     ]
-    assert [sid for sid, _ in ffmpeg_session.get_source_sessions("src1")] == [
+    assert [sid for sid, _ in transcode.get_source_sessions("src1")] == [
         "z-legacy",
         "m1",
         "a3",
     ]
-    assert ffmpeg_session.get_user_sessions("alice")[0][1] is legacy
-    assert ffmpeg_session.get_user_sessions("nobody") == []
+    assert transcode.get_user_sessions("alice")[0][1] is legacy
+    assert transcode.get_user_sessions("nobody") == []
 
 
 class TestEnforceStreamLimits:
     """Tests for enforce_stream_limits."""
 
     def test_no_limits_returns_none(self):
-        assert asyncio.run(ffmpeg_session.enforce_stream_limits("alice", None, 0, 0)) is None
+        assert asyncio.run(transcode.enforce_stream_limits("alice", None, 0, 0)) is None
 
     def test_user_limit_stops_oldest(self, env: _Env, tmp_path: pathlib.Path):
         for sid, started in [("s1", 1), ("s2", 2)]:
             env.sessions[sid] = _live(tmp_path / sid)
             env.sessions[sid].update(username="alice", started=started)
-        assert asyncio.run(ffmpeg_session.enforce_stream_limits("alice", None, 2, 0)) is None
+        assert asyncio.run(transcode.enforce_stream_limits("alice", None, 2, 0)) is None
         assert set(env.sessions) == {"s2"}
 
     def test_user_below_limit_keeps_sessions(self, env: _Env, tmp_path: pathlib.Path):
         env.sessions["s1"] = _live(tmp_path)
         env.sessions["s1"]["username"] = "alice"
-        assert asyncio.run(ffmpeg_session.enforce_stream_limits("alice", None, 2, 0)) is None
+        assert asyncio.run(transcode.enforce_stream_limits("alice", None, 2, 0)) is None
         assert set(env.sessions) == {"s1"}
 
     def test_source_limit_stops_user_session(self, env: _Env, tmp_path: pathlib.Path):
         env.sessions["s1"] = _live(tmp_path)
         env.sessions["s1"].update(username="alice", source_id="src1")
-        assert asyncio.run(ffmpeg_session.enforce_stream_limits("alice", "src1", 0, 1)) is None
+        assert asyncio.run(transcode.enforce_stream_limits("alice", "src1", 0, 1)) is None
         assert not env.sessions
 
     def test_source_limit_returns_error_for_other_user(self, env: _Env, tmp_path: pathlib.Path):
         env.sessions["s1"] = _live(tmp_path)
         env.sessions["s1"].update(username="bob", source_id="src1")
-        result = asyncio.run(ffmpeg_session.enforce_stream_limits("alice", "src1", 0, 1))
+        result = asyncio.run(transcode.enforce_stream_limits("alice", "src1", 0, 1))
         assert result == "Source at capacity (1 streams)"
         assert "s1" in env.sessions
 
 
 def test_get_session_returns_a_copy(env: _Env, tmp_path: pathlib.Path):
     env.sessions["test"] = _live(tmp_path)
-    session = ffmpeg_session.get_session("test")
+    session = transcode.get_session("test")
     assert session == env.sessions["test"]
     assert session is not env.sessions["test"]
-    assert ffmpeg_session.get_session("nonexistent") is None
+    assert transcode.get_session("nonexistent") is None
 
 
 def test_touch_session_records_heartbeat(env: _Env, tmp_path: pathlib.Path):
     env.sessions["test"] = _live(tmp_path)
     env.sessions["test"]["last_access"] = _NOW - 100
-    assert ffmpeg_session.touch_session("test") is True
+    assert transcode.touch_session("test") is True
     assert env.sessions["test"].get("last_access") == _NOW
-    assert ffmpeg_session.touch_session("nonexistent") is False
+    assert transcode.touch_session("nonexistent") is False
 
 
 class TestGetSessionProgress:
@@ -1250,7 +1252,7 @@ class TestGetSessionProgress:
         )
         env.sessions["test"] = _live(tmp_path)
         env.sessions["test"].update(last_access=0, username="alice")
-        assert ffmpeg_session.get_session_progress("test", "alice") == {
+        assert transcode.get_session_progress("test", "alice") == {
             "segment_count": 2,
             "duration": 6.5,
         }
@@ -1259,13 +1261,13 @@ class TestGetSessionProgress:
     def test_progress_no_playlist(self, env: _Env, tmp_path: pathlib.Path):
         env.sessions["test"] = _live(tmp_path)
         env.sessions["test"]["username"] = "alice"
-        assert ffmpeg_session.get_session_progress("test", "alice") == {
+        assert transcode.get_session_progress("test", "alice") == {
             "segment_count": 0,
             "duration": 0.0,
         }
 
     def test_progress_nonexistent_session(self):
-        assert ffmpeg_session.get_session_progress("nonexistent", "alice") is None
+        assert transcode.get_session_progress("nonexistent", "alice") is None
 
     def test_another_users_progress_reads_as_absent_and_keeps_no_heartbeat(
         self,
@@ -1274,7 +1276,7 @@ class TestGetSessionProgress:
     ):
         env.sessions["test"] = _live(tmp_path)
         env.sessions["test"].update(last_access=0, username="alice")
-        assert ffmpeg_session.get_session_progress("test", "eve") is None
+        assert transcode.get_session_progress("test", "eve") is None
         assert env.sessions["test"].get("last_access") == 0
 
     def test_progress_reads_the_fast_start_rendition(self, env: _Env, tmp_path: pathlib.Path):
@@ -1282,12 +1284,12 @@ class TestGetSessionProgress:
         (tmp_path / "up.m3u8").write_text("#EXTINF:1.5,\nup_0.ts\n#EXTINF:1.5,\nup_1.ts\n")
         env.sessions["s"] = _fast_session(tmp_path)
         env.sessions["s"]["username"] = "alice"
-        assert ffmpeg_session.get_session_progress("s", "alice") == {
+        assert transcode.get_session_progress("s", "alice") == {
             "segment_count": 1,
             "duration": 2.0,
         }
         env.sessions["s"]["rendition"] = "up"
-        assert ffmpeg_session.get_session_progress("s", "alice") == {
+        assert transcode.get_session_progress("s", "alice") == {
             "segment_count": 2,
             "duration": 3.0,
         }
@@ -1295,9 +1297,9 @@ class TestGetSessionProgress:
 
 def test_clear_url_session(env: _Env):
     env.urls["http://test"] = "session-123"
-    assert ffmpeg_session.clear_url_session("http://test") == "session-123"
+    assert transcode.clear_url_session("http://test") == "session-123"
     assert not env.urls
-    assert ffmpeg_session.clear_url_session("http://nonexistent") is None
+    assert transcode.clear_url_session("http://nonexistent") is None
 
 
 @pytest.mark.parametrize("seek_time", [None, 0, 30])
@@ -1306,7 +1308,7 @@ def test_shared_session_process_update(env: _Env, seek_time: int | None, tmp_pat
     session.update(seek_offset=15, caption_timestamp_origin=3.0)
     env.sessions["resume"] = session
     process = FakeProcess(exit_code=None)
-    assert ffmpeg_session._update_session_process(
+    assert transcode._update_session_process(
         "resume",
         process,
         url="https://provider/movie",
@@ -1317,7 +1319,7 @@ def test_shared_session_process_update(env: _Env, seek_time: int | None, tmp_pat
     # A seek moves the timeline, so the caption clock must be measured again.
     assert ("caption_timestamp_origin" in session) is (seek_time is None)
     assert env.urls == {"https://provider/movie": "resume"}
-    assert not ffmpeg_session._update_session_process(
+    assert not transcode._update_session_process(
         "missing",
         process,
         url="https://provider/missing",
@@ -1328,7 +1330,7 @@ def test_shared_session_process_update(env: _Env, seek_time: int | None, tmp_pat
 
 def test_update_session_process_without_url_keeps_mapping(env: _Env, tmp_path: pathlib.Path):
     env.sessions["s"] = _live(tmp_path)
-    assert ffmpeg_session._update_session_process("s", FakeProcess(exit_code=None))
+    assert transcode._update_session_process("s", FakeProcess(exit_code=None))
     assert not env.urls
 
 
@@ -1351,7 +1353,7 @@ def test_recovery_removes_orphaned_dirs(env: _Env):
     orphan = env.root / "netv_transcode_orphan"
     orphan.mkdir()
     (orphan / "seg000.ts").write_bytes(b"data")
-    ffmpeg_session.cleanup_and_recover_sessions()
+    transcode.cleanup_and_recover_sessions()
     assert not orphan.exists()
 
 
@@ -1369,10 +1371,10 @@ def test_recovery_restores_valid_vod_session(env: _Env):
             "username": "alice",
         },
     )
-    ffmpeg_session.cleanup_and_recover_sessions()
+    transcode.cleanup_and_recover_sessions()
     session = env.sessions["vod123"]
     assert env.urls == {"http://movie.mp4": "vod123"}
-    assert isinstance(session["process"], ffmpeg_session._DeadProcess)
+    assert isinstance(session["process"], transcode._DeadProcess)
     assert (session["started"], session.get("last_access")) == (5, _NOW)
     assert (session.get("duration"), session.get("subtitles")) == (3600, [2])
     assert (session.get("is_vod"), session.get("username")) == (True, "alice")
@@ -1386,7 +1388,7 @@ def test_recovery_removes_expired_vod_session(env: _Env):
     )
     os.utime(directory, (_NOW - 61, _NOW - 61))
     cache.save_server_settings({**cache.load_server_settings(), "vod_transcode_cache_mins": 1})
-    ffmpeg_session.cleanup_and_recover_sessions()
+    transcode.cleanup_and_recover_sessions()
     assert not directory.exists()
     assert not env.sessions
 
@@ -1397,7 +1399,7 @@ def test_recovery_discards_legacy_cached_archives(env: _Env):
         "archive",
         {"session_id": "archive", "url": ARCHIVE_URL, "is_vod": True},
     )
-    ffmpeg_session.cleanup_and_recover_sessions()
+    transcode.cleanup_and_recover_sessions()
     assert not directory.exists()
     assert not env.sessions
 
@@ -1408,7 +1410,7 @@ def test_recovery_ignores_plain_files_and_dangling_links(env: _Env):
     stray.write_text("x")
     dangling = env.root / "netv_transcode_link"
     dangling.symlink_to(env.root / "missing")
-    ffmpeg_session.cleanup_and_recover_sessions()
+    transcode.cleanup_and_recover_sessions()
     assert stray.exists()
     assert dangling.is_symlink()
     assert not env.sessions
@@ -1421,14 +1423,14 @@ def test_recovery_removes_session_without_segments(env: _Env):
         {"session_id": "e", "url": "http://m", "is_vod": True},
         segment=False,
     )
-    ffmpeg_session.cleanup_and_recover_sessions()
+    transcode.cleanup_and_recover_sessions()
     assert not directory.exists()
     assert not env.sessions
 
 
 def test_recovery_removes_corrupt_session_json(env: _Env):
     directory = _vod_dir(env.root, "bad", "{not json")
-    ffmpeg_session.cleanup_and_recover_sessions()
+    transcode.cleanup_and_recover_sessions()
     assert not directory.exists()
 
 
@@ -1443,7 +1445,7 @@ def test_recovery_prefers_seeked_or_newer_duplicate(
     new_seek: int,
     winner: str,
 ):
-    env.sessions["old"] = ffmpeg_session.TranscodeSession(
+    env.sessions["old"] = transcode.TranscodeSession(
         seek_offset=existing_seek,
         last_access=0,
         dir=str(tmp_path),
@@ -1457,7 +1459,7 @@ def test_recovery_prefers_seeked_or_newer_duplicate(
         "new",
         {"session_id": "new", "url": "http://m", "is_vod": True, "seek_offset": new_seek},
     )
-    ffmpeg_session.cleanup_and_recover_sessions()
+    transcode.cleanup_and_recover_sessions()
     assert "new" in env.sessions
     assert env.urls["http://m"] == winner
 
@@ -1489,8 +1491,8 @@ def test_recovery_restores_probe_cache(env: _Env):
         },
     }
     _vod_dir(env.root, "p", info)
-    ffmpeg_session.cleanup_and_recover_sessions()
-    media, subs = ffmpeg_command.probe_media("http://m", 7, 8, source_id="")
+    transcode.cleanup_and_recover_sessions()
+    media, subs = probe.probe_media("http://m", 7, 8, source_id="")
     assert media is not None
     assert (media.video_codec, media.height, media.duration, media.interlaced) == (
         "hevc",
@@ -1500,7 +1502,7 @@ def test_recovery_restores_probe_cache(env: _Env):
     )
     assert subs == [SubtitleStream(index=2, lang="eng", name="")]
     assert [t.lang for t in media.audio_tracks] == ["eng"]
-    assert ffmpeg_command.probe_media("http://m", source_id="") == (media, subs)
+    assert probe.probe_media("http://m", source_id="") == (media, subs)
     assert env.run.calls == []
 
 
@@ -1511,22 +1513,22 @@ def test_recovery_restores_probe_cache(env: _Env):
 
 def test_calc_hls_duration_reads_playlist_or_estimates(tmp_path: pathlib.Path):
     playlist_path = tmp_path / "stream.m3u8"
-    assert ffmpeg_session._calc_hls_duration(playlist_path, 5) == 15.0
+    assert transcode._calc_hls_duration(playlist_path, 5) == 15.0
     playlist_path.write_text("#EXTM3U\n")
-    assert ffmpeg_session._calc_hls_duration(playlist_path, 2) == 6.0
+    assert transcode._calc_hls_duration(playlist_path, 2) == 6.0
     playlist_path.write_text("#EXTM3U\n#EXTINF:3.5,\nseg0.ts\n#EXTINF:3.0,\nseg1.ts\n")
-    assert ffmpeg_session._calc_hls_duration(playlist_path, 2) == 6.5
+    assert transcode._calc_hls_duration(playlist_path, 2) == 6.5
 
 
 class TestBuildSubtitleTracks:
     """Tests for _build_subtitle_tracks."""
 
     def test_builds_track_list(self):
-        sub_info: list[ffmpeg_session.StoredSubtitle | int] = [
+        sub_info: list[transcode.StoredSubtitle | int] = [
             {"index": 2, "lang": "eng", "name": "English"},
             {"index": 3, "lang": "jpn", "name": "Japanese"},
         ]
-        assert ffmpeg_session._build_subtitle_tracks("session-123", sub_info) == [
+        assert transcode._build_subtitle_tracks("session-123", sub_info) == [
             {
                 "url": "/subs/session-123/sub0.vtt",
                 "lang": "eng",
@@ -1542,17 +1544,17 @@ class TestBuildSubtitleTracks:
         ]
 
     def test_empty_sub_info(self):
-        assert ffmpeg_session._build_subtitle_tracks("s", []) == []
-        assert ffmpeg_session._build_subtitle_tracks("s", None) == []
+        assert transcode._build_subtitle_tracks("s", []) == []
+        assert transcode._build_subtitle_tracks("s", None) == []
 
     def test_non_dict_sub_info(self):
         """Returns empty list for old format (indices only)."""
-        assert ffmpeg_session._build_subtitle_tracks("s", [2, 3]) == []
+        assert transcode._build_subtitle_tracks("s", [2, 3]) == []
 
 
 class TestCaptionMasterPlaylist:
     def test_links_native_hls_subtitle_renditions(self):
-        result = ffmpeg_session._caption_master_playlist(
+        result = transcode._caption_master_playlist(
             [
                 {"lang": "eng", "name": "English"},
                 {"lang": "spa", "name": 'Español "CC"'},
@@ -1572,7 +1574,7 @@ class TestCaptionMasterPlaylist:
         )
 
     def test_names_unnamed_tracks_and_disambiguates_duplicates(self):
-        result = ffmpeg_session._caption_master_playlist(
+        result = transcode._caption_master_playlist(
             [
                 {"lang": "eng", "name": "English"},
                 {"lang": "eng", "name": "English"},
@@ -1592,10 +1594,10 @@ class TestWebvttTimestampMap:
         )
         (tmp_path / "seg000.ts").touch()
         (tmp_path / "seg001.ts").write_bytes(video_packet(14.08))
-        assert ffmpeg_session._caption_timestamp_origin(str(tmp_path)) == pytest.approx(10.08)
+        assert transcode._caption_timestamp_origin(str(tmp_path)) == pytest.approx(10.08)
 
     def test_maps_webvtt_to_the_mpeg_ts_clock(self):
-        mapped = ffmpeg_session.add_webvtt_timestamp_map(
+        mapped = transcode.add_webvtt_timestamp_map(
             "WEBVTT\n\n00:01.000 --> 00:03.000\nCaption\n",
             10.08,
         )
@@ -1603,29 +1605,29 @@ class TestWebvttTimestampMap:
             "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:907200\n"
             "\n00:01.000 --> 00:03.000\nCaption\n"
         )
-        crlf = ffmpeg_session.add_webvtt_timestamp_map("WEBVTT\r\n\r\nWEBVTT\r\n", 1)
+        crlf = transcode.add_webvtt_timestamp_map("WEBVTT\r\n\r\nWEBVTT\r\n", 1)
         assert crlf == "WEBVTT\r\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:90000\r\n\r\nWEBVTT\r\n"
 
     def test_wraps_the_timestamp_at_33_bits(self):
-        mapped = ffmpeg_session.add_webvtt_timestamp_map("WEBVTT\n", (1 << 33) / 90_000 + 1)
+        mapped = transcode.add_webvtt_timestamp_map("WEBVTT\n", (1 << 33) / 90_000 + 1)
         assert "MPEGTS:90000\n" in mapped
 
     def test_preserves_existing_mapping_and_non_webvtt_content(self):
         mapped = "WEBVTT\r\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:90000\r\n"
-        assert ffmpeg_session.add_webvtt_timestamp_map(mapped, 10.08) == mapped
-        assert ffmpeg_session.add_webvtt_timestamp_map("not WebVTT", 10.08) == "not WebVTT"
-        assert ffmpeg_session.add_webvtt_timestamp_map("WEBVTT\n", None) == "WEBVTT\n"
+        assert transcode.add_webvtt_timestamp_map(mapped, 10.08) == mapped
+        assert transcode.add_webvtt_timestamp_map("not WebVTT", 10.08) == "not WebVTT"
+        assert transcode.add_webvtt_timestamp_map("WEBVTT\n", None) == "WEBVTT\n"
 
 
 def test_caption_timestamp_origin_paths(env: _Env, tmp_path: pathlib.Path):
-    assert ffmpeg_session.get_caption_timestamp_origin("missing") is None
+    assert transcode.get_caption_timestamp_origin("missing") is None
     env.sessions["cached"] = _live(tmp_path)
     env.sessions["cached"]["caption_timestamp_origin"] = 3
-    assert ffmpeg_session.get_caption_timestamp_origin("cached") == 3.0
+    assert transcode.get_caption_timestamp_origin("cached") == 3.0
     env.sessions["none"] = _live(tmp_path)
-    assert ffmpeg_session.get_caption_timestamp_origin("none") is None
+    assert transcode.get_caption_timestamp_origin("none") is None
     _media_playlist(tmp_path / "stream.m3u8", ["seg0.ts"], start_pts=4.5)
-    assert ffmpeg_session.get_caption_timestamp_origin("none") == 4.5
+    assert transcode.get_caption_timestamp_origin("none") == 4.5
     assert env.sessions["none"].get("caption_timestamp_origin") == 4.5
 
 
@@ -1641,7 +1643,7 @@ def test_caption_timestamp_origin_none_when_session_stops_while_reading(
     env.sessions["gone"] = _live(tmp_path)
     results: list[float | None] = []
     reader = threading.Thread(
-        target=lambda: results.append(ffmpeg_session.get_caption_timestamp_origin("gone")),
+        target=lambda: results.append(transcode.get_caption_timestamp_origin("gone")),
     )
     reader.start()
     with fifo.open("wb") as writer:
@@ -1656,11 +1658,11 @@ def test_caption_timestamp_origin_skips_nested_names_and_counts_elapsed(tmp_path
     (tmp_path / "sub" / "x.ts").write_bytes(video_packet(99))
     (tmp_path / "seg0.ts").write_bytes(b"not mpeg-ts")
     (tmp_path / "stream.m3u8").write_text("#EXTINF:bad,\n#EXTINF:4,\nsub/x.ts\nseg0.ts\n")
-    assert ffmpeg_session._caption_timestamp_origin(str(tmp_path)) is None
+    assert transcode._caption_timestamp_origin(str(tmp_path)) is None
     (tmp_path / "seg1.ts").write_bytes(video_packet(10))
     with (tmp_path / "stream.m3u8").open("a") as playlist_file:
         playlist_file.write("#EXTINF:2,\nseg1.ts\n")
-    assert ffmpeg_session._caption_timestamp_origin(str(tmp_path)) == 6.0
+    assert transcode._caption_timestamp_origin(str(tmp_path)) == 6.0
 
 
 class TestRegeneratePlaylist:
@@ -1669,7 +1671,7 @@ class TestRegeneratePlaylist:
     def test_regenerates_playlist_from_segments(self, tmp_path: pathlib.Path):
         for i in range(3):
             (tmp_path / f"seg00{i}.ts").write_bytes(b"x" * 2000)
-        ffmpeg_session._regenerate_playlist(tmp_path, start_segment=1)
+        transcode._regenerate_playlist(tmp_path, start_segment=1)
         assert (tmp_path / "stream.m3u8").read_text() == (
             "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:1\n"
             "#EXT-X-PLAYLIST-TYPE:EVENT\n#EXTINF:3.000000,\nseg001.ts\n"
@@ -1679,14 +1681,14 @@ class TestRegeneratePlaylist:
     def test_regenerate_skips_small_segments(self, tmp_path: pathlib.Path):
         (tmp_path / "seg000.ts").write_bytes(b"x" * 1000)  # Not above the threshold.
         (tmp_path / "seg001.ts").write_bytes(b"x" * 1001)
-        ffmpeg_session._regenerate_playlist(tmp_path, start_segment=0)
+        transcode._regenerate_playlist(tmp_path, start_segment=0)
         content = (tmp_path / "stream.m3u8").read_text()
         assert "seg001.ts" in content
         assert "seg000.ts" not in content
 
     def test_regenerate_playlist_skips_bad_names_and_empty(self, tmp_path: pathlib.Path):
         (tmp_path / "segabc.ts").write_bytes(b"x" * 2000)
-        ffmpeg_session._regenerate_playlist(tmp_path, 0)
+        transcode._regenerate_playlist(tmp_path, 0)
         assert not (tmp_path / "stream.m3u8").exists()
 
 
@@ -1724,7 +1726,7 @@ def _existing(
 @pytest.mark.asyncio
 async def test_start_rejects_bandwidth_saver_for_vod():
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session.start_transcode("http://m", "movie", bandwidth_saver=True)
+        await transcode.start_transcode("http://m", "movie", bandwidth_saver=True)
     assert error.value.status_code == 400
 
 
@@ -1733,7 +1735,7 @@ async def test_start_enforces_stream_limits(env: _Env, tmp_path: pathlib.Path):
     env.sessions["bob"] = _live(tmp_path, url="http://other")
     env.sessions["bob"].update(username="bob", source_id="src")
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session.start_transcode(
+        await transcode.start_transcode(
             "http://live",
             username="alice",
             source_id="src",
@@ -1747,7 +1749,7 @@ async def test_start_enforces_stream_limits(env: _Env, tmp_path: pathlib.Path):
 async def test_start_rejects_archive_owned_by_other_user(env: _Env, tmp_path: pathlib.Path):
     _existing(env, tmp_path, ARCHIVE_URL, username="bob")
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie", username="alice")
+        await transcode.start_transcode(ARCHIVE_URL, "movie", username="alice")
     assert (error.value.status_code, error.value.detail) == (
         409,
         "This archive is playing on another device.",
@@ -1762,7 +1764,7 @@ async def test_start_reuses_own_archive_session(
 ):
     del tasks
     _existing(env, tmp_path, ARCHIVE_URL, username="alice")
-    result = await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie", username="alice")
+    result = await transcode.start_transcode(ARCHIVE_URL, "movie", username="alice")
     assert result["session_id"] == "old"
     assert env.launcher.commands == []
 
@@ -1778,7 +1780,7 @@ async def test_start_replaces_own_live_session_for_bandwidth_saver(
     env.run.program("ffprobe", Program(stdout=probed_video_json()))
     _existing(env, tmp_path, "http://live", username="alice")
     old = env.sessions["old"]["process"]
-    result = await ffmpeg_session.start_transcode(
+    result = await transcode.start_transcode(
         "http://live",
         username="alice",
         bandwidth_saver=True,
@@ -1803,7 +1805,7 @@ async def test_start_replaces_own_dolby_movie_for_an_aac_client_at_its_position(
     cache.save_server_settings({**cache.load_server_settings(), "probe_movies": False})
     _existing(env, tmp_path, "http://movie", username="alice", audio_passthrough=True)
     env.sessions["old"]["seek_offset"] = 30
-    result = await ffmpeg_session.start_transcode("http://movie", "movie", username="alice")
+    result = await transcode.start_transcode("http://movie", "movie", username="alice")
     sid = result["session_id"]
     assert set(env.sessions) == {sid}
     assert env.sessions[sid].get("seek_offset") == 30
@@ -1823,8 +1825,8 @@ async def test_start_replaces_own_movie_in_another_audio_language_at_its_positio
     cache.save_server_settings({**cache.load_server_settings(), "probe_movies": False})
     _existing(env, tmp_path, "http://movie", username="alice")
     env.sessions["old"].update(seek_offset=30, audio_lang="fr", is_vod=True)
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-        result = await ffmpeg_session.start_transcode("http://movie", "movie", username="alice")
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
+        result = await transcode.start_transcode("http://movie", "movie", username="alice")
     sid = result["session_id"]
     assert set(env.sessions) == {sid}
     assert env.sessions[sid].get("audio_lang") == "en"
@@ -1840,7 +1842,7 @@ async def test_start_reuses_own_movie_in_the_users_audio_language(
 ):
     _existing(env, tmp_path, "http://movie", username="alice")
     env.sessions["old"].update(audio_lang="en", is_vod=True)
-    result = await ffmpeg_session.start_transcode("http://movie", "movie", username="alice")
+    result = await transcode.start_transcode("http://movie", "movie", username="alice")
     assert result["session_id"] == "old"
     assert env.launcher.commands == []
 
@@ -1857,8 +1859,8 @@ async def test_start_replaces_own_plain_live_session_without_reusing_it(
     env.run.program("ffprobe", Program(stdout=probed_video_json()))
     _existing(env, tmp_path, "http://live", username="alice")
     env.sessions["old"]["audio_lang"] = "fr"
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-        result = await ffmpeg_session.start_transcode("http://live", username="alice")
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
+        result = await transcode.start_transcode("http://live", username="alice")
     assert result["session_id"] != "old"
     assert len(upstreams.opened) == 1
     about_old = [m for m in (r.getMessage() for r in caplog.records) if m.endswith(" old")]
@@ -1892,7 +1894,7 @@ async def test_start_refuses_other_users_session(
         fast_start=fast_start,
     )
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session.start_transcode(
+        await transcode.start_transcode(
             "http://live",
             username="alice",
             bandwidth_saver=bandwidth_saver,
@@ -1912,7 +1914,7 @@ async def test_start_rejoins_own_fast_start_session(env: _Env, tmp_path: pathlib
         last_access=_NOW - 1,
         fast_start=True,
     )
-    result = await ffmpeg_session.start_transcode("http://live", username="alice")
+    result = await transcode.start_transcode("http://live", username="alice")
     assert result["playlist"] == "/transcode/old/low.m3u8"
     assert env.sessions["old"].get("last_access") == _NOW
     assert env.launcher.commands == []
@@ -1926,8 +1928,8 @@ async def test_start_reuses_valid_session(
 ):
     _existing(env, tmp_path, "http://movie")
     env.sessions["old"]["is_vod"] = True
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-        result = await ffmpeg_session.start_transcode("http://movie", "movie")
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
+        result = await transcode.start_transcode("http://movie", "movie")
     assert (result["session_id"], result["playlist"]) == ("old", "/transcode/old/stream.m3u8")
     assert env.launcher.commands == []
     assert [r.getMessage() for r in caplog.records] == [
@@ -1943,11 +1945,11 @@ async def test_a_shared_vod_session_admits_only_those_it_was_handed_to(
 ):
     _existing(env, tmp_path, "http://movie", username="bob")
     env.sessions["old"]["is_vod"] = True
-    assert ffmpeg_session.user_session("old", "alice") is None
-    result = await ffmpeg_session.start_transcode("http://movie", "movie", username="alice")
+    assert transcode.user_session("old", "alice") is None
+    result = await transcode.start_transcode("http://movie", "movie", username="alice")
     assert result["session_id"] == "old"
     assert [
-        ffmpeg_session.user_session(session_id, name) is not None
+        transcode.user_session(session_id, name) is not None
         for session_id, name in [("old", "alice"), ("old", "bob"), ("old", "eve"), ("gone", "bob")]
     ] == [True, True, False, False]
 
@@ -1963,8 +1965,8 @@ async def test_start_replaces_an_expired_session(
     _existing(env, tmp_path, "http://movie", username="alice", last_access=_NOW - 60)
     env.sessions["old"]["is_vod"] = True
     old = env.sessions["old"]["process"]
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-        result = await ffmpeg_session.start_transcode("http://movie", "movie", username="alice")
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
+        result = await transcode.start_transcode("http://movie", "movie", username="alice")
     sid = result["session_id"]
     assert set(env.sessions) == {sid} != {"old"}
     assert env.urls == {"http://movie": sid}
@@ -1985,7 +1987,7 @@ async def test_start_replaces_a_dead_session_even_when_just_accessed(
     del tasks
     _existing(env, tmp_path, "http://movie", username="alice", last_access=_NOW - 1)
     env.sessions["old"].update(process=FakeProcess(exited=True), is_vod=True)
-    result = await ffmpeg_session.start_transcode("http://movie", "movie", username="alice")
+    result = await transcode.start_transcode("http://movie", "movie", username="alice")
     sid = result["session_id"]
     assert set(env.sessions) == {sid}
     assert not (tmp_path / "old").exists()
@@ -1999,7 +2001,7 @@ async def test_start_resumes_a_cached_vod_session(
     env: _Env,
     tasks: BackgroundTasks,
     tmp_path: pathlib.Path,
-    content_type: ffmpeg_session.ContentType,
+    content_type: transcode.ContentType,
     probes: int,
 ):
     del tasks
@@ -2007,7 +2009,7 @@ async def test_start_resumes_a_cached_vod_session(
     _existing(env, tmp_path, "http://movie")
     env.sessions["old"].update(process=FakeProcess(exited=True), is_vod=True, seek_offset=0)
     (tmp_path / "old" / "seg000.ts").write_bytes(b"x" * 2000)
-    result = await ffmpeg_session.start_transcode("http://movie", content_type)
+    result = await transcode.start_transcode("http://movie", content_type)
     assert result["session_id"] == "old"
     (command,) = env.launcher.commands
     assert _option(command, "-i") == "http://movie"
@@ -2024,7 +2026,7 @@ async def test_start_rotates_the_users_oldest_stream(
     del tasks
     env.sessions["older"] = _live(tmp_path, url="http://other")
     env.sessions["older"].update(username="alice", started=1)
-    result = await ffmpeg_session.start_transcode(
+    result = await transcode.start_transcode(
         "http://live",
         username="alice",
         user_max_streams=1,
@@ -2041,7 +2043,7 @@ async def test_start_cleans_up_unreusable_session(
     del tasks
     _existing(env, tmp_path, "http://movie")
     env.sessions["old"].update(process=FakeProcess(exited=True), is_vod=True)
-    result = await ffmpeg_session.start_transcode("http://movie", "movie")
+    result = await transcode.start_transcode("http://movie", "movie")
     assert set(env.sessions) == {result["session_id"]}
     assert len(env.launcher.commands) == 1
 
@@ -2054,7 +2056,7 @@ async def test_start_fast_live_without_dvr(
 ):
     del tasks
     cache.save_server_settings({**cache.load_server_settings(), "live_dvr_mins": 0})
-    result = await ffmpeg_session.start_transcode("http://live")
+    result = await transcode.start_transcode("http://live")
     assert result.get("master_playlist") == f"/transcode/{result['session_id']}/master.m3u8"
     session = env.sessions[result["session_id"]]
     assert (session.get("username"), session.get("source_id")) == ("", "")
@@ -2078,9 +2080,9 @@ async def test_start_retries_movie_with_a_stale_cached_probe(
     cache.save_server_settings({**cache.load_server_settings(), "probe_series": False})
     env.run.program("ffprobe", Program(stdout=_DOLBY_PROBE))
     stale = MediaInfo(video_codec="h264", audio_codec="aac", pix_fmt="yuv420p", height=720)
-    ffmpeg_command.remember_probe("http://movie", stale)
+    probe.remember_probe("http://movie", stale)
     launcher = _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
-    result = await ffmpeg_session.start_transcode(
+    result = await transcode.start_transcode(
         "http://movie",
         "movie",
         username="alice",
@@ -2088,7 +2090,7 @@ async def test_start_retries_movie_with_a_stale_cached_probe(
     )
     assert env.sessions[result["session_id"]].get("audio_passthrough") is True
     assert len(launcher.commands) == 2
-    assert ffmpeg_command.probe_media("http://movie", source_id="")[0] != stale
+    assert probe.probe_media("http://movie", source_id="")[0] != stale
 
 
 @pytest.mark.asyncio
@@ -2099,7 +2101,7 @@ async def test_start_does_not_retry_a_freshly_probed_movie(
     env.run.program("ffprobe", Program(stdout=_DOLBY_PROBE))
     launcher = _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
     with pytest.raises(HTTPException):
-        await ffmpeg_session.start_transcode("http://movie", "movie", username="alice")
+        await transcode.start_transcode("http://movie", "movie", username="alice")
     assert len(launcher.commands) == 1
 
 
@@ -2114,11 +2116,11 @@ async def test_start_reprobes_an_episode_the_series_probe_misfits(
     cache.save_server_settings({**cache.load_server_settings(), "probe_series": True})
     env.run.program("ffprobe", Program(stdout=_DOLBY_PROBE))
     typical = MediaInfo(video_codec="h264", audio_codec="aac", pix_fmt="yuv420p", duration=1)
-    ffmpeg_command.restore_probe_cache_entry("http://ep1", typical, [], 3, 1)
-    ffmpeg_command._series_probe_cache[3]["mru"] = 1
+    probe.restore_probe_cache_entry("http://ep1", typical, [], 3, 1)
+    probe._series_probe_cache[3]["mru"] = 1
     launcher = _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-        await ffmpeg_session.start_transcode(
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
+        await transcode.start_transcode(
             "http://ep4",
             "series",
             series_id=3,
@@ -2131,7 +2133,7 @@ async def test_start_reprobes_an_episode_the_series_probe_misfits(
     ]
     assert len(launcher.commands) == 2
     assert [call[-1] for call in env.run.calls if call[0] == "ffprobe"] == ["http://ep4"]
-    series = ffmpeg_command._series_probe_cache[3]
+    series = probe._series_probe_cache[3]
     # The misfit is recorded as its own episode; others keep the typical probe.
     assert series["episodes"][4][1] is not None
     assert series["episodes"][4][1].height == 720
@@ -2148,10 +2150,10 @@ async def test_start_reprobes_a_stale_cached_episode(
     cache.save_server_settings({**cache.load_server_settings(), "probe_series": True})
     env.run.program("ffprobe", Program(stdout=_DOLBY_PROBE))
     media = MediaInfo(video_codec="h264", audio_codec="aac", pix_fmt="yuv420p", duration=1)
-    ffmpeg_command.restore_probe_cache_entry("http://other", media, [], 3, 4)
-    ffmpeg_command.restore_probe_cache_entry("http://other", media, [], 3, 5)
+    probe.restore_probe_cache_entry("http://other", media, [], 3, 4)
+    probe.restore_probe_cache_entry("http://other", media, [], 3, 5)
     launcher = _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
-    result = await ffmpeg_session.start_transcode(
+    result = await transcode.start_transcode(
         "http://ep",
         "series",
         series_id=3,
@@ -2173,7 +2175,7 @@ async def test_start_reprobes_a_stale_cached_episode(
     # The retry probed afresh and found Dolby audio this client can decode.
     assert session.get("audio_passthrough") is True
     assert len(launcher.commands) == 2
-    (series,) = ffmpeg_command.get_series_probe_cache_stats()
+    (series,) = probe.get_series_probe_cache_stats()
     assert series["name"] == "Show"
     assert sorted(episode["episode_id"] for episode in series["episodes"]) == [4, 5]
 
@@ -2188,7 +2190,7 @@ async def test_retry_keeps_the_requested_deinterlacing(
 ):
     del tasks
     cache.save_server_settings({**cache.load_server_settings(), "transcode_hw": "software"})
-    ffmpeg_command.restore_probe_cache_entry(
+    probe.restore_probe_cache_entry(
         "http://other",
         MediaInfo(video_codec="h264", audio_codec="aac", pix_fmt="yuv420p"),
         [],
@@ -2196,7 +2198,7 @@ async def test_retry_keeps_the_requested_deinterlacing(
         1,
     )
     launcher = _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
-    result = await ffmpeg_session.start_transcode(
+    result = await transcode.start_transcode(
         "http://ep",
         "series",
         series_id=3,
@@ -2222,7 +2224,7 @@ async def test_retry_still_honours_a_disconnected_archive_client(
     async def disconnected() -> bool:
         return next(answers)
 
-    ffmpeg_command.restore_probe_cache_entry(
+    probe.restore_probe_cache_entry(
         "http://other",
         MediaInfo(video_codec="h264", audio_codec="aac", pix_fmt="yuv420p"),
         [],
@@ -2231,7 +2233,7 @@ async def test_retry_still_honours_a_disconnected_archive_client(
     )
     launcher = _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session.start_transcode(
+        await transcode.start_transcode(
             ARCHIVE_URL,
             "series",
             series_id=3,
@@ -2251,7 +2253,7 @@ async def test_failed_movie_start_is_not_retried(
     del tasks
     launcher = _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session.start_transcode("http://movie", "movie")
+        await transcode.start_transcode("http://movie", "movie")
     assert error.value.status_code == 500
     assert len(launcher.commands) == 1
     assert not env.sessions
@@ -2283,7 +2285,7 @@ def test_live_resolution_caps_saver_at_720p_without_raising_480p(
 ):
     _save_max_resolution(max_resolution)
     settings = cache.load_server_settings()
-    assert ffmpeg_session._live_resolution(settings, bandwidth_saver=bandwidth_saver) == resolution
+    assert transcode._live_resolution(settings, bandwidth_saver=bandwidth_saver) == resolution
 
 
 @pytest.mark.asyncio
@@ -2322,7 +2324,7 @@ async def test_dvr_start_copies_only_copyable_sources(
         ],
     }
     env.run.program("ffprobe", Program(stdout=json.dumps(source)), when="-show_streams")
-    await ffmpeg_session.start_transcode("http://live", audio_passthrough=passthrough)
+    await transcode.start_transcode("http://live", audio_passthrough=passthrough)
     (worker,) = env.launcher.commands
     assert _option(worker, "-i") == "pipe:0"
     assert ("-c" in worker and _option(worker, "-c") == "copy") is remux
@@ -2353,7 +2355,7 @@ async def test_start_passes_viewer_choices_to_fast_start(env: _Env, fast_env: Ba
         ),
         when="-show_streams",
     )
-    result = await ffmpeg_session.start_transcode(
+    result = await transcode.start_transcode(
         "http://live",
         deinterlace_fallback=False,
         audio_passthrough=True,
@@ -2364,7 +2366,7 @@ async def test_start_passes_viewer_choices_to_fast_start(env: _Env, fast_env: Ba
     session = env.sessions[result["session_id"]]
     assert (session.get("username"), session.get("source_id")) == ("alice", "src")
     # Its relay dials by its source's rule.
-    assert ffmpeg_session._is_fast_live(session)
+    assert transcode._is_fast_live(session)
     assert session["plan"].source_id == "src"
     assert session.get("bandwidth_saver") is True
     assert session.get("audio_passthrough") is True
@@ -2383,7 +2385,7 @@ async def test_fast_start_gives_up_when_the_client_disconnects(
     del fast_env
     _save_max_resolution("4k")
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session.start_transcode("http://live", is_disconnected=_disconnected)
+        await transcode.start_transcode("http://live", is_disconnected=_disconnected)
     assert (error.value.status_code, error.value.detail) == (499, "Playback request disconnected")
     (worker,) = env.launcher.processes
     assert worker.signals == ["TERM"]
@@ -2408,7 +2410,7 @@ async def test_failed_fast_start_reports_the_worker_exit_and_the_upstream(
     del fast_env
     _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session.start_transcode(url)
+        await transcode.start_transcode(url)
     assert (error.value.status_code, error.value.detail) == (
         500,
         "Fast-start stream failed to become ready",
@@ -2421,7 +2423,7 @@ async def test_failed_fast_start_reports_the_worker_exit_and_the_upstream(
 @pytest.mark.asyncio
 async def test_start_passes_the_request_to_the_transcoder(env: _Env, tasks: BackgroundTasks):
     del tasks
-    result = await ffmpeg_session.start_transcode(
+    result = await transcode.start_transcode(
         "http://ep",
         "series",
         series_id=3,
@@ -2443,7 +2445,7 @@ async def test_start_passes_probe_choices_to_the_transcoder(env: _Env, tasks: Ba
     del tasks
     cache.save_server_settings({**cache.load_server_settings(), "probe_series": True})
     env.run.program("ffprobe", Program(stdout=_DOLBY_PROBE))
-    result = await ffmpeg_session.start_transcode(
+    result = await transcode.start_transcode(
         "http://ep",
         "series",
         series_id=3,
@@ -2452,7 +2454,7 @@ async def test_start_passes_probe_choices_to_the_transcoder(env: _Env, tasks: Ba
         audio_passthrough=True,
     )
     assert env.sessions[result["session_id"]].get("audio_passthrough") is True
-    (series,) = ffmpeg_command.get_series_probe_cache_stats()
+    (series,) = probe.get_series_probe_cache_stats()
     assert series["name"] == "Show"
 
 
@@ -2477,8 +2479,8 @@ async def test_do_start_records_the_probed_session(
         {**cache.load_server_settings(), "probe_series": True, "max_resolution": "1080p"},
     )
     env.run.program("ffprobe", Program(stdout=_DOLBY_PROBE))
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-        result = await ffmpeg_session._do_start_transcode(
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
+        result = await transcode._do_start_transcode(
             "http://ep",
             "series",
             3,
@@ -2496,7 +2498,7 @@ async def test_do_start_records_the_probed_session(
     directory = pathlib.Path(session["dir"])
     assert directory.parent == env.root
     assert directory.name.startswith(f"netv_transcode_{sid}_")
-    subtitles: list[ffmpeg_session.StoredSubtitle | int] = [
+    subtitles: list[transcode.StoredSubtitle | int] = [
         {"index": 2, "lang": "eng", "name": "English"},
         {"index": 3, "lang": "spa", "name": "Spanish"},
     ]
@@ -2536,7 +2538,7 @@ async def test_do_start_records_the_probed_session(
     assert "0:3" in command
     assert _option(command, "-c:a") == "copy"
     assert "BANDWIDTH=9440000," in (directory / "captions.m3u8").read_text()
-    (series,) = ffmpeg_command.get_series_probe_cache_stats()
+    (series,) = probe.get_series_probe_cache_stats()
     assert (series["series_id"], series["name"]) == (3, "Show")
     assert [episode["episode_id"] for episode in series["episodes"]] == [4]
     assert [r.getMessage() for r in caplog.records] == [
@@ -2565,8 +2567,8 @@ async def test_do_start_logs_a_sparse_probe(
         ],
     }
     env.run.program("ffprobe", Program(stdout=json.dumps(sparse)))
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-        await ffmpeg_session._do_start_transcode("http://movie", "movie", None, None, 0)
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
+        await transcode._do_start_transcode("http://movie", "movie", None, None, 0)
     # No bitrate, no format duration, and no subtitle streams.
     assert caplog.records[0].getMessage() == (
         "Probe: video=hevc/yuv420p10le/2160p/? audio=aac/2ch/44100Hz duration=0s subs=none"
@@ -2579,7 +2581,7 @@ async def test_do_start_defaults(env: _Env, tasks: BackgroundTasks):
     cache.save_server_settings(
         {**cache.load_server_settings(), "probe_movies": False, "transcode_hw": "software"},
     )
-    result = await ffmpeg_session._do_start_transcode("http://movie", "movie", None, None, 0)
+    result = await transcode._do_start_transcode("http://movie", "movie", None, None, 0)
     session = env.sessions[result["session_id"]]
     assert (session.get("username"), session.get("source_id")) == ("", "")
     assert (session.get("duration"), session.get("audio_passthrough")) == (0.0, False)
@@ -2598,14 +2600,14 @@ async def test_do_start_series_defaults_keep_dolby_from_aac_clients(
     del tasks
     cache.save_server_settings({**cache.load_server_settings(), "probe_series": True})
     env.run.program("ffprobe", Program(stdout=_DOLBY_PROBE))
-    result = await ffmpeg_session._do_start_transcode("http://ep", "series", 9, None, 0)
+    result = await transcode._do_start_transcode("http://ep", "series", 9, None, 0)
     session = env.sessions[result["session_id"]]
     assert session.get("is_vod") is True
     assert session.get("audio_passthrough") is False
     (command,) = env.launcher.commands
     assert _option(command, "-c:a") == "aac"
     assert _option(command, "-hls_list_size") == "0"
-    (series,) = ffmpeg_command.get_series_probe_cache_stats()
+    (series,) = probe.get_series_probe_cache_stats()
     assert (series["name"], [e["episode_id"] for e in series["episodes"]]) == ("", [0])
 
 
@@ -2620,7 +2622,7 @@ async def test_do_start_applies_the_quality_setting(env: _Env, tasks: Background
             "transcode_hw": "software",
         },
     )
-    result = await ffmpeg_session._do_start_transcode("http://movie", "movie", None, None, 0)
+    result = await transcode._do_start_transcode("http://movie", "movie", None, None, 0)
     assert env.run.calls == []
     assert env.sessions[result["session_id"]].get("is_vod") is True
     (command,) = env.launcher.commands
@@ -2647,10 +2649,10 @@ async def test_failed_start_reports_the_last_stderr_lines(
     launcher = _relaunch(monkeypatch, [FakeProcess(exit_code=exit_code, stderr=stderr)])
     launcher.on_launch = None
     with (
-        caplog.at_level(logging.DEBUG, logger="netv.ffmpeg_session"),
+        caplog.at_level(logging.DEBUG, logger="netv.ffmpeg.transcode"),
         pytest.raises(HTTPException) as error,
     ):
-        await ffmpeg_session._do_start_transcode("http://movie", "movie", None, None, seek_offset)
+        await transcode._do_start_transcode("http://movie", "movie", None, None, seek_offset)
     assert (error.value.status_code, error.value.detail) == (
         500,
         "Transcode failed - check server logs for details",
@@ -2681,7 +2683,7 @@ async def test_do_start_needs_two_published_segments(
         ["seg000.ts"],
     )
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session._do_start_transcode("http://movie", "movie", None, None, 0)
+        await transcode._do_start_transcode("http://movie", "movie", None, None, 0)
     assert error.value.status_code == 500
 
 
@@ -2692,7 +2694,7 @@ async def test_do_start_ignores_disconnects_for_ordinary_streams(
 ):
     del tasks
     cache.save_server_settings({**cache.load_server_settings(), "probe_movies": False})
-    result = await ffmpeg_session._do_start_transcode(
+    result = await transcode._do_start_transcode(
         "http://movie",
         "movie",
         None,
@@ -2712,7 +2714,7 @@ async def test_do_start_cancelled_while_waiting_releases_a_recent_session(
     cache.save_server_settings({**cache.load_server_settings(), "probe_movies": False})
     env.launcher.on_launch = None
     task = asyncio.create_task(
-        ffmpeg_session._do_start_transcode("http://movie", "movie", None, None, 0),
+        transcode._do_start_transcode("http://movie", "movie", None, None, 0),
     )
     await until(lambda: env.sessions)
     task.cancel()
@@ -2741,7 +2743,7 @@ def archive(
     engines = tmp_path / "engines"
     engines.mkdir()
     (engines / "2x-nomosuni-compact_1080p_fp16.engine").write_bytes(b"engine")
-    monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", str(engines))
+    monkeypatch.setattr(commands, "_sr_engine_dir", str(engines))
     cache.save_server_settings(
         {
             **cache.load_server_settings(),
@@ -2766,7 +2768,7 @@ async def test_archive_bypasses_upscale_without_changing_movies(
     url: str,
     upscale: bool,
 ):
-    result = await ffmpeg_session.start_transcode(url, "movie")
+    result = await transcode.start_transcode(url, "movie")
     [command] = archive.launcher.commands
     video_filter = command[command.index("-vf") + 1]
     assert ("dnn_processing=" in video_filter) is upscale
@@ -2795,8 +2797,8 @@ async def test_fast_start_reads_the_best_variant_through_one_remuxer(
         b"#EXT-X-STREAM-INF:BANDWIDTH=8000000\n1_hi.m3u8\n",
     )
     remuxers = PopenRecorder()
-    install_subprocess(monkeypatch, ffmpeg_session, popen=remuxers)
-    task = asyncio.create_task(ffmpeg_session.start_transcode(master, "live", source_id="h"))
+    install_subprocess(monkeypatch, transcode, popen=remuxers)
+    task = asyncio.create_task(transcode.start_transcode(master, "live", source_id="h"))
     await until(lambda: remuxers.started)
     (remuxer,) = remuxers.started
     try:
@@ -2811,13 +2813,13 @@ async def test_fast_start_reads_the_best_variant_through_one_remuxer(
             "env": proxy.ffmpeg_env(),
         }
         session = env.sessions[result["session_id"]]
-        assert ffmpeg_session._is_fast_live(session)
+        assert transcode._is_fast_live(session)
         # Each connection resolves anew: variant URLs carry tokens that expire.
         assert session["plan"].source_url == master
         # Reuse and casting match the URL the client asked for.
         assert session["url"] == master
         assert env.urls[master] == result["session_id"]
-        await ffmpeg_session.stop_session(result["session_id"], force=True)
+        await transcode.stop_session(result["session_id"], force=True)
         # Closing the relay stops the remuxer and its pipe.
         assert set(remuxer.signals) == {"KILL"}
         assert remuxer.stdout.closed
@@ -2830,7 +2832,7 @@ def test_direct_sources_open_once_with_a_burst_tolerant_timeout(
     upstreams: FakeUpstreams,
 ):
     """Panels send TS in ~10 s segment bursts; 30 s of silence ends the relay for the watchdog."""
-    body = ffmpeg_session._open_source("http://live", "agent/1", "s")
+    body = transcode._open_source("http://live", "agent/1", "s")
     assert body is upstreams.opened[0]
     (fetch,) = env.web.fetches
     assert (fetch.url, fetch.timeout, fetch.headers) == (
@@ -2877,7 +2879,7 @@ async def test_a_tuner_a_home_lineup_lists_is_read_on_the_home_network(
     await stream.close()
     _relaunch(monkeypatch, [], error=OSError("no ffmpeg"))
     with pytest.raises(OSError, match="no ffmpeg"):
-        await ffmpeg_session.record_live("alice", tuner, "t", str(recording_dir), 60)
+        await transcode.record_live("alice", tuner, "t", str(recording_dir), 60)
     assert len(env.web.fetches) == 2
     for fetch in env.web.fetches:
         vets = testing.address_vets(fetch)
@@ -2886,9 +2888,9 @@ async def test_a_tuner_a_home_lineup_lists_is_read_on_the_home_network(
 
 @pytest.mark.asyncio
 async def test_archive_stop_releases_recent_session_without_caching(archive: _Env):
-    result = await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie")
+    result = await transcode.start_transcode(ARCHIVE_URL, "movie")
     directory = pathlib.Path(archive.sessions[result["session_id"]]["dir"])
-    await ffmpeg_session.stop_session(result["session_id"])
+    await transcode.stop_session(result["session_id"])
     assert archive.launcher.processes[0].signals == ["TERM"]
     assert not archive.sessions
     assert ARCHIVE_URL not in archive.urls
@@ -2898,7 +2900,7 @@ async def test_archive_stop_releases_recent_session_without_caching(archive: _En
 @pytest.mark.asyncio
 async def test_disconnected_archive_does_not_launch_encoder(archive: _Env):
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie", is_disconnected=_disconnected)
+        await transcode.start_transcode(ARCHIVE_URL, "movie", is_disconnected=_disconnected)
     assert (error.value.status_code, error.value.detail) == (499, "Playback request disconnected")
     assert archive.launcher.launches == []
     assert not list(archive.root.iterdir())
@@ -2912,7 +2914,7 @@ async def test_archive_disconnect_during_playlist_wait_releases_encoder(archive:
         return next(answers)
 
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie", is_disconnected=disconnected)
+        await transcode.start_transcode(ARCHIVE_URL, "movie", is_disconnected=disconnected)
     assert error.value.status_code == 499
     [process] = archive.launcher.processes
     assert process.signals == ["TERM"]
@@ -2923,7 +2925,7 @@ async def test_archive_disconnect_during_playlist_wait_releases_encoder(archive:
 @pytest.mark.asyncio
 async def test_archive_cancelled_startup_releases_encoder(archive: _Env):
     archive.launcher.on_launch = None
-    task = asyncio.create_task(ffmpeg_session.start_transcode(ARCHIVE_URL, "movie"))
+    task = asyncio.create_task(transcode.start_transcode(ARCHIVE_URL, "movie"))
     await until(lambda: archive.launcher.launches)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -2936,18 +2938,18 @@ async def test_archive_cancelled_startup_releases_encoder(archive: _Env):
 
 @pytest.mark.asyncio
 async def test_archive_rejects_file_offset_seek_without_interrupting_playback(archive: _Env):
-    result = await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie")
+    result = await transcode.start_transcode(ARCHIVE_URL, "movie")
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session.seek_transcode(result["session_id"], 600)
+        await transcode.seek_transcode(result["session_id"], 600)
     assert error.value.status_code == 400
     assert archive.launcher.processes[0].returncode is None
 
 
 @pytest.mark.asyncio
 async def test_dead_archive_is_not_resumed_using_byte_seeking(archive: _Env):
-    result = await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie")
+    result = await transcode.start_transcode(ARCHIVE_URL, "movie")
     archive.launcher.processes[0].kill()
-    resumed = await ffmpeg_session._handle_existing_vod_session(
+    resumed = await transcode._handle_existing_vod_session(
         result["session_id"],
         ARCHIVE_URL,
         "software",
@@ -2970,7 +2972,7 @@ async def test_transcode_response_includes_native_caption_playlist(archive: _Env
         },
     )
     archive.run.program("ffprobe", Program(stdout=_MOVIE_PROBE))
-    result = await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie")
+    result = await transcode.start_transcode(ARCHIVE_URL, "movie")
     sid = result["session_id"]
     assert result.get("caption_playlist") == f"/transcode/{sid}/captions.m3u8"
     assert result["subtitles"] == [
@@ -2992,7 +2994,7 @@ async def test_transcode_response_includes_native_caption_playlist(archive: _Env
 def test_adaptive_response_with_captions_and_generation(env: _Env, tmp_path: pathlib.Path):
     env.sessions["s"] = _live(tmp_path)
     env.sessions["s"].update(playlist_generation=3, closed_captions=True, playback_buffer_seconds=8)
-    response = ffmpeg_session._adaptive_session_response("s")
+    response = transcode._adaptive_session_response("s")
     assert response == {
         "session_id": "s",
         "playlist": "/transcode/s/low.m3u8?generation=3",
@@ -3003,26 +3005,26 @@ def test_adaptive_response_with_captions_and_generation(env: _Env, tmp_path: pat
         "seek_offset": 0,
         "caption_playlist": "/transcode/s/low-captions.m3u8?generation=3",
     }
-    missing = ffmpeg_session._adaptive_session_response("missing")
+    missing = transcode._adaptive_session_response("missing")
     assert missing["playlist"] == "/transcode/missing/low.m3u8"
     assert missing.get("playback_buffer_seconds") == 12.0
     assert "caption_playlist" not in missing
 
 
 def test_get_existing_session_variants(env: _Env, tmp_path: pathlib.Path):
-    assert ffmpeg_session._get_existing_session("http://none") is None
+    assert transcode._get_existing_session("http://none") is None
     env.urls["http://dangling"] = "gone"
-    assert ffmpeg_session._get_existing_session("http://dangling") is None
+    assert transcode._get_existing_session("http://dangling") is None
     env.sessions["s"] = _live(tmp_path)
     env.sessions["s"]["seek_offset"] = 7
     env.urls["http://live"] = "s"
-    existing = ffmpeg_session._get_existing_session("http://live")
+    existing = transcode._get_existing_session("http://live")
     assert existing is not None
     assert (existing.session_id, existing.is_valid) == ("s", True)
     assert existing.session == env.sessions["s"]
     assert existing.session is not env.sessions["s"]
     env.sessions["s"]["last_access"] = _NOW - 60
-    existing = ffmpeg_session._get_existing_session("http://live")
+    existing = transcode._get_existing_session("http://live")
     assert existing is not None
     assert existing.is_valid is False
 
@@ -3038,7 +3040,7 @@ async def test_start_resumes_at_the_previous_seek_offset_except_for_archives(
     for url in ("http://movie", ARCHIVE_URL):
         directory = tmp_path / str(len(env.sessions))
         directory.mkdir()
-        env.sessions[url] = ffmpeg_session.TranscodeSession(
+        env.sessions[url] = transcode.TranscodeSession(
             dir=str(directory),
             process=FakeProcess(exited=True),
             started=_NOW,
@@ -3048,8 +3050,8 @@ async def test_start_resumes_at_the_previous_seek_offset_except_for_archives(
             username="",
         )
         env.urls[url] = url
-    await ffmpeg_session.start_transcode("http://movie", "movie")
-    await ffmpeg_session.start_transcode(ARCHIVE_URL, "movie")
+    await transcode.start_transcode("http://movie", "movie")
+    await transcode.start_transcode(ARCHIVE_URL, "movie")
     movie, archive = env.launcher.commands
     assert _option(movie, "-ss") == "30"
     assert "-ss" not in archive
@@ -3069,7 +3071,7 @@ async def test_try_reuse_vod_uses_settings(
     env: _Env,
     tasks: BackgroundTasks,
     tmp_path: pathlib.Path,
-    content_type: ffmpeg_session.VodType,
+    content_type: transcode.VodType,
     probe_movies: bool,
     probe_series: bool,
     probed: bool,
@@ -3086,7 +3088,7 @@ async def test_try_reuse_vod_uses_settings(
         },
     )
     (tmp_path / "seg000.ts").write_bytes(b"x" * 2000)
-    env.sessions["s"] = ffmpeg_session.TranscodeSession(
+    env.sessions["s"] = transcode.TranscodeSession(
         dir=str(tmp_path),
         process=FakeProcess(exited=True),
         url="http://ep",
@@ -3094,7 +3096,7 @@ async def test_try_reuse_vod_uses_settings(
         seek_offset=0,
         started=_NOW,
     )
-    assert await ffmpeg_session._try_reuse_session("s", "http://ep", content_type) is not None
+    assert await transcode._try_reuse_session("s", "http://ep", content_type) is not None
     (command,) = env.launcher.commands
     assert command[command.index("-c:v") + 1] == "h264_nvenc"
     assert command[command.index("-qp") + 1] == "35"
@@ -3113,14 +3115,14 @@ async def test_try_reuse_vod_defaults_without_quality_settings(
         {**cache.load_server_settings(), "transcode_hw": "software", "probe_series": False},
     )
     (tmp_path / "seg000.ts").write_bytes(b"x" * 2000)
-    env.sessions["s"] = ffmpeg_session.TranscodeSession(
+    env.sessions["s"] = transcode.TranscodeSession(
         dir=str(tmp_path),
         process=FakeProcess(exited=True),
         url="http://ep",
         is_vod=True,
         started=_NOW,
     )
-    assert await ffmpeg_session._try_reuse_session("s", "http://ep", "series") is not None
+    assert await transcode._try_reuse_session("s", "http://ep", "series") is not None
     (command,) = env.launcher.commands
     assert command[command.index("-crf") + 1] == "20"
     assert "min(ih\\,1080)" in command[command.index("-vf") + 1]
@@ -3137,7 +3139,7 @@ def seek_dir(env: _Env, tasks: BackgroundTasks, tmp_path: pathlib.Path) -> pathl
     del tasks
     directory = tmp_path / "v"
     directory.mkdir()
-    env.sessions["v"] = ffmpeg_session.TranscodeSession(
+    env.sessions["v"] = transcode.TranscodeSession(
         dir=str(directory),
         process=FakeProcess(exit_code=None),
         url="http://movie",
@@ -3156,7 +3158,7 @@ async def test_seek_unknown_or_live_session_is_404(env: _Env, tmp_path: pathlib.
     env.sessions["live"] = _live(tmp_path)
     for sid in ("missing", "live"):
         with pytest.raises(HTTPException) as error:
-            await ffmpeg_session.seek_transcode(sid, 10)
+            await transcode.seek_transcode(sid, 10)
         assert error.value.status_code == 404
 
 
@@ -3164,7 +3166,7 @@ async def test_seek_unknown_or_live_session_is_404(env: _Env, tmp_path: pathlib.
 async def test_smart_seek_reuses_existing_segment(env: _Env, seek_dir: pathlib.Path):
     old = env.sessions["v"]["process"]
     (seek_dir / "seg001.ts").write_bytes(b"x" * 2000)
-    result = await ffmpeg_session.seek_transcode("v", 4.0)
+    result = await transcode.seek_transcode("v", 4.0)
     assert result == {"session_id": "v", "playlist": "/transcode/v/stream.m3u8"}
     assert env.sessions["v"].get("seek_offset") == 4.0
     assert "#EXT-X-MEDIA-SEQUENCE:1" in (seek_dir / "stream.m3u8").read_text()
@@ -3178,7 +3180,7 @@ async def test_seek_into_a_dead_transcode_restarts_ffmpeg(env: _Env, seek_dir: p
     # Ffmpeg stopped (a full disk); a segment it left behind cannot carry playback on.
     env.sessions["v"]["process"] = FakeProcess(exited=True, exit_code=134)
     (seek_dir / "seg001.ts").write_bytes(b"x" * 2000)
-    result = await ffmpeg_session.seek_transcode("v", 4.0)
+    result = await transcode.seek_transcode("v", 4.0)
     assert result == {"ok": True, "segment": 1, "time": 4.0}
     (command,) = env.launcher.commands
     # Before the playlist: ffmpeg ignores options after its last output.
@@ -3186,7 +3188,7 @@ async def test_seek_into_a_dead_transcode_restarts_ffmpeg(env: _Env, seek_dir: p
 
 
 def _served(session_id: str, number: int) -> int:
-    return ffmpeg_session.note_segment_served(session_id, f"seg{number:03d}.ts", keep_behind_sec=6)
+    return transcode.note_segment_served(session_id, f"seg{number:03d}.ts", keep_behind_sec=6)
 
 
 def test_segments_far_behind_playback_are_deleted(seek_dir: pathlib.Path):
@@ -3210,13 +3212,54 @@ def test_segments_far_behind_playback_are_deleted(seek_dir: pathlib.Path):
     }
 
 
+def test_segments_regenerated_behind_an_eviction_wait_for_playback(seek_dir: pathlib.Path):
+    """A seek back writes segments before the player asks for them; those stay put."""
+    # The first segment is already gone; the ones after it still go.
+    for number in range(1, 8):
+        (seek_dir / f"seg{number:03d}.ts").write_bytes(b"x")
+    assert _served("v", 4) == 1
+    # Fetching exactly the first kept segment moves nothing back.
+    assert _served("v", 2) == 0
+    (seek_dir / "seg000.ts").write_bytes(b"x")
+    assert _served("v", 6) == 2
+    assert (seek_dir / "seg000.ts").exists()
+
+
+def test_played_segments_are_kept_twenty_minutes_by_default(seek_dir: pathlib.Path):
+    (seek_dir / "seg000.ts").write_bytes(b"x")
+    # Twenty minutes of three-second segments is 400 segments.
+    assert transcode.note_segment_served("v", "seg400.ts") == 0
+    assert transcode.note_segment_served("v", "seg401.ts") == 1
+
+
+@pytest.mark.parametrize(
+    ("is_vod", "fast_start", "evicted"),
+    [(None, None, False), (True, None, True), (True, False, True), (False, False, False)],
+)
+def test_only_plain_vod_sessions_evict(
+    env: _Env,
+    seek_dir: pathlib.Path,
+    is_vod: bool | None,
+    fast_start: bool | None,
+    evicted: bool,
+):
+    session = env.sessions["v"]
+    session.pop("is_vod", None)
+    if is_vod is not None:
+        session["is_vod"] = is_vod
+    if fast_start is not None:
+        session["fast_start"] = fast_start
+    (seek_dir / "seg000.ts").write_bytes(b"x")
+    assert transcode.note_segment_served("v", "seg009.ts", keep_behind_sec=0) == int(evicted)
+
+
 @pytest.mark.parametrize(
     "filename",
-    ["stream.m3u8", "sub0_000001.vtt", "segxyz.ts", "seg001.vtt", "missing", "seg.ts"],
+    ["stream.m3u8", "sub0_000001.vtt", "segxyz.ts", "seg001.vtt", "missing", "seg.ts", "seg009"],
 )
 def test_only_vod_segments_count_as_served(seek_dir: pathlib.Path, filename: str):
     (seek_dir / "seg000.ts").write_bytes(b"x")
-    assert ffmpeg_session.note_segment_served("v", filename, keep_behind_sec=0) == 0
+    assert transcode.note_segment_served("v", filename, keep_behind_sec=0) == 0
     assert (seek_dir / "seg000.ts").exists()
 
 
@@ -3225,12 +3268,12 @@ def test_served_segments_of_live_or_unknown_sessions_are_kept(
     seek_dir: pathlib.Path,
 ):
     (seek_dir / "seg000.ts").write_bytes(b"x")
-    assert ffmpeg_session.note_segment_served("missing", "seg009.ts", keep_behind_sec=0) == 0
+    assert transcode.note_segment_served("missing", "seg009.ts", keep_behind_sec=0) == 0
     env.sessions["v"]["fast_start"] = True
-    assert ffmpeg_session.note_segment_served("v", "seg009.ts", keep_behind_sec=0) == 0
+    assert transcode.note_segment_served("v", "seg009.ts", keep_behind_sec=0) == 0
     env.sessions["v"]["fast_start"] = False
     env.sessions["v"]["is_vod"] = False
-    assert ffmpeg_session.note_segment_served("v", "seg009.ts", keep_behind_sec=0) == 0
+    assert transcode.note_segment_served("v", "seg009.ts", keep_behind_sec=0) == 0
     assert (seek_dir / "seg000.ts").exists()
 
 
@@ -3241,7 +3284,7 @@ async def test_seek_restarts_ffmpeg_at_target(env: _Env, seek_dir: pathlib.Path)
     for name in ("seg005.ts", "segxyz.ts", "sub0.vtt", "stream.m3u8"):
         (seek_dir / name).write_bytes(b"x")
     (seek_dir / "session.json").write_text(json.dumps({"seek_offset": 0}))
-    result = await ffmpeg_session.seek_transcode("v", 9.0)
+    result = await transcode.seek_transcode("v", 9.0)
     assert result == {"ok": True, "segment": 3, "time": 9.0}
     assert old is not None
     assert old.returncode == -15
@@ -3274,7 +3317,7 @@ async def test_seek_timeout_without_probe_tolerates_bad_session_json(
     (seek_dir / "session.json").write_text("{bad")
     env.launcher.on_launch = None
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session.seek_transcode("v", 1.0)
+        await transcode.seek_transcode("v", 1.0)
     assert error.value.status_code == 500
     assert env.run.calls == []
     assert "caption_timestamp_origin" not in env.sessions["v"]
@@ -3289,7 +3332,7 @@ async def test_seek_kills_new_process_when_session_disappears(
     del seek_dir
     env.launcher.on_launch = lambda command: env.sessions.pop("v")
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session.seek_transcode("v", 1.0)
+        await transcode.seek_transcode("v", 1.0)
     assert error.value.status_code == 404
     assert env.launcher.processes[0].returncode == -15
 
@@ -3299,7 +3342,7 @@ async def test_seek_caption_preparation_failure(env: _Env, seek_dir: pathlib.Pat
     seek_dir.chmod(0o555)
     try:
         with pytest.raises(HTTPException) as error:
-            await ffmpeg_session.seek_transcode("v", 1.0)
+            await transcode.seek_transcode("v", 1.0)
     finally:
         seek_dir.chmod(0o755)
     assert error.value.status_code == 500
@@ -3315,10 +3358,10 @@ def test_feedback_decision_and_heartbeat(env: _Env, tmp_path: pathlib.Path):
     env.sessions["live"] = _fast_health_session(tmp_path, bandwidth_saver=False)
     env.sessions["live"].update(username="viewer", last_access=0, closed_captions=False)
     health = PlaybackHealth(buffer_seconds=0, waiting=True)
-    decisions: list[ffmpeg_session.HealthResponse] = []
+    decisions: list[transcode.HealthResponse] = []
     for now in range(0, 26, 2):
         env.clock.now = now
-        decisions.append(ffmpeg_session.report_playback_health("live", "viewer", health))
+        decisions.append(transcode.report_playback_health("live", "viewer", health))
     assert decisions[-2] == {"bandwidth_saver": False, "playlist": "/transcode/live/low.m3u8"}
     assert decisions[-1] == {"bandwidth_saver": True}
     assert env.sessions["live"].get("last_access") == 24
@@ -3334,7 +3377,7 @@ def test_feedback_requires_owner_and_live_session(env: _Env, tmp_path: pathlib.P
         ("vod", "viewer", 400),
     ]:
         with pytest.raises(HTTPException) as error:
-            ffmpeg_session.report_playback_health(session_id, username, health)
+            transcode.report_playback_health(session_id, username, health)
         assert error.value.status_code == status
 
 
@@ -3343,14 +3386,14 @@ def test_feedback_remembers_the_full_quality_requirement(env: _Env, tmp_path: pa
     env.sessions["live"]["closed_captions"] = False
     for required in (3e6, 2e6):
         health = PlaybackHealth(buffer_seconds=10, waiting=False, required_bitrate=required)
-        assert ffmpeg_session.report_playback_health("live", "u", health) == {
+        assert transcode.report_playback_health("live", "u", health) == {
             "bandwidth_saver": False,
             "playlist": "/transcode/live/low.m3u8",
         }
     assert env.sessions["live"].get("recovery_bitrate") == 3e6
     env.sessions["live"]["bandwidth_saver"] = True
     health = PlaybackHealth(buffer_seconds=10, waiting=False, required_bitrate=9e6)
-    ffmpeg_session.report_playback_health("live", "u", health)
+    transcode.report_playback_health("live", "u", health)
     assert env.sessions["live"].get("recovery_bitrate") == 3e6
 
 
@@ -3367,7 +3410,7 @@ def test_fast_start_health_learns_bitrate_from_live_encoder(env: _Env, tmp_path:
     env.sessions["f"].update(process=encoder, playlist_generation=2)
     health = PlaybackHealth(buffer_seconds=10, waiting=False, observed_bitrate=1e8)
     _low_playlist(tmp_path, 1250)
-    assert ffmpeg_session.report_playback_health("f", "u", health) == {
+    assert transcode.report_playback_health("f", "u", health) == {
         "bandwidth_saver": False,
         "playlist": "/transcode/f/low.m3u8?generation=2",
         "caption_playlist": "/transcode/f/low-captions.m3u8?generation=2",
@@ -3375,7 +3418,7 @@ def test_fast_start_health_learns_bitrate_from_live_encoder(env: _Env, tmp_path:
     assert env.sessions["f"].get("recovery_bitrate") == 5e6
     encoder.returncode = 1
     _low_playlist(tmp_path, 2250)
-    ffmpeg_session.report_playback_health("f", "u", health)
+    transcode.report_playback_health("f", "u", health)
     assert env.sessions["f"].get("recovery_bitrate") == 5e6
 
 
@@ -3384,7 +3427,7 @@ def _fast_health_session(
     *,
     bandwidth_saver: bool,
     recovery_bitrate: float = 0,
-) -> ffmpeg_session.FastLiveSession:
+) -> transcode.FastLiveSession:
     """A captioned fast-start session owned by "u" whose worker has exited."""
     session = _fast_session(tmp_path, FakeProcess(exited=True))
     session.update(
@@ -3404,10 +3447,10 @@ def test_congestion_on_full_quality_session_omits_playlist_so_clients_retune(
 ):
     env.sessions["f"] = _fast_health_session(tmp_path, bandwidth_saver=False)
     stalled = PlaybackHealth(buffer_seconds=0, waiting=True)
-    results: list[ffmpeg_session.HealthResponse] = []
+    results: list[transcode.HealthResponse] = []
     for now in range(0, 26, 2):
         env.clock.now = _NOW + now
-        results.append(ffmpeg_session.report_playback_health("f", "u", stalled))
+        results.append(transcode.report_playback_health("f", "u", stalled))
     assert results[0] == {
         "bandwidth_saver": False,
         "playlist": "/transcode/f/low.m3u8",
@@ -3422,10 +3465,10 @@ def test_recovery_on_saver_session_omits_playlist_so_clients_retune(
 ):
     env.sessions["f"] = _fast_health_session(tmp_path, bandwidth_saver=True, recovery_bitrate=1000)
     good = PlaybackHealth(buffer_seconds=12, waiting=False, observed_bitrate=100_000)
-    results: list[ffmpeg_session.HealthResponse] = []
+    results: list[transcode.HealthResponse] = []
     for now in range(0, 62, 2):
         env.clock.now = _NOW + now
-        results.append(ffmpeg_session.report_playback_health("f", "u", good))
+        results.append(transcode.report_playback_health("f", "u", good))
     assert results[0] == {
         "bandwidth_saver": True,
         "playlist": "/transcode/f/low.m3u8",
@@ -3477,7 +3520,7 @@ async def test_start_fast_live_runs_one_worker_fed_by_the_relay(
     bitrate: str,
     height: str,
 ):
-    result = await ffmpeg_session._start_fast_live(
+    result = await transcode._start_fast_live(
         "http://live",
         "alice",
         "src",
@@ -3486,7 +3529,7 @@ async def test_start_fast_live_runs_one_worker_fed_by_the_relay(
     )
     sid = result["session_id"]
     session = env.sessions[sid]
-    assert ffmpeg_session._is_fast_live(session)
+    assert transcode._is_fast_live(session)
     (launch,) = env.launcher.launches
     worker = launch.command
     assert launch.options["stdin"] == asyncio.subprocess.PIPE
@@ -3552,14 +3595,14 @@ def test_xtream_live_reads_mpegts_where_the_panel_allows_it(env: _Env):
     info = {"user_info": {"allowed_output_formats": ["m3u8", "ts"]}}
     env.web.routes[api] = lambda: FakeResponse(json.dumps(info).encode())
     hls = "https://panel/live/u/p/7.m3u8"
-    assert ffmpeg_session._relay_url(hls, "x") == "https://panel/live/u/p/7.ts"
-    assert ffmpeg_session._relay_url("https://panel/live/u/p/8.m3u8", "x").endswith("/8.ts")
+    assert transcode._relay_url(hls, "x") == "https://panel/live/u/p/7.ts"
+    assert transcode._relay_url("https://panel/live/u/p/8.m3u8", "x").endswith("/8.ts")
     # The panel's formats are asked once per source.
     assert env.web.urls == [api]
     # A list's HLS URL is the only format it offers; other URLs are already TS.
-    assert ffmpeg_session._relay_url(hls, "m") == hls
-    assert ffmpeg_session._relay_url(hls, "gone") == hls
-    assert ffmpeg_session._relay_url("https://panel/live/u/p/7.ts", "x").endswith("/7.ts")
+    assert transcode._relay_url(hls, "m") == hls
+    assert transcode._relay_url(hls, "gone") == hls
+    assert transcode._relay_url("https://panel/live/u/p/7.ts", "x").endswith("/7.ts")
     assert env.web.urls == [api]
 
 
@@ -3576,8 +3619,8 @@ def test_xtream_live_stays_hls_where_ts_is_not_offered(env: _Env, answer: object
     api = _panel()
     env.web.routes[api] = lambda: FakeResponse(json.dumps(answer).encode())
     hls = "https://panel/live/u/p/7.m3u8"
-    assert ffmpeg_session._relay_url(hls, "x") == hls
-    assert ffmpeg_session._relay_url(hls, "x") == hls
+    assert transcode._relay_url(hls, "x") == hls
+    assert transcode._relay_url(hls, "x") == hls
     assert env.web.urls == [api]
 
 
@@ -3587,8 +3630,8 @@ def test_unreachable_panel_api_keeps_hls_and_asks_again(
 ):
     api = _panel()
     hls = "https://panel/live/u/p/7.m3u8"
-    assert ffmpeg_session._relay_url(hls, "x") == hls
-    assert ffmpeg_session._relay_url(hls, "x") == hls
+    assert transcode._relay_url(hls, "x") == hls
+    assert transcode._relay_url(hls, "x") == hls
     assert env.web.urls == [api, api]
     assert [record.getMessage() for record in caplog.records] == [
         "Xtream source x did not report its output formats",
@@ -3603,9 +3646,9 @@ async def test_sources_that_deliver_in_bursts_start_with_a_reserve_that_bridges_
 ):
     """A source that went silent for 10 s between bursts gets 10 s of output before playing."""
     del fast_env
-    first = await ffmpeg_session._start_fast_live("http://live", "alice", "src", False)
+    first = await transcode._start_fast_live("http://live", "alice", "src", False)
     session = env.sessions[first["session_id"]]
-    assert ffmpeg_session._is_fast_live(session)
+    assert transcode._is_fast_live(session)
     # Continuous so far: two 4 s segments suffice and clients hold the 12 s default.
     assert first.get("playback_buffer_seconds") == 12.0
     # A pattern: one silence alone could be a stall.
@@ -3613,9 +3656,9 @@ async def test_sources_that_deliver_in_bursts_start_with_a_reserve_that_bridges_
         env.clock.advance(10)
         upstreams.opened[0].feed(video_packet(pts))
         await session["relay"].wait_for_bytes(len(session["relay"].history()) + 1)
-    await ffmpeg_session.stop_session(first["session_id"], force=True)
+    await transcode.stop_session(first["session_id"], force=True)
     # The next session on this source waits for output covering the gap.
-    task = asyncio.create_task(ffmpeg_session._start_fast_live("http://live", "bob", "src", False))
+    task = asyncio.create_task(transcode._start_fast_live("http://live", "bob", "src", False))
     await until(lambda: len(env.launcher.launches) == 2)
     directory = pathlib.Path(env.launcher.launches[1].command[-1]).parent
     for _ in range(20):
@@ -3625,7 +3668,7 @@ async def test_sources_that_deliver_in_bursts_start_with_a_reserve_that_bridges_
     second = await task
     assert second.get("playback_buffer_seconds") == 20.0
     assert env.sessions[second["session_id"]].get("watchdog_stale_after") == 45.0
-    await ffmpeg_session.stop_session(second["session_id"], force=True)
+    await transcode.stop_session(second["session_id"], force=True)
 
 
 @pytest.mark.asyncio
@@ -3640,16 +3683,16 @@ async def test_a_client_holding_its_own_lead_is_answered_at_the_first_segment(
     def first_segment(command: list[str]) -> None:
         _media_playlist(pathlib.Path(command[-1]), ["low_000000.ts"], duration=0.25)
 
-    install_launcher(monkeypatch, ProcessLauncher(on_launch=first_segment), ffmpeg_session)
-    result = await ffmpeg_session.start_transcode("http://live", min_segments=1)
+    install_launcher(monkeypatch, ProcessLauncher(on_launch=first_segment), transcode)
+    result = await transcode.start_transcode("http://live", min_segments=1)
     assert result["session_id"] in env.sessions
-    await ffmpeg_session.stop_session(result["session_id"], force=True)
+    await transcode.stop_session(result["session_id"], force=True)
 
 
 @pytest.mark.asyncio
 async def test_a_prestarted_live_session_waits_for_its_page(env: _Env, fast_env: BackgroundTasks):
     """The play page starts the stream while its scripts load; the page then joins it."""
-    ffmpeg_session.prestart_live(
+    transcode.prestart_live(
         "http://live",
         username="alice",
         source_id="src",
@@ -3663,7 +3706,7 @@ async def test_a_prestarted_live_session_waits_for_its_page(env: _Env, fast_env:
     # Nobody watches yet: the prestart is not a viewer that would hold the stream.
     assert env.sessions[session_id].get("viewers") == {}
 
-    page = await ffmpeg_session.start_transcode(
+    page = await transcode.start_transcode(
         "http://live",
         username="alice",
         source_id="src",
@@ -3672,14 +3715,14 @@ async def test_a_prestarted_live_session_waits_for_its_page(env: _Env, fast_env:
 
     assert page["session_id"] == session_id
     session = env.sessions[session_id]
-    assert ffmpeg_session._is_fast_live(session)
+    assert transcode._is_fast_live(session)
     assert list(session["viewers"]) == [page.get("viewer_id")]
     assert len(env.launcher.launches) == 1
-    await ffmpeg_session.stop_session(session_id, force=True)
+    await transcode.stop_session(session_id, force=True)
 
 
 def _pretune(url: str, username: str = "alice") -> None:
-    ffmpeg_session.pretune_live(
+    transcode.pretune_live(
         url,
         username=username,
         source_id="src",
@@ -3706,7 +3749,7 @@ async def test_a_pretuned_channel_is_joined_by_the_page_that_plays_it(
     assert _coroutine_names(fast_env) == ["_prestart"]
     await _run_new(fast_env, 0)
     [session_id] = env.sessions
-    page = await ffmpeg_session.start_transcode(
+    page = await transcode.start_transcode(
         "http://live",
         username="alice",
         source_id="src",
@@ -3715,9 +3758,9 @@ async def test_a_pretuned_channel_is_joined_by_the_page_that_plays_it(
     assert page["session_id"] == session_id
     assert len(env.launcher.launches) == 1
     # The page now watches it, so letting the guide go leaves it playing.
-    await ffmpeg_session.release_pretune("alice")
+    await transcode.release_pretune("alice")
     assert session_id in env.sessions
-    await ffmpeg_session.stop_session(session_id, force=True)
+    await transcode.stop_session(session_id, force=True)
 
 
 @pytest.mark.asyncio
@@ -3733,7 +3776,7 @@ async def test_resting_on_another_channel_releases_the_last_pretune(
     # One tuner at a time per viewer: the first channel stopped once the second began.
     assert [env.sessions[s]["url"] for s in env.sessions] == ["http://two"]
     assert first not in env.sessions
-    await ffmpeg_session.release_pretune("alice")
+    await transcode.release_pretune("alice")
     assert env.sessions == {}
 
 
@@ -3743,8 +3786,8 @@ def test_a_pretune_starts_the_channel_as_its_page_would(monkeypatch: pytest.Monk
     def prestart(url: str, **options: object) -> None:
         starts.append((url, options))
 
-    monkeypatch.setattr(ffmpeg_session, "prestart_live", prestart)
-    ffmpeg_session.pretune_live(
+    monkeypatch.setattr(transcode, "prestart_live", prestart)
+    transcode.pretune_live(
         "http://live",
         username="alice",
         source_id="src",
@@ -3774,20 +3817,20 @@ async def test_releasing_one_viewers_pretune_leaves_anothers(
     _pretune("http://one", "alice")
     _pretune("http://two", "bob")
     await _run_new(fast_env, 0)
-    await ffmpeg_session.release_pretune("alice")
-    await ffmpeg_session.release_pretune("carol")
+    await transcode.release_pretune("alice")
+    await transcode.release_pretune("carol")
     assert [env.sessions[s]["url"] for s in env.sessions] == ["http://two"]
-    await ffmpeg_session.release_pretune("bob")
+    await transcode.release_pretune("bob")
 
 
 class _Starts:
     """Stands in for ``start_transcode``, answering with ``response``."""
 
-    def __init__(self, response: ffmpeg_session.TranscodeResponse) -> None:
+    def __init__(self, response: transcode.TranscodeResponse) -> None:
         self.response = response
         self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
-    async def __call__(self, *args: object, **kwargs: object) -> ffmpeg_session.TranscodeResponse:
+    async def __call__(self, *args: object, **kwargs: object) -> transcode.TranscodeResponse:
         self.calls.append((args, kwargs))
         return self.response
 
@@ -3800,7 +3843,7 @@ async def test_a_prestart_asks_for_the_page_stream_answered_at_one_segment(
     monkeypatch: pytest.MonkeyPatch,
 ):
     session = _watched(env, tmp_path, {"prestart": _NOW, "page": _NOW})
-    response: ffmpeg_session.TranscodeResponse = {
+    response: transcode.TranscodeResponse = {
         "session_id": "s",
         "playlist": "/transcode/s/low.m3u8",
         "subtitles": [],
@@ -3809,8 +3852,8 @@ async def test_a_prestart_asks_for_the_page_stream_answered_at_one_segment(
         "viewer_id": "prestart",
     }
     starts = _Starts(response)
-    monkeypatch.setattr(ffmpeg_session, "start_transcode", starts)
-    ffmpeg_session.prestart_live(
+    monkeypatch.setattr(transcode, "start_transcode", starts)
+    transcode.prestart_live(
         "http://live",
         username="alice",
         source_id="src",
@@ -3844,15 +3887,15 @@ async def test_a_prestart_answered_without_a_viewer_releases_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ):
     session = _watched(env, tmp_path, {"page": _NOW})
-    response: ffmpeg_session.TranscodeResponse = {
+    response: transcode.TranscodeResponse = {
         "session_id": "s",
         "playlist": "/transcode/s/low.m3u8",
         "subtitles": [],
         "duration": 0,
         "seek_offset": 0,
     }
-    monkeypatch.setattr(ffmpeg_session, "start_transcode", _Starts(response))
-    ffmpeg_session.prestart_live(
+    monkeypatch.setattr(transcode, "start_transcode", _Starts(response))
+    transcode.prestart_live(
         "http://live",
         username="alice",
         source_id="src",
@@ -3875,7 +3918,7 @@ async def test_a_prestart_that_cannot_start_leaves_it_to_the_page(
 ):
     env.sessions["bob"] = _live(tmp_path)
     env.sessions["bob"].update(username="bob", source_id="src")
-    ffmpeg_session.prestart_live(
+    transcode.prestart_live(
         "http://live",
         username="alice",
         source_id="src",
@@ -3883,7 +3926,7 @@ async def test_a_prestart_that_cannot_start_leaves_it_to_the_page(
         user_max_streams=0,
         source_max_streams=1,
     )
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
         await tasks.tasks[0].run()
     assert set(env.sessions) == {"bob"}
     assert "Live prestart did not start: Source at capacity (1 streams)" in caplog.messages
@@ -3892,7 +3935,7 @@ async def test_a_prestart_that_cannot_start_leaves_it_to_the_page(
 def test_master_without_known_captions_declares_none(tmp_path: pathlib.Path):
     session = _fast_session(tmp_path)
     session["master_audio_bitrate"] = 0
-    ffmpeg_session._publish_fast_master(session)
+    transcode._publish_fast_master(session)
     assert sorted(path.name for path in tmp_path.iterdir()) == ["master.m3u8"]
     assert (tmp_path / "master.m3u8").read_text() == master_playlist("1080p")
 
@@ -3912,7 +3955,7 @@ def upscaler(
     engines = tmp_path / "engines"
     engines.mkdir()
     (engines / "2x-nomosuni-compact_1080p_fp16.engine").write_bytes(b"engine")
-    monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", str(engines))
+    monkeypatch.setattr(commands, "_sr_engine_dir", str(engines))
     cache.save_server_settings(
         {
             **cache.load_server_settings(),
@@ -3943,9 +3986,9 @@ async def test_startup_switches_to_the_ai_upscale_rendition_once_it_caught_up(
     caplog: pytest.LogCaptureFixture,
 ):
     """TensorRT loads slowly, so playback starts plain and moves to "up" at a new generation."""
-    result = await ffmpeg_session._start_fast_live("http://live", "alice", "src", True)
+    result = await transcode._start_fast_live("http://live", "alice", "src", True)
     session = env.sessions[result["session_id"]]
-    assert ffmpeg_session._is_fast_live(session)
+    assert transcode._is_fast_live(session)
     (plain,) = env.launcher.launches
     assert plain.command[-1].endswith("/low.m3u8")
     assert not _upscales(plain.command)
@@ -3956,7 +3999,7 @@ async def test_startup_switches_to_the_ai_upscale_rendition_once_it_caught_up(
     ]
     plain_subscription = session.get("subscription")
     assert plain_subscription is not None
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
         await _upgrade_task(upscaler).run()
     _, up = env.launcher.launches
     assert up.command[-1].endswith("/up.m3u8")
@@ -3969,7 +4012,7 @@ async def test_startup_switches_to_the_ai_upscale_rendition_once_it_caught_up(
     assert session.get("subscription") is not plain_subscription
     assert session.get("rendition") == "up"
     assert session.get("playlist_generation") == 1
-    assert ffmpeg_session.playlist_file(session) == "up.m3u8"
+    assert transcode.playlist_file(session) == "up.m3u8"
     assert plain.process.signals == ["TERM"]
     await plain_subscription.wait_closed()
     assert plain.process.stdin.closed
@@ -3983,17 +4026,17 @@ async def test_startup_switches_to_the_ai_upscale_rendition_once_it_caught_up(
     directory = pathlib.Path(session["dir"])
     low = (directory / "low.m3u8").read_text()
     assert session.get("splice_low") == low
-    assert ffmpeg_session.live_playlist(result["session_id"]) == low
+    assert transcode.live_playlist(result["session_id"]) == low
     _media_playlist(
         directory / "up.m3u8",
         ["up_000009.ts", "up_000010.ts", "up_000011.ts"],
         duration=4.0,
     )
-    assert ffmpeg_session.live_playlist(result["session_id"]) == fast_start.splice_playlists(
+    assert transcode.live_playlist(result["session_id"]) == fast_start.splice_playlists(
         low,
         (directory / "up.m3u8").read_text(),
         2,
-        list_size=ffmpeg_command.get_live_hls_list_size(1.0),
+        list_size=commands.get_live_hls_list_size(1.0),
     )
     assert session.get("splice_point") == 2
 
@@ -4007,22 +4050,22 @@ async def test_switch_waits_until_the_upscaled_rendition_catches_up(
     _media_playlist(tmp_path / "up.m3u8", ["up_1.ts"], duration=2.0)
     running = FakeProcess(exit_code=None)
     directory = str(tmp_path)
-    assert not await ffmpeg_session._caught_up(directory, FakeProcess(exited=True))
-    assert not await ffmpeg_session._caught_up(directory, running, timeout_sec=1)
+    assert not await transcode._caught_up(directory, FakeProcess(exited=True))
+    assert not await transcode._caught_up(directory, running, timeout_sec=1)
     assert set(env.clock.sleeps) == {0.2}
     assert 1 <= sum(env.clock.sleeps) < 1.2
     env.clock.sleeps.clear()
-    caught_up = asyncio.create_task(ffmpeg_session._caught_up(directory, running))
+    caught_up = asyncio.create_task(transcode._caught_up(directory, running))
     await until(lambda: env.clock.sleeps)
     assert not caught_up.done()
     _media_playlist(tmp_path / "up.m3u8", ["up_1.ts", "up_2.ts"], duration=2.0)
     assert await caught_up
     # A playlist without a dated segment has no end yet.
     (tmp_path / "up.m3u8").write_text("#EXTM3U\n")
-    assert not await ffmpeg_session._caught_up(directory, running, timeout_sec=0.1)
+    assert not await transcode._caught_up(directory, running, timeout_sec=0.1)
     env.clock.sleeps.clear()
     # Quarter-second polls land exactly on the 30 s deadline, which ends the wait.
-    assert not await ffmpeg_session._caught_up(directory, running, poll_interval_sec=0.25)
+    assert not await transcode._caught_up(directory, running, poll_interval_sec=0.25)
     assert len(env.clock.sleeps) == 120
 
 
@@ -4032,22 +4075,22 @@ def test_live_playlist_continues_the_plain_rendition_across_the_switch(
 ):
     env.sessions["vod"] = _live(tmp_path)
     for session_id in ("missing", "vod"):
-        assert ffmpeg_session.live_playlist(session_id) is None
+        assert transcode.live_playlist(session_id) is None
     session = _fast_session(tmp_path)
     env.sessions["f"] = session
-    assert ffmpeg_session.live_playlist("f") is None
+    assert transcode.live_playlist("f") is None
     _media_playlist(tmp_path / "low.m3u8", ["low_1.ts", "low_2.ts"], duration=2.0)
     low = (tmp_path / "low.m3u8").read_text()
-    assert ffmpeg_session.live_playlist("f") == low
+    assert transcode.live_playlist("f") == low
     # Until the upscaler cuts a segment past the plain list's end, clients keep the plain list.
     _media_playlist(tmp_path / "up.m3u8", ["up_1.ts"], duration=2.0, start_pts=13)
     session.update(rendition="up", splice_low=low)
-    assert ffmpeg_session.live_playlist("f") == low
+    assert transcode.live_playlist("f") == low
     assert "splice_point" not in session
     _media_playlist(tmp_path / "up.m3u8", ["up_1.ts", "up_2.ts"], duration=2.0, start_pts=12)
     up = (tmp_path / "up.m3u8").read_text()
-    list_size = ffmpeg_command.get_live_hls_list_size(1.0)
-    assert ffmpeg_session.live_playlist("f") == fast_start.splice_playlists(
+    list_size = commands.get_live_hls_list_size(1.0)
+    assert transcode.live_playlist("f") == fast_start.splice_playlists(
         low,
         up,
         1,
@@ -4057,7 +4100,7 @@ def test_live_playlist_continues_the_plain_rendition_across_the_switch(
     # The splice point holds once found, even when it could no longer be found.
     (tmp_path / "up_2.ts").unlink()
     assert fast_start.splice_point(str(tmp_path), low, up) is None
-    assert ffmpeg_session.live_playlist("f") == fast_start.splice_playlists(
+    assert transcode.live_playlist("f") == fast_start.splice_playlists(
         low,
         up,
         1,
@@ -4074,15 +4117,15 @@ async def test_failed_ai_upscale_keeps_the_plain_rendition(
 ):
     plain_worker = FakeProcess(exit_code=None)
     launcher = _relaunch(monkeypatch, [plain_worker, FakeProcess(exited=True, exit_code=1)])
-    result = await ffmpeg_session._start_fast_live("http://live", "alice", "src", True)
+    result = await transcode._start_fast_live("http://live", "alice", "src", True)
     session = env.sessions[result["session_id"]]
-    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg_session"):
+    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg.transcode"):
         await _upgrade_task(upscaler).run()
     _, up = launcher.processes
     assert session["process"] is plain_worker
     assert "rendition" not in session
     assert session.get("playlist_generation") == 0
-    assert ffmpeg_session.playlist_file(session) == "low.m3u8"
+    assert transcode.playlist_file(session) == "low.m3u8"
     assert plain_worker.signals == []
     assert (
         f"Fast-start session {result['session_id']} keeps its plain rendition: AI Upscale failed"
@@ -4102,12 +4145,12 @@ async def test_ai_upscale_stops_when_the_session_ends_first(
             _ffmpeg_output(command)
 
     env.launcher.on_launch = plain_only
-    result = await ffmpeg_session._start_fast_live("http://live", "alice", "src", True)
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
+    result = await transcode._start_fast_live("http://live", "alice", "src", True)
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
         upgrade = asyncio.create_task(_upgrade_task(upscaler).run())
         await until(lambda: len(env.launcher.launches) == 2)
         # Shutdown drops the session but leaves its directory, so the worker catches up.
-        await ffmpeg_session.shutdown()
+        await transcode.shutdown()
         _ffmpeg_output(env.launcher.commands[1])
         await upgrade
     up = env.launcher.processes[1]
@@ -4127,14 +4170,14 @@ async def test_ai_upscale_rejects_a_worker_without_stdin(
     deaf = FakeProcess(exit_code=None)
     monkeypatch.setattr(deaf, "stdin", None)
     _relaunch(monkeypatch, [FakeProcess(exit_code=None), deaf])
-    await ffmpeg_session._start_fast_live("http://live", "alice", "src", True)
+    await transcode._start_fast_live("http://live", "alice", "src", True)
     with pytest.raises(ValueError, match=r"^Expected process\.stdin is not None\.$"):
         await _upgrade_task(upscaler).run()
 
 
 @pytest.mark.asyncio
 async def test_saver_session_never_upscales(env: _Env, upscaler: BackgroundTasks):
-    await ffmpeg_session._start_fast_live(
+    await transcode._start_fast_live(
         "http://live",
         "alice",
         "src",
@@ -4151,14 +4194,14 @@ async def test_restart_after_the_switch_relaunches_the_upscaled_rendition(
     env: _Env,
     upscaler: BackgroundTasks,
 ):
-    result = await ffmpeg_session._start_fast_live("http://live", "alice", "src", True)
+    result = await transcode._start_fast_live("http://live", "alice", "src", True)
     session = env.sessions[result["session_id"]]
-    assert ffmpeg_session._is_fast_live(session)
+    assert transcode._is_fast_live(session)
     await _upgrade_task(upscaler).run()
     directory = pathlib.Path(session["dir"])
     _media_playlist(directory / "up.m3u8", ["up_000001.ts"])
     up = session["process"]
-    await ffmpeg_session._restart_fast_pipeline(result["session_id"], session, "low output")
+    await transcode._restart_fast_pipeline(result["session_id"], session, "low output")
     restart = env.launcher.launches[-1]
     assert len(env.launcher.launches) == 3
     assert restart.command[-1].endswith("/up.m3u8")
@@ -4181,7 +4224,7 @@ async def test_start_fast_live_launch_failure_releases_everything(
     del fast_env
     env.launcher.error = OSError("no ffmpeg")
     with pytest.raises(OSError, match="no ffmpeg"):
-        await ffmpeg_session._start_fast_live("http://live", "alice", "src", True)
+        await transcode._start_fast_live("http://live", "alice", "src", True)
     assert upstreams.opened[0].closed
     assert not env.sessions
     assert not env.urls
@@ -4200,7 +4243,7 @@ async def test_start_fast_live_rejects_a_worker_without_stdin(
     monkeypatch.setattr(worker, "stdin", None)
     _relaunch(monkeypatch, [worker])
     with pytest.raises(ValueError, match=r"^Expected process\.stdin is not None\.$"):
-        await ffmpeg_session._start_fast_live("http://live", "alice", "src", True)
+        await transcode._start_fast_live("http://live", "alice", "src", True)
     assert worker.signals == ["TERM"]
     assert upstreams.opened[0].closed
     assert not env.sessions
@@ -4219,11 +4262,11 @@ async def test_start_fast_live_aborts_when_the_session_stops_during_launch(
     async def stop_during_launch(command: list[str]) -> None:
         del command
         stopped.extend(env.sessions)
-        await ffmpeg_session.stop_session(stopped[0], force=True)
+        await transcode.stop_session(stopped[0], force=True)
 
     env.launcher.on_launch = stop_during_launch
     with pytest.raises(KeyError) as error:
-        await ffmpeg_session._start_fast_live("http://live", "alice", "src", True)
+        await transcode._start_fast_live("http://live", "alice", "src", True)
     assert error.value.args == (stopped[0],)
     (worker,) = env.launcher.processes
     assert worker.signals == ["TERM"]
@@ -4239,7 +4282,7 @@ def test_startup_rejects_a_replaced_session_with_its_identifier(
     session = _live(tmp_path)
     env.sessions["replaced"] = _live(tmp_path)
     with pytest.raises(KeyError) as error:
-        ffmpeg_session._require_current("replaced", session)
+        transcode._require_current("replaced", session)
     assert error.value.args == ("replaced",)
 
 
@@ -4260,9 +4303,9 @@ def startups(env: _Env, tasks: BackgroundTasks) -> ProcessLauncher:
     return env.launcher
 
 
-def _start(user_max_streams: int = 0) -> asyncio.Task[ffmpeg_session.TranscodeResponse]:
+def _start(user_max_streams: int = 0) -> asyncio.Task[transcode.TranscodeResponse]:
     return asyncio.create_task(
-        ffmpeg_session.start_transcode(
+        transcode.start_transcode(
             "http://live",
             username="viewer",
             user_max_streams=user_max_streams,
@@ -4324,7 +4367,7 @@ async def test_concurrent_starts_open_one_upstream_within_stream_limits(
     results = await asyncio.gather(*requests)
     assert len(upstreams.opened) == 1
     assert {result["session_id"] for result in results} == set(env.sessions)
-    assert not ffmpeg_session._startup_guards
+    assert not transcode._startup_guards
 
 
 # =============================================================================
@@ -4333,7 +4376,7 @@ async def test_concurrent_starts_open_one_upstream_within_stream_limits(
 
 
 def test_dead_process_signals_are_noops():
-    process = ffmpeg_session._DeadProcess()
+    process = transcode._DeadProcess()
     process.terminate()
     process.kill()
     assert process.returncode == -1
@@ -4346,7 +4389,7 @@ async def test_shared_ffmpeg_launcher(env: _Env, monkeypatch: pytest.MonkeyPatch
     env.launcher.on_launch = None
     # A no_proxy variable would send matching hosts around the egress proxy.
     monkeypatch.setenv("no_proxy", "127.0.0.1")
-    assert await ffmpeg_session._launch_ffmpeg(cmd) is env.launcher.processes[0]
+    assert await transcode._launch_ffmpeg(cmd) is env.launcher.processes[0]
     [launch] = env.launcher.launches
     assert launch.command == cmd
     assert launch.options == {
@@ -4363,8 +4406,8 @@ async def test_monitor_stderr_collects_lines(caplog: pytest.LogCaptureFixture):
     process = FakeProcess(stderr=[b"frame=1\n", b"Fatal error\n", b"Aborting now\n"])
     lines: list[str] = []
     done = asyncio.Event()
-    with caplog.at_level(logging.DEBUG, logger="netv.ffmpeg_session"):
-        await ffmpeg_session._monitor_ffmpeg_stderr(_proc(process), "s", lines, done)
+    with caplog.at_level(logging.DEBUG, logger="netv.ffmpeg.transcode"):
+        await transcode._monitor_ffmpeg_stderr(_proc(process), "s", lines, done)
     assert lines == ["frame=1", "Fatal error", "Aborting now"]
     # Set only once stderr closed, so a reader of ``lines`` sees the last of them.
     assert done.is_set()
@@ -4377,14 +4420,14 @@ async def test_monitor_stderr_collects_lines(caplog: pytest.LogCaptureFixture):
     ]
     process.stderr = None
     with pytest.raises(ValueError):
-        await ffmpeg_session._monitor_ffmpeg_stderr(_proc(process), "s")
+        await transcode._monitor_ffmpeg_stderr(_proc(process), "s")
 
 
 @pytest.mark.asyncio
 async def test_monitor_resume_invalidates_quick_failure(env: _Env, tmp_path: pathlib.Path):
     env.sessions["s"] = _live(tmp_path)
     env.urls["http://m"] = "s"
-    await ffmpeg_session._monitor_resume_ffmpeg(_proc(FakeProcess(exit_code=1)), "s", "http://m")
+    await transcode._monitor_resume_ffmpeg(_proc(FakeProcess(exit_code=1)), "s", "http://m")
     assert not env.sessions
     assert not env.urls
     assert not tmp_path.exists()
@@ -4397,8 +4440,8 @@ async def test_monitor_resume_keeps_session_after_clean_or_slow_exit(
 ):
     env.sessions["s"] = _live(tmp_path)
     env.urls["http://m"] = "s"
-    await ffmpeg_session._monitor_resume_ffmpeg(_proc(FakeProcess(exit_code=0)), "s", "http://m")
-    await ffmpeg_session._monitor_resume_ffmpeg(
+    await transcode._monitor_resume_ffmpeg(_proc(FakeProcess(exit_code=0)), "s", "http://m")
+    await transcode._monitor_resume_ffmpeg(
         _proc(FakeProcess(exit_code=1)),
         "s",
         "http://m",
@@ -4410,9 +4453,9 @@ async def test_monitor_resume_keeps_session_after_clean_or_slow_exit(
 
 @pytest.mark.asyncio
 async def test_monitor_seek_logs_failure(caplog: pytest.LogCaptureFixture):
-    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg_session"):
-        await ffmpeg_session._monitor_seek_ffmpeg(_proc(FakeProcess(exit_code=0)), "s")
-        await ffmpeg_session._monitor_seek_ffmpeg(_proc(FakeProcess(exit_code=2)), "s")
+    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg.transcode"):
+        await transcode._monitor_seek_ffmpeg(_proc(FakeProcess(exit_code=0)), "s")
+        await transcode._monitor_seek_ffmpeg(_proc(FakeProcess(exit_code=2)), "s")
     assert [r.getMessage() for r in caplog.records] == [
         "Seek ffmpeg exited with code 2 for session s",
     ]
@@ -4423,27 +4466,27 @@ async def test_spawn_background_task_tracks_until_done():
     async def work() -> None:
         return None
 
-    task = ffmpeg_session._spawn_background_task(work())
-    assert task in ffmpeg_session._background_tasks
+    task = transcode._spawn_background_task(work())
+    assert task in transcode._background_tasks
     await task
     await asyncio.sleep(0)
-    assert task not in ffmpeg_session._background_tasks
+    assert task not in transcode._background_tasks
 
 
 @pytest.mark.asyncio
 async def test_wait_for_playlist_paths(env: _Env, tmp_path: pathlib.Path):
     playlist_path = tmp_path / "stream.m3u8"
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session._wait_for_playlist(
+        await transcode._wait_for_playlist(
             playlist_path,
             FakeProcess(exit_code=None),
             is_disconnected=_disconnected,
         )
     assert error.value.status_code == 499
-    assert await ffmpeg_session._wait_for_playlist(playlist_path, FakeProcess(exited=True)) is False
+    assert await transcode._wait_for_playlist(playlist_path, FakeProcess(exited=True)) is False
     playlist_path.write_text("#EXTINF:3,\nseg000.ts\n")
     assert (
-        await ffmpeg_session._wait_for_playlist(
+        await transcode._wait_for_playlist(
             playlist_path,
             FakeProcess(exit_code=None),
             min_segments=2,
@@ -4456,7 +4499,7 @@ async def test_wait_for_playlist_paths(env: _Env, tmp_path: pathlib.Path):
     (tmp_path / "seg000.ts").write_bytes(b"x" * 1000)
     (tmp_path / "seg001.ts").write_bytes(b"x")
     assert (
-        await ffmpeg_session._wait_for_playlist(
+        await transcode._wait_for_playlist(
             playlist_path,
             FakeProcess(exit_code=None),
             min_segments=2,
@@ -4466,7 +4509,7 @@ async def test_wait_for_playlist_paths(env: _Env, tmp_path: pathlib.Path):
     )
     (tmp_path / "seg000.ts").write_bytes(b"x" * 1001)
     assert (
-        await ffmpeg_session._wait_for_playlist(
+        await transcode._wait_for_playlist(
             playlist_path,
             FakeProcess(exit_code=None),
             min_segments=2,
@@ -4488,7 +4531,7 @@ def vod_dir(env: _Env, tasks: BackgroundTasks, tmp_path: pathlib.Path) -> pathli
     (directory / "seg000.ts").write_bytes(b"x" * 2000)
     (directory / "seg001.ts").write_bytes(b"x" * 2000)
     (directory / "stream.m3u8").write_text("#EXTINF:3.0,\nseg000.ts\n#EXTINF:3.0,\nseg001.ts\n")
-    env.sessions["v"] = ffmpeg_session.TranscodeSession(
+    env.sessions["v"] = transcode.TranscodeSession(
         dir=str(directory),
         process=FakeProcess(exited=True),
         url="http://movie",
@@ -4503,7 +4546,7 @@ def vod_dir(env: _Env, tasks: BackgroundTasks, tmp_path: pathlib.Path) -> pathli
 @pytest.mark.asyncio
 async def test_existing_vod_missing_session():
     assert (
-        await ffmpeg_session._handle_existing_vod_session("missing", "http://m", "software", False)
+        await transcode._handle_existing_vod_session("missing", "http://m", "software", False)
         is None
     )
 
@@ -4512,7 +4555,7 @@ async def test_existing_vod_missing_session():
 async def test_existing_vod_active_session_waits_for_playlist(env: _Env, vod_dir: pathlib.Path):
     env.sessions["v"]["process"] = FakeProcess(exit_code=None)
     (vod_dir / "stream.m3u8").unlink()
-    result = await ffmpeg_session._handle_existing_vod_session(
+    result = await transcode._handle_existing_vod_session(
         "v",
         "http://movie",
         "software",
@@ -4530,8 +4573,7 @@ async def test_existing_vod_without_segments_is_released(env: _Env, vod_dir: pat
         segment.unlink()
     env.urls["http://movie"] = "v"
     assert (
-        await ffmpeg_session._handle_existing_vod_session("v", "http://movie", "software", False)
-        is None
+        await transcode._handle_existing_vod_session("v", "http://movie", "software", False) is None
     )
     assert not env.sessions
     assert not env.urls
@@ -4552,7 +4594,7 @@ async def test_existing_vod_that_died_after_a_seek_is_replaced(
         (vod_dir / "stream.m3u8").write_text(playlist)
     env.sessions["v"].update(seek_offset=30)
     env.urls["http://movie"] = "v"
-    result = await ffmpeg_session._handle_existing_vod_session(
+    result = await transcode._handle_existing_vod_session(
         "v",
         "http://movie",
         "software",
@@ -4574,17 +4616,17 @@ async def test_existing_vod_with_seek_offset_returns_cache(
     (vod_dir / "captions.m3u8").write_text("#EXTM3U\n")
     with (vod_dir / "stream.m3u8").open("a") as playlist:
         playlist.write("#EXT-X-ENDLIST\n")
-    subs: list[ffmpeg_session.StoredSubtitle | int] = [
+    subs: list[transcode.StoredSubtitle | int] = [
         {"index": 2, "lang": "eng", "name": "English"},
     ]
     env.sessions["v"].update(seek_offset=30, last_access=0, subtitles=subs if captioned else [])
-    result = await ffmpeg_session._handle_existing_vod_session(
+    result = await transcode._handle_existing_vod_session(
         "v",
         "http://movie",
         "software",
         False,
     )
-    expected: ffmpeg_session.TranscodeResponse = {
+    expected: transcode.TranscodeResponse = {
         "session_id": "v",
         "playlist": "/transcode/v/stream.m3u8",
         "subtitles": [],
@@ -4606,7 +4648,7 @@ async def test_existing_vod_with_seek_offset_returns_cache(
 @pytest.mark.asyncio
 async def test_existing_vod_resume_appends_to_playlist(env: _Env, vod_dir: pathlib.Path):
     del vod_dir
-    result = await ffmpeg_session._handle_existing_vod_session(
+    result = await transcode._handle_existing_vod_session(
         "v",
         "http://movie",
         "software",
@@ -4666,7 +4708,7 @@ async def test_a_vod_start_reads_its_source_by_that_source_s_rule(
     del tasks
     _home_movie(env)
     env.run.program("ffprobe", Program(stdout=_DOLBY_PROBE))
-    await ffmpeg_session.start_transcode(_HOME_MOVIE, "movie", source_id="h")
+    await transcode.start_transcode(_HOME_MOVIE, "movie", source_id="h")
     assert _read_home(env)
 
 
@@ -4675,7 +4717,7 @@ async def test_a_seek_reads_its_source_by_that_source_s_rule(env: _Env, seek_dir
     _home_movie(env)
     env.sessions["v"].update(url=_HOME_MOVIE, source_id="h")
     (seek_dir / "session.json").write_text(json.dumps({"seek_offset": 0}))
-    await ffmpeg_session.seek_transcode("v", 9.0)
+    await transcode.seek_transcode("v", 9.0)
     assert _read_home(env)
 
 
@@ -4684,13 +4726,13 @@ async def test_a_resume_reads_its_source_by_that_source_s_rule(env: _Env, vod_di
     del vod_dir
     _home_movie(env)
     env.sessions["v"].update(url=_HOME_MOVIE, source_id="h")
-    await ffmpeg_session._handle_existing_vod_session("v", _HOME_MOVIE, "software", True)
+    await transcode._handle_existing_vod_session("v", _HOME_MOVIE, "software", True)
     assert _read_home(env)
 
 
 def test_a_session_snapshot_carries_every_field_it_resumes_with(env: _Env, tmp_path: pathlib.Path):
     process = FakeProcess(exit_code=None)
-    env.sessions["full"] = ffmpeg_session.TranscodeSession(
+    env.sessions["full"] = transcode.TranscodeSession(
         dir=str(tmp_path),
         process=process,
         url="http://movie",
@@ -4703,14 +4745,14 @@ def test_a_session_snapshot_carries_every_field_it_resumes_with(env: _Env, tmp_p
         source_id="h",
         started=_NOW,
     )
-    env.sessions["bare"] = ffmpeg_session.TranscodeSession(
+    env.sessions["bare"] = transcode.TranscodeSession(
         dir=str(tmp_path),
         process=None,
         url="http://movie",
         is_vod=True,
         started=_NOW,
     )
-    assert ffmpeg_session._get_session_snapshot("full") == ffmpeg_session._SessionSnapshot(
+    assert transcode._get_session_snapshot("full") == transcode._SessionSnapshot(
         output_dir=str(tmp_path),
         process=process,
         seek_offset=12.5,
@@ -4720,7 +4762,7 @@ def test_a_session_snapshot_carries_every_field_it_resumes_with(env: _Env, tmp_p
         username="alice",
         source_id="h",
     )
-    assert ffmpeg_session._get_session_snapshot("bare") == ffmpeg_session._SessionSnapshot(
+    assert transcode._get_session_snapshot("bare") == transcode._SessionSnapshot(
         output_dir=str(tmp_path),
         process=None,
         seek_offset=0,
@@ -4730,14 +4772,14 @@ def test_a_session_snapshot_carries_every_field_it_resumes_with(env: _Env, tmp_p
         username="",
         source_id="",
     )
-    assert ffmpeg_session._get_session_snapshot("missing") is None
+    assert transcode._get_session_snapshot("missing") is None
 
 
 @pytest.mark.asyncio
 async def test_existing_vod_resume_polls_for_next_segment(env: _Env, vod_dir: pathlib.Path):
     del vod_dir
     env.launcher.on_launch = None
-    result = await ffmpeg_session._handle_existing_vod_session(
+    result = await transcode._handle_existing_vod_session(
         "v",
         "http://movie",
         "software",
@@ -4757,8 +4799,7 @@ async def test_existing_vod_resume_dies_immediately(
     launcher = _relaunch(monkeypatch, [FakeProcess(exited=True, exit_code=1)])
     launcher.on_launch = None
     assert (
-        await ffmpeg_session._handle_existing_vod_session("v", "http://movie", "software", False)
-        is None
+        await transcode._handle_existing_vod_session("v", "http://movie", "software", False) is None
     )
 
 
@@ -4767,8 +4808,7 @@ async def test_existing_vod_resume_session_vanishes(env: _Env, vod_dir: pathlib.
     del vod_dir
     env.launcher.on_launch = lambda command: env.sessions.pop("v")
     assert (
-        await ffmpeg_session._handle_existing_vod_session("v", "http://movie", "software", False)
-        is None
+        await transcode._handle_existing_vod_session("v", "http://movie", "software", False) is None
     )
     assert env.launcher.processes[0].returncode == -15
 
@@ -4790,7 +4830,7 @@ def do_env(env: _Env, tasks: BackgroundTasks) -> None:
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("do_env")
 async def test_do_start_vod_with_seek_offset_persists_probe(env: _Env):
-    result = await ffmpeg_session._do_start_transcode(
+    result = await transcode._do_start_transcode(
         "http://movie",
         "movie",
         1,
@@ -4855,8 +4895,8 @@ async def test_do_start_vod_with_seek_offset_persists_probe(env: _Env):
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("do_env")
 async def test_do_start_plays_the_users_audio_language(env: _Env):
-    probe = json.loads(_MOVIE_PROBE)
-    probe["streams"].append(
+    report = json.loads(_MOVIE_PROBE)
+    report["streams"].append(
         {
             "index": 3,
             "codec_type": "audio",
@@ -4866,9 +4906,9 @@ async def test_do_start_plays_the_users_audio_language(env: _Env):
             "tags": {"language": "fre"},
         },
     )
-    env.run.program("ffprobe", Program(stdout=json.dumps(probe)))
+    env.run.program("ffprobe", Program(stdout=json.dumps(report)))
     cache.save_user_settings("alice", {**cache.load_user_settings("alice"), "audio_lang": "fr"})
-    result = await ffmpeg_session._do_start_transcode(
+    result = await transcode._do_start_transcode(
         "http://movie",
         "movie",
         None,
@@ -4886,7 +4926,7 @@ async def test_do_start_plays_the_users_audio_language(env: _Env):
 async def test_do_start_launch_failure_removes_output(env: _Env, monkeypatch: pytest.MonkeyPatch):
     _relaunch(monkeypatch, [], error=FileNotFoundError("ffmpeg"))
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session._do_start_transcode("http://movie", "movie", None, None, 0)
+        await transcode._do_start_transcode("http://movie", "movie", None, None, 0)
     assert (error.value.status_code, error.value.detail) == (500, "Could not start the transcoder")
     assert not list(env.root.iterdir())
     assert not env.sessions
@@ -4903,7 +4943,7 @@ async def test_do_start_cancelled_mid_launch_removes_output(env: _Env):
 
     env.launcher.on_launch = blocked
     task = asyncio.create_task(
-        ffmpeg_session._do_start_transcode("http://movie", "movie", None, None, 0),
+        transcode._do_start_transcode("http://movie", "movie", None, None, 0),
     )
     while not env.root.exists() or not list(env.root.iterdir()):
         await asyncio.sleep(0)
@@ -4928,10 +4968,10 @@ async def test_do_start_reports_failed_startup(
     launcher = _relaunch(monkeypatch, [FakeProcess(exit_code=1)])
     launcher.on_launch = None
     with (
-        caplog.at_level(logging.ERROR, logger="netv.ffmpeg_session"),
+        caplog.at_level(logging.ERROR, logger="netv.ffmpeg.transcode"),
         pytest.raises(HTTPException) as error,
     ):
-        await ffmpeg_session._do_start_transcode("http://movie", "movie", None, None, 42.0)
+        await transcode._do_start_transcode("http://movie", "movie", None, None, 42.0)
     assert error.value.status_code == 500
     assert "failed (exit 1): unknown" in caplog.text
     # A resumed start waits out the longer seek deadline, then up to 1 s for stderr
@@ -4948,20 +4988,20 @@ async def test_do_start_reports_failed_startup(
 
 def test_playlist_marker_and_segments(tmp_path: pathlib.Path):
     path = tmp_path / "low.m3u8"
-    assert ffmpeg_session._playlist_marker(path) is None
-    assert ffmpeg_session._playlist_segments(path) == set()
+    assert transcode._playlist_marker(path) is None
+    assert transcode._playlist_segments(path) == set()
     path.write_text("#EXTM3U\n\nlow_1.ts\n../escape.ts\n#EXTINF:2,\nlow_2.ts\n")
     stat = path.stat()
-    assert ffmpeg_session._playlist_marker(path) == (stat.st_ino, stat.st_mtime_ns, stat.st_size)
-    assert ffmpeg_session._playlist_segments(path) == {"low_1.ts", "low_2.ts"}
+    assert transcode._playlist_marker(path) == (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+    assert transcode._playlist_segments(path) == {"low_1.ts", "low_2.ts"}
 
 
 def test_prepare_encoder_restart():
     command = ["ffmpeg", "-i", "x", "out.m3u8"]
-    assert ffmpeg_session._prepare_encoder_restart(command, {"a.ts"}) is command
+    assert transcode._prepare_encoder_restart(command, {"a.ts"}) is command
     numbered = ["ffmpeg", "-hls_start_number_source", "x", "out.m3u8"]
-    assert ffmpeg_session._prepare_encoder_restart(numbered, set()) is numbered
-    assert ffmpeg_session._prepare_encoder_restart(command, set()) == [
+    assert transcode._prepare_encoder_restart(numbered, set()) is numbered
+    assert transcode._prepare_encoder_restart(command, set()) == [
         "ffmpeg",
         "-i",
         "x",
@@ -4976,10 +5016,10 @@ def test_prepare_encoder_restart():
 async def test_wait_for_fresh_fast_playlist(env: _Env, tmp_path: pathlib.Path):
     path = tmp_path / "low.m3u8"
     _media_playlist(path, ["low_1.ts", "low_2.ts"])
-    marker = ffmpeg_session._playlist_marker(path)
+    marker = transcode._playlist_marker(path)
     directory = str(tmp_path)
     running = FakeProcess(exit_code=None)
-    wait = ffmpeg_session._wait_for_fresh_fast_playlist
+    wait = transcode._wait_for_fresh_fast_playlist
     assert not await wait(directory, "low.m3u8", FakeProcess(exited=True), None)
     assert env.clock.sleeps == []
     # The playlist has not changed since the old worker published it.
@@ -5009,8 +5049,8 @@ async def test_wait_for_fresh_fast_playlist(env: _Env, tmp_path: pathlib.Path):
 async def test_fresh_playlist_waits_for_two_new_segments(tmp_path: pathlib.Path):
     playlist(tmp_path, "low")
     path = tmp_path / "low.m3u8"
-    marker = ffmpeg_session._playlist_marker(path)
-    previous_segments = ffmpeg_session._playlist_segments(path)
+    marker = transcode._playlist_marker(path)
+    previous_segments = transcode._playlist_segments(path)
 
     def publish_segment(number: int) -> None:
         filename = f"low_{number}.ts"
@@ -5019,7 +5059,7 @@ async def test_fresh_playlist_waits_for_two_new_segments(tmp_path: pathlib.Path)
             playlist_file.write(f"#EXTINF:2,\n{filename}\n")
 
     waiter = asyncio.create_task(
-        ffmpeg_session._wait_for_fresh_fast_playlist(
+        transcode._wait_for_fresh_fast_playlist(
             str(tmp_path),
             "low.m3u8",
             FakeProcess(exit_code=None),
@@ -5040,7 +5080,7 @@ async def test_worker_sample_starts_at_the_first_keyframe(upstreams: FakeUpstrea
     stream = _plan(_TUNER).relay()
     await stream.start()
     await until(lambda: upstreams.opened)
-    sample = asyncio.create_task(ffmpeg_session._wait_for_keyframe(stream))
+    sample = asyncio.create_task(transcode._wait_for_keyframe(stream))
     upstreams.opened[0].feed(pat_packet() + pmt_packet() + video_packet(9) * 5)
     await until(lambda: stream.stats.bytes_received)
     await _yield_to_startups()
@@ -5062,7 +5102,7 @@ async def test_a_source_without_keyframe_marks_is_used_whole(
     await stream.start()
     await until(lambda: upstreams.opened)
     sample = asyncio.create_task(
-        ffmpeg_session._wait_for_keyframe(stream, max_bytes=len(unmarked) * (2 if ends else 1)),
+        transcode._wait_for_keyframe(stream, max_bytes=len(unmarked) * (2 if ends else 1)),
     )
     upstreams.opened[0].feed(unmarked)
     if ends:
@@ -5074,21 +5114,21 @@ async def test_a_source_without_keyframe_marks_is_used_whole(
 @pytest.mark.asyncio
 async def test_terminate_process_simple_paths():
     dead = FakeProcess(exited=True)
-    await ffmpeg_session._terminate_process(dead)
+    await transcode._terminate_process(dead)
     assert (dead.returncode, dead.signals) == (0, [])
-    await ffmpeg_session._terminate_process(None)
+    await transcode._terminate_process(None)
     vanished = FakeProcess(exit_code=None, reaped=True)
-    await ffmpeg_session._terminate_process(vanished)
+    await transcode._terminate_process(vanished)
     assert vanished.returncode is None
     graceful = FakeProcess(exit_code=None)
-    await ffmpeg_session._terminate_process(graceful)
+    await transcode._terminate_process(graceful)
     assert (graceful.returncode, graceful.signals) == (-15, ["TERM"])
 
 
 @pytest.mark.asyncio
 async def test_terminate_process_escalates_after_timeout(env: _Env):
     process = FakeProcess(exit_code=None, ignores_terminate=True)
-    await ffmpeg_session._terminate_process(process)
+    await transcode._terminate_process(process)
     assert (process.returncode, process.signals) == (-9, ["TERM", "KILL"])
     assert env.clock.sleeps == [5]
 
@@ -5096,7 +5136,7 @@ async def test_terminate_process_escalates_after_timeout(env: _Env):
 @pytest.mark.asyncio
 async def test_terminate_process_escalates_when_cancelled():
     process = FakeProcess(exit_code=None, ignores_terminate=True)
-    task = asyncio.create_task(ffmpeg_session._terminate_process(process))
+    task = asyncio.create_task(transcode._terminate_process(process))
     await asyncio.sleep(0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -5113,7 +5153,7 @@ async def test_launch_ffmpeg_terminates_a_process_launched_after_cancellation(en
         await gate.wait()
 
     env.launcher.on_launch = blocked
-    task = asyncio.create_task(ffmpeg_session._launch_ffmpeg(["ffmpeg"]))
+    task = asyncio.create_task(transcode._launch_ffmpeg(["ffmpeg"]))
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     task.cancel()
@@ -5136,18 +5176,18 @@ async def test_monitor_fast_process(
     process = FakeProcess(stderr=stderr, exit_code=1)
     quiet = FakeProcess(exit_code=3)
     for sid, worker in (("f", process), ("g", quiet)):
-        env.sessions[sid] = ffmpeg_session.TranscodeSession(
+        env.sessions[sid] = transcode.TranscodeSession(
             process=worker,
             dir=str(tmp_path),
             started=_NOW,
             url="http://stream.test/live",
         )
-    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg_session"):
-        await ffmpeg_session._monitor_fast_process(_proc(process), "encoder", "f")
-        await ffmpeg_session._monitor_fast_process(_proc(quiet), "remux", "g")
+    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg.transcode"):
+        await transcode._monitor_fast_process(_proc(process), "encoder", "f")
+        await transcode._monitor_fast_process(_proc(quiet), "remux", "g")
         # A replaced worker, or one whose session ended, exits quietly.
-        await ffmpeg_session._monitor_fast_process(_proc(FakeProcess(exit_code=1)), "encoder", "f")
-        await ffmpeg_session._monitor_fast_process(_proc(FakeProcess(exit_code=1)), "encoder", "x")
+        await transcode._monitor_fast_process(_proc(FakeProcess(exit_code=1)), "encoder", "f")
+        await transcode._monitor_fast_process(_proc(FakeProcess(exit_code=1)), "encoder", "x")
     warnings = [r.getMessage() for r in caplog.records]
     assert warnings == [
         "Fast-start encoder exited for f (code 1): "
@@ -5156,15 +5196,15 @@ async def test_monitor_fast_process(
     ]
     process.stderr = None
     with pytest.raises(ValueError, match=r"^Expected process\.stderr is not None\.$"):
-        await ffmpeg_session._monitor_fast_process(_proc(process), "encoder", "f")
+        await transcode._monitor_fast_process(_proc(process), "encoder", "f")
 
 
 def test_log_watchdog_delay_rate_limited(caplog: pytest.LogCaptureFixture, tmp_path: pathlib.Path):
     session = _live(tmp_path)
-    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg_session"):
-        ffmpeg_session._log_watchdog_delay("f", session, "pipeline", 100)
-        ffmpeg_session._log_watchdog_delay("f", session, "pipeline", 129.9)
-        ffmpeg_session._log_watchdog_delay("f", session, "pipeline", 130)
+    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg.transcode"):
+        transcode._log_watchdog_delay("f", session, "pipeline", 100)
+        transcode._log_watchdog_delay("f", session, "pipeline", 129.9)
+        transcode._log_watchdog_delay("f", session, "pipeline", 130)
     assert [r.getMessage() for r in caplog.records] == [
         "Live watchdog f is delaying pipeline recovery because its restart budget is cooling down",
     ] * 2
@@ -5181,29 +5221,29 @@ async def test_restart_clock_dates_old_segments_then_follows_the_new_relay(
     session.update(origin_pts=5000.0, origin_time=100.0)
     env.sessions["f"] = session
     # Before the first worker publishes, there is nothing to date.
-    await ffmpeg_session._restart_session_clock("f", session, 1.5, 200.0)
+    await transcode._restart_session_clock("f", session, 1.5, 200.0)
     assert "segment_dates" not in session
     assert (session.get("origin_pts"), session.get("origin_time")) == (1.5, 200.0)
     (tmp_path / "low.m3u8").write_text("#EXTINF:2,\nlow_1.ts\n")
     session.update(origin_pts=5000.0, origin_time=100.0)
-    await ffmpeg_session._restart_session_clock("f", session, None, 300.0)
+    await transcode._restart_session_clock("f", session, None, 300.0)
     assert session.get("segment_dates") == {"low_1.ts": 102.0}
     assert (session.get("origin_pts"), session.get("origin_time")) == (None, 300.0)
     env.sessions.clear()
     with pytest.raises(KeyError):
-        await ffmpeg_session._restart_session_clock("f", session, 7.0, 400.0)
+        await transcode._restart_session_clock("f", session, 7.0, 400.0)
     assert (session.get("origin_pts"), session.get("origin_time")) == (None, 300.0)
 
 
 def test_dated_fast_playlist_needs_a_known_clock(env: _Env, tmp_path: pathlib.Path):
-    assert ffmpeg_session.dated_fast_playlist("missing", "#EXTM3U\n") == "#EXTM3U\n"
+    assert transcode.dated_fast_playlist("missing", "#EXTM3U\n") == "#EXTM3U\n"
     env.sessions["f"] = _fast_session(tmp_path)
-    assert ffmpeg_session.dated_fast_playlist("f", "#EXTM3U\n") == "#EXTM3U\n"
+    assert transcode.dated_fast_playlist("f", "#EXTM3U\n") == "#EXTM3U\n"
     env.sessions["f"]["origin_pts"] = None
-    assert ffmpeg_session.dated_fast_playlist("f", "#EXTM3U\n") == "#EXTM3U\n"
+    assert transcode.dated_fast_playlist("f", "#EXTM3U\n") == "#EXTM3U\n"
     env.sessions["f"]["origin_pts"] = 1.0
     with pytest.raises(KeyError, match="origin_time"):
-        ffmpeg_session.dated_fast_playlist("f", "#EXTM3U\n")
+        transcode.dated_fast_playlist("f", "#EXTM3U\n")
 
 
 def _published_low(directory: pathlib.Path) -> None:
@@ -5215,7 +5255,7 @@ def _published_low(directory: pathlib.Path) -> None:
 @pytest.mark.asyncio
 async def test_restart_pipeline_skips_replaced_session(env: _Env, tmp_path: pathlib.Path):
     session = _fast_session(tmp_path)
-    await ffmpeg_session._restart_fast_pipeline("f", session, "input")
+    await transcode._restart_fast_pipeline("f", session, "input")
     assert "watchdog_recovering" not in session
     assert env.launcher.commands == []
 
@@ -5250,8 +5290,8 @@ async def test_restart_pipeline_success(
     await _receiving(session)
     session["subscription"] = first.subscribe(old.stdin)
     env.clock.now = _NOW + 30
-    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg_session"):
-        await ffmpeg_session._restart_fast_pipeline("f", session, stage)
+    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg.transcode"):
+        await transcode._restart_fast_pipeline("f", session, stage)
     (launch,) = env.launcher.launches
     # The replacement appends to the rendition after a discontinuity.
     assert "append_list" in _option(launch.command, "-hls_flags")
@@ -5300,10 +5340,10 @@ async def test_restart_pipeline_failure_discards_the_replacement(
     await _receiving(session)
     env.launcher.on_launch = None
     env.launcher.error = None if silent else OSError("no ffmpeg")
-    with caplog.at_level(logging.ERROR, logger="netv.ffmpeg_session"):
-        await ffmpeg_session._restart_fast_pipeline("f", session, "low output")
+    with caplog.at_level(logging.ERROR, logger="netv.ffmpeg.transcode"):
+        await transcode._restart_fast_pipeline("f", session, "low output")
     assert "failed to recover the pipeline after low output stalled" in caplog.text
-    assert isinstance(session["process"], ffmpeg_session._DeadProcess)
+    assert isinstance(session["process"], transcode._DeadProcess)
     assert [p.signals for p in env.launcher.processes] == ([["TERM"]] if silent else [])
     assert session.get("playlist_generation") == 5
     # The stall stays on record and the budget frees for the next attempt.
@@ -5330,11 +5370,11 @@ async def test_restart_pipeline_stops_when_the_session_ends(
 
     async def stop_during_launch(command: list[str]) -> None:
         del command
-        await ffmpeg_session.stop_session("f", force=True)
+        await transcode.stop_session("f", force=True)
 
     env.launcher.on_launch = stop_during_launch
-    with caplog.at_level(logging.INFO, logger="netv.ffmpeg_session"):
-        await ffmpeg_session._restart_fast_pipeline("f", session, stage)
+    with caplog.at_level(logging.INFO, logger="netv.ffmpeg.transcode"):
+        await transcode._restart_fast_pipeline("f", session, stage)
     (replacement,) = env.launcher.processes
     assert replacement.signals == ["TERM"]
     assert "Live watchdog f stopped recovering: the session ended" in caplog.messages
@@ -5367,7 +5407,7 @@ def _process(alive: bool | None) -> FakeProcess | None:
 
 
 async def _relay_last_heard(
-    session: ffmpeg_session.FastLiveSession,
+    session: transcode.FastLiveSession,
     clock: FakeClock,
     at: float,
 ) -> None:
@@ -5426,8 +5466,8 @@ async def test_watchdog_checks_live_media_and_persists_each_observation(
         await session["relay"].wait_finished()
     env.clock.now = now
 
-    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg_session"):
-        await ffmpeg_session._check_fast_live_session("media-check", session)
+    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg.transcode"):
+        await transcode._check_fast_live_session("media-check", session)
 
     max_age = 10 if stale_after is None else stale_after
     ready = {
@@ -5490,8 +5530,8 @@ async def test_watchdog_dispatches_recovery_with_updated_policy(
     await _relay_last_heard(session, env.clock, now - 100)
     env.clock.now = now
 
-    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg_session"):
-        await ffmpeg_session._check_fast_live_session("dispatch-check", session)
+    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg.transcode"):
+        await transcode._check_fast_live_session("dispatch-check", session)
 
     stage = "input" if input_stalled else "low output"
     recovery = session["live_recovery"]
@@ -5529,7 +5569,7 @@ async def test_watchdog_dispatches_recovery_with_updated_policy(
     if action == "stop":
         # Without a pipeline, polling clients would otherwise keep reusing it.
         assert not env.sessions
-        assert ffmpeg_session._get_existing_session("http://live") is None
+        assert transcode._get_existing_session("http://live") is None
         assert not env.urls
         assert upstreams.opened[0].closed
         assert not tmp_path.exists()
@@ -5575,8 +5615,8 @@ async def test_check_restarts_stalled_pipeline(
     await _relay_last_heard(session, env.clock, _NOW if input_ready else _NOW - 100)
     env.clock.now = _NOW
     env.launcher.on_launch = None
-    with caplog.at_level(logging.ERROR, logger="netv.ffmpeg_session"):
-        await ffmpeg_session._check_fast_live_session("f", session)
+    with caplog.at_level(logging.ERROR, logger="netv.ffmpeg.transcode"):
+        await transcode._check_fast_live_session("f", session)
     assert f"failed to recover the pipeline after {stage} stalled" in caplog.text
     (command,) = env.launcher.commands
     assert _option(command, "-i") == "pipe:0"
@@ -5605,9 +5645,9 @@ async def test_watchdog_logs_errors_and_propagates_cancel(
         await release.wait()
 
     env.launcher.on_launch = launch
-    with caplog.at_level(logging.ERROR, logger="netv.ffmpeg_session"):
+    with caplog.at_level(logging.ERROR, logger="netv.ffmpeg.transcode"):
         watchdog = asyncio.create_task(
-            ffmpeg_session._watch_fast_live("f", watchdog_interval_sec=6),
+            transcode._watch_fast_live("f", watchdog_interval_sec=6),
         )
         await until(lambda: len(launched) == 2)
         watchdog.cancel()
@@ -5631,7 +5671,7 @@ async def test_watchdog_skips_idle_session_and_exits_when_removed(
     session = _fast_session(tmp_path, live_recovery=policy)
     session["last_access"] = _NOW - 30.5
     env.sessions["f"] = session
-    task = asyncio.create_task(ffmpeg_session._watch_fast_live("f", watchdog_interval_sec=0))
+    task = asyncio.create_task(transcode._watch_fast_live("f", watchdog_interval_sec=0))
     for _ in range(3):
         await asyncio.sleep(0)
     env.sessions.clear()
@@ -5642,9 +5682,9 @@ async def test_watchdog_skips_idle_session_and_exits_when_removed(
 
 @pytest.mark.asyncio
 async def test_watchdog_missing_recovery_names_the_required_field(tmp_path: pathlib.Path):
-    session = ffmpeg_session.TranscodeSession(dir=str(tmp_path), process=None, started=0, url="x")
+    session = transcode.TranscodeSession(dir=str(tmp_path), process=None, started=0, url="x")
     with pytest.raises(KeyError) as error:
-        await ffmpeg_session._check_fast_live_session("missing-policy", session)
+        await transcode._check_fast_live_session("missing-policy", session)
     assert error.value.args == ("live_recovery",)
 
 
@@ -5655,7 +5695,7 @@ async def test_watchdog_missing_recovery_names_the_required_field(tmp_path: path
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class _Recovery:
-    session: ffmpeg_session.FastLiveSession
+    session: transcode.FastLiveSession
     launcher: ProcessLauncher
     clock: FakeClock
     upstreams: FakeUpstreams
@@ -5709,7 +5749,7 @@ async def _check(recovery: _Recovery, now: float, fresh: dict[str, bool]) -> Non
     playlist(directory, "low")
     mtime = now if fresh["low"] else now - 100
     os.utime(directory / "low.m3u8", (mtime, mtime))
-    await ffmpeg_session._check_fast_live_session("recover", recovery.session)
+    await transcode._check_fast_live_session("recover", recovery.session)
 
 
 @pytest.mark.asyncio
@@ -5718,7 +5758,7 @@ async def test_input_stall_restarts_pipeline_once(
     caplog: pytest.LogCaptureFixture,
 ):
     fresh = {"input": False, "low": True}
-    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg_session"):
+    with caplog.at_level(logging.WARNING, logger="netv.ffmpeg.transcode"):
         await _check(recovery, 1000, fresh)
         assert recovery.launcher.launches == []
         await _check(recovery, 1002, fresh)
@@ -5729,7 +5769,7 @@ async def test_input_stall_restarts_pipeline_once(
     assert recovery.low.signals == ["TERM"]
     assert [upstream.closed for upstream in recovery.upstreams.opened] == [True, False]
     assert recovery.session.get("playlist_generation") == 1
-    assert [r.getMessage() for r in caplog.records if r.name == "netv.ffmpeg_session"] == [
+    assert [r.getMessage() for r in caplog.records if r.name == "netv.ffmpeg.transcode"] == [
         "Live watchdog recover recovered pipeline generation 1 after input stalled",
     ]
 
@@ -5748,9 +5788,168 @@ async def test_running_pipeline_tolerates_thirty_second_publication_gap(recovery
     await _deliver(recovery, 70)
     os.utime(pathlib.Path(recovery.session["dir"]) / "low.m3u8", (70, 70))
     recovery.clock.now = 100
-    await ffmpeg_session._check_fast_live_session("recover", recovery.session)
+    await transcode._check_fast_live_session("recover", recovery.session)
     assert recovery.launcher.launches == []
     assert dict(recovery.session["live_recovery"].failures) == {}
+
+
+# =============================================================================
+# Letterbox
+# =============================================================================
+
+
+# A 2.40:1 picture letterboxed in 16:9: rows 140-939 of 1080.
+_SCOPE = CropBox(top=0.13, height=0.74)
+
+
+def _detected(directory: pathlib.Path, *, seconds: int = 60) -> None:
+    """Write what ``seconds`` of a transcode's bar detection reports for ``_SCOPE``."""
+    (directory / DETECTION_FILE).write_text(
+        f"frame:{seconds - 1} pts:{seconds - 1}\nlavfi.cropdetect.x1=0\nlavfi.cropdetect.x2=999\n"
+        "lavfi.cropdetect.y1=130\nlavfi.cropdetect.y2=869\n",
+    )
+
+
+def _letterboxed_movie(crop: CropBox | None = _SCOPE) -> MediaInfo:
+    return MediaInfo(
+        video_codec="hevc",
+        audio_codec="aac",
+        pix_fmt="yuv420p",
+        width=1920,
+        height=1080,
+        crop=crop,
+    )
+
+
+def _cached_crop(url: str) -> CropBox | None:
+    info, _ = probe.probe_media(url, source_id="")
+    assert info is not None
+    return info.crop
+
+
+@pytest.mark.asyncio
+async def test_a_movie_with_known_bars_starts_without_them(env: _Env, tasks: BackgroundTasks):
+    del tasks
+    cache.save_server_settings({**cache.load_server_settings(), "transcode_hw": "software"})
+    probe.remember_probe("http://movie", _letterboxed_movie())
+    result = await transcode._do_start_transcode("http://movie", "movie", None, None, 0)
+    session = env.sessions[result["session_id"]]
+    assert session.get("crop") == _SCOPE
+    (command,) = env.launcher.commands
+    assert _option(command, "-vf").startswith("fps=source_fps,crop=1920:800:0:140,")
+    stored = json.loads((pathlib.Path(session["dir"]) / "session.json").read_text())
+    assert stored["crop"] == _SCOPE.to_cache()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_crop", [None, _SCOPE])
+async def test_a_seek_records_the_bars_found_and_keeps_the_session_s_crop(
+    env: _Env,
+    seek_dir: pathlib.Path,
+    session_crop: CropBox | None,
+):
+    cache.save_server_settings({**cache.load_server_settings(), "transcode_hw": "software"})
+    probe.remember_probe("http://movie", _letterboxed_movie(crop=None))
+    if session_crop is not None:
+        env.sessions["v"]["crop"] = session_crop
+    _detected(seek_dir)
+    await transcode.seek_transcode("v", 9.0)
+    assert _cached_crop("http://movie") == _SCOPE
+    (command,) = env.launcher.commands
+    # New segments match the ones the session already encoded.
+    assert ("crop=" in _option(command, "-vf")) is (session_crop is not None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_crop", [None, _SCOPE])
+async def test_a_resume_keeps_the_session_s_crop(
+    env: _Env,
+    tasks: BackgroundTasks,
+    tmp_path: pathlib.Path,
+    session_crop: CropBox | None,
+):
+    del tasks
+    cache.save_server_settings({**cache.load_server_settings(), "transcode_hw": "software"})
+    probe.remember_probe("http://ep", _letterboxed_movie())
+    (tmp_path / "seg000.ts").write_bytes(b"x" * 2000)
+    env.sessions["s"] = transcode.TranscodeSession(
+        dir=str(tmp_path),
+        process=FakeProcess(exited=True),
+        url="http://ep",
+        is_vod=True,
+        started=_NOW,
+    )
+    if session_crop is not None:
+        env.sessions["s"]["crop"] = session_crop
+    assert await transcode._try_reuse_session("s", "http://ep", "movie") is not None
+    (command,) = env.launcher.commands
+    # Appended segments continue the playlist, so they keep its frame size.
+    assert ("crop=" in _option(command, "-vf")) is (session_crop is not None)
+
+
+@pytest.mark.parametrize(("url", "recorded"), [("http://vod", True), (ARCHIVE_URL, False)])
+def test_stopping_a_movie_records_the_bars_found(
+    env: _Env,
+    tmp_path: pathlib.Path,
+    url: str,
+    recorded: bool,
+):
+    probe.remember_probe(url, _letterboxed_movie(crop=None))
+    _detected(tmp_path)
+    env.sessions["s"] = transcode.TranscodeSession(
+        process=FakeProcess(exit_code=None),
+        dir=str(tmp_path),
+        url=url,
+        is_vod=True,
+        started=_NOW,
+    )
+    asyncio.run(transcode.stop_session("s", force=True))
+    assert _cached_crop(url) == (_SCOPE if recorded else None)
+
+
+def test_stopping_live_records_no_bars(env: _Env, tmp_path: pathlib.Path):
+    probe.remember_probe("http://live", _letterboxed_movie(crop=None))
+    _detected(tmp_path)
+    env.sessions["s"] = _live(tmp_path)
+    asyncio.run(transcode.stop_session("s", force=True))
+    assert _cached_crop("http://live") is None
+
+
+def test_live_players_hide_the_bars_every_sample_had(env: _Env, tmp_path: pathlib.Path):
+    env.sessions["live"] = _live(tmp_path)
+    env.sessions["live"]["username"] = "u"
+    assert transcode.crop_view("live", "u") is None
+    _detected(tmp_path, seconds=4)
+    assert transcode.crop_view("live", "u") is None
+    # Players hide the bars after five seconds; the box only grows as more is seen.
+    _detected(tmp_path, seconds=5)
+    assert transcode.crop_view("live", "u") == _SCOPE
+
+
+def test_a_cropped_movie_shows_only_the_bars_its_crop_missed(env: _Env, tmp_path: pathlib.Path):
+    env.sessions["m"] = _live(tmp_path)
+    env.sessions["m"].update(username="u", is_vod=True, crop=CropBox(top=0.1, height=0.8))
+    _detected(tmp_path)
+    assert transcode.crop_view("m", "u") == CropBox(top=0.0375, height=0.925)
+
+
+def test_crop_view_of_another_user_s_session_is_not_found(env: _Env, tmp_path: pathlib.Path):
+    env.sessions["s"] = _live(tmp_path)
+    env.sessions["s"]["username"] = "owner"
+    for session_id in ("s", "missing"):
+        with pytest.raises(HTTPException) as error:
+            transcode.crop_view(session_id, "u")
+        assert (error.value.status_code, error.value.detail) == (404, "Session not found")
+
+
+def test_recovery_restores_the_session_s_crop(env: _Env):
+    _vod_dir(
+        env.root,
+        "vod1",
+        {"session_id": "vod1", "url": "http://m.mp4", "is_vod": True, "crop": _SCOPE.to_cache()},
+    )
+    transcode.cleanup_and_recover_sessions()
+    assert env.sessions["vod1"].get("crop") == _SCOPE
 
 
 if __name__ == "__main__":

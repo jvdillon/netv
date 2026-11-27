@@ -63,20 +63,7 @@ from starlette.responses import StreamingResponse
 from starlette.types import Scope
 from treekle import MutablePlainTree, ReadError, from_plain, json_loads
 
-from netv import (
-    auth,
-    cache,
-    catchup,
-    chromecast,
-    db,
-    epg,
-    ffmpeg_command,
-    ffmpeg_session,
-    handoff,
-    imdb,
-    playlists,
-    proxy,
-)
+from netv import auth, cache, catchup, chromecast, db, epg, handoff, imdb, playlists, proxy
 from netv.auth import TokenClaims, create_token, verify_password, verify_token
 from netv.cache import (
     AVAILABLE_ENCODERS,
@@ -106,7 +93,8 @@ from netv.cache import (
     update_source_epg_url,
 )
 from netv.epg import fetch_epg
-from netv.fast_start import add_live_start_offset, blocking_master, with_blocking_reload
+from netv.ffmpeg import commands, probe, transcode
+from netv.ffmpeg.fast_start import add_live_start_offset, blocking_master, with_blocking_reload
 from netv.m3u import (
     cached_live_data,
     cached_series_data,
@@ -219,14 +207,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     imdb.init()
 
     # Initialize transcoding module with settings callback.
-    ffmpeg_command.init(
+    commands.init(
         load_server_settings,
         sr_engine_dir=str(sr_engine_dir()) if is_sr_available() else "",
     )
 
     _kill_orphaned_ffmpeg()
     # Clean up orphaned dirs and recover valid VOD sessions.
-    ffmpeg_session.cleanup_and_recover_sessions()
+    transcode.cleanup_and_recover_sessions()
     handoff.load(cache.USERS_DIR)
     handoff.cleanup_orphans()
 
@@ -263,7 +251,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     def cleanup_loop():
         while not cleanup_stop.wait(60):  # Check every minute.
-            _run_on_loop(loop, ffmpeg_session.cleanup_expired_sessions())
+            _run_on_loop(loop, transcode.cleanup_expired_sessions())
 
     cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
     cleanup_thread.start()
@@ -353,7 +341,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     cleanup_stop.set()
     scheduler_stop.set()
     await asyncio.to_thread(chromecast.manager.close)
-    await ffmpeg_session.shutdown()
+    await transcode.shutdown()
 
 
 def _run_on_loop(
@@ -373,7 +361,7 @@ def _handoff_recorder(loop: asyncio.AbstractEventLoop) -> handoff.Recorder:
         directory: pathlib.Path,
         seconds: float,
     ) -> handoff.Recording:
-        recording = ffmpeg_session.record_live(
+        recording = transcode.record_live(
             username,
             channel.url,
             channel.source_id,
@@ -1579,7 +1567,7 @@ async def player_page(
         and not chromecast.manager.owns_url(info.url)
     ):
         user_max_streams, source_max_streams = _stream_limits(username, info.source_id)
-        ffmpeg_session.prestart_live(
+        transcode.prestart_live(
             info.url,
             username=username,
             source_id=info.source_id,
@@ -1672,7 +1660,7 @@ async def pretune_api(
     if not await asyncio.to_thread(_tuner_to_spare, info.url, info.source_id):
         return {"pretuned": False}
     user_max_streams, source_max_streams = _stream_limits(username, info.source_id)
-    ffmpeg_session.pretune_live(
+    transcode.pretune_live(
         info.url,
         username=username,
         source_id=info.source_id,
@@ -1686,7 +1674,7 @@ async def pretune_api(
 @app.delete("/api/pretune", status_code=204)
 async def release_pretune_api(user: Annotated[TokenClaims, Depends(require_auth)]) -> Response:
     """Stop the viewer's pretuned channel: their guide focus left it."""
-    await ffmpeg_session.release_pretune(user["sub"])
+    await transcode.release_pretune(user["sub"])
     return Response(status_code=204)
 
 
@@ -1694,13 +1682,13 @@ async def release_pretune_api(user: Annotated[TokenClaims, Depends(require_auth)
 class _PlayTarget:
     """What a play path plays: a channel, a movie, or an episode of a series."""
 
-    kind: ffmpeg_session.ContentType
+    kind: transcode.ContentType
     stream_id: str
     series_id: int = 0
 
 
 # The same stream always gets the same link; the database remembers what it plays.
-def _play_path(kind: ffmpeg_session.ContentType, stream_id: str, *, series_id: int = 0) -> str:
+def _play_path(kind: transcode.ContentType, stream_id: str, *, series_id: int = 0) -> str:
     """The player URL of a channel, movie, or episode: ten characters naming nothing."""
     digest = hashlib.sha256(f"{kind}:{series_id}:{stream_id}".encode()).digest()
     link = base64.b32encode(digest).decode()[:10].lower()
@@ -2050,7 +2038,7 @@ async def playlist_xspf(
 
 
 # =============================================================================
-# Transcoding routes (logic in ffmpeg_session.py)
+# Transcoding routes (logic in ffmpeg/transcode.py)
 # =============================================================================
 
 
@@ -2059,7 +2047,7 @@ async def transcode_start(
     request: Request,
     user: Annotated[TokenClaims, Depends(require_auth)],
     ref: str = "",
-    content_type: ffmpeg_session.ContentType = "live",
+    content_type: transcode.ContentType = "live",
     series_id: int | None = None,
     episode_id: int | None = None,
     series_name: str = "",
@@ -2100,7 +2088,7 @@ async def transcode_start(
     _require_visible_source(username, url, source_id)
 
     user_max_streams, source_max_streams = _stream_limits(username, source_id)
-    result = await ffmpeg_session.start_transcode(
+    result = await transcode.start_transcode(
         url,
         content_type,
         series_id,
@@ -2118,7 +2106,7 @@ async def transcode_start(
     )
     if content_type == "live" and await request.is_disconnected():
         # A reload disconnects the old page's request: end only its viewing.
-        await ffmpeg_session.stop_session(
+        await transcode.stop_session(
             result["session_id"],
             force=True,
             viewer=result.get("viewer_id", ""),
@@ -2134,8 +2122,8 @@ async def transcode_health(
     user: Annotated[TokenClaims, Depends(require_auth)],
     viewer: str = "",
 ):
-    decision = ffmpeg_session.report_playback_health(session_id, user.get("sub", ""), health)
-    ffmpeg_session.note_viewer(session_id, viewer)
+    decision = transcode.report_playback_health(session_id, user.get("sub", ""), health)
+    transcode.note_viewer(session_id, viewer)
     return decision
 
 
@@ -2149,7 +2137,7 @@ async def transcode_seek(
     _require_session_user(session_id, user)
     if chromecast.manager.owns_session(session_id):
         raise HTTPException(409, "Stop casting before changing the transcode position.")
-    return await ffmpeg_session.seek_transcode(session_id, time)
+    return await transcode.seek_transcode(session_id, time)
 
 
 @app.get("/transcode/progress/{session_id}")
@@ -2158,10 +2146,20 @@ async def transcode_progress(
     user: Annotated[TokenClaims, Depends(require_auth)],
 ):
     """Get transcode progress (segment count, duration)."""
-    progress = ffmpeg_session.get_session_progress(session_id, user["sub"])
+    progress = transcode.get_session_progress(session_id, user["sub"])
     if progress is None:
         raise HTTPException(404, "Session not found")
     return progress
+
+
+@app.get("/transcode/crop/{session_id}")
+async def transcode_crop(
+    session_id: str,
+    user: Annotated[TokenClaims, Depends(require_auth)],
+):
+    """Get the picture area of the session's frames, so the player can hide black bars."""
+    crop = await asyncio.to_thread(transcode.crop_view, session_id, user["sub"])
+    return {"crop": None if crop is None else crop.to_cache()}
 
 
 @app.get("/transcode/{session_id}/{filename}")
@@ -2187,7 +2185,7 @@ async def transcode_file(
     if safe_filename != filename or ".." in filename:
         raise HTTPException(400, "Invalid filename")
 
-    session = ffmpeg_session.get_session(session_id)
+    session = transcode.get_session(session_id)
     if session is None:
         log.debug("[CAST] 404 session not found: %s", session_id)
         raise HTTPException(404, "Transcode session not found")
@@ -2198,8 +2196,8 @@ async def transcode_file(
         log.debug("[CAST] 404 file not found: %s", file_path)
         raise HTTPException(404, "File not found")
 
-    ffmpeg_session.touch_session(session_id)
-    ffmpeg_session.note_segment_served(session_id, safe_filename)
+    transcode.touch_session(session_id)
+    transcode.note_segment_served(session_id, safe_filename)
 
     # Log Chromecast requests.
     ua = request.headers.get("user-agent", "")
@@ -2210,13 +2208,13 @@ async def transcode_file(
     if filename.endswith(".m3u8"):
         fast_start = session.get("fast_start", False)
         if fast_start and filename == "low.m3u8" and blocking and hls_msn is not None:
-            await ffmpeg_session.wait_for_segment(session_id, hls_msn)
+            await transcode.wait_for_segment(session_id, hls_msn)
         content = file_path.read_text()
         if fast_start and filename == "low.m3u8":
             content = add_live_start_offset(
-                ffmpeg_session.dated_fast_playlist(
+                transcode.dated_fast_playlist(
                     session_id,
-                    ffmpeg_session.live_playlist(session_id) or content,
+                    transcode.live_playlist(session_id) or content,
                 ),
                 float(session.get("playback_buffer_seconds", 12.0)),
             )
@@ -2232,9 +2230,9 @@ async def transcode_file(
     if filename.endswith(".vtt"):
         content = file_path.read_text()
         if re.fullmatch(r"sub\d+_\d+\.vtt", filename):
-            content = ffmpeg_session.add_webvtt_timestamp_map(
+            content = transcode.add_webvtt_timestamp_map(
                 content,
-                ffmpeg_session.get_caption_timestamp_origin(session_id),
+                transcode.get_caption_timestamp_origin(session_id),
             )
         return Response(content=content, media_type="text/vtt", headers=cors)
     return FileResponse(file_path, media_type="video/mp2t", headers=cors)
@@ -2255,7 +2253,7 @@ async def subtitle_file(request: Request, session_id: str, filename: str):
         raise HTTPException(400, "Invalid filename")
     if not safe_filename.endswith(".vtt"):
         raise HTTPException(400, "Only VTT files allowed")
-    session = ffmpeg_session.get_session(session_id)
+    session = transcode.get_session(session_id)
     if session is None:
         raise HTTPException(404, "Session not found")
     _require_owner_here(request, session.get("username", ""))
@@ -2289,7 +2287,7 @@ async def transcode_stop(
         viewer: The leaving page's ``viewer_id``; a live session other pages
             still watch keeps playing.
     """
-    session = ffmpeg_session.get_session(session_id)
+    session = transcode.get_session(session_id)
     if session is not None:
         _require_session_user(session_id, user)
     if chromecast.manager.owns_session(session_id):
@@ -2297,7 +2295,7 @@ async def transcode_stop(
     force = force or (session is not None and session.get("is_archive", False))
     if force and session is not None and session.get("username") != user["sub"]:
         raise HTTPException(404, "Session not found")
-    await ffmpeg_session.stop_session(session_id, force=force, viewer=viewer)
+    await transcode.stop_session(session_id, force=force, viewer=viewer)
     return {"status": "stopped"}
 
 
@@ -2326,9 +2324,9 @@ async def transcode_clear(
     url = _issued_url(ref, user["sub"])
     if chromecast.manager.owns_url(url):
         raise HTTPException(409, "Stop casting before restarting this transcode.")
-    session_id = ffmpeg_session.clear_url_session(url)
+    session_id = transcode.clear_url_session(url)
     if session_id is not None:
-        await ffmpeg_session.stop_session(session_id, force=True)
+        await transcode.stop_session(session_id, force=True)
         log.info("Force-cleared transcode session %s for URL", session_id)
     return {"status": "cleared", "session_id": session_id}
 
@@ -2905,7 +2903,7 @@ async def cast_control(data: CastCommand, user: Annotated[TokenClaims, Depends(r
         data.volume,
         release=lambda session_id: _run_on_loop(
             loop,
-            ffmpeg_session.stop_session(session_id, force=True),
+            transcode.stop_session(session_id, force=True),
         ),
     )
 
@@ -3266,7 +3264,7 @@ async def get_probe_cache(
     del user
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     probes = await asyncio.to_thread(_labeled_url_probes)
-    stats = ffmpeg_command.get_series_probe_cache_stats()
+    stats = probe.get_series_probe_cache_stats()
     xtream = get_first_xtream_client()
     if xtream:
         stats = await asyncio.to_thread(_enrich_probe_cache_stats, stats, xtream)
@@ -3277,7 +3275,7 @@ async def get_probe_cache(
 async def clear_probe_cache(user: Annotated[TokenClaims, Depends(require_admin)]):
     """Clear all probe caches."""
     del user
-    count = ffmpeg_command.clear_all_probe_cache()
+    count = probe.clear_all_probe_cache()
     return {"ok": True, "cleared": count}
 
 
@@ -3289,7 +3287,7 @@ async def clear_series_probe_cache(
 ):
     """Clear probe cache for a specific series or episode."""
     del user
-    ffmpeg_command.invalidate_series_probe_cache(series_id, episode_id)
+    probe.invalidate_series_probe_cache(series_id, episode_id)
     return {"ok": True}
 
 
@@ -3312,7 +3310,7 @@ async def clear_url_probe_cache(
         for url, probe in await asyncio.to_thread(_labeled_url_probes)
         if (probe["kind"], probe["stream_id"]) == (kind, stream_id)
     ]
-    return {"ok": True, "cleared": ffmpeg_command.invalidate_url_probe_cache(urls)}
+    return {"ok": True, "cleared": probe.invalidate_url_probe_cache(urls)}
 
 
 class _UrlProbe(TypedDict):
@@ -3335,7 +3333,7 @@ async def clear_series_mru(
 ):
     """Clear only the MRU for a series, keeping episode cache intact."""
     del user
-    ffmpeg_command.clear_series_mru(series_id)
+    probe.clear_series_mru(series_id)
     return {"ok": True}
 
 
@@ -5365,7 +5363,7 @@ def _fetch_logo(url: str, timeout: int = 3, *, max_size: int = 1024 * 1024) -> t
 
 
 def _enrich_probe_cache_stats(
-    stats: list[ffmpeg_command.SeriesProbeStats],
+    stats: list[probe.SeriesProbeStats],
     xtream: XtreamClient,
 ) -> list[dict[str, object]]:
     """Copy probe cache stats, adding series and episode names (blocking)."""
@@ -5810,7 +5808,7 @@ def _labeled_url_probes() -> list[tuple[str, _UrlProbe]]:
     by_url = {text_field(c, "direct_url"): c for c in channels if c.get("direct_url") is not None}
     by_id = {str(c.get("stream_id")): c for c in channels}
     labeled: list[tuple[str, _UrlProbe]] = []
-    for stats in ffmpeg_command.get_url_probe_cache_stats():
+    for stats in probe.get_url_probe_cache_stats():
         url = stats["url"]
         parts = parse.urlparse(url).path.split("/")
         stem = parts[-1].split(".")[0]
@@ -6028,7 +6026,7 @@ def _require_visible_source(username: str, url: str, source_id: str = "") -> Non
 
 def _require_session_user(session_id: str, user: TokenClaims) -> None:
     """Refuse a session to anyone who neither started it nor was handed it."""
-    if ffmpeg_session.user_session(session_id, user["sub"]) is None:
+    if transcode.user_session(session_id, user["sub"]) is None:
         raise HTTPException(404, "Session not found")
 
 
@@ -6125,7 +6123,7 @@ def _play_links() -> sqlite3.Connection:
     return conn
 
 
-def _play_kind(text: str) -> ffmpeg_session.ContentType:
+def _play_kind(text: str) -> transcode.ContentType:
     match text:
         case "live" | "movie" | "series":
             return text

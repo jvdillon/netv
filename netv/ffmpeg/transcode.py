@@ -1,4 +1,4 @@
-"""FFmpeg session lifecycle management."""
+"""Transcode sessions: starting, seeking, recovering, and stopping each ffmpeg."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ import functools
 import io
 import json
 import logging
+import math
 import pathlib
 import re
 import shutil
@@ -44,7 +45,19 @@ from netv.cache import (
     relay_hints,
     remember_burst_gap,
 )
-from netv.fast_start import (
+from netv.ffmpeg.commands import (
+    SEG_PREFIX,
+    build_hls_ffmpeg_cmd,
+    can_remux_live,
+    encoder_crop,
+    get_hls_segment_duration,
+    get_live_hls_list_size,
+    get_settings,
+    get_transcode_dir,
+    live_video_bitrates,
+    uses_audio_passthrough,
+)
+from netv.ffmpeg.fast_start import (
     closed_caption_master_playlist,
     dated_playlist,
     encoder_command,
@@ -64,28 +77,21 @@ from netv.fast_start import (
     splice_point,
     surround_audio_bitrate,
 )
-from netv.ffmpeg_command import (
-    SEG_PREFIX,
+from netv.ffmpeg.letterbox import CachedCrop, CropBox, detected_crop
+from netv.ffmpeg.probe import (
     CachedAudioTrack,
     MediaInfo,
     SubtitleStream,
     audio_tracks_from_cache,
     audio_tracks_to_cache,
-    build_hls_ffmpeg_cmd,
-    can_remux_live,
-    get_hls_segment_duration,
-    get_live_hls_list_size,
-    get_settings,
-    get_transcode_dir,
     has_cached_probe,
-    live_video_bitrates,
     probe_closed_captions,
     probe_media,
     probe_segment,
+    remember_crop,
     remember_probe,
     resolve_hls_master_playlist,
     restore_probe_cache_entry,
-    uses_audio_passthrough,
     with_audio_language,
 )
 from netv.m3u import live_ts_offered
@@ -183,6 +189,8 @@ class TranscodeSession(TypedDict, total=False):
     watchdog_task: asyncio.Task[None]
     watchdog_recovering: str
     pipeline_restart_log_at: float
+    # The crop every ffmpeg of a VOD session cuts, so its segments share a frame size.
+    crop: CropBox
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -452,6 +460,14 @@ async def stop_session(
                 del _url_to_session[session["url"]]
 
     await _terminate_processes(processes)
+    if session.get("is_vod", False) and not _is_archive_url(session["url"]):
+        await asyncio.to_thread(
+            _remember_detected_crop,
+            session["url"],
+            session["dir"],
+            session.get("series_id"),
+            session.get("episode_id"),
+        )
     if _is_fast_live(session):
         subscription = session.get("subscription")
         if subscription is not None:
@@ -749,6 +765,8 @@ def cleanup_and_recover_sessions() -> None:
                     "audio_passthrough": info.get("audio_passthrough", False),
                     "audio_lang": info.get("audio_lang", ""),
                 }
+                if "crop" in info:
+                    _transcode_sessions[session_id]["crop"] = CropBox.from_cache(info["crop"])
                 # Prefer session with seek_offset or more recent mtime.
                 existing_id = _url_to_session.get(url)
                 existing = None if existing_id is None else _transcode_sessions.get(existing_id)
@@ -895,6 +913,7 @@ class _SessionSnapshot:
     audio_passthrough: bool = False
     username: str = ""
     source_id: str = ""
+    crop: CropBox | None = None
 
 
 # ===========================================================================
@@ -1139,10 +1158,14 @@ def note_segment_served(
         served = int(stem[len(SEG_PREFIX) :])
     except ValueError:
         return 0
-    keep = int(keep_behind_sec / get_hls_segment_duration())
+    keep = math.ceil(keep_behind_sec / get_hls_segment_duration())
     with _transcode_lock:
         session = _transcode_sessions.get(session_id)
-        if session is None or not session.get("is_vod", False) or session.get("fast_start", False):
+        if (
+            session is None
+            or session.get("is_vod") is not True
+            or session.get("fast_start") is True
+        ):
             return 0
         evicted_below = session.get("evicted_below", 0)
         # Playback moved back (a seek restarted ffmpeg earlier): evict from there again.
@@ -1153,10 +1176,11 @@ def note_segment_served(
         directory = pathlib.Path(session["dir"])
     deleted = 0
     for number in range(evicted_below, cutoff):
-        path = directory / f"{SEG_PREFIX}{number:03d}.ts"
-        if path.exists():
-            path.unlink(missing_ok=True)
-            deleted += 1
+        try:
+            (directory / f"{SEG_PREFIX}{number:03d}.ts").unlink()
+        except FileNotFoundError:
+            continue
+        deleted += 1
     return deleted
 
 
@@ -1199,6 +1223,31 @@ def get_session_progress(session_id: str, username: str) -> SessionProgress | No
     }
 
 
+def crop_view(session_id: str, username: str) -> CropBox | None:
+    """The part of a session's output frame that is picture, for players to show alone.
+
+    Args:
+        session_id: Session to inspect.
+        username: Viewer asking; another user's session is not found.
+
+    Returns:
+        crop: Picture area as fractions of the output frame, past any crop the encoder
+            applied; None until detection has sampled five seconds.
+
+    Raises:
+        HTTPException: 404 when the session is not the viewer's.
+    """
+    session = user_session(session_id, username)
+    if session is None:
+        raise fastapi.HTTPException(404, "Session not found")
+    # A tight early box shows a little less picture until it widens; the encoder
+    # cache, which cuts pixels for good, waits the full minute.
+    seen = detected_crop(session["dir"], min_samples=5)
+    if seen is None:
+        return None
+    return seen.within(session.get("crop", CropBox()))
+
+
 def clear_url_session(url: str) -> str | None:
     """Clear URL-to-session mapping."""
     with _transcode_lock:
@@ -1223,6 +1272,7 @@ class _SeekSessionInfo:
     audio_passthrough: bool = False
     username: str = ""
     source_id: str = ""
+    crop: CropBox | None = None
 
 
 async def seek_transcode(
@@ -1279,6 +1329,14 @@ async def seek_transcode(
         return {"session_id": session_id, "playlist": f"/transcode/{session_id}/stream.m3u8"}
 
     await _terminate_process(info.process)
+    # The next ffmpeg truncates the detections; keep what this one found.
+    await asyncio.to_thread(
+        _remember_detected_crop,
+        info.url,
+        info.output_dir,
+        info.series_id,
+        info.episode_id,
+    )
 
     # Clear playlist but keep segments (for backward seeks later)
     playlist_file = output_path / "stream.m3u8"
@@ -1317,6 +1375,7 @@ async def seek_transcode(
             )[0],
             info.username,
         )
+        media_info = _with_crop(media_info, info.crop)
     else:
         media_info = None
 
@@ -1950,6 +2009,7 @@ def _get_session_snapshot(session_id: str) -> _SessionSnapshot | None:
             audio_passthrough=session.get("audio_passthrough", False),
             username=session.get("username", ""),
             source_id=session.get("source_id", ""),
+            crop=session.get("crop"),
         )
 
 
@@ -2133,13 +2193,16 @@ async def _handle_existing_vod_session(
     url = await asyncio.to_thread(resolve_hls_master_playlist, url, snap.source_id)
 
     media_info = (
-        _user_audio(
-            (
-                await asyncio.to_thread(
-                    functools.partial(probe_media, url, source_id=snap.source_id),
-                )
-            )[0],
-            snap.username,
+        _with_crop(
+            _user_audio(
+                (
+                    await asyncio.to_thread(
+                        functools.partial(probe_media, url, source_id=snap.source_id),
+                    )
+                )[0],
+                snap.username,
+            ),
+            snap.crop,
         )
         if do_probe
         else None
@@ -2310,6 +2373,7 @@ async def _do_start_transcode(
         input_args=proxy.ffmpeg_input_args(url, source_id),
     )
     passthrough_used = uses_audio_passthrough(media_info, audio_passthrough)
+    crop = encoder_crop(media_info, max_resolution, allow_upscale=not is_archive)
     if old_seek_offset > 0:
         i_idx = cmd.index("-i")
         cmd.insert(i_idx, str(old_seek_offset))
@@ -2359,6 +2423,8 @@ async def _do_start_transcode(
             "audio_passthrough": passthrough_used,
             "audio_lang": _audio_lang(username),
         }
+        if crop is not None:
+            _transcode_sessions[session_id]["crop"] = crop
         _url_to_session[url] = session_id
 
     if not is_archive:
@@ -2390,6 +2456,8 @@ async def _do_start_transcode(
                 "interlaced": media_info.interlaced,
                 "audio_tracks": audio_tracks_to_cache(media_info.audio_tracks),
             }
+        if crop is not None:
+            session_info["crop"] = crop.to_cache()
         (pathlib.Path(output_dir) / "session.json").write_text(json.dumps(session_info))
 
     timeout = seek_wait_timeout_sec if old_seek_offset > 0 else playlist_wait_timeout_sec
@@ -2451,6 +2519,7 @@ def _get_seek_session_info(session_id: str) -> _SeekSessionInfo | None:
             audio_passthrough=session.get("audio_passthrough", False),
             username=session.get("username", ""),
             source_id=session.get("source_id", ""),
+            crop=session.get("crop"),
         )
 
 
@@ -2924,6 +2993,7 @@ class _SessionInfo(TypedDict, total=False):
     audio_passthrough: bool
     audio_lang: str
     probe: _SessionProbe
+    crop: CachedCrop
 
 
 async def _finish_recording(
@@ -3299,6 +3369,23 @@ def _audio_lang(username: str) -> str:
 def _user_audio(media_info: MediaInfo | None, username: str) -> MediaInfo | None:
     """``media_info`` playing the audio track in the user's preferred language."""
     return with_audio_language(media_info, _audio_lang(username))
+
+
+def _with_crop(media_info: MediaInfo | None, crop: CropBox | None) -> MediaInfo | None:
+    """``media_info`` cutting ``crop``, the crop its session's earlier segments used."""
+    return None if media_info is None else replace(media_info, crop=crop)
+
+
+def _remember_detected_crop(
+    url: str,
+    directory: str,
+    series_id: int | None,
+    episode_id: int | None,
+) -> None:
+    """Cache the picture area a VOD transcode detected, for its later transcodes."""
+    crop = detected_crop(directory)
+    if crop is not None:
+        remember_crop(url, crop, series_id, episode_id)
 
 
 def _admit(session_id: str, username: str) -> None:

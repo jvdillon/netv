@@ -22,9 +22,10 @@ from treekle import MutablePlainTree, ReadError, json_loads
 
 import pytest
 
-from netv import auth, cache, db, epg, ffmpeg_command, ffmpeg_session, gateway, testing, util
+from netv import auth, cache, db, epg, gateway, testing, util
 from netv.cache import SourceConfig
-from netv.ffmpeg_session import TranscodeSession
+from netv.ffmpeg import commands, probe, transcode
+from netv.ffmpeg.transcode import TranscodeSession
 from netv.gateway_catalog import CatalogSnapshot, GatewayCatalog, GatewayStream, StreamIdRegistry
 
 
@@ -50,8 +51,8 @@ def engines(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def sessions(monkeypatch: pytest.MonkeyPatch) -> dict[str, TranscodeSession]:
     """Start with no transcode sessions; return the live session table."""
     table: dict[str, TranscodeSession] = {}
-    monkeypatch.setattr(ffmpeg_session, "_transcode_sessions", table)
-    monkeypatch.setattr(ffmpeg_session, "_url_to_session", {})
+    monkeypatch.setattr(transcode, "_transcode_sessions", table)
+    monkeypatch.setattr(transcode, "_url_to_session", {})
     return table
 
 
@@ -72,7 +73,7 @@ def gateway_client(
     web: testing.FakeWeb,
 ) -> GatewayClient:
     monkeypatch.delenv("NETV_GATEWAY_PUBLIC_URL", raising=False)
-    monkeypatch.setattr(ffmpeg_command, "_load_settings", cache.load_server_settings)
+    monkeypatch.setattr(commands, "_load_settings", cache.load_server_settings)
     auth.create_user("player", "local-pass")
     _set_sources(_source())
     monkeypatch.setattr(gateway, "authenticator", gateway.GatewayAuthenticator())
@@ -351,7 +352,7 @@ def test_upscale_live_stream_starts_session(
     running = _session(tmp_path / "upscale", url=UPSTREAM)
     running.update(process=testing.FakeProcess(exit_code=None), fast_start=True)
     sessions["upscale-session"] = running
-    ffmpeg_session._url_to_session[UPSTREAM] = "upscale-session"
+    transcode._url_to_session[UPSTREAM] = "upscale-session"
 
     response = client.get(
         "/live/player/local-pass/41.m3u8",
@@ -746,7 +747,7 @@ def test_lifespan_initializes_and_shuts_down(
     message: str,
 ):
     for name in ("_load_settings", "_sr_engine_dir"):
-        monkeypatch.setattr(ffmpeg_command, name, getattr(ffmpeg_command, name))
+        monkeypatch.setattr(commands, name, getattr(commands, name))
     transcodes = tmp_path / "transcodes"
     (transcodes / "netv_transcode_orphan").mkdir(parents=True)
     _set_upscale(sr_model=sr_model)
@@ -757,8 +758,8 @@ def test_lifespan_initializes_and_shuts_down(
 
     with caplog.at_level("INFO", logger="netv.gateway"), TestClient(gateway.app) as client:
         assert not (transcodes / "netv_transcode_orphan").exists()
-        assert ffmpeg_command.get_settings().get("sr_model") == sr_model
-        assert ffmpeg_command._sr_engine_dir == str(engines)
+        assert commands.get_settings().get("sr_model") == sr_model
+        assert commands._sr_engine_dir == str(engines)
         assert client.get("/healthz").status_code == 200
         assert "running" in sessions
 
@@ -1174,15 +1175,15 @@ def _start_upscale(
     settings["transcode_dir"] = str(tmp_path / "transcodes")
     cache.save_server_settings(settings)
     web.routes[UPSTREAM] = testing.ended_upstream
-    probe = testing.FakeRun()
-    probe.program("ffprobe", testing.Program(stdout=probe_json))
-    testing.install_subprocess(monkeypatch, ffmpeg_command, run=probe)
+    ffprobe = testing.FakeRun()
+    ffprobe.program("ffprobe", testing.Program(stdout=probe_json))
+    testing.install_subprocess(monkeypatch, probe, commands, run=ffprobe)
     if launcher is None:
         launcher = testing.ProcessLauncher([testing.FakeProcess(exited=True, exit_code=1)])
-    testing.install_launcher(monkeypatch, launcher, ffmpeg_session)
-    testing.install_clock(monkeypatch, testing.FakeClock(), ffmpeg_session)
+    testing.install_launcher(monkeypatch, launcher, transcode)
+    testing.install_clock(monkeypatch, testing.FakeClock(), transcode)
     tasks = testing.BackgroundTasks()
-    monkeypatch.setattr(ffmpeg_session, "_spawn_background_task", tasks)
+    monkeypatch.setattr(transcode, "_spawn_background_task", tasks)
     response = client.get("/live/player/local-pass/41.ts", follow_redirects=False)
     tasks.discard()
     return launcher, response.status_code
@@ -1218,7 +1219,7 @@ def test_upscale_playlist_follows_the_rendition_players_should_see(
     # The upscaler caught up and took over, as _upgrade_to_upscale leaves it; players
     # keep requesting low.m3u8 and continue into it where the plain playlist ended.
     _publish_rendition(launcher.commands[0], "up", first=1)
-    assert ffmpeg_session._is_fast_live(session)
+    assert transcode._is_fast_live(session)
     session["rendition"] = "up"
     session["splice_low"] = plain
     spliced = client.get(playlist)
@@ -1471,10 +1472,10 @@ def test_upscale_file_rejects_vanished_session(
     # The session ends between the heartbeat and the lookup that follows it.
     ended = testing.ContendedLock(sessions.clear)
     monkeypatch.setattr(
-        ffmpeg_session,
+        transcode,
         "_transcode_lock",
         testing.ContendedLock(
-            lambda: monkeypatch.setattr(ffmpeg_session, "_transcode_lock", ended),
+            lambda: monkeypatch.setattr(transcode, "_transcode_lock", ended),
         ),
     )
 

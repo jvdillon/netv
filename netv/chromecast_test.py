@@ -9,8 +9,9 @@ from pychromecast.error import NotConnected
 
 import pytest
 
-from netv import cache, chromecast, ffmpeg_session, testing
-from netv.ffmpeg_session import TranscodeSession
+from netv import cache, chromecast, testing
+from netv.ffmpeg import transcode
+from netv.ffmpeg.transcode import TranscodeSession
 
 
 HOST = "192.168.1.50"
@@ -37,7 +38,7 @@ class CastEnv:
 @pytest.fixture
 def clock(monkeypatch: pytest.MonkeyPatch) -> testing.FakeClock:
     clock = testing.FakeClock()
-    testing.install_clock(monkeypatch, clock, chromecast, ffmpeg_session)
+    testing.install_clock(monkeypatch, clock, chromecast, transcode)
     return clock
 
 
@@ -69,7 +70,7 @@ def cast_env(
         "duration": 3600,
         "seek_offset": 120,
     }
-    monkeypatch.setattr(ffmpeg_session, "_transcode_sessions", {"session123": session})
+    monkeypatch.setattr(transcode, "_transcode_sessions", {"session123": session})
     return CastEnv(
         manager=chromecast.CastManager(),
         network=network,
@@ -195,7 +196,7 @@ def test_other_user_cannot_cast_or_control_session(cast_env: CastEnv):
 
 
 def test_missing_session_cannot_be_cast(cast_env: CastEnv):
-    ffmpeg_session._transcode_sessions.clear()
+    transcode._transcode_sessions.clear()
     with pytest.raises(HTTPException) as error:
         start(cast_env)
     assert error.value.status_code == 404
@@ -229,7 +230,7 @@ def test_connection_failure_releases_reservation_but_keeps_local_stream(cast_env
     assert not cast_env.manager.owns_session("session123")
     assert cast_env.receiver.disconnected
     assert cast_env.released == []
-    assert ffmpeg_session.get_session("session123") is not None
+    assert transcode.get_session("session123") is not None
 
 
 def test_load_timeout_does_not_report_success(cast_env: CastEnv):
@@ -347,7 +348,7 @@ def test_save_position_skips_live_and_ended_sessions(cast_env: CastEnv):
     record = cast_env.manager._sessions[HOST]
     cast_env.receiver.media_controller.status.adjusted_current_time = 600
     cast_env.manager._save_position(record)
-    ffmpeg_session._transcode_sessions.clear()
+    transcode._transcode_sessions.clear()
     cast_env.manager._save_position(record)
     cast_env.manager._save_position(replace(record, cast=None))
     assert watched() == {}
@@ -404,7 +405,7 @@ def test_finished_worker_is_restarted(
 def test_monitor_maintains_until_stopped(cast_env: CastEnv, monkeypatch: pytest.MonkeyPatch):
     start = testing.FakeClock().now
     clock = testing.FakeClock(now=start, deadline=start + 12)
-    testing.install_clock(monkeypatch, clock, chromecast, ffmpeg_session)
+    testing.install_clock(monkeypatch, clock, chromecast, transcode)
     manager = chromecast.CastManager()
     record = starting_record("session123")
     manager._sessions[record.host] = record

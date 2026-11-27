@@ -30,8 +30,6 @@ from netv import (
     chromecast,
     db,
     epg,
-    ffmpeg_command,
-    ffmpeg_session,
     handoff,
     imdb,
     m3u as m3u_module,
@@ -43,7 +41,8 @@ from netv import (
 )
 from netv.cache import SourceConfig
 from netv.chromecast import CastSession
-from netv.ffmpeg_command import MediaInfo, SeriesProbeStats
+from netv.ffmpeg import commands, probe, transcode
+from netv.ffmpeg.probe import MediaInfo, SeriesProbeStats
 from netv.main import PlayerInfo
 from netv.testing import (
     FakeClock,
@@ -683,7 +682,7 @@ def test_probe_cache_route_names_series(
     _use_sources(_source("s1", "xtream"))
     media = MediaInfo(video_codec="h264", audio_codec="aac", pix_fmt="yuv420p", duration=60.0)
     monkeypatch.setattr(
-        ffmpeg_command,
+        probe,
         "_series_probe_cache",
         {1: {"name": "", "mru": None, "episodes": {11: (1.0, media, [])}}},
     )
@@ -723,12 +722,12 @@ def test_enrich_probe_cache_names_series_and_episodes(web: FakeWeb):
 
 def test_clear_series_mru(auth_client: TestClient, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
-        ffmpeg_command,
+        probe,
         "_series_probe_cache",
         {7: {"name": "Show", "mru": 3, "episodes": {}}},
     )
     assert auth_client.post("/settings/probe-cache/clear-mru/7").json() == {"ok": True}
-    assert ffmpeg_command._series_probe_cache == {7: {"name": "Show", "episodes": {}}}
+    assert probe._series_probe_cache == {7: {"name": "Show", "episodes": {}}}
     saved = json.loads((cache_module.CACHE_DIR / "series_probe_cache.json").read_text())
     assert saved["7"]["mru"] is None
 
@@ -789,7 +788,7 @@ def test_handoff_file_routes(
     tmp_path: Path,
 ):
     del clean_handoff
-    monkeypatch.setattr(ffmpeg_command, "_load_settings", cache_module.load_server_settings)
+    monkeypatch.setattr(commands, "_load_settings", cache_module.load_server_settings)
     cache_module.save_server_settings(
         {**cache_module.load_server_settings(), "transcode_dir": str(tmp_path)},
     )
@@ -2421,7 +2420,7 @@ def test_created_app_serves_static_files_that_browsers_revalidate() -> None:
     assert application.url_path_for("static", path="/js/app.js") == "/static/js/app.js"
 
 
-_PLAY_TARGETS: list[tuple[ffmpeg_session.ContentType, str, int]] = [
+_PLAY_TARGETS: list[tuple[transcode.ContentType, str, int]] = [
     ("live", "ota:v2.1", 0),
     ("live", "20080", 0),
     ("movie", "486947", 0),

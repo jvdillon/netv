@@ -111,6 +111,7 @@ async function player({
   levelEdge = 12,
   viewerIds = true,
   embeddedCaptions = false,
+  crop = null,
 } = {}) {
   isVod = isVod || catchup;
   const elements = new Map();
@@ -138,6 +139,9 @@ async function player({
     },
     seekable,
     textTracks: Object.assign([], element()),
+    parentElement: Object.assign(element(), {
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 1000, height: 1000 }),
+    }),
     play: async () => {
       video.paused = false;
     },
@@ -394,6 +398,8 @@ async function player({
         if (stopFailure) return { ok: false, status: 503 };
       } else if (url.startsWith("/transcode/progress/")) {
         data = { duration: transcodedDuration };
+      } else if (url.startsWith("/transcode/crop/")) {
+        data = { crop };
       } else if (url.includes("/health")) {
         data = {
           playlist: `/transcode/session${sessionNumber}/low.m3u8${
@@ -460,6 +466,9 @@ async function player({
     setTranscodedDuration: (value) => {
       transcodedDuration = value;
     },
+    setCrop: (value) => {
+      crop = value;
+    },
     setLiveEdge: (value) => {
       for (const engine of engines) engine.liveSyncPosition = value;
     },
@@ -519,6 +528,59 @@ test("web live startup and health polls use one shared adaptive session", async 
   );
   await p.window.emit("pagehide");
   assert.deepEqual(p.beacons, ["/transcode/session1/stop?force=true&viewer=viewer1"]);
+  assert.deepEqual(p.errors, []);
+});
+
+const cropStyle = (video) =>
+  ["position", "left", "top", "width", "height"].map((name) => video.style[name]);
+
+// Runs the two-second polls (crop and progress), intervals that keep running.
+async function pollCrop(p) {
+  for (const [, timer] of [...p.timers].filter(([, timer]) => timer.ms === 2000)) {
+    await timer.fn();
+  }
+  await flush();
+}
+
+test("the player shows only the picture once the server finds black bars", async () => {
+  // A 2.37:1 picture in the middle three quarters of a 1280x720 frame.
+  const p = await player({
+    isVod: true,
+    crop: { left: 0, top: 0.125, width: 1, height: 0.75 },
+  });
+  assert.ok(p.calls.some((call) => call.url === "/transcode/crop/session1"));
+  // Fit to the 1000x1000 player, the picture is 1000x421.875, centered; the bars
+  // overflow above and below it.
+  assert.deepEqual(cropStyle(p.video), [
+    "absolute",
+    "0px",
+    "218.75px",
+    "1000px",
+    "562.5px",
+  ]);
+  // Not enough samples yet leaves the picture as it is.
+  p.setCrop(null);
+  await pollCrop(p);
+  assert.equal(p.video.style.width, "1000px");
+  // A frame that is all picture restores the plain video.
+  p.setCrop({ left: 0, top: 0, width: 1, height: 1 });
+  await pollCrop(p);
+  assert.deepEqual(cropStyle(p.video), ["", "", "", "", ""]);
+  assert.deepEqual(p.errors, []);
+});
+
+test("a restarted session's bars come from the new session", async () => {
+  const p = await player({ crop: { left: 0.125, top: 0, width: 0.75, height: 1 } });
+  assert.equal(p.video.style.position, "absolute");
+  p.setCrop(null);
+  await p.elements.get("menu-restart").emit("click");
+  await flush();
+  // The old session's crop goes with it; the new one has reported nothing yet.
+  assert.deepEqual(
+    p.calls.filter((call) => call.url.startsWith("/transcode/crop/")).map((c) => c.url),
+    ["/transcode/crop/session1", "/transcode/crop/session2"],
+  );
+  assert.deepEqual(cropStyle(p.video), ["", "", "", "", ""]);
   assert.deepEqual(p.errors, []);
 });
 

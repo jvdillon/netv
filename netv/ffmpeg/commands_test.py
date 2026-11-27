@@ -1,61 +1,51 @@
-"""Tests for ffmpeg command generation and media probing."""
+"""Tests for ffmpeg command building."""
 
-from dataclasses import replace
 from pathlib import Path
 
 import json
 import subprocess
 import tempfile
-import time
 
 import pytest
 
-from netv import cache, ffmpeg_command, proxy, testing, util
-from netv.cache import HwAccel, ServerSettings, get_user_agent
-from netv.ffmpeg_command import (
-    AudioTrack,
-    MediaInfo,
-    SubtitleStream,
+from netv import cache, proxy
+from netv.cache import HwAccel, ServerSettings
+from netv.ffmpeg import commands, probe, probe_test
+from netv.ffmpeg.commands import (
     _build_audio_args,
     _build_sr_filter,
     _build_video_args,
     _find_sr_engine,
     _get_gpu_nvdec_codecs,
-    audio_tracks_from_cache,
-    audio_tracks_to_cache,
     build_hls_ffmpeg_cmd,
     can_remux_live,
-    clear_all_probe_cache,
-    clear_series_mru,
+    encoder_crop,
     get_live_hls_list_size,
-    get_series_probe_cache_stats,
     get_transcode_dir,
-    get_url_probe_cache_stats,
-    has_cached_probe,
     http_reconnect_args,
-    invalidate_series_probe_cache,
-    invalidate_url_probe_cache,
     limit_live_video_bitrate,
-    probe_closed_captions,
-    probe_media,
-    probe_segment,
-    resolve_hls_master_playlist,
-    restore_probe_cache_entry,
-    with_audio_language,
 )
-from netv.testing import FakeResponse, FakeRun, FakeWeb, Program, install_subprocess, install_web
+from netv.ffmpeg.letterbox import DETECTION_FILE, CropBox, detection_args
+from netv.ffmpeg.letterbox_test import SCOPE
+from netv.ffmpeg.probe import MediaInfo, SubtitleStream
+from netv.ffmpeg.probe_test import media_info, option, save_home_lineup
+from netv.testing import FakeRun, Program, install_subprocess
+
+
+# Fixtures resolve by module attribute, so the shared one is bound here.
+probe_state = probe_test.probe_state
 
 
 @pytest.fixture(autouse=True)
 def command_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """Start each test with empty probe caches, the real settings loader, and a VAAPI device."""
     monkeypatch.setattr(cache, "VAAPI_DEVICE", "/dev/dri/renderD128")
-    monkeypatch.setattr(ffmpeg_command, "_load_settings", cache.load_server_settings)
-    monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", None)
-    monkeypatch.setattr(ffmpeg_command, "_probe_cache", {})
-    monkeypatch.setattr(ffmpeg_command, "_series_probe_cache", {})
-    monkeypatch.setattr(ffmpeg_command, "_gpu_nvdec_codecs", None)
-    monkeypatch.setattr(ffmpeg_command, "_has_libplacebo", None)
+    monkeypatch.setattr(commands, "_load_settings", cache.load_server_settings)
+    monkeypatch.setattr(commands, "_sr_engine_dir", None)
+    monkeypatch.setattr(probe, "_probe_cache", {})
+    monkeypatch.setattr(probe, "_series_probe_cache", {})
+    monkeypatch.setattr(commands, "_gpu_nvdec_codecs", None)
+    monkeypatch.setattr(commands, "_has_libplacebo", None)
 
 
 @pytest.fixture(autouse=True)
@@ -63,7 +53,7 @@ def fake_run(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) ->
     """Serve ffprobe, ffmpeg, and nvidia-smi from scripts, except in real-ffmpeg tests."""
     run = FakeRun()
     if request.node.get_closest_marker("cli_ffmpeg") is None:
-        install_subprocess(monkeypatch, ffmpeg_command, run=run)
+        install_subprocess(monkeypatch, commands, probe, run=run)
     return run
 
 
@@ -75,7 +65,7 @@ def _enable_sr(monkeypatch: pytest.MonkeyPatch, engine_dir: Path, *, model: str 
     """Install one 720p AI Upscale engine and select a model; return the engine path."""
     engine = engine_dir / "2x-nomosuni-compact_720p_fp16.engine"
     engine.write_bytes(b"engine")
-    monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", str(engine_dir))
+    monkeypatch.setattr(commands, "_sr_engine_dir", str(engine_dir))
     cache.save_server_settings({**cache.load_server_settings(), "sr_model": model})
     return engine
 
@@ -88,23 +78,8 @@ def _script_libplacebo(run: FakeRun, *, available: bool) -> None:
     )
 
 
-def _ffprobe(
-    run: FakeRun,
-    payload: object,
-    *,
-    returncode: int = 0,
-    when: str | None = None,
-) -> None:
-    run.program("ffprobe", Program(stdout=json.dumps(payload), returncode=returncode), when=when)
-
-
 def _between(cmd: list[str], start: str, end: str) -> list[str]:
     return cmd[cmd.index(start) + 1 : cmd.index(end)]
-
-
-# =============================================================================
-# Video Args Tests
-# =============================================================================
 
 
 class TestBuildVideoArgs:
@@ -229,7 +204,7 @@ class TestBuildVideoArgs:
         for height in (480, 720, 1080):
             (tmp_path / f"2x-nomosuni-compact_{height}p_fp16.engine").write_bytes(b"engine")
         (tmp_path / "retired-model_576p_fp16.engine").write_bytes(b"engine")
-        monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", str(tmp_path))
+        monkeypatch.setattr(commands, "_sr_engine_dir", str(tmp_path))
 
         result = _find_sr_engine(source_height)
 
@@ -440,17 +415,12 @@ class TestBuildVideoArgs:
         assert "tonemap_vaapi" in vf
 
 
-# =============================================================================
-# Audio Args Tests
-# =============================================================================
-
-
 class TestBuildAudioArgs:
     """Tests for _build_audio_args."""
 
     def test_copy_audio(self):
         """Test copy_audio returns copy args."""
-        assert _build_audio_args(copy_audio=True, audio=_media_info()) == ["-c:a", "copy"]
+        assert _build_audio_args(copy_audio=True, audio=media_info()) == ["-c:a", "copy"]
         assert _build_audio_args(copy_audio=True, audio=None) == ["-c:a", "copy"]
 
     @pytest.mark.parametrize(
@@ -464,20 +434,20 @@ class TestBuildAudioArgs:
     )
     def test_sample_rates(self, sample_rate: int, expected: str):
         """Test sample rate handling."""
-        args = _build_audio_args(copy_audio=False, audio=_media_info(audio_sample_rate=sample_rate))
+        args = _build_audio_args(copy_audio=False, audio=media_info(audio_sample_rate=sample_rate))
         assert args[args.index("-ar") + 1] == expected
 
     @pytest.mark.parametrize("channels", [3, 6, 8])
     def test_surround_encodes_5_1(self, channels: int):
         """Surround sources stay surround instead of being downmixed to stereo."""
-        args = _build_audio_args(copy_audio=False, audio=_media_info(audio_channels=channels))
+        args = _build_audio_args(copy_audio=False, audio=media_info(audio_channels=channels))
         assert args[args.index("-af") + 1] == "aformat=channel_layouts=5.1"
         assert args[args.index("-b:a") + 1] == "384k"
         assert "-ac" not in args
 
     @pytest.mark.parametrize("channels", [1, 2])
     def test_stereo_stays_stereo(self, channels: int):
-        args = _build_audio_args(copy_audio=False, audio=_media_info(audio_channels=channels))
+        args = _build_audio_args(copy_audio=False, audio=media_info(audio_channels=channels))
         assert args[args.index("-ac") + 1] == "2"
         assert args[args.index("-b:a") + 1] == "192k"
         assert "-af" not in args
@@ -487,17 +457,12 @@ class TestBuildAudioArgs:
         assert _build_audio_args(copy_audio=False, audio=None) == _UNKNOWN_LAYOUT_AAC
         unknown_channels = _build_audio_args(
             copy_audio=False,
-            audio=_media_info(audio_channels=0, audio_sample_rate=44_100),
+            audio=media_info(audio_channels=0, audio_sample_rate=44_100),
         )
         assert unknown_channels[unknown_channels.index("-af") + 1] == (
             "aformat=channel_layouts=stereo|5.1"
         )
         assert unknown_channels[unknown_channels.index("-ar") + 1] == "44100"
-
-
-# =============================================================================
-# HLS Command Tests
-# =============================================================================
 
 
 _RECONNECT = [
@@ -512,6 +477,8 @@ _RECONNECT = [
     "-reconnect_delay_max",
     "30",
 ]
+
+
 _UNKNOWN_LAYOUT_AAC = [
     "-c:a",
     "aac",
@@ -567,7 +534,7 @@ class TestHlsAssemblyContract:
     ):
         _save_dvr(1)
         engine = _enable_sr(monkeypatch, tmp_path) if sr else None
-        media = _media_info(height=720, is_hls=True) if has_media else None
+        media = media_info(height=720, is_hls=True) if has_media else None
         cmd = build_hls_ffmpeg_cmd(
             "https://source/stream",
             "nvenc+software" if sr else "software",
@@ -679,6 +646,8 @@ class TestHlsAssemblyContract:
             if not is_vod:
                 expected += ["-segment_list_flags", "+live"]
             expected += [f"/output/sub{number}_%06d.vtt"]
+        if engine is not None or not has_media:
+            expected += detection_args("/output", "", is_10bit=False)
         expected += [
             "-map",
             "0:v:0",
@@ -733,7 +702,7 @@ class TestHlsAssemblyContract:
         assert "-c:s" not in cmd
 
     def test_default_transcodes_dolby_audio(self):
-        dolby = _media_info(audio_codec="eac3", audio_channels=6)
+        dolby = media_info(audio_codec="eac3", audio_channels=6)
         default = build_hls_ffmpeg_cmd(
             "input",
             "software",
@@ -755,7 +724,7 @@ class TestHlsAssemblyContract:
     @pytest.mark.parametrize("probed_as", ["media_info", "source"])
     def test_explicit_forwarding(self, probed_as: str):
         """Probed facts drive video and audio alike, however the caller holds them."""
-        media = _media_info(
+        media = media_info(
             height=2160,
             is_hdr=True,
             audio_sample_rate=44_100,
@@ -802,7 +771,7 @@ class TestHlsAssemblyContract:
             "input",
             hw,
             "/output",
-            source=_media_info(video_codec=codec),
+            source=media_info(video_codec=codec),
             input_args=(),
         )
         supported = {
@@ -820,7 +789,7 @@ class TestHlsAssemblyContract:
     @pytest.mark.parametrize("hw", ["nvenc+software", "vaapi", "qsv", "amf+software", "software"])
     def test_copied_video_skips_hardware_pipeline(self, fake_run: FakeRun, hw: HwAccel):
         fake_run.program("nvidia-smi", Program(stdout="NVIDIA GeForce RTX 3080, 8.6\n"))
-        cmd = build_hls_ffmpeg_cmd("input", hw, "/output", media_info=_media_info(), input_args=())
+        cmd = build_hls_ffmpeg_cmd("input", hw, "/output", media_info=media_info(), input_args=())
         assert cmd[cmd.index("-c:v") + 1] == "copy"
         assert "-hwaccel" not in cmd
         assert fake_run.calls == []
@@ -830,8 +799,8 @@ class TestHlsAssemblyContract:
             "input",
             "qsv",
             "/output",
-            media_info=_media_info(video_codec="vp8"),
-            source=_media_info(video_codec="h264"),
+            media_info=media_info(video_codec="vp8"),
+            source=media_info(video_codec="h264"),
             input_args=(),
         )
         assert "-hwaccel" not in cmd
@@ -853,7 +822,7 @@ class TestHlsAssemblyContract:
         media = (
             None
             if height is None
-            else _media_info(height=height, interlaced=interlaced, pix_fmt="yuv420p10le")
+            else media_info(height=height, interlaced=interlaced, pix_fmt="yuv420p10le")
         )
         cmd = build_hls_ffmpeg_cmd(
             "input",
@@ -885,7 +854,7 @@ class TestHlsAssemblyContract:
         live_deinterlaced: bool,
     ):
         """A probed file is what it is; a live sample is only the moment it was taken."""
-        progressive = _media_info(video_codec=codec, height=height, pix_fmt="yuv420p10le")
+        progressive = media_info(video_codec=codec, height=height, pix_fmt="yuv420p10le")
         live = build_hls_ffmpeg_cmd(
             "input",
             "software",
@@ -964,7 +933,7 @@ class TestBuildHlsFfmpegCmd:
 
     def test_copy_video_with_compatible_media(self):
         """Test copy_video is used for compatible VOD media."""
-        media = _media_info(video_codec="h264", pix_fmt="yuv420p", height=1080)
+        media = media_info(video_codec="h264", pix_fmt="yuv420p", height=1080)
         cmd = build_hls_ffmpeg_cmd(
             "http://test",
             "vaapi",
@@ -980,7 +949,7 @@ class TestBuildHlsFfmpegCmd:
 
     def test_no_copy_for_10bit(self):
         """Test 10-bit content is transcoded, not copied."""
-        media = _media_info(video_codec="h264", pix_fmt="yuv420p10le", height=1080)
+        media = media_info(video_codec="h264", pix_fmt="yuv420p10le", height=1080)
         cmd = build_hls_ffmpeg_cmd(
             "http://test",
             "vaapi",
@@ -994,7 +963,7 @@ class TestBuildHlsFfmpegCmd:
 
     def test_no_copy_when_scaling_needed(self):
         """Test scaling requirement prevents copy."""
-        media = _media_info(video_codec="h264", pix_fmt="yuv420p", height=2160)
+        media = media_info(video_codec="h264", pix_fmt="yuv420p", height=2160)
         cmd = build_hls_ffmpeg_cmd(
             "http://test",
             "vaapi",
@@ -1008,25 +977,29 @@ class TestBuildHlsFfmpegCmd:
 
     def test_can_remux_live_compatible_source(self):
         """Test a browser-compatible progressive H.264/AAC source can remux."""
-        assert can_remux_live(_media_info(), "1080p")
+        assert can_remux_live(media_info(), "1080p")
+
+    def test_can_remux_live_defaults_to_a_1080p_ceiling(self):
+        assert can_remux_live(media_info(height=1080))
+        assert not can_remux_live(media_info(height=1440))
 
     def test_can_remux_live_rejects_unplayable_sources(self):
         """Test remux is rejected for missing info or incompatible sources."""
         assert not can_remux_live(None, "1080p")
-        assert not can_remux_live(_media_info(video_codec="hevc"), "1080p")
-        assert not can_remux_live(_media_info(interlaced=True), "1080p")
-        assert not can_remux_live(_media_info(height=2160), "1080p")
-        assert not can_remux_live(_media_info(audio_codec="ac3"), "1080p")
-        assert not can_remux_live(_media_info(audio_profile="HE-AAC"), "1080p")
+        assert not can_remux_live(media_info(video_codec="hevc"), "1080p")
+        assert not can_remux_live(media_info(interlaced=True), "1080p")
+        assert not can_remux_live(media_info(height=2160), "1080p")
+        assert not can_remux_live(media_info(audio_codec="ac3"), "1080p")
+        assert not can_remux_live(media_info(audio_profile="HE-AAC"), "1080p")
 
     def test_can_remux_live_surround_audio(self):
         """5.1 AAC copies for every client; Dolby only for passthrough clients."""
-        assert can_remux_live(_media_info(audio_channels=6), "1080p")
-        dolby = _media_info(audio_codec="eac3", audio_channels=6)
+        assert can_remux_live(media_info(audio_channels=6), "1080p")
+        dolby = media_info(audio_codec="eac3", audio_channels=6)
         assert not can_remux_live(dolby, "1080p")
         assert can_remux_live(dolby, "1080p", audio_passthrough=True)
         for profile in ("Main", "", "he-aac"):
-            aac = _media_info(audio_channels=6, audio_profile=profile)
+            aac = media_info(audio_channels=6, audio_profile=profile)
             assert not can_remux_live(aac, "1080p")
 
     @pytest.mark.parametrize(
@@ -1089,7 +1062,7 @@ class TestBuildHlsFfmpegCmd:
 
     def test_no_probe_args_with_media_info(self):
         """Test probe args are skipped when media_info provided."""
-        media = _media_info()
+        media = media_info()
         cmd = build_hls_ffmpeg_cmd(
             "http://test",
             "software",
@@ -1098,6 +1071,24 @@ class TestBuildHlsFfmpegCmd:
             input_args=(),
         )
         assert "-probesize" not in cmd
+
+    @pytest.mark.parametrize(("audio_index", "mapped"), [(None, "0:a:0"), (3, "0:3")])
+    def test_maps_the_chosen_audio_track(self, audio_index: int | None, mapped: str):
+        media = MediaInfo(
+            video_codec="h264",
+            audio_codec="aac",
+            pix_fmt="yuv420p",
+            audio_index=audio_index,
+        )
+        cmd = build_hls_ffmpeg_cmd(
+            "http://x/m.mkv",
+            "software",
+            "/o",
+            True,
+            media_info=media,
+            input_args=(),
+        )
+        assert cmd[cmd.index("0:v:0") + 2] == mapped
 
     def test_subtitle_extraction(self):
         """Test subtitle streams are extracted."""
@@ -1206,11 +1197,6 @@ def test_live_ai_upscale_uses_shared_bitrate_policy(
         assert cmd.count("-maxrate") == 1
 
 
-# =============================================================================
-# Aspect Ratio Tests
-# =============================================================================
-
-
 class TestAspectRatioHandling:
     """Tests for various aspect ratio content."""
 
@@ -1227,7 +1213,7 @@ class TestAspectRatioHandling:
     )
     def test_scaling_decisions(self, input_height: int, max_res: str, should_scale: bool):
         """Test correct scaling decisions for various input heights."""
-        media = _media_info(height=input_height, pix_fmt="yuv420p10le")
+        media = media_info(height=input_height, pix_fmt="yuv420p10le")
         cmd = build_hls_ffmpeg_cmd(
             "http://test",
             "vaapi",
@@ -1242,11 +1228,6 @@ class TestAspectRatioHandling:
         # Comma is escaped in FFmpeg filter expressions.
         height_expr = f"min(ih\\,{max_h})"
         assert height_expr in vf, f"Expected {height_expr} in {vf}"
-
-
-# =============================================================================
-# GPU Detection Tests
-# =============================================================================
 
 
 class TestGpuDetection:
@@ -1269,7 +1250,7 @@ class TestGpuDetection:
         compute: str,
         codecs: set[str],
     ):
-        caplog.set_level("INFO", logger="netv.ffmpeg_command")
+        caplog.set_level("INFO", logger="netv.ffmpeg.commands")
         fake_run.program("nvidia-smi", Program(stdout=f"NVIDIA Card, X, {compute}\n"))
         assert _get_gpu_nvdec_codecs() == codecs
         # A bounded probe whose output is read as text.
@@ -1281,7 +1262,7 @@ class TestGpuDetection:
 
     def test_a_failed_probe_says_why(self, fake_run: FakeRun, caplog: pytest.LogCaptureFixture):
         del fake_run
-        caplog.set_level("DEBUG", logger="netv.ffmpeg_command")
+        caplog.set_level("DEBUG", logger="netv.ffmpeg.commands")
         assert _get_gpu_nvdec_codecs() == set()
         assert _command_log(caplog) == [
             ("DEBUG", "GPU probe failed: [Errno 2] No such file or directory: 'nvidia-smi'"),
@@ -1297,7 +1278,7 @@ class TestGpuDetection:
 
     def test_no_nvidia_gpu(self, fake_run: FakeRun, caplog: pytest.LogCaptureFixture):
         """Test handling when no NVIDIA GPU present."""
-        caplog.set_level("INFO", logger="netv.ffmpeg_command")
+        caplog.set_level("INFO", logger="netv.ffmpeg.commands")
         fake_run.program(
             "nvidia-smi",
             Program(stdout="NVIDIA GeForce RTX 3080, 8.6\n", returncode=1),
@@ -1317,58 +1298,9 @@ class TestGpuDetection:
         fake_run.program("nvidia-smi", Program(stdout="NVIDIA GeForce GTX 960, 5.2\n"))
         assert _get_gpu_nvdec_codecs() == {"mpeg2video", "h264"}
         # A Kepler card decodes broadcast MPEG-2 only.
-        ffmpeg_command._gpu_nvdec_codecs = None
+        commands._gpu_nvdec_codecs = None
         fake_run.program("nvidia-smi", Program(stdout="NVIDIA GeForce GTX 780, 3.5\n"))
         assert _get_gpu_nvdec_codecs() == {"mpeg2video"}
-
-
-# =============================================================================
-# User Agent Tests
-# =============================================================================
-
-
-def _save_user_agent(preset: str, custom: str = "") -> None:
-    cache.save_server_settings(
-        {**cache.load_server_settings(), "user_agent_preset": preset, "user_agent_custom": custom},
-    )
-
-
-class TestUserAgent:
-    """Tests for user agent handling."""
-
-    def test_default_user_agent(self):
-        """Test default preset returns None."""
-        _save_user_agent("default")
-        assert get_user_agent() is None
-
-    def test_vlc_user_agent(self):
-        """Test VLC preset."""
-        _save_user_agent("vlc")
-        ua = get_user_agent()
-        assert ua is not None
-        assert "VLC" in ua
-
-    def test_chrome_user_agent(self):
-        """Test Chrome preset."""
-        _save_user_agent("chrome")
-        ua = get_user_agent()
-        assert ua is not None
-        assert "Chrome" in ua
-
-    def test_custom_user_agent(self):
-        """Test custom user agent."""
-        _save_user_agent("custom", "MyAgent/1.0")
-        assert get_user_agent() == "MyAgent/1.0"
-
-    def test_custom_empty_returns_none(self):
-        """Test empty custom user agent returns None."""
-        _save_user_agent("custom")
-        assert get_user_agent() is None
-
-
-# =============================================================================
-# Transcode Directory Tests
-# =============================================================================
 
 
 def _save_transcode_dir(path: str) -> None:
@@ -1388,11 +1320,6 @@ class TestTranscodeDir:
         _save_transcode_dir(str(custom_dir))
         assert get_transcode_dir() == custom_dir
         assert custom_dir.exists()
-
-
-# =============================================================================
-# HLS List Size Tests
-# =============================================================================
 
 
 class TestHlsListSize:
@@ -1430,29 +1357,8 @@ class TestHlsListSize:
         assert get_live_hls_list_size() == 2400
 
 
-# =============================================================================
-# Probe Media Tests
-# =============================================================================
-
-
-def _save_home_lineup() -> None:
-    cache.save_server_settings(
-        {
-            **cache.load_server_settings(),
-            "sources": [
-                {
-                    "id": "t",
-                    "name": "Tuner",
-                    "type": "m3u",
-                    "url": "http://192.168.1.24/lineup.m3u",
-                },
-            ],
-        },
-    )
-
-
 def test_network_inputs_reach_the_provider_only_through_the_egress_proxy():
-    _save_home_lineup()
+    save_home_lineup()
     tuner = "http://192.168.1.87:5004/auto/v5.1"
     for url, source_id in (("http://8.8.8.8/movie/u/p/1.mkv", ""), (tuner, "t")):
         expected = proxy.ffmpeg_input_args(url, source_id)
@@ -1460,552 +1366,15 @@ def test_network_inputs_reach_the_provider_only_through_the_egress_proxy():
         start = cmd.index("-protocol_whitelist")
         assert cmd[start : start + len(expected)] == expected
         assert start + len(expected) <= cmd.index("-i")
-    assert _option(cmd, "-http_proxy") == proxy.egress().url(lan=True)
+    assert option(cmd, "-http_proxy") == proxy.egress().url(lan=True)
     # The server's own files and pipes are read directly, with every protocol ffmpeg has.
     for local in ("/tmp/input.m3u8", "pipe:0"):
         assert proxy.ffmpeg_input_args(local, "t") == []
 
 
-def _option(cmd: list[str], flag: str) -> str:
-    return cmd[cmd.index(flag) + 1]
-
-
-class TestProbeMedia:
-    """Tests for media probing."""
-
-    def test_probes_reach_the_provider_only_through_the_egress_proxy(
-        self,
-        fake_run: FakeRun,
-        monkeypatch: pytest.MonkeyPatch,
-    ):
-        _save_home_lineup()
-        monkeypatch.setenv("no_proxy", "192.168.1.87")
-        _ffprobe(fake_run, {"streams": [], "format": {}})
-        tuner = "http://192.168.1.87:5004/auto/v5.1"
-        probe_media(tuner, source_id="t")
-        for command, options in zip(fake_run.calls, fake_run.options, strict=True):
-            assert command[-1] == tuner
-            assert _option(command, "-http_proxy") == proxy.egress().url(lan=True)
-            assert _option(command, "-protocol_whitelist") == proxy.ffmpeg_input_args(tuner, "t")[1]
-            assert options["env"] == proxy.ffmpeg_env()
-
-    def test_probe_success(self, fake_run: FakeRun):
-        """Test successful probe parses media info."""
-        _ffprobe(
-            fake_run,
-            {
-                "streams": [
-                    {
-                        "codec_type": "video",
-                        "codec_name": "h264",
-                        "pix_fmt": "yuv420p",
-                        "height": 1080,
-                        "field_order": "progressive",
-                    },
-                    {
-                        "codec_type": "audio",
-                        "codec_name": "aac",
-                        "channels": 2,
-                        "sample_rate": "48000",
-                    },
-                ],
-                "format": {"duration": "3600.0"},
-            },
-        )
-
-        media_info, subs = probe_media("http://test/video.mp4", source_id="")
-
-        assert media_info is not None
-        assert media_info.video_codec == "h264"
-        assert media_info.audio_codec == "aac"
-        assert media_info.height == 1080
-        assert media_info.duration == 3600.0
-        assert not media_info.interlaced
-        assert subs == []
-        assert len(fake_run.calls) == 1
-        assert fake_run.calls[0][-1] == "http://test/video.mp4"
-        assert fake_run.options == [
-            {
-                "check": False,
-                "capture_output": True,
-                "text": True,
-                "timeout": 30,
-                "env": proxy.ffmpeg_env(),
-            },
-        ]
-
-    def test_probe_interlaced_detection(self, fake_run: FakeRun):
-        """Test interlaced content detection."""
-        _ffprobe(
-            fake_run,
-            {
-                "streams": [
-                    {
-                        "codec_type": "video",
-                        "codec_name": "mpeg2video",
-                        "pix_fmt": "yuv420p",
-                        "height": 1080,
-                        "field_order": "tt",  # Top field first = interlaced.
-                    },
-                ],
-                "format": {},
-            },
-        )
-
-        media_info, _ = probe_media("http://test/interlaced.ts", source_id="")
-
-        assert media_info is not None
-        assert media_info.interlaced is True
-
-    @pytest.mark.parametrize(
-        "pix_fmt,expected",
-        [
-            ("yuv420p10le", True),  # 10-bit little endian.
-            ("yuv420p10be", True),  # 10-bit big endian.
-            ("yuv422p10le", True),  # 10-bit 4:2:2.
-            ("p010le", True),  # CUDA/VAAPI 10-bit format.
-            ("yuv420p", False),  # 8-bit.
-            ("yuv410p", False),  # 4:1:0 chroma, NOT 10-bit (was a false positive)
-            ("nv12", False),  # 8-bit NV12.
-        ],
-    )
-    def test_probe_10bit_detection(self, fake_run: FakeRun, pix_fmt: str, expected: bool):
-        """Test 10-bit content detection from pix_fmt."""
-        _ffprobe(
-            fake_run,
-            {
-                "streams": [
-                    {
-                        "codec_type": "video",
-                        "codec_name": "hevc",
-                        "pix_fmt": pix_fmt,
-                        "height": 2160,
-                    },
-                ],
-                "format": {},
-            },
-        )
-
-        media_info, _ = probe_media(f"http://test/{pix_fmt}.mkv", source_id="")
-
-        assert media_info is not None
-        assert media_info.is_10bit is expected, f"pix_fmt={pix_fmt} should be is_10bit={expected}"
-
-    @pytest.mark.parametrize(
-        "color_transfer,expected",
-        [
-            ("smpte2084", True),  # PQ (HDR10, HDR10+, Dolby Vision)
-            ("arib-std-b67", True),  # HLG
-            ("bt709", False),  # SDR
-            ("bt2020-10", False),  # Wide gamut but not HDR transfer.
-            ("", False),  # Unknown/missing.
-        ],
-    )
-    def test_probe_hdr_detection(self, fake_run: FakeRun, color_transfer: str, expected: bool):
-        """Test HDR content detection from color_transfer."""
-        _ffprobe(
-            fake_run,
-            {
-                "streams": [
-                    {
-                        "codec_type": "video",
-                        "codec_name": "hevc",
-                        "pix_fmt": "yuv420p10le",
-                        "height": 2160,
-                        "color_transfer": color_transfer,
-                    },
-                ],
-                "format": {},
-            },
-        )
-
-        media_info, _ = probe_media(f"http://test/{color_transfer or 'unknown'}.mkv", source_id="")
-
-        assert media_info is not None
-        assert media_info.is_hdr is expected, (
-            f"color_transfer={color_transfer} should be is_hdr={expected}"
-        )
-
-    def test_probe_failure(self, fake_run: FakeRun):
-        """Test probe failure returns None."""
-        _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}}, returncode=1)
-
-        media_info, subs = probe_media("http://test/bad.mp4", source_id="")
-
-        assert media_info is None
-        assert subs == []
-        assert len(fake_run.calls) == 2
-        assert ffmpeg_command._probe_cache == {}
-
-    def test_probe_cache_hit(self, fake_run: FakeRun):
-        """Test probe cache returns cached result."""
-        cached_info = MediaInfo(
-            video_codec="h264",
-            audio_codec="aac",
-            pix_fmt="yuv420p",
-        )
-        ffmpeg_command._probe_cache["http://cached"] = (
-            time.time(),
-            cached_info,
-            list[SubtitleStream](),
-        )
-
-        media_info, _ = probe_media("http://cached", source_id="")
-
-        assert fake_run.calls == []
-        assert media_info == cached_info
-
-    def test_probe_extracts_subtitles(self, fake_run: FakeRun):
-        """Test subtitle stream extraction."""
-        _ffprobe(
-            fake_run,
-            {
-                "streams": [
-                    {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"},
-                    {
-                        "codec_type": "subtitle",
-                        "codec_name": "subrip",
-                        "index": 2,
-                        "tags": {"language": "eng", "title": "English"},
-                    },
-                    {
-                        "codec_type": "subtitle",
-                        "codec_name": "ass",
-                        "index": 3,
-                        "tags": {"language": "jpn"},
-                    },
-                ],
-                "format": {},
-            },
-        )
-
-        _, subs = probe_media("http://test/subs.mkv", source_id="")
-
-        assert subs == [
-            SubtitleStream(index=2, lang="eng", name="English"),
-            SubtitleStream(index=3, lang="jpn", name="Japanese"),
-        ]
-
-
-# =============================================================================
-# Probe Cache Management Tests
-# =============================================================================
-
-
-def _series_cache_text() -> str:
-    return (cache.CACHE_DIR / "series_probe_cache.json").read_text()
-
-
-class TestProbeCacheManagement:
-    """Tests for probe cache management functions."""
-
-    def test_clear_all_probe_cache(self):
-        """Test clearing all probe caches."""
-        ffmpeg_command._probe_cache["url1"] = (time.time(), None, list[SubtitleStream]())
-        ffmpeg_command._probe_cache["url2"] = (time.time(), None, list[SubtitleStream]())
-        ffmpeg_command._series_probe_cache[123] = {
-            "episodes": {1: (time.time(), None, list[SubtitleStream]())},
-        }
-
-        count = clear_all_probe_cache()
-
-        assert count == 3
-        assert len(ffmpeg_command._probe_cache) == 0
-        assert len(ffmpeg_command._series_probe_cache) == 0
-        assert json.loads(_series_cache_text()) == {}
-
-    def test_invalidate_series_probe_cache_entire_series(self):
-        """Test invalidating entire series cache."""
-        ffmpeg_command._series_probe_cache[123] = {
-            "name": "Test",
-            "episodes": {
-                1: (0, None, list[SubtitleStream]()),
-                2: (0, None, list[SubtitleStream]()),
-            },
-        }
-
-        invalidate_series_probe_cache(123)
-
-        assert 123 not in ffmpeg_command._series_probe_cache
-        assert json.loads(_series_cache_text()) == {}
-
-    def test_invalidate_series_probe_cache_single_episode(self):
-        """Test invalidating single episode cache."""
-        ffmpeg_command._series_probe_cache[123] = {
-            "name": "Test",
-            "episodes": {
-                1: (0, _media_info(), list[SubtitleStream]()),
-                2: (0, _media_info(), list[SubtitleStream]()),
-            },
-        }
-
-        invalidate_series_probe_cache(123, episode_id=1)
-
-        assert 123 in ffmpeg_command._series_probe_cache
-        assert 1 not in ffmpeg_command._series_probe_cache[123]["episodes"]
-        assert 2 in ffmpeg_command._series_probe_cache[123]["episodes"]
-        assert list(json.loads(_series_cache_text())["123"]["episodes"]) == ["2"]
-
-    def test_invalidate_unknown_episode_keeps_series(self):
-        ffmpeg_command._series_probe_cache[123] = {
-            "name": "Test",
-            "episodes": {2: (0, _media_info(), list[SubtitleStream]())},
-        }
-
-        invalidate_series_probe_cache(123, episode_id=1)
-
-        assert list(ffmpeg_command._series_probe_cache[123]["episodes"]) == [2]
-
-    def test_clear_series_mru(self):
-        """Test clearing series MRU."""
-        ffmpeg_command._series_probe_cache[123] = {
-            "name": "Test",
-            "mru": 5,
-            "episodes": {1: (0, None, list[SubtitleStream]())},
-        }
-
-        clear_series_mru(123)
-
-        assert "mru" not in ffmpeg_command._series_probe_cache[123]
-        assert "episodes" in ffmpeg_command._series_probe_cache[123]
-        assert json.loads(_series_cache_text()) == {
-            "123": {"name": "Test", "mru": None, "episodes": {}},
-        }
-
-    def test_clear_series_mru_without_mru_still_saves(self):
-        ffmpeg_command._series_probe_cache[123] = {
-            "name": "Test",
-            "episodes": dict[int, ffmpeg_command._ProbeEntry](),
-        }
-
-        clear_series_mru(123)
-
-        assert json.loads(_series_cache_text()) == {
-            "123": {"name": "Test", "mru": None, "episodes": {}},
-        }
-
-    def test_restore_probe_cache_entry(self):
-        """Test restoring probe cache entry."""
-        media_info = MediaInfo(video_codec="h264", audio_codec="aac", pix_fmt="yuv420p")
-        subs = [SubtitleStream(index=2, lang="eng", name="English")]
-
-        restore_probe_cache_entry("http://test", media_info, subs, series_id=123, episode_id=5)
-
-        assert "http://test" in ffmpeg_command._probe_cache
-        assert 123 in ffmpeg_command._series_probe_cache
-        assert 5 in ffmpeg_command._series_probe_cache[123]["episodes"]
-
-    def test_get_series_probe_cache_stats(self):
-        """Test getting cache stats for UI."""
-        ffmpeg_command._series_probe_cache[123] = {
-            "name": "Test Series",
-            "mru": 2,
-            "episodes": {
-                1: (time.time(), _media_info(), list[SubtitleStream]()),
-                2: (time.time(), _media_info(), list[SubtitleStream]()),
-            },
-        }
-
-        stats = get_series_probe_cache_stats()
-
-        assert len(stats) == 1
-        assert stats[0]["series_id"] == 123
-        assert stats[0]["name"] == "Test Series"
-        assert stats[0]["episode_count"] == 2
-
-
-class TestResolveHlsMasterPlaylist:
-    """Tests for resolve_hls_master_playlist function."""
-
-    def test_non_m3u8_url_returns_unchanged(self, monkeypatch: pytest.MonkeyPatch):
-        """Non-m3u8 URLs should be returned unchanged."""
-        web = FakeWeb()
-        install_web(monkeypatch, web, util)
-        url = "http://example.com/video.mp4"
-        assert resolve_hls_master_playlist(url, source_id="") == url
-        assert web.fetches == []
-
-    def test_master_playlist_selects_highest_bandwidth(self, monkeypatch: pytest.MonkeyPatch):
-        """Master playlist should resolve to highest bandwidth variant."""
-        master_playlist = b"""#EXTM3U
-#EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=640x360
-low.m3u8
-#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080
-high.m3u8
-#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=1280x720
-mid.m3u8
-"""
-        url = "http://example.com/master.m3u8"
-        web = FakeWeb({url: FakeResponse(master_playlist)})
-        install_web(monkeypatch, web, util)
-
-        assert resolve_hls_master_playlist(url, source_id="") == "http://example.com/high.m3u8"
-        assert [(f.url, f.timeout, f.headers) for f in web.fetches] == [
-            (url, 10, {"User-agent": "TiviMate/4.7.0"}),
-        ]
-
-    def test_media_playlist_returns_unchanged(self, monkeypatch: pytest.MonkeyPatch):
-        """Media playlist (not master) should return original URL."""
-        media_playlist = b"""#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-TARGETDURATION:10
-#EXTINF:10.0,
-segment0.ts
-#EXTINF:10.0,
-segment1.ts
-"""
-        url = "http://example.com/stream.m3u8"
-        install_web(monkeypatch, FakeWeb({url: FakeResponse(media_playlist)}), util)
-
-        assert resolve_hls_master_playlist(url, source_id="") == url
-
-    def test_fetch_error_returns_original_url(self, monkeypatch: pytest.MonkeyPatch):
-        """On fetch error, should return original URL."""
-        url = "http://example.com/master.m3u8?token=1"
-        web = FakeWeb({url: Exception("Network error")})
-        install_web(monkeypatch, web, util)
-
-        assert resolve_hls_master_playlist(url, source_id="") == url
-        assert web.urls == [url]
-
-    def test_relative_url_resolved_correctly(self, monkeypatch: pytest.MonkeyPatch):
-        """Relative variant URLs should be resolved against base URL."""
-        master_playlist = b"""#EXTM3U
-#EXT-X-STREAM-INF:BANDWIDTH=3000000
-../streams/1080p/index.m3u8
-"""
-        url = "http://example.com/hls/master.m3u8"
-        install_web(monkeypatch, FakeWeb({url: FakeResponse(master_playlist)}), util)
-
-        assert (
-            resolve_hls_master_playlist(url, source_id="")
-            == "http://example.com/streams/1080p/index.m3u8"
-        )
-
-    def test_redirected_playlists_resolve_to_where_they_were_served(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ):
-        """Providers redirect each playlist request (~1 s); ffmpeg should not repeat the hop."""
-        media = "http://example.com/live/1.m3u8"
-        master = "http://example.com/live/2.m3u8"
-        web = FakeWeb(
-            {
-                media: FakeResponse(b"#EXTM3U\n#EXTINF:10,\ns.ts\n", url="http://edge/a/1.m3u8"),
-                master: FakeResponse(
-                    b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhd/index.m3u8\n",
-                    url="http://edge/b/2.m3u8",
-                ),
-            },
-        )
-        install_web(monkeypatch, web, util)
-
-        assert resolve_hls_master_playlist(media, source_id="") == "http://edge/a/1.m3u8"
-        assert resolve_hls_master_playlist(master, source_id="") == "http://edge/b/hd/index.m3u8"
-
-    def test_a_provider_s_master_may_not_point_ffmpeg_inward(self, monkeypatch: pytest.MonkeyPatch):
-        url = "http://8.8.8.8/live/master.m3u8"
-        body = (
-            b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=9000000\nhttp://127.0.0.1:8000/settings\n"
-            b"#EXT-X-STREAM-INF:BANDWIDTH=1\nlow.m3u8\n"
-        )
-        web = FakeWeb({url: FakeResponse(body)})
-        install_web(monkeypatch, web, util)
-        # The best variant names this server, so the best one on the internet plays.
-        assert resolve_hls_master_playlist(url, source_id="") == "http://8.8.8.8/live/low.m3u8"
-        # And the master's own redirects may not turn inward either.
-        [fetch] = web.fetches
-        assert testing.dials_only_the_internet(fetch)
-
-    def test_default_user_agent_sends_the_server_s_default(self, monkeypatch: pytest.MonkeyPatch):
-        _save_user_agent("default")
-        url = "http://example.com/stream.m3u8"
-        web = FakeWeb({url: FakeResponse(b"#EXTM3U\n")})
-        install_web(monkeypatch, web, util)
-
-        assert resolve_hls_master_playlist(url, source_id="") == url
-        # As every other server fetch does: providers block Python's own.
-        assert web.fetches[0].headers == {"User-agent": "VLC/3.0.20 LibVLC/3.0.20"}
-
-    @pytest.mark.parametrize(
-        ("playlist", "variant", "count", "bandwidth"),
-        [
-            # A missing BANDWIDTH ranks as 0; ties keep playlist order.
-            (b"BANDWIDTH=0\nzero.m3u8\n#EXT-X-STREAM-INF:RESOLUTION=1x1\nnone.m3u8", "zero", 2, 0),
-            (b"BANDWIDTH=7\na.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=7\nb.m3u8", "a", 2, 7),
-            (b"BANDWIDTH=abc\nonly.m3u8", "only", 1, 0),
-            (b"BANDWIDTH=900, RESOLUTION=1x1\nhd.m3u8", "hd", 1, 900),
-            (
-                b"BANDWIDTH=500\nlow.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=3000000\nhigh.m3u8",
-                "high",
-                2,
-                3_000_000,
-            ),
-        ],
-    )
-    def test_variant_selection_is_logged(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-        playlist: bytes,
-        variant: str,
-        count: int,
-        bandwidth: int,
-    ):
-        caplog.set_level("INFO", logger="netv.ffmpeg_command")
-        base = f"http://example.com/{'p' * 90}/"
-        url = base + "master.m3u8"
-        body = b"#EXTM3U\n#EXT-X-STREAM-INF:" + playlist + b"\n"
-        install_web(monkeypatch, FakeWeb({url: FakeResponse(body)}), util)
-
-        best = f"{base}{variant}.m3u8"
-        assert resolve_hls_master_playlist(url, source_id="") == best
-        assert _command_log(caplog) == [
-            (
-                "INFO",
-                f"HLS master playlist resolved: {count} variants, selected {bandwidth} bps: {best[:80]}",
-            ),
-        ]
-
-    def test_invalid_utf8_is_replaced(self, monkeypatch: pytest.MonkeyPatch):
-        url = "http://example.com/master.m3u8"
-        body = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nvid\xff.m3u8\n"
-        install_web(monkeypatch, FakeWeb({url: FakeResponse(body)}), util)
-
-        assert resolve_hls_master_playlist(url, source_id="") == "http://example.com/vid\ufffd.m3u8"
-
-    def test_master_without_variants_logs_served_url(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-    ):
-        url = "http://example.com/master.m3u8"
-        served = f"http://edge.example.com/{'p' * 90}/master.m3u8"
-        body = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n#comment\n"
-        install_web(monkeypatch, FakeWeb({url: FakeResponse(body, url=served)}), util)
-
-        assert resolve_hls_master_playlist(url, source_id="") == served
-        assert _command_log(caplog) == [
-            ("WARNING", f"HLS master playlist has no variants: {served[:80]}"),
-        ]
-
-    def test_fetch_error_is_logged(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-    ):
-        url = f"http://example.com/{'p' * 90}/master.m3u8"
-        install_web(monkeypatch, FakeWeb({url: Exception("Network error")}), util)
-
-        assert resolve_hls_master_playlist(url, source_id="") == url
-        assert _command_log(caplog) == [
-            ("WARNING", f"Failed to resolve HLS master playlist {url[:80]}: Network error"),
-        ]
-
-
 def _command_log(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str]]:
     return [
-        (r.levelname, r.getMessage()) for r in caplog.records if r.name == "netv.ffmpeg_command"
+        (r.levelname, r.getMessage()) for r in caplog.records if r.name == "netv.ffmpeg.commands"
     ]
 
 
@@ -2051,7 +1420,7 @@ def test_allow_upscale_gates_ai_for_low_resolution_sources(
         "http://example.com/live.ts",
         "nvenc+software",
         "/tmp/hls",
-        media_info=_media_info(height=480, pix_fmt="yuv420p10le"),
+        media_info=media_info(height=480, pix_fmt="yuv420p10le"),
         max_resolution="720p",
         allow_upscale=allow_upscale,
         input_args=(),
@@ -2074,7 +1443,7 @@ def test_ai_upscale_engine_follows_source_height(
         "http://example.com/live.ts",
         "nvenc+software",
         "/tmp/hls",
-        media_info=None if height is None else _media_info(height=height),
+        media_info=None if height is None else media_info(height=height),
         max_resolution="4k",
         input_args=(),
     )
@@ -2113,169 +1482,6 @@ def test_archive_policy_copies_compatible_source_without_ai_upscaling(
     assert "-vf" not in cmd
 
 
-def test_probe_segment_parses_video_and_audio(fake_run: FakeRun):
-    _ffprobe(
-        fake_run,
-        {
-            "streams": [
-                {
-                    "codec_type": "video",
-                    "codec_name": "H264",
-                    "pix_fmt": "yuv420p",
-                    "height": 1080,
-                    "field_order": "tt",
-                },
-                {
-                    "codec_type": "audio",
-                    "codec_name": "AAC",
-                    "channels": 6,
-                    "sample_rate": "48000",
-                    "profile": "LC",
-                },
-            ],
-            "format": {"format_name": "mpegts", "bit_rate": "5000000"},
-        },
-    )
-    info = probe_segment("input_0.ts")
-    assert info == MediaInfo(
-        video_codec="h264",
-        audio_codec="aac",
-        pix_fmt="yuv420p",
-        audio_channels=6,
-        audio_sample_rate=48_000,
-        audio_profile="LC",
-        height=1080,
-        video_bitrate=5_000_000,
-        interlaced=True,
-        audio_tracks=(
-            AudioTrack(
-                index=None,
-                lang="und",
-                codec="aac",
-                channels=6,
-                sample_rate=48_000,
-                profile="LC",
-            ),
-        ),
-    )
-    assert fake_run.calls == [
-        ["ffprobe", "-v", "error", "-of", "json", "-show_streams", "-show_format", "input_0.ts"],
-    ]
-    assert fake_run.options == [
-        {"capture_output": True, "text": True, "timeout": 5, "check": False},
-    ]
-
-
-def _multi_audio_probe() -> dict[str, object]:
-    return {
-        "streams": [
-            {"index": 0, "codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"},
-            {
-                "index": 1,
-                "codec_type": "audio",
-                "codec_name": "eac3",
-                "channels": 6,
-                "tags": {"language": "chi"},
-                "disposition": {"default": 1},
-            },
-            {"index": 2, "codec_type": "audio", "codec_name": "ac3", "tags": {"language": "cze"}},
-            {
-                "index": 3,
-                "codec_type": "audio",
-                "codec_name": "aac",
-                "channels": 2,
-                "tags": {"language": "eng"},
-            },
-        ],
-        "format": {"duration": "60"},
-    }
-
-
-def test_audio_language_selects_matching_track(fake_run: FakeRun):
-    _ffprobe(fake_run, _multi_audio_probe())
-    info = probe_segment("x.mkv")
-    assert info is not None
-    assert (info.audio_codec, info.audio_index) == ("eac3", None)
-    english = with_audio_language(info, "en-US")
-    assert english is not None
-    assert (english.audio_codec, english.audio_channels, english.audio_index) == ("aac", 2, 3)
-    cmd = build_hls_ffmpeg_cmd(
-        "http://x/m.mkv",
-        "software",
-        "/tmp/o",
-        True,
-        None,
-        english,
-        input_args=(),
-    )
-    assert cmd[cmd.index("0:v:0") + 2] == "0:3"
-    assert with_audio_language(info, "cs") == replace(
-        info,
-        audio_codec="ac3",
-        audio_channels=0,
-        audio_index=2,
-    )
-    assert with_audio_language(info, "ja") == info
-    assert with_audio_language(info, "") == info
-    assert audio_tracks_from_cache(audio_tracks_to_cache(info.audio_tracks)) == info.audio_tracks
-
-
-@pytest.mark.parametrize(
-    "outcome",
-    [
-        Program(error=OSError("unavailable")),
-        Program(error=subprocess.TimeoutExpired("ffprobe", 5)),
-        Program(stdout="not json"),
-        Program(stdout='{"streams": []}'),
-        Program(stdout='{"streams": [{"codec_type": "audio", "codec_name": "aac"}]}'),
-    ],
-)
-def test_probe_segment_without_readable_video_returns_none(fake_run: FakeRun, outcome: Program):
-    fake_run.program("ffprobe", outcome)
-    assert probe_segment("input_0.ts") is None
-
-
-@pytest.mark.parametrize(
-    "side_data_type, expected",
-    [
-        ("ATSC A53 Part 4 Closed Captions", True),
-        ("H.264 User Data Unregistered SEI message", False),
-    ],
-)
-def test_probe_closed_captions_reads_video_side_data(
-    fake_run: FakeRun,
-    side_data_type: str,
-    expected: bool,
-):
-    _ffprobe(fake_run, {"frames": [{"side_data_list": [{"side_data_type": side_data_type}]}]})
-    assert probe_closed_captions("/tmp/input.ts") is expected
-
-    command = fake_run.calls[0]
-    assert command[0] == "ffprobe"
-    assert command[-1] == "/tmp/input.ts"
-    assert command[command.index("-read_intervals") + 1] == "%+2"
-    assert command[command.index("-show_entries") + 1] == "frame=side_data_list"
-    assert fake_run.options == [
-        {"capture_output": True, "text": True, "timeout": 5, "check": False},
-    ]
-
-
-# =============================================================================
-# Module state, caches, persistence, and probing edge cases
-# =============================================================================
-
-
-@pytest.fixture
-def probe_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Keep the on-disk probe cache in tmp_path and send no User-Agent."""
-    _save_user_agent("default")
-    monkeypatch.setattr(cache, "CACHE_DIR", tmp_path)
-    return tmp_path
-
-
-_VIDEO = {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p", "height": 720}
-
-
 def _server_settings() -> ServerSettings:
     return {
         "transcode_mode": "auto",
@@ -2301,21 +1507,21 @@ def test_init_sets_settings_and_engine_dir(monkeypatch: pytest.MonkeyPatch, prob
     settings = _server_settings()
     settings["sr_model"] = "x"
 
-    ffmpeg_command.init(lambda: settings, sr_engine_dir="/engines")
+    commands.init(lambda: settings, sr_engine_dir="/engines")
     assert probe_state / "logos" == cache.LOGOS_DIR
-    assert ffmpeg_command._sr_engine_dir == "/engines"
-    assert ffmpeg_command.get_settings() is settings
-    assert list(ffmpeg_command._series_probe_cache[4]["episodes"]) == [1]
+    assert commands._sr_engine_dir == "/engines"
+    assert commands.get_settings() is settings
+    assert list(probe._series_probe_cache[4]["episodes"]) == [1]
 
 
 def test_init_without_engine_dir_disables_upscale(
     monkeypatch: pytest.MonkeyPatch,
     probe_state: Path,
 ):
-    monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", "/stale")
-    ffmpeg_command.init(_server_settings)
-    assert ffmpeg_command._sr_engine_dir is None
-    assert ffmpeg_command.get_settings() == _server_settings()
+    monkeypatch.setattr(commands, "_sr_engine_dir", "/stale")
+    commands.init(_server_settings)
+    assert commands._sr_engine_dir is None
+    assert commands.get_settings() == _server_settings()
 
 
 def test_transcode_dir_falls_back_when_inaccessible(probe_state: Path):
@@ -2325,262 +1531,11 @@ def test_transcode_dir_falls_back_when_inaccessible(probe_state: Path):
     assert get_transcode_dir() == Path(tempfile.gettempdir())
 
 
-def test_series_stats_skip_empty_and_unprobed_series(probe_state: Path):
-    ffmpeg_command._series_probe_cache.update(
-        {
-            1: {"name": "Empty", "episodes": {}},
-            2: {"name": "Unprobed", "episodes": {1: (5, None, [])}},
-            3: {
-                "episodes": {
-                    2: (2, _media_info(), [SubtitleStream(index=1, lang="eng", name="E")]),
-                    1: (1, None, []),
-                },
-            },
-        },
-    )
-    stats = get_series_probe_cache_stats()
-    assert [s["series_id"] for s in stats] == [3]
-    assert stats[0]["episode_count"] == 2
-    assert stats[0]["subtitle_count"] == 1
-    assert stats[0]["episodes"] == [{"episode_id": 2, "duration": 0.0, "subtitle_count": 1}]
-
-
-def test_cache_mutators_ignore_unknown_series(probe_state: Path):
-    invalidate_series_probe_cache(999)
-    invalidate_series_probe_cache(999, episode_id=1)
-    clear_series_mru(999)
-    assert not (probe_state / "series_probe_cache.json").exists()
-    assert ffmpeg_command._series_probe_cache == {}
-
-
-def test_master_playlist_without_variant_urls_returns_original(
-    monkeypatch: pytest.MonkeyPatch,
-    probe_state: Path,
-):
-    _save_user_agent("custom", "UA/1")
-    url = "http://example.com/master.m3u8"
-    body = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=abc\n#comment\n"
-    web = FakeWeb({url: FakeResponse(body)})
-    install_web(monkeypatch, web, util)
-    assert resolve_hls_master_playlist(url, source_id="") == url
-    assert web.fetches[0].headers == {"User-agent": "UA/1"}
-
-
-class TestProbeMediaSeriesCache:
-    """Series/episode cache paths in probe_media."""
-
-    def test_exact_episode_hit_keeps_mru(self, fake_run: FakeRun, probe_state: Path):
-        info = _media_info()
-        ffmpeg_command._series_probe_cache[7] = {
-            "name": "S",
-            "mru": 1,
-            "episodes": {2: (time.time(), info, list[SubtitleStream]())},
-        }
-        assert probe_media("http://x", series_id=7, episode_id=2, source_id="") == (info, [])
-        assert ffmpeg_command._series_probe_cache[7].get("mru") == 1
-        assert not (probe_state / "series_probe_cache.json").exists()
-        assert fake_run.calls == []
-
-    def test_uncached_probe_records_the_episode_and_keeps_mru(
-        self,
-        fake_run: FakeRun,
-        probe_state: Path,
-    ):
-        typical = _media_info(video_codec="typical")
-        ffmpeg_command._series_probe_cache[7] = {
-            "mru": 1,
-            "episodes": {1: (time.time(), typical, list[SubtitleStream]())},
-        }
-        ffmpeg_command._probe_cache["http://x"] = (0, typical, list[SubtitleStream]())
-        _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}})
-        info, _ = probe_media("http://x", series_id=7, episode_id=2, source_id="", use_cache=False)
-        assert info is not None and info.video_codec == "h264"
-        series = ffmpeg_command._series_probe_cache[7]
-        assert series["episodes"][2][1] is info
-        assert series.get("mru") == 1
-        # Episodes without their own probe still share the typical one.
-        assert probe_media("http://y", series_id=7, episode_id=3, source_id="")[0] is typical
-
-    def test_uncached_probe_replaces_a_url_probe(self, fake_run: FakeRun, probe_state: Path):
-        old = _media_info(video_codec="old")
-        ffmpeg_command._probe_cache["http://x"] = (0, old, list[SubtitleStream]())
-        _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}})
-        info, _ = probe_media("http://x", source_id="", use_cache=False)
-        assert info is not None and info.video_codec == "h264"
-        assert probe_media("http://x", source_id="")[0] is info
-
-    def test_mru_fallback_hit(self, fake_run: FakeRun, probe_state: Path):
-        info = _media_info()
-        ffmpeg_command._series_probe_cache[7] = {
-            "mru": 1,
-            "episodes": {1: (time.time(), info, list[SubtitleStream]())},
-        }
-        assert probe_media("http://x", series_id=7, episode_id=99, source_id="") == (info, [])
-        assert fake_run.calls == []
-
-    @pytest.mark.parametrize("episode_id", [1, 99])
-    def test_old_series_entries_still_hit(
-        self,
-        fake_run: FakeRun,
-        probe_state: Path,
-        episode_id: int,
-    ):
-        old = _media_info(video_codec="old")
-        ffmpeg_command._series_probe_cache[7] = {
-            "mru": 1,
-            "episodes": {1: (0, old, list[SubtitleStream]())},
-        }
-        ffmpeg_command._probe_cache["http://y"] = (0, old, list[SubtitleStream]())
-        assert probe_media("http://x", series_id=7, episode_id=episode_id, source_id="") == (
-            old,
-            [],
-        )
-        assert probe_media("http://y", source_id="") == (old, [])
-        assert fake_run.calls == []
-
-    def test_a_series_without_cached_episodes_is_probed(
-        self,
-        fake_run: FakeRun,
-        probe_state: Path,
-    ):
-        ffmpeg_command._series_probe_cache[7] = {
-            "mru": 3,
-            "episodes": dict[int, ffmpeg_command._ProbeEntry](),
-        }
-        _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}})
-        info, _ = probe_media("http://x", series_id=7, episode_id=2, series_name="N", source_id="")
-        assert info is not None and info.video_codec == "h264"
-        series = ffmpeg_command._series_probe_cache[7]
-        assert "name" in series
-        assert series["name"] == "N"
-        assert series["mru"] == 2
-        assert series["episodes"][2][1] is info
-
-    def test_new_series_is_cached_and_persisted(self, fake_run: FakeRun, probe_state: Path):
-        _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}})
-        info, _ = probe_media("http://x", series_id=8, series_name="New", source_id="")
-        series = ffmpeg_command._series_probe_cache[8]
-        assert "name" in series
-        assert series["name"] == "New"
-        assert "mru" in series
-        assert series["mru"] == 0
-        assert series["episodes"][0][1] is info
-        saved = json.loads((probe_state / "series_probe_cache.json").read_text())
-        assert saved["8"]["episodes"]["0"]["video_codec"] == "h264"
-
-    def test_existing_named_series_keeps_name(self, fake_run: FakeRun, probe_state: Path):
-        ffmpeg_command._series_probe_cache[8] = {
-            "name": "Kept",
-            "episodes": dict[int, ffmpeg_command._ProbeEntry](),
-        }
-        _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}})
-        probe_media("http://x", series_id=8, episode_id=3, series_name="Other", source_id="")
-        assert ffmpeg_command._series_probe_cache[8]["name"] == "Kept"
-        assert 3 in ffmpeg_command._series_probe_cache[8]["episodes"]
-
-
-class TestProbeMediaEdgeCases:
-    def test_subprocess_exceptions_yield_none(self, fake_run: FakeRun, probe_state: Path):
-        fake_run.program("ffprobe", Program(error=OSError("boom")))
-        assert probe_media("http://x", source_id="") == (None, [])
-        assert len(fake_run.calls) == 2
-        assert fake_run.calls[0][-1] == "http://x"
-        assert "hls" not in fake_run.calls[0]
-        assert fake_run.calls[1][-5:] == ["-f", "hls", "-extension_picky", "0", "http://x"]
-
-    def test_user_agent_and_format_bitrate_fallback(self, fake_run: FakeRun, probe_state: Path):
-        _save_user_agent("custom", "UA/1")
-        fmt = {"bit_rate": "1234", "format_name": "hls"}
-        _ffprobe(fake_run, {"streams": [_VIDEO], "format": fmt})
-        info, _ = probe_media("http://x", source_id="")
-        assert info is not None
-        assert info.video_bitrate == 1234
-        assert info.is_hls
-        cmd = fake_run.calls[0]
-        assert cmd[cmd.index("-user_agent") + 1] == "UA/1"
-
-    def test_invalid_format_bitrate_ignored(self, fake_run: FakeRun, probe_state: Path):
-        _ffprobe(fake_run, {"streams": [_VIDEO], "format": {"bit_rate": "n/a"}})
-        info, _ = probe_media("http://x", source_id="")
-        assert info is not None and info.video_bitrate == 0
-        assert "-user_agent" not in fake_run.calls[0]
-
-    def test_audio_only_returns_none(self, fake_run: FakeRun, probe_state: Path):
-        audio = {"codec_type": "audio", "codec_name": "aac", "channels": 2}
-        _ffprobe(fake_run, {"streams": [audio], "format": {}})
-        assert probe_media("http://x", source_id="") == (None, [])
-
-    def test_zero_height_not_cached(self, fake_run: FakeRun, probe_state: Path):
-        _ffprobe(fake_run, {"streams": [{**_VIDEO, "height": 0}], "format": {}})
-        info, _ = probe_media("http://x", series_id=1, source_id="")
-        assert info is not None and info.height == 0
-        assert ffmpeg_command._probe_cache == {}
-        assert ffmpeg_command._series_probe_cache == {}
-
-
 def test_uses_audio_passthrough():
-    assert ffmpeg_command.uses_audio_passthrough(_media_info(audio_codec="eac3"), True)
-    assert not ffmpeg_command.uses_audio_passthrough(_media_info(audio_codec="eac3"), False)
-    assert not ffmpeg_command.uses_audio_passthrough(_media_info(audio_codec="aac"), True)
-    assert not ffmpeg_command.uses_audio_passthrough(None, True)
-
-
-def test_probe_closed_captions_reports_ffprobe_failure(
-    fake_run: FakeRun,
-    caplog: pytest.LogCaptureFixture,
-):
-    fake_run.program("ffprobe", Program(returncode=1, stderr="  bad input \n"))
-    assert probe_closed_captions("/tmp/dir/a.ts") is False
-    assert "a.ts: bad input" in caplog.text
-
-    fake_run.program("ffprobe", Program(returncode=2))
-    assert probe_closed_captions("/tmp/dir/a.ts") is False
-    assert "ffprobe exited 2" in caplog.text
-
-
-@pytest.mark.parametrize(
-    "outcome",
-    [
-        Program(error=subprocess.TimeoutExpired("ffprobe", 5)),
-        Program(stdout="not json"),
-    ],
-)
-def test_probe_closed_captions_handles_errors(
-    fake_run: FakeRun,
-    outcome: Program,
-    caplog: pytest.LogCaptureFixture,
-):
-    fake_run.program("ffprobe", outcome)
-    assert probe_closed_captions("/tmp/a.ts") is False
-    assert "Could not inspect embedded captions in a.ts" in caplog.text
-
-
-@pytest.mark.parametrize("stdout", ['["not", "a", "dict"]', '{"frames": "not a list"}'])
-def test_probe_closed_captions_rejects_malformed_shapes(fake_run: FakeRun, stdout: str):
-    """A probe of the wrong shape means no captions, not a crash."""
-    fake_run.program("ffprobe", Program(stdout=stdout))
-    assert probe_closed_captions("/tmp/a.ts") is False
-
-
-def test_probe_media_retries_hls_when_a_field_has_the_wrong_type(
-    fake_run: FakeRun,
-    probe_state: Path,
-):
-    """A mistyped field fails that probe attempt; the HLS retry still succeeds."""
-    _ffprobe(fake_run, {"streams": [{**_VIDEO, "codec_name": 7}], "format": {}})
-    _ffprobe(fake_run, {"streams": [_VIDEO], "format": {}}, when="hls")
-    info, _ = probe_media("http://x/mistyped", source_id="")
-    assert info is not None
-    assert info.video_codec == "h264"
-    assert info.is_hls
-    assert len(fake_run.calls) == 2
-    assert fake_run.calls[1][-5:] == [
-        "-f",
-        "hls",
-        "-extension_picky",
-        "0",
-        "http://x/mistyped",
-    ]
+    assert commands.uses_audio_passthrough(media_info(audio_codec="eac3"), True)
+    assert not commands.uses_audio_passthrough(media_info(audio_codec="eac3"), False)
+    assert not commands.uses_audio_passthrough(media_info(audio_codec="aac"), True)
+    assert not commands.uses_audio_passthrough(None, True)
 
 
 def test_hls_media_info_adds_hls_demuxer_options():
@@ -2588,7 +1543,7 @@ def test_hls_media_info_adds_hls_demuxer_options():
         "http://x/live.m3u8",
         "software",
         "/out",
-        media_info=_media_info(is_hls=True),
+        media_info=media_info(is_hls=True),
         input_args=(),
     )
     i = cmd.index("-i")
@@ -2601,7 +1556,7 @@ class TestSrEngineSelection:
         assert _build_sr_filter(720, 1080) == ""
 
     def test_missing_engine_dir(self, monkeypatch: pytest.MonkeyPatch, probe_state: Path):
-        monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", str(probe_state / "missing"))
+        monkeypatch.setattr(commands, "_sr_engine_dir", str(probe_state / "missing"))
         assert _find_sr_engine(720) is None
 
     def test_no_valid_engines(self, monkeypatch: pytest.MonkeyPatch, probe_state: Path):
@@ -2619,7 +1574,7 @@ class TestSrEngineSelection:
     ):
         for height in (480, 1080):
             (probe_state / f"2x-nomosuni-compact_{height}p_fp16.engine").write_bytes(b"")
-        monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", str(probe_state))
+        monkeypatch.setattr(commands, "_sr_engine_dir", str(probe_state))
         result = _find_sr_engine(0)
         assert result is not None
         assert result[1:] == (1080, 1920, 2)
@@ -2630,7 +1585,7 @@ class TestSrEngineSelection:
         probe_state: Path,
     ):
         (probe_state / "2x-nomosuni-compact_480p_fp16.engine").write_bytes(b"")
-        monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", str(probe_state))
+        monkeypatch.setattr(commands, "_sr_engine_dir", str(probe_state))
         result = _find_sr_engine(1080)
         assert result is not None and result[1] == 480
 
@@ -2640,7 +1595,7 @@ class TestSrEngineSelection:
         probe_state: Path,
     ):
         (probe_state / "2x-nomosuni-compact_720p_fp16.engine").write_bytes(b"")
-        monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", str(probe_state))
+        monkeypatch.setattr(commands, "_sr_engine_dir", str(probe_state))
         assert _build_sr_filter(480, 1080) == ""
 
     def test_filter_skipped_when_source_meets_target(
@@ -2674,193 +1629,13 @@ class TestHardwareProbes:
     @pytest.mark.parametrize("available", [True, False])
     def test_libplacebo_probe(self, fake_run: FakeRun, available: bool):
         _script_libplacebo(fake_run, available=available)
-        assert ffmpeg_command._has_libplacebo_filter() is available
-        assert ffmpeg_command._has_libplacebo_filter() is available
+        assert commands._has_libplacebo_filter() is available
+        assert commands._has_libplacebo_filter() is available
         assert fake_run.calls == [["ffmpeg", "-filters"]]
 
     def test_libplacebo_probe_failure(self, fake_run: FakeRun):
         fake_run.program("ffmpeg", Program(error=OSError("no ffmpeg")))
-        assert ffmpeg_command._has_libplacebo_filter() is False
-
-
-class TestUrlProbeCachePersistence:
-    def test_probes_survive_a_restart(self, probe_state: Path):
-        track = AudioTrack(index=3, lang="eng", codec="ac3", channels=6, default=True)
-        info = MediaInfo(
-            video_codec="h264",
-            audio_codec="ac3",
-            pix_fmt="yuv420p",
-            height=1080,
-            duration=90.0,
-            is_hls=True,
-            audio_tracks=(track,),
-        )
-        ffmpeg_command.remember_probe("http://h/movie/u/p/1.mkv", info)
-        ffmpeg_command.remember_probe("http://h/movie/u/p/2.mkv", None)
-        saved = json.loads((probe_state / "probe_cache.json").read_text())
-        assert list(saved) == ["http://h/movie/u/p/1.mkv"]
-        assert saved["http://h/movie/u/p/1.mkv"]["time"] > 0
-        assert saved["http://h/movie/u/p/1.mkv"]["is_hls"] is True
-        saved["http://h/movie/u/p/3.mkv"] = {"audio_codec": "aac"}
-        (probe_state / "probe_cache.json").write_text(json.dumps(saved))
-
-        ffmpeg_command._probe_cache.clear()
-        ffmpeg_command._load_url_probe_cache()
-        assert set(ffmpeg_command._probe_cache) == {"http://h/movie/u/p/1.mkv"}
-        assert probe_media("http://h/movie/u/p/1.mkv", source_id="") == (info, [])
-        assert has_cached_probe("http://h/movie/u/p/1.mkv")
-        assert not has_cached_probe("http://h/movie/u/p/2.mkv")
-
-    def test_load_missing_or_corrupt_file(
-        self,
-        probe_state: Path,
-        caplog: pytest.LogCaptureFixture,
-    ):
-        ffmpeg_command._load_url_probe_cache()
-        assert ffmpeg_command._probe_cache == {}
-        (probe_state / "probe_cache.json").write_text("{not json")
-        ffmpeg_command._load_url_probe_cache()
-        assert ffmpeg_command._probe_cache == {}
-        assert "Failed to load probe cache" in caplog.text
-
-    def test_save_failure_is_logged(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-    ):
-        blocker = tmp_path / "file"
-        blocker.write_text("")
-        monkeypatch.setattr(cache, "CACHE_DIR", blocker / "sub")
-        ffmpeg_command.remember_probe("http://h/x", _media_info())
-        assert "Failed to save probe cache" in caplog.text
-
-    def test_invalidation_rewrites_the_file(self, probe_state: Path):
-        info = _media_info()
-        ffmpeg_command.remember_probe("http://a", info)
-        ffmpeg_command.remember_probe("http://b", info)
-        assert invalidate_url_probe_cache(["http://a", "http://missing"]) == 1
-        assert list(json.loads((probe_state / "probe_cache.json").read_text())) == ["http://b"]
-
-
-def test_url_probe_stats_list_recent_probes_first():
-    track = AudioTrack(index=1, lang="eng", codec="ac3")
-    old = MediaInfo(video_codec="h264", audio_codec="ac3", pix_fmt="yuv420p", audio_tracks=(track,))
-    new = MediaInfo(video_codec="hevc", audio_codec="aac", pix_fmt="yuv420p", height=2160)
-    subs = [SubtitleStream(index=2, lang="eng", name="English")]
-    ffmpeg_command._probe_cache.update(
-        {
-            "http://old": (1.0, old, subs),
-            "http://new": (2.0, new, []),
-            "http://none": (3.0, None, []),
-        },
-    )
-    assert get_url_probe_cache_stats() == [
-        {
-            "url": "http://new",
-            "probed_at": 2.0,
-            "video_codec": "hevc",
-            "audio_codec": "aac",
-            "audio_langs": [],
-            "subtitle_count": 0,
-            "duration": 0.0,
-            "height": 2160,
-        },
-        {
-            "url": "http://old",
-            "probed_at": 1.0,
-            "video_codec": "h264",
-            "audio_codec": "ac3",
-            "audio_langs": ["eng"],
-            "subtitle_count": 1,
-            "duration": 0.0,
-            "height": 0,
-        },
-    ]
-
-
-class TestSeriesProbeCachePersistence:
-    def test_load_missing_file_is_noop(self, probe_state: Path):
-        ffmpeg_command._load_series_probe_cache()
-        assert ffmpeg_command._series_probe_cache == {}
-
-    def test_load_corrupt_file_is_logged(self, probe_state: Path, caplog: pytest.LogCaptureFixture):
-        (probe_state / "series_probe_cache.json").write_text("{not json")
-        ffmpeg_command._load_series_probe_cache()
-        assert ffmpeg_command._series_probe_cache == {}
-        assert "Failed to load series probe cache" in caplog.text
-
-    def test_round_trip_and_merge(self, probe_state: Path):
-        info = MediaInfo(
-            video_codec="hevc",
-            audio_codec="eac3",
-            pix_fmt="yuv420p10le",
-            audio_channels=6,
-            audio_sample_rate=48_000,
-            subtitle_codecs=["subrip"],
-            duration=42.5,
-            height=2160,
-            video_bitrate=9_000,
-            interlaced=True,
-            is_10bit=True,
-            is_hdr=True,
-        )
-        subs = [SubtitleStream(index=3, lang="eng", name="English")]
-        ffmpeg_command._series_probe_cache.update(
-            {
-                5: {"name": "Show", "mru": 2, "episodes": {2: (123.0, info, subs)}},
-                6: {"episodes": {1: (1.0, None, [])}},
-            },
-        )
-        ffmpeg_command._save_series_probe_cache()
-        saved = json.loads((probe_state / "series_probe_cache.json").read_text())
-        assert saved["6"] == {"name": "", "mru": None, "episodes": {}}
-        assert saved["5"]["episodes"]["2"]["subtitles"] == [
-            {"index": 3, "lang": "eng", "name": "English"},
-        ]
-
-        # Add entries the loader must skip or default.
-        saved["5"]["episodes"]["4"] = {"audio_codec": "aac"}
-        saved["5"]["episodes"]["5"] = {"video_codec": "h264", "subtitles": [{"index": 1}]}
-        (probe_state / "series_probe_cache.json").write_text(json.dumps(saved))
-
-        existing = _media_info(video_codec="mpeg2video")
-        ffmpeg_command._series_probe_cache.clear()
-        ffmpeg_command._series_probe_cache[5] = {
-            "episodes": {2: (999.0, existing, list[SubtitleStream]())},
-        }
-        ffmpeg_command._load_series_probe_cache()
-
-        show = ffmpeg_command._series_probe_cache[5]
-        assert "name" in show
-        assert show["name"] == "Show"
-        assert "mru" in show
-        assert show["mru"] == 2
-        assert show["episodes"][2] == (999.0, existing, list[SubtitleStream]())
-        assert 4 not in show["episodes"]
-        time5, info5, subs5 = show["episodes"][5]
-        assert info5 is not None
-        assert (time5, info5.video_codec, info5.height) == (0, "h264", 0)
-        assert subs5 == [SubtitleStream(index=1, lang="und", name="")]
-        assert ffmpeg_command._series_probe_cache[6] == {"name": "", "mru": None, "episodes": {}}
-
-        ffmpeg_command._series_probe_cache.clear()
-        ffmpeg_command._load_series_probe_cache()
-        _, loaded, loaded_subs = ffmpeg_command._series_probe_cache[5]["episodes"][2]
-        assert loaded == info
-        assert loaded_subs == subs
-
-    def test_save_failure_is_logged(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        probe_state: Path,
-        caplog: pytest.LogCaptureFixture,
-    ):
-        blocker = probe_state / "file"
-        blocker.write_text("")
-        monkeypatch.setattr(ffmpeg_command.cache, "CACHE_DIR", blocker / "sub")
-        ffmpeg_command._save_series_probe_cache()
-        assert "Failed to save series probe cache" in caplog.text
+        assert commands._has_libplacebo_filter() is False
 
 
 class TestVideoArgsRemainingBranches:
@@ -2949,35 +1724,6 @@ class TestVideoArgsRemainingBranches:
         """Film with pulldown otherwise gets muxer-duplicated frames that garble CEA-608."""
         _, post = self._args(hw, hw_pipeline=hw_pipeline, deinterlace=True)
         assert self._vf(post).startswith("fps=source_fps,")
-
-
-def _media_info(
-    *,
-    video_codec: str = "h264",
-    audio_codec: str = "aac",
-    pix_fmt: str = "yuv420p",
-    audio_channels: int = 2,
-    audio_sample_rate: int = 48_000,
-    audio_profile: str = "LC",
-    height: int = 1080,
-    interlaced: bool = False,
-    is_10bit: bool = False,
-    is_hdr: bool = False,
-    is_hls: bool = False,
-) -> MediaInfo:
-    return MediaInfo(
-        video_codec=video_codec,
-        audio_codec=audio_codec,
-        pix_fmt=pix_fmt,
-        audio_channels=audio_channels,
-        audio_sample_rate=audio_sample_rate,
-        audio_profile=audio_profile,
-        height=height,
-        interlaced=interlaced,
-        is_10bit=is_10bit,
-        is_hdr=is_hdr,
-        is_hls=is_hls,
-    )
 
 
 _VIDEO_ARGS_CASES = [
@@ -3397,7 +2143,7 @@ def test_video_args_per_encoder_branch(
     pre: str,
     post: str,
 ):
-    monkeypatch.setattr(ffmpeg_command, "_has_libplacebo", env["libplacebo"])
+    monkeypatch.setattr(commands, "_has_libplacebo", env["libplacebo"])
     monkeypatch.setitem(cache.AVAILABLE_ENCODERS, "vaapi_baseline_only", env["vaapi_baseline_only"])
     resolution, quality = target
     actual_pre, actual_post = _build_video_args(
@@ -3487,21 +2233,6 @@ def test_missing_vaapi_device_warns(
     assert "VAAPI" in caplog.records[0].getMessage()
 
 
-def test_audio_tracks_round_trip_through_the_cache():
-    tracks = (
-        AudioTrack(
-            index=2,
-            lang="spa",
-            codec="aac",
-            channels=6,
-            sample_rate=44_100,
-            profile="HE-AAC",
-            default=True,
-        ),
-    )
-    assert audio_tracks_from_cache(audio_tracks_to_cache(tracks)) == tracks
-
-
 @pytest.mark.parametrize(
     ("url", "paced"),
     [
@@ -3514,6 +2245,279 @@ def test_vod_read_pacing_applies_to_network_sources(url: str, paced: bool):
     assert (
         "-readrate" in build_hls_ffmpeg_cmd(url, "software", "/output", True, input_args=())
     ) is paced
+
+
+def _letterboxed(
+    *,
+    crop: CropBox | None = SCOPE,
+    video_codec: str = "hevc",
+    width: int = 1920,
+    interlaced: bool = False,
+    is_10bit: bool = False,
+) -> MediaInfo:
+    """A probed 1080p source with detected bars; as hevc, no client plays it copied."""
+    return media_info(
+        video_codec=video_codec,
+        width=width,
+        crop=crop,
+        interlaced=interlaced,
+        is_10bit=is_10bit,
+    )
+
+
+def _gpu(run: FakeRun) -> None:
+    run.program("nvidia-smi", Program(stdout="NVIDIA GeForce GTX 960, 5.2\n"))
+
+
+class TestLetterbox:
+    def test_encoder_crop_needs_a_box_a_frame_size_and_a_reencode(self):
+        assert encoder_crop(_letterboxed(), "1080p") == SCOPE
+        assert encoder_crop(None, "1080p") is None
+        assert encoder_crop(_letterboxed(crop=None), "1080p") is None
+        assert encoder_crop(_letterboxed(crop=CropBox()), "1080p") is None
+        assert encoder_crop(_letterboxed(width=0), "1080p") is None
+        # A stream copy keeps every pixel.
+        assert encoder_crop(_letterboxed(video_codec="h264"), "1080p") is None
+        assert encoder_crop(_letterboxed(video_codec="h264"), "720p") == SCOPE
+
+    @pytest.mark.parametrize("allow_upscale", [True, False])
+    def test_encoder_crop_of_an_upscaled_source(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        allow_upscale: bool,
+    ):
+        _enable_sr(monkeypatch, tmp_path)
+        crop = encoder_crop(_letterboxed(video_codec="h264"), "1080p", allow_upscale=allow_upscale)
+        assert crop == (SCOPE if allow_upscale else None)
+
+    def test_reencodes_detect_bars_in_an_output_before_the_main_one(self):
+        media = _letterboxed(crop=None)
+        cmd = build_hls_ffmpeg_cmd(
+            "input",
+            "software",
+            "/out",
+            True,
+            media_info=media,
+            input_args=(),
+        )
+        detect = detection_args("/out", "", is_10bit=False)
+        start = cmd.index("-filter:v") - 2
+        assert cmd[start : start + len(detect) + 2] == [*detect, "-map", "0:v:0"]
+
+    def test_stream_copies_detect_nothing(self):
+        cmd = build_hls_ffmpeg_cmd(
+            "input",
+            "software",
+            "/out",
+            True,
+            media_info=media_info(),
+            input_args=(),
+        )
+        assert "-filter:v" not in cmd
+
+    @pytest.mark.parametrize(
+        ("hw", "codec", "frames"),
+        [
+            ("software", "hevc", ""),
+            ("nvenc+software", "h264", "cuda"),
+            ("vaapi", "hevc", "vaapi"),
+            ("qsv", "hevc", "qsv"),
+        ],
+    )
+    def test_detection_reads_the_decoder_s_frames(
+        self,
+        fake_run: FakeRun,
+        hw: HwAccel,
+        codec: str,
+        frames: str,
+    ):
+        _gpu(fake_run)
+        media = _letterboxed(crop=None, video_codec=codec, interlaced=True, is_10bit=True)
+        cmd = build_hls_ffmpeg_cmd("input", hw, "/out", True, media_info=media, input_args=())
+        assert cmd[cmd.index("-filter:v") + 1] == detection_args("/out", frames, is_10bit=True)[3]
+
+    def test_software_frames_crop_before_any_filter(self):
+        cmd = build_hls_ffmpeg_cmd(
+            "input",
+            "software",
+            "/out",
+            True,
+            media_info=_letterboxed(),
+            input_args=(),
+        )
+        assert cmd[cmd.index("-vf") + 1] == (
+            "fps=source_fps,crop=1920:800:0:140,scale=-2:min(ih\\,1080),format=yuv420p"
+        )
+
+    @pytest.mark.parametrize(
+        ("resolution", "size"),
+        [("720p", "1728:720"), ("1080p", "1920:800"), ("original", "1920:800")],
+    )
+    def test_cuda_frames_crop_at_an_explicit_size(
+        self,
+        fake_run: FakeRun,
+        resolution: str,
+        size: str,
+    ):
+        _gpu(fake_run)
+        media = _letterboxed(video_codec="h264", interlaced=True)
+        cmd = build_hls_ffmpeg_cmd(
+            "input",
+            "nvenc+software",
+            "/out",
+            True,
+            media_info=media,
+            max_resolution=resolution,
+            input_args=(),
+        )
+        assert "-hwaccel" in cmd
+        # scale_cuda sizes from the uncropped frame, so -2 would squash the picture.
+        assert cmd[cmd.index("-vf") + 1] == (
+            f"fps=source_fps,yadif_cuda=0:-1:1,crop=1920:800:0:140,scale_cuda={size}:format=nv12"
+        )
+
+    @pytest.mark.parametrize("hw", ["vaapi", "qsv", "nvenc+vaapi", "amf+vaapi"])
+    def test_other_gpu_frames_decode_in_software_to_crop(self, hw: HwAccel):
+        cmd = build_hls_ffmpeg_cmd(
+            "input",
+            hw,
+            "/out",
+            True,
+            media_info=_letterboxed(),
+            input_args=(),
+        )
+        assert "-hwaccel" not in cmd
+        assert cmd[cmd.index("-vf") + 1].startswith("fps=source_fps,crop=1920:800:0:140,")
+        assert cmd[cmd.index("-filter:v") + 1] == detection_args("/out", "", is_10bit=False)[3]
+
+    def test_upscaling_crops_the_padding_it_adds(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        engine = _enable_sr(monkeypatch, tmp_path)
+        cmd = build_hls_ffmpeg_cmd(
+            "input",
+            "nvenc+software",
+            "/out",
+            True,
+            media_info=_letterboxed(),
+            input_args=(),
+        )
+        vf = cmd[cmd.index("-vf") + 1]
+        # The 800-line picture upscales; the 16:9 engine pads it to 1280x533 in 1280x720.
+        assert vf.startswith("fps=source_fps,crop=1920:800:0:140,scale=1280:720:")
+        assert vf.endswith(f"model={engine},crop=2560:1066:0:186,scale_cuda=w=2592:h=1080")
+
+    def test_a_picture_already_past_the_target_is_not_upscaled(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        _enable_sr(monkeypatch, tmp_path)
+        cmd = build_hls_ffmpeg_cmd(
+            "input",
+            "nvenc+software",
+            "/out",
+            True,
+            media_info=_letterboxed(),
+            max_resolution="720p",
+            input_args=(),
+        )
+        # The picture's 800 lines, not its 140-line top bar, meet the 720p target.
+        assert "dnn_processing" not in cmd[cmd.index("-vf") + 1]
+
+    @pytest.mark.parametrize(("resolution", "cropped"), [("720p", True), ("1080p", False)])
+    def test_a_copyable_source_is_cropped_only_when_re_encoded(
+        self,
+        resolution: str,
+        cropped: bool,
+    ):
+        cmd = build_hls_ffmpeg_cmd(
+            "input",
+            "software",
+            "/out",
+            True,
+            media_info=_letterboxed(video_codec="h264"),
+            max_resolution=resolution,
+            input_args=(),
+        )
+        assert ("-vf" in cmd and "crop=" in cmd[cmd.index("-vf") + 1]) is cropped
+
+    @pytest.mark.parametrize("allow_upscale", [True, False])
+    def test_an_upscaled_source_is_re_encoded_and_cropped(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        allow_upscale: bool,
+    ):
+        _enable_sr(monkeypatch, tmp_path)
+        cmd = build_hls_ffmpeg_cmd(
+            "input",
+            "nvenc+software",
+            "/out",
+            True,
+            media_info=_letterboxed(video_codec="h264"),
+            allow_upscale=allow_upscale,
+            input_args=(),
+        )
+        vf = cmd[cmd.index("-vf") + 1] if "-vf" in cmd else ""
+        assert vf.startswith("fps=source_fps,crop=1920:800:0:140,") is allow_upscale
+
+
+@pytest.mark.cli_ffmpeg
+def test_letterboxed_source_encodes_without_its_bars(tmp_path: Path):
+    source = tmp_path / "bars.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:s=1920x1080:r=10:d=4,drawbox=x=0:y=140:w=1920:h=800:c=white:t=fill",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=stereo",
+            "-t",
+            "4",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            str(source),
+        ],
+        check=True,
+    )
+    cmd = build_hls_ffmpeg_cmd(
+        str(source),
+        "software",
+        str(tmp_path),
+        True,
+        media_info=_letterboxed(),
+        input_args=(),
+    )
+    subprocess.run(cmd, check=True)
+    size = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            str(tmp_path / "seg000.ts"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert size.stdout.split() == ["1920,800"]
+    assert (tmp_path / DETECTION_FILE).exists()
 
 
 if __name__ == "__main__":

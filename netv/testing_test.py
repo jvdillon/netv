@@ -24,7 +24,8 @@ from pychromecast.error import PyChromecastError
 import pytest
 import uvicorn
 
-from netv import auth, fast_start, testing, util
+from netv import auth, testing, util
+from netv.ffmpeg import fast_start
 
 
 @pytest.mark.asyncio

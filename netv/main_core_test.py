@@ -32,8 +32,6 @@ from netv import (
     chromecast,
     db,
     epg,
-    ffmpeg_command,
-    ffmpeg_session,
     handoff,
     imdb,
     m3u as m3u_module,
@@ -44,7 +42,9 @@ from netv import (
 )
 from netv.cache import SourceConfig
 from netv.chromecast import CastSession
-from netv.ffmpeg_session import TranscodeSession
+from netv.ffmpeg import commands, probe, transcode
+from netv.ffmpeg.letterbox import DETECTION_FILE
+from netv.ffmpeg.transcode import TranscodeSession
 from netv.xtream import ProviderRecord
 
 
@@ -75,7 +75,7 @@ def prestarts(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         del options
         urls.append(url)
 
-    monkeypatch.setattr(ffmpeg_session, "prestart_live", prestart)
+    monkeypatch.setattr(transcode, "prestart_live", prestart)
     return urls
 
 
@@ -91,8 +91,8 @@ def web(monkeypatch: pytest.MonkeyPatch) -> testing.FakeWeb:
 def sessions(monkeypatch: pytest.MonkeyPatch) -> dict[str, TranscodeSession]:
     """Start with no transcode sessions; return the live session table."""
     table: dict[str, TranscodeSession] = {}
-    monkeypatch.setattr(ffmpeg_session, "_transcode_sessions", table)
-    monkeypatch.setattr(ffmpeg_session, "_url_to_session", {})
+    monkeypatch.setattr(transcode, "_transcode_sessions", table)
+    monkeypatch.setattr(transcode, "_url_to_session", {})
     return table
 
 
@@ -206,20 +206,20 @@ def test_lifespan_runs_workers_and_shuts_down(
     testing.install_subprocess(monkeypatch, main, run=run)
     signals = testing.SignalRecorder()
     testing.install_signals(monkeypatch, signals, main)
-    probe = testing.FakeRun()
-    probe.program("ffprobe", testing.Program(stdout=testing.probed_video_json()))
-    testing.install_subprocess(monkeypatch, ffmpeg_command, run=probe)
+    ffprobe = testing.FakeRun()
+    ffprobe.program("ffprobe", testing.Program(stdout=testing.probed_video_json()))
+    testing.install_subprocess(monkeypatch, probe, commands, run=ffprobe)
 
     def publish(command: list[str]) -> None:
         if not launcher.launches:  # The viewer's worker; the recorder publishes nothing awaited.
             _publish_rendition(Path(command[-1]).parent)
 
     launcher = testing.ProcessLauncher(on_launch=publish)
-    testing.install_launcher(monkeypatch, launcher, ffmpeg_session)
+    testing.install_launcher(monkeypatch, launcher, transcode)
     tasks = testing.BackgroundTasks()
-    monkeypatch.setattr(ffmpeg_session, "_spawn_background_task", tasks)
-    monkeypatch.setattr(ffmpeg_session, "_startup_guards", {})
-    monkeypatch.setattr(ffmpeg_session, "_recordings", set())
+    monkeypatch.setattr(transcode, "_spawn_background_task", tasks)
+    monkeypatch.setattr(transcode, "_startup_guards", {})
+    monkeypatch.setattr(transcode, "_recordings", set())
     upstreams = testing.FakeUpstreams()
     empty: dict[str, object] = {}
     for name, value in (
@@ -245,8 +245,8 @@ def test_lifespan_runs_workers_and_shuts_down(
     monkeypatch.setattr(imdb, "build", failing_build)
     monkeypatch.setattr(chromecast.manager, "_sessions", {})
     monkeypatch.setattr(chromecast.manager, "_stop", threading.Event())
-    monkeypatch.setattr(ffmpeg_command, "_sr_engine_dir", None)
-    monkeypatch.setattr(ffmpeg_command, "_load_settings", cache.load_server_settings)
+    monkeypatch.setattr(commands, "_sr_engine_dir", None)
+    monkeypatch.setattr(commands, "_load_settings", cache.load_server_settings)
     engines = tmp_path / "engines"
     engines.mkdir()
     (engines / "2x-nomosuni-compact_1080p_fp16.engine").touch()
@@ -327,7 +327,7 @@ def test_lifespan_runs_workers_and_shuts_down(
                 refresh.run()
             # The viewer is still playing the channel it will be handed off from.
             viewing = asyncio.create_task(
-                ffmpeg_session.start_transcode(stream_url, username="viewer"),
+                transcode.start_transcode(stream_url, username="viewer"),
             )
             while not upstreams.opened:
                 assert not viewing.done()
@@ -364,7 +364,7 @@ def test_lifespan_runs_workers_and_shuts_down(
     shutdown_event = main._shutdown_event
     assert shutdown_event is not None and shutdown_event.is_set()
     assert signals.kills == [(77, signal.SIGKILL)]
-    assert ffmpeg_command._sr_engine_dir == str(engines)
+    assert commands._sr_engine_dir == str(engines)
     assert not (transcodes / "netv_transcode_orphan").exists()
     assert not (transcodes / "netv_handoff_orphan").exists()
     data = cache.get_cache()
@@ -2142,7 +2142,7 @@ def test_player_series_strips_year_from_name(api: TestClient, web: testing.FakeW
 def test_an_old_player_link_moves_to_its_one_segment_path(
     api: TestClient,
     old: str,
-    kind: ffmpeg_session.ContentType,
+    kind: transcode.ContentType,
     stream_id: str,
     series_id: int,
     query: str,
@@ -2170,7 +2170,7 @@ _TUNER = "http://192.168.1.87:5004/auto/v5.1"
 
 
 class _Pretunes:
-    """Stands in for ``ffmpeg_session``'s pretune calls: no stream is started."""
+    """Stands in for ``transcode``'s pretune calls: no stream is started."""
 
     def __init__(self) -> None:
         self.tuned: list[tuple[str, str]] = []
@@ -2187,8 +2187,8 @@ class _Pretunes:
 @pytest.fixture
 def pretunes(monkeypatch: pytest.MonkeyPatch) -> _Pretunes:
     recorder = _Pretunes()
-    monkeypatch.setattr(ffmpeg_session, "pretune_live", recorder.pretune)
-    monkeypatch.setattr(ffmpeg_session, "release_pretune", recorder.release)
+    monkeypatch.setattr(transcode, "pretune_live", recorder.pretune)
+    monkeypatch.setattr(transcode, "release_pretune", recorder.release)
     return recorder
 
 
@@ -2769,7 +2769,7 @@ def test_transcode_start_enforces_source_limit(
     for name in ("a", "b", "c"):
         sessions[name] = _session(tmp_path / name, username="other", source_id="s1")
     launcher = testing.ProcessLauncher()
-    testing.install_launcher(monkeypatch, launcher, ffmpeg_session)
+    testing.install_launcher(monkeypatch, launcher, transcode)
     resp = api.get("/transcode/start", params=_start("http://up/l", source_id="s1"))
     assert resp.status_code == 429
     assert resp.json() == {"detail": "Source at capacity (3 streams)"}
@@ -2788,14 +2788,14 @@ def test_transcode_start_rotates_users_oldest_stream(
     sessions["old"] = _session(tmp_path / "old", source_id="s1", started=1.0)
     sessions["new"] = _session(tmp_path / "new", source_id="s1", started=2.0)
     web.routes["http://up/l"] = testing.ended_upstream
-    probe = testing.FakeRun()
-    probe.program("ffprobe", testing.Program(stdout=testing.probed_video_json()))
-    testing.install_subprocess(monkeypatch, ffmpeg_command, run=probe)
+    ffprobe = testing.FakeRun()
+    ffprobe.program("ffprobe", testing.Program(stdout=testing.probed_video_json()))
+    testing.install_subprocess(monkeypatch, probe, commands, run=ffprobe)
     launcher = testing.ProcessLauncher([testing.FakeProcess(exited=True, exit_code=1)])
-    testing.install_launcher(monkeypatch, launcher, ffmpeg_session)
-    testing.install_clock(monkeypatch, testing.FakeClock(), ffmpeg_session)
+    testing.install_launcher(monkeypatch, launcher, transcode)
+    testing.install_clock(monkeypatch, testing.FakeClock(), transcode)
     tasks = testing.BackgroundTasks()
-    monkeypatch.setattr(ffmpeg_session, "_spawn_background_task", tasks)
+    monkeypatch.setattr(transcode, "_spawn_background_task", tasks)
     resp = api.get("/transcode/start", params=_start("http://up/l", source_id="s1"))
     tasks.discard()
     # The user's limit of two stopped their oldest stream before the start, which
@@ -2825,6 +2825,22 @@ def test_transcode_seek_and_progress(
     assert progress.json() == {"segment_count": 2, "duration": 6.0}
 
 
+def test_transcode_crop_reports_the_picture_area(
+    api: TestClient,
+    tmp_path: Path,
+    sessions: dict[str, TranscodeSession],
+) -> None:
+    sessions["abc"] = _session(tmp_path / "abc", is_vod=True)
+    assert api.get("/transcode/crop/abc").json() == {"crop": None}
+    (tmp_path / "abc" / DETECTION_FILE).write_text(
+        "frame:59\nlavfi.cropdetect.x1=0\nlavfi.cropdetect.x2=999\n"
+        "lavfi.cropdetect.y1=130\nlavfi.cropdetect.y2=869\n",
+    )
+    assert api.get("/transcode/crop/abc").json() == {
+        "crop": {"left": 0.0, "top": 0.13, "width": 1.0, "height": 0.74},
+    }
+
+
 def test_a_stranger_cannot_seek_follow_or_stop_a_session(
     api: TestClient,
     tmp_path: Path,
@@ -2839,12 +2855,13 @@ def test_a_stranger_cannot_seek_follow_or_stop_a_session(
     refused = [
         eve.get("/transcode/seek/abc?time=10"),
         eve.get("/transcode/progress/abc"),
+        eve.get("/transcode/crop/abc"),
         eve.delete("/transcode/abc"),
         eve.post("/transcode/abc/stop"),
     ]
     assert [(r.status_code, r.json()) for r in refused] == [
         (404, {"detail": "Session not found"}),
-    ] * 4
+    ] * 5
     assert "seek_offset" not in sessions["abc"]
     assert process.returncode is None
 
@@ -3000,7 +3017,7 @@ def test_transcode_clear_stops_cached_session(
 ) -> None:
     sessions["sid"] = _session(tmp_path / "sid", url="http://up/x", is_vod=True)
     urls = {"http://up/x": "sid"}
-    monkeypatch.setattr(ffmpeg_session, "_url_to_session", urls)
+    monkeypatch.setattr(transcode, "_url_to_session", urls)
     resp = api.delete(
         "/transcode-clear",
         params={"ref": auth.stream_ref("testuser", "http://up/x")},

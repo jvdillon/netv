@@ -15,9 +15,11 @@ from fastapi import HTTPException
 import pytest
 import pytest_asyncio
 
-from netv import cache, fast_start, ffmpeg_command, ffmpeg_session, proxy, util
+from netv import cache, proxy, util
 from netv.cache import HwAccel
-from netv.ffmpeg_command import MediaInfo
+from netv.ffmpeg import commands, fast_start, probe, transcode
+from netv.ffmpeg.letterbox import detection_args
+from netv.ffmpeg.probe import MediaInfo
 from netv.playback_policy import LiveRecoveryPolicy, PlaybackHealth, PlaybackPolicy
 from netv.testing import (
     BackgroundTasks,
@@ -50,7 +52,7 @@ PROVIDER = "https://provider/live"
 def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
     """Each readiness poll advances fake time instead of sleeping 0.2s."""
     fake = FakeClock()
-    install_clock(monkeypatch, fake, ffmpeg_session)
+    install_clock(monkeypatch, fake, transcode)
     return fake
 
 
@@ -59,7 +61,7 @@ def programs(monkeypatch: pytest.MonkeyPatch) -> FakeRun:
     """Fake samples carry no media; ffprobe reports a 1080p video unless scripted."""
     run = FakeRun()
     run.program("ffprobe", Program(stdout=probed_video_json()))
-    install_subprocess(monkeypatch, ffmpeg_command, run=run)
+    install_subprocess(monkeypatch, probe, commands, run=run)
     return run
 
 
@@ -74,16 +76,16 @@ async def upstreams(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[FakeUpstre
 
 @pytest.fixture(autouse=True)
 def fresh_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ffmpeg_session, "_transcode_sessions", {})
-    monkeypatch.setattr(ffmpeg_session, "_url_to_session", {})
-    monkeypatch.setattr(ffmpeg_session, "_startup_guards", {})
-    monkeypatch.setattr(ffmpeg_command, "_probe_cache", {})
+    monkeypatch.setattr(transcode, "_transcode_sessions", {})
+    monkeypatch.setattr(transcode, "_url_to_session", {})
+    monkeypatch.setattr(transcode, "_startup_guards", {})
+    monkeypatch.setattr(probe, "_probe_cache", {})
 
 
 @pytest.fixture
 def tasks(monkeypatch: pytest.MonkeyPatch) -> Iterator[BackgroundTasks]:
     background = BackgroundTasks()
-    monkeypatch.setattr(ffmpeg_session, "_spawn_background_task", background)
+    monkeypatch.setattr(transcode, "_spawn_background_task", background)
     yield background
     background.discard()
 
@@ -93,7 +95,7 @@ def launcher(monkeypatch: pytest.MonkeyPatch, tasks: BackgroundTasks) -> Process
     """Record ffmpeg launches; monitors and watchdogs stay unscheduled in ``tasks``."""
     del tasks
     fake = ProcessLauncher()
-    install_launcher(monkeypatch, fake, ffmpeg_session)
+    install_launcher(monkeypatch, fake, transcode)
     return fake
 
 
@@ -127,7 +129,7 @@ def ffprobe_source(video_codec: str, audio_codec: str = "aac", channels: int = 2
 
 async def until(
     condition: Callable[[], bool],
-    task: asyncio.Task[ffmpeg_session.TranscodeResponse],
+    task: asyncio.Task[transcode.TranscodeResponse],
 ) -> None:
     """Yield to ``task`` until ``condition`` holds, surfacing the task's failure.
 
@@ -146,7 +148,7 @@ async def until(
 
 async def polled_again(
     clock: FakeClock,
-    task: asyncio.Task[ffmpeg_session.TranscodeResponse],
+    task: asyncio.Task[transcode.TranscodeResponse],
 ) -> None:
     """Wait until ``task`` slept after re-reading its playlists at least once."""
     polls = len(clock.sleeps)
@@ -159,7 +161,7 @@ def output_dir(launcher: ProcessLauncher, index: int) -> pathlib.Path:
 
 async def feed_source(
     upstreams: FakeUpstreams,
-    task: asyncio.Task[ffmpeg_session.TranscodeResponse],
+    task: asyncio.Task[transcode.TranscodeResponse],
     data: bytes | None = None,
 ) -> None:
     """Wait for the session to connect upstream, then deliver ``data``."""
@@ -170,8 +172,8 @@ async def feed_source(
 async def serve_fast_start(
     launcher: ProcessLauncher,
     upstreams: FakeUpstreams,
-    task: asyncio.Task[ffmpeg_session.TranscodeResponse],
-) -> ffmpeg_session.TranscodeResponse:
+    task: asyncio.Task[transcode.TranscodeResponse],
+) -> transcode.TranscodeResponse:
     """Deliver the source, publish what the worker would write, then finish startup."""
     await feed_source(upstreams, task)
     await until(lambda: len(launcher.launches) == 1, task)
@@ -181,8 +183,8 @@ async def serve_fast_start(
 
 async def serve_transcode(
     launcher: ProcessLauncher,
-    task: asyncio.Task[ffmpeg_session.TranscodeResponse],
-) -> ffmpeg_session.TranscodeResponse:
+    task: asyncio.Task[transcode.TranscodeResponse],
+) -> transcode.TranscodeResponse:
     """Publish what a single HLS transcode would write, then finish startup."""
     await until(lambda: len(launcher.launches) == 1, task)
     directory = output_dir(launcher, 0)
@@ -594,7 +596,7 @@ def test_encoder_command_for_an_interlaced_surround_broadcast(
 ):
     """The whole command a 1080i, 5.1 broadcast gets on an NVENC host."""
     configure(tmp_path)
-    monkeypatch.setattr(ffmpeg_command, "_gpu_nvdec_codecs", {"h264"})
+    monkeypatch.setattr(commands, "_gpu_nvdec_codecs", {"h264"})
     source = MediaInfo(
         video_codec="h264",
         audio_codec="ac3",
@@ -643,6 +645,8 @@ def test_encoder_command_for_an_interlaced_surround_broadcast(
         "mpegts",
         "-i",
         "pipe:0",
+        # The player hides bars that every sampled frame of the channel had.
+        *detection_args("/s", "cuda", is_10bit=False),
         "-map",
         "0:v:0",
         "-map",
@@ -763,7 +767,7 @@ def test_encoders_decode_on_gpu_when_source_codec_is_known(
 ):
     # Maxwell decodes H.264 but not HEVC.
     programs.program("nvidia-smi", Program(stdout="NVIDIA GeForce GTX TITAN X, 5.2\n"))
-    monkeypatch.setattr(ffmpeg_command, "_gpu_nvdec_codecs", None)
+    monkeypatch.setattr(commands, "_gpu_nvdec_codecs", None)
     for upscale in (False, True):
         args = (str(tmp_path), "nvenc+software", "1080p", "high", False)
         h264 = MediaInfo(video_codec="h264", audio_codec="", pix_fmt="")
@@ -820,9 +824,9 @@ def fast_session(
     *,
     bandwidth_saver: bool = False,
     recovery_bitrate: float = 0,
-) -> ffmpeg_session.FastLiveSession:
+) -> transcode.FastLiveSession:
     """A running fast-live session with a live worker; its relay never starts."""
-    plan = ffmpeg_session._FastLivePlan(
+    plan = transcode._FastLivePlan(
         source_url="http://stream.test/live",
         source_id="",
         user_agent=None,
@@ -834,7 +838,7 @@ def fast_session(
         audio_passthrough=False,
         dvr=False,
     )
-    return ffmpeg_session.FastLiveSession(
+    return transcode.FastLiveSession(
         dir=str(directory),
         username="u",
         fast_start=True,
@@ -858,21 +862,21 @@ def test_health_learns_full_quality_bitrate_then_saver_recovers(
 ):
     playlist(tmp_path, "low")
     session = fast_session(tmp_path, clock.time())
-    ffmpeg_session._transcode_sessions["fast"] = session
+    transcode._transcode_sessions["fast"] = session
     start = clock.now
     good = PlaybackHealth(buffer_seconds=10, waiting=False, observed_bitrate=20_000)
-    result = ffmpeg_session.report_playback_health("fast", "u", good)
+    result = transcode.report_playback_health("fast", "u", good)
     assert result == {"bandwidth_saver": False, "playlist": "/transcode/fast/low.m3u8"}
     assert "recovery_bitrate" in session
     assert session["recovery_bitrate"] == 7520
     session["playback_policy"] = replace(session["playback_policy"], bandwidth_saver=True)
     for offset in range(2, 62, 2):
         clock.now = start + offset
-        result = ffmpeg_session.report_playback_health("fast", "u", good)
+        result = transcode.report_playback_health("fast", "u", good)
         # The full-quality session cannot serve saver: clients must retune.
         assert result == {"bandwidth_saver": True}
     clock.now = start + 62
-    result = ffmpeg_session.report_playback_health("fast", "u", good)
+    result = transcode.report_playback_health("fast", "u", good)
     assert result == {"bandwidth_saver": False, "playlist": "/transcode/fast/low.m3u8"}
 
 
@@ -898,7 +902,7 @@ async def test_shared_session_runs_one_worker_fed_by_the_relay(
     configure(tmp_path)
     programs.program("ffprobe", Program(stdout=CAPTIONED_FRAMES), when="frame=side_data_list")
     task = asyncio.create_task(
-        ffmpeg_session.start_transcode(PROVIDER, bandwidth_saver=bandwidth_saver),
+        transcode.start_transcode(PROVIDER, bandwidth_saver=bandwidth_saver),
     )
     first_byte_at = clock.now
     await feed_source(upstreams, task)
@@ -919,7 +923,7 @@ async def test_shared_session_runs_one_worker_fed_by_the_relay(
     await launch.process.stdin.wait_for(len(ts_source()))
     assert bytes(launch.process.stdin.written) == ts_source()
     assert worker[worker.index("-b:v") + 1] == bitrate
-    session = ffmpeg_session.get_session(result["session_id"])
+    session = transcode.get_session(result["session_id"])
     assert session is not None
     assert "audio_info" in session
     assert session["audio_info"] is not None
@@ -940,7 +944,7 @@ async def test_shared_session_runs_one_worker_fed_by_the_relay(
     expected_playback_buffer = min(60, max(12, 2 * segment_duration))
     assert "playback_buffer_seconds" in result
     assert result["playback_buffer_seconds"] == expected_playback_buffer
-    assert ffmpeg_session._is_fast_live(session)
+    assert transcode._is_fast_live(session)
     assert session["playback_policy"].bandwidth_saver is bandwidth_saver
     assert "watchdog_stale_after" in session
     assert session["watchdog_stale_after"] == max(45, 2 * segment_duration + 2)
@@ -957,12 +961,12 @@ async def test_shared_session_runs_one_worker_fed_by_the_relay(
         "master.m3u8",
         "probe.ts",
     ]
-    reused = await ffmpeg_session.start_transcode(PROVIDER)
+    reused = await transcode.start_transcode(PROVIDER)
     # The same session, handed to a second page: its own viewer id.
     assert {**reused, "viewer_id": ""} == {**result, "viewer_id": ""}
     assert reused.get("viewer_id") not in (None, result.get("viewer_id"))
     [upstream] = upstreams.opened
-    await ffmpeg_session.stop_session(result["session_id"], force=True)
+    await transcode.stop_session(result["session_id"], force=True)
     assert launch.process.returncode is not None
     assert upstream.closed
     assert launch.process.stdin.closed
@@ -978,7 +982,7 @@ async def test_worker_starts_at_the_first_keyframe(
 ):
     """Bytes before the first keyframe cannot decode; neither probe nor worker sees them."""
     configure(tmp_path)
-    task = asyncio.create_task(ffmpeg_session.start_transcode(PROVIDER))
+    task = asyncio.create_task(transcode.start_transcode(PROVIDER))
     joined_mid_gop = pat_packet() + pmt_packet() + video_packet(9) * 50
     await feed_source(upstreams, task, joined_mid_gop)
     for _ in range(1000):
@@ -994,11 +998,11 @@ async def test_worker_starts_at_the_first_keyframe(
     assert bytes(stdin.written) == probed
     media_playlist(output_dir(launcher, 0), "low", [1, 1])
     result = await task
-    session = ffmpeg_session.get_session(result["session_id"])
+    session = transcode.get_session(result["session_id"])
     assert session is not None
     # The clock still starts from the first byte's timestamp.
     assert session.get("origin_pts") == 9
-    await ffmpeg_session.stop_session(result["session_id"], force=True)
+    await transcode.stop_session(result["session_id"], force=True)
 
 
 @pytest.mark.asyncio
@@ -1012,7 +1016,7 @@ async def test_a_source_without_keyframe_marks_is_used_whole(
 ):
     """Without random-access marks, the worker gets everything: at 4 MB, or when upstream ends."""
     configure(tmp_path)
-    task = asyncio.create_task(ffmpeg_session.start_transcode(PROVIDER))
+    task = asyncio.create_task(transcode.start_transcode(PROVIDER))
     unmarked = video_packet(10) * (10 if ends else (4 << 20) // 188 + 1)
     await feed_source(upstreams, task, unmarked)
     if ends:
@@ -1022,7 +1026,7 @@ async def test_a_source_without_keyframe_marks_is_used_whole(
     await launcher.processes[0].stdin.wait_for(len(unmarked))
     media_playlist(output_dir(launcher, 0), "low", [1, 1])
     result = await task
-    await ffmpeg_session.stop_session(result["session_id"], force=True)
+    await transcode.stop_session(result["session_id"], force=True)
 
 
 def test_keyframe_replay_starts_at_the_last_keyframe_with_the_tables():
@@ -1084,8 +1088,8 @@ async def test_hls_sources_are_read_once_through_a_remuxer(
     web = FakeWeb({url: lambda: FakeResponse(b"#EXTM3U\n#EXTINF:6,\nsegment.ts\n")})
     install_web(monkeypatch, web, util)
     remuxers = PopenRecorder()
-    install_subprocess(monkeypatch, ffmpeg_session, popen=remuxers)
-    task = asyncio.create_task(ffmpeg_session.start_transcode(url))
+    install_subprocess(monkeypatch, transcode, popen=remuxers)
+    task = asyncio.create_task(transcode.start_transcode(url))
     await until(lambda: bool(remuxers.started), task)
     [remuxer] = remuxers.started
     try:
@@ -1099,7 +1103,7 @@ async def test_hls_sources_are_read_once_through_a_remuxer(
         await until(lambda: len(launcher.launches) == 1, task)
         media_playlist(output_dir(launcher, 0), "low", [1, 1])
         result = await task
-        await ffmpeg_session.stop_session(result["session_id"], force=True)
+        await transcode.stop_session(result["session_id"], force=True)
         # Both the relay's close and its reader's exit stop the remuxer.
         assert set(remuxer.signals) == {"KILL"}
         assert remuxer.stdout.closed
@@ -1134,9 +1138,9 @@ async def test_xtream_live_is_read_as_one_mpegts_stream(
     web = FakeWeb({api: lambda: FakeResponse(formats), "https://panel/live/u/p/7.ts": stream})
     install_web(monkeypatch, web, util)
     remuxers = PopenRecorder()
-    install_subprocess(monkeypatch, ffmpeg_session, popen=remuxers)
+    install_subprocess(monkeypatch, transcode, popen=remuxers)
     url = "https://panel/live/u/p/7.m3u8"
-    task = asyncio.create_task(ffmpeg_session.start_transcode(url, source_id="x"))
+    task = asyncio.create_task(transcode.start_transcode(url, source_id="x"))
     try:
         await until(lambda: bool(stream.opened), task)
         stream.opened[0].feed(ts_source())
@@ -1145,11 +1149,11 @@ async def test_xtream_live_is_read_as_one_mpegts_stream(
         result = await task
         assert web.urls == [api, "https://panel/live/u/p/7.ts"]
         assert not remuxers.started
-        session = ffmpeg_session.get_session(result["session_id"])
+        session = transcode.get_session(result["session_id"])
         assert session is not None
         # Clients, reuse, and casting keep the URL that was asked for.
         assert session["url"] == url
-        await ffmpeg_session.stop_session(result["session_id"], force=True)
+        await transcode.stop_session(result["session_id"], force=True)
     finally:
         stream.close()
 
@@ -1168,7 +1172,7 @@ def test_hls_source_command_remuxes_to_stdout():
     # Every playlist, segment and redirect it fetches goes through the egress proxy for
     # its source; a dropped connection retries within 5 s.
     egress = proxy.ffmpeg_input_args(url, "h")
-    reconnect = ffmpeg_command.http_reconnect_args(url, max_delay=5)
+    reconnect = commands.http_reconnect_args(url, max_delay=5)
     assert cmd[: 4 + len(egress) + len(reconnect) + 2] == [
         "ffmpeg",
         "-hide_banner",
@@ -1204,7 +1208,7 @@ async def test_startup_cancellation_closes_the_upstream(
     upstreams: FakeUpstreams,
 ):
     configure(tmp_path)
-    task = asyncio.create_task(ffmpeg_session.start_transcode(PROVIDER))
+    task = asyncio.create_task(transcode.start_transcode(PROVIDER))
     await until(lambda: bool(upstreams.opened), task)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -1226,7 +1230,7 @@ async def test_disconnected_startup_stops_waiting_and_cleans_up(
         return True
 
     task = asyncio.create_task(
-        ffmpeg_session.start_transcode(PROVIDER, is_disconnected=disconnected),
+        transcode.start_transcode(PROVIDER, is_disconnected=disconnected),
     )
     await feed_source(upstreams, task)
     with pytest.raises(HTTPException) as error:
@@ -1254,8 +1258,8 @@ async def test_worker_startup_failure_cleans_up(
     # A cancelled client leaves the worker running; otherwise it dies at startup.
     worker = FakeProcess(exit_code=None) if cancelled else FakeProcess(exited=True, exit_code=1)
     launcher = ProcessLauncher([worker])
-    install_launcher(monkeypatch, launcher, ffmpeg_session)
-    task = asyncio.create_task(ffmpeg_session.start_transcode(PROVIDER))
+    install_launcher(monkeypatch, launcher, transcode)
+    task = asyncio.create_task(transcode.start_transcode(PROVIDER))
     await feed_source(upstreams, task)
     await until(lambda: len(launcher.launches) == 1, task)
     if cancelled:
@@ -1281,7 +1285,7 @@ async def test_unreachable_upstream_fails_startup_and_reports_why(
 ):
     configure(tmp_path)
     with pytest.raises(HTTPException) as error:
-        await ffmpeg_session.start_transcode("https://provider/gone")
+        await transcode.start_transcode("https://provider/gone")
     assert error.value.status_code == 500
     assert "upstream=<urlopen error no route to https://provider/gone>" in caplog.text
     assert not list(tmp_path.iterdir())
@@ -1351,7 +1355,7 @@ async def test_dvr_copyable_source_stream_copies_the_relay(
     """DVR of a copy-compatible source remuxes the relay's bytes; upstream is opened once."""
     configure(tmp_path, live_dvr_mins=60)
     programs.program("ffprobe", Program(stdout=ffprobe_source("h264")), when="-show_streams")
-    task = asyncio.create_task(ffmpeg_session.start_transcode(PROVIDER))
+    task = asyncio.create_task(transcode.start_transcode(PROVIDER))
     result = await serve_fast_start(launcher, upstreams, task)
     directory = output_dir(launcher, 0)
     assert result["playlist"] == f"/transcode/{result['session_id']}/low.m3u8"
@@ -1364,7 +1368,7 @@ async def test_dvr_copyable_source_stream_copies_the_relay(
     assert len(upstreams.opened) == 1
     assert programs.calls
     assert all(call[-1].endswith("/probe.ts") for call in programs.calls)
-    await ffmpeg_session.stop_session(result["session_id"], force=True)
+    await transcode.stop_session(result["session_id"], force=True)
     assert not list(tmp_path.iterdir())
 
 
@@ -1386,7 +1390,7 @@ async def test_live_encodes_when_copy_is_unavailable_or_unneeded(
     configure(tmp_path, live_dvr_mins=live_dvr_mins)
     programs.program("ffprobe", Program(stdout=ffprobe_source(video_codec)), when="-show_streams")
     task = asyncio.create_task(
-        ffmpeg_session.start_transcode(PROVIDER, bandwidth_saver=bandwidth_saver),
+        transcode.start_transcode(PROVIDER, bandwidth_saver=bandwidth_saver),
     )
     result = await serve_fast_start(launcher, upstreams, task)
     assert result["playlist"] == f"/transcode/{result['session_id']}/low.m3u8"
@@ -1395,7 +1399,7 @@ async def test_live_encodes_when_copy_is_unavailable_or_unneeded(
     # One stream probe and one caption probe of the relay's sample.
     assert len(programs.calls) == 2
     assert all(call[-1].endswith("/probe.ts") for call in programs.calls)
-    await ffmpeg_session.stop_session(result["session_id"], force=True)
+    await transcode.stop_session(result["session_id"], force=True)
 
 
 def test_saver_session_keeps_full_quality_recovery_target(
@@ -1404,13 +1408,13 @@ def test_saver_session_keeps_full_quality_recovery_target(
 ):
     playlist(tmp_path, "low")
     session = fast_session(tmp_path, clock.time(), bandwidth_saver=True, recovery_bitrate=50_000)
-    ffmpeg_session._transcode_sessions["saver"] = session
+    transcode._transcode_sessions["saver"] = session
     start = clock.now
     # Enough for the 720p saver output (7520 bps), not the full-quality target.
     good = PlaybackHealth(buffer_seconds=12, waiting=False, observed_bitrate=60_000)
     for offset in range(0, 120, 2):
         clock.now = start + offset
-        result = ffmpeg_session.report_playback_health("saver", "u", good)
+        result = transcode.report_playback_health("saver", "u", good)
         assert result["bandwidth_saver"]
         assert "playlist" in result
         assert result["playlist"].endswith("/low.m3u8")

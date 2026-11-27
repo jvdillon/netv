@@ -10,15 +10,15 @@ import time
 
 from netv import proxy
 from netv.cache import HwAccel
-from netv.ffmpeg_command import (
+from netv.ffmpeg.commands import (
     PASSTHROUGH_AUDIO_CODECS,
-    MediaInfo,
     build_hls_ffmpeg_cmd,
     get_live_hls_list_size,
     http_reconnect_args,
     limit_live_video_bitrate,
     live_video_bitrates,
 )
+from netv.ffmpeg.probe import MediaInfo
 
 
 def live_buffer_durations(

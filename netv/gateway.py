@@ -41,8 +41,9 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from netv import auth, cache, ffmpeg_command, ffmpeg_session, proxy
+from netv import auth, cache, proxy
 from netv.cache import ServerSettings
+from netv.ffmpeg import commands, transcode
 from netv.gateway_catalog import CatalogSnapshot, GatewayCatalog, GatewayStream
 from netv.gateway_epg import EpgUnavailableError, build_filtered_xmltv
 from netv.m3u import get_xtream_client_by_source
@@ -100,18 +101,18 @@ async def _cleanup_upscale_sessions(
 ) -> None:
     while True:
         await sleep(interval_sec)
-        await ffmpeg_session.cleanup_expired_sessions()
+        await transcode.cleanup_expired_sessions()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     del app
     cache.initialize()
-    ffmpeg_command.init(
+    commands.init(
         _upscale_settings,
         sr_engine_dir=str(_upscale_engine_dir()),
     )
-    ffmpeg_session.cleanup_and_recover_sessions()
+    transcode.cleanup_and_recover_sessions()
     settings = _upscale_settings()
     if settings.get("sr_model", ""):
         log.info(
@@ -129,7 +130,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         cleanup_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await cleanup_task
-        await ffmpeg_session.shutdown()
+        await transcode.shutdown()
 
 
 app = FastAPI(
@@ -395,7 +396,7 @@ async def live_stream(request: Request, stream_path: str) -> Response:
             None,
         )
         user_limits = auth.get_user_limits(username)
-        result = await ffmpeg_session.start_transcode(
+        result = await transcode.start_transcode(
             _resolve_upstream(stream, "ts"),
             content_type="live",
             deinterlace_fallback=True
@@ -418,7 +419,7 @@ async def upscale_file(request: Request, session_id: str, filename: str) -> Resp
     safe_filename = Path(filename).name
     if safe_filename != filename or ".." in filename:
         raise HTTPException(400, "Invalid filename")
-    session = ffmpeg_session.get_session(session_id)
+    session = transcode.get_session(session_id)
     if session is None:
         raise HTTPException(404, "Upscale session not found")
     # The unguessable name is the only key here, so its owner's rule still holds:
@@ -426,7 +427,7 @@ async def upscale_file(request: Request, session_id: str, filename: str) -> Resp
     client_ip = request.client.host if request.client else ""
     if not auth.allowed_from(session.get("username", ""), client_ip):
         raise HTTPException(403, "This stream is not available from here")
-    if not ffmpeg_session.touch_session(session_id):
+    if not transcode.touch_session(session_id):
         raise HTTPException(404, "Upscale session not found")
     file_path = Path(session["dir"]) / safe_filename
     if not file_path.exists():
@@ -435,7 +436,7 @@ async def upscale_file(request: Request, session_id: str, filename: str) -> Resp
     if safe_filename.endswith(".m3u8"):
         content = file_path.read_text()
         if safe_filename == "low.m3u8":
-            content = ffmpeg_session.live_playlist(session_id) or content
+            content = transcode.live_playlist(session_id) or content
         return Response(
             content,
             media_type="application/vnd.apple.mpegurl",

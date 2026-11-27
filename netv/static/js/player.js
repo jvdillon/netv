@@ -38,6 +38,9 @@
   let currentSubtitles = null;
   let activeTrackStates = null;
   let progressPollTimerId = null;
+  // The picture's part of each frame ({left, top, width, height} fractions), or null.
+  let pictureCrop = null;
+  let cropPollTimerId = null;
   let lastSavedPosition = 0;
   let savePositionTimeout = null;
   let autoMutedByPolicy = false;
@@ -1094,6 +1097,72 @@
   }
 
   // ============================================================
+  // Black Bars
+  // ============================================================
+
+  // Sizes the video so only its picture shows, centered in the player: the bars
+  // overflow the container, and the picture keeps its own shape.
+  function applyPictureCrop() {
+    const crop = pictureCrop;
+    if (!crop || !video.videoWidth || !video.videoHeight) {
+      for (const name of ["position", "left", "top", "width", "height"]) {
+        video.style[name] = "";
+      }
+      return;
+    }
+    const box = video.parentElement.getBoundingClientRect();
+    const aspect = (video.videoWidth * crop.width) / (video.videoHeight * crop.height);
+    const shownWidth = Math.min(box.width, box.height * aspect);
+    const shownHeight = shownWidth / aspect;
+    const width = shownWidth / crop.width;
+    const height = shownHeight / crop.height;
+    Object.assign(video.style, {
+      position: "absolute",
+      width: `${width}px`,
+      height: `${height}px`,
+      left: `${(box.width - shownWidth) / 2 - crop.left * width}px`,
+      top: `${(box.height - shownHeight) / 2 - crop.top * height}px`,
+    });
+  }
+
+  function setupPictureCrop() {
+    window.addEventListener("resize", applyPictureCrop);
+    for (const event of ["loadedmetadata", "resize"]) {
+      video.addEventListener(event, applyPictureCrop);
+    }
+  }
+
+  // The server learns where the bars are as the transcode decodes; poll until the
+  // session ends. A null report means it has not seen enough yet.
+  function startCropPolling() {
+    stopCropPolling();
+    const poll = async () => {
+      if (!transcodeSessionId) return;
+      try {
+        const resp = await fetch(`/transcode/crop/${transcodeSessionId}`);
+        if (!resp.ok) return;
+        const { crop } = await resp.json();
+        if (!crop) return;
+        const full =
+          crop.left === 0 && crop.top === 0 && crop.width === 1 && crop.height === 1;
+        pictureCrop = full ? null : crop;
+        applyPictureCrop();
+      } catch {}
+    };
+    poll();
+    cropPollTimerId = setInterval(poll, 2000);
+  }
+
+  function stopCropPolling() {
+    if (cropPollTimerId) {
+      clearInterval(cropPollTimerId);
+      cropPollTimerId = null;
+    }
+    pictureCrop = null;
+    applyPictureCrop();
+  }
+
+  // ============================================================
   // Transcode Management
   // ============================================================
 
@@ -1104,6 +1173,7 @@
     adaptiveSession = null;
     transcodePlaylist = null;
     stopProgressPolling();
+    stopCropPolling();
     if (subtitlePollTimerId) {
       clearInterval(subtitlePollTimerId);
       subtitlePollTimerId = null;
@@ -1130,6 +1200,7 @@
     adaptivePlayback?.destroy();
     adaptivePlayback = null;
     stopProgressPolling();
+    stopCropPolling();
     if (subtitlePollTimerId) {
       clearInterval(subtitlePollTimerId);
       subtitlePollTimerId = null;
@@ -1272,6 +1343,7 @@
       const data = await transcodeSession.start(url);
       if (!data) return;
       transcodeSessionId = data.session_id;
+      startCropPolling();
       transcodePlaylist = data.playlist;
       const playlistPath = new URL(data.playlist, window.location.href).pathname;
       adaptiveSession = !cfg.isVod && playlistPath.endsWith("/low.m3u8") ? data : null;
@@ -2421,6 +2493,7 @@
     setupCatchup();
     setupHandoffRecording();
     setupHandoff();
+    setupPictureCrop();
     setupKeyboardControls();
     setupButtonHandlers();
     setupActivityTracking();

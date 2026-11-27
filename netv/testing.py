@@ -10,7 +10,7 @@ that overrides only the faked names, so the event loop and pytest keep the
 real ones. Example::
 
     launcher = ProcessLauncher()
-    install_launcher(monkeypatch, launcher, ffmpeg_session)
+    install_launcher(monkeypatch, launcher, transcode)
     ...
     assert launcher.commands[0][0] == "ffmpeg"
 """
@@ -1285,16 +1285,15 @@ def install_cheap_kdf(monkeypatch: pytest.MonkeyPatch, *modules: ModuleType) -> 
 
 def install_subprocess(
     monkeypatch: pytest.MonkeyPatch,
-    module: ModuleType,
-    *,
+    *modules: ModuleType,
     run: FakeRun | None = None,
     popen: PopenRecorder | None = None,
 ) -> None:
-    """Point ``module.subprocess.run``/``Popen`` at fakes.
+    """Point each module's ``subprocess.run``/``Popen`` at fakes.
 
     Args:
         monkeypatch: The test's monkeypatch.
-        module: neTV module whose ``subprocess`` global to replace.
+        modules: neTV modules whose ``subprocess`` global to replace.
         run: Replacement for ``subprocess.run``; real when omitted.
         popen: Replacement for ``subprocess.Popen``; real when omitted.
     """
@@ -1303,7 +1302,8 @@ def install_subprocess(
         overrides["run"] = run
     if popen is not None:
         overrides["Popen"] = popen
-    _override(monkeypatch, module, "subprocess", subprocess, **overrides)
+    for module in modules:
+        _override(monkeypatch, module, "subprocess", subprocess, **overrides)
 
 
 def install_threads(
