@@ -4,7 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{% block title %}neTV{% endblock %}</title>
-  <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/htmx.org@2.0.4"></script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
   <style>
@@ -19,6 +18,9 @@
     .scroll-ring-safe { padding: 2px; margin: -2px; }
   </style>
   {% block head_extra %}{% endblock %}
+  {# Last in <head>, after every inline <style>: the Play CDN appended its rules there, so
+     utilities such as .hidden still win over same-specificity rules like .settings-item. #}
+  <link rel="stylesheet" href="/static/css/tailwind.css">
 </head>
 <body class="h-full bg-gray-900 text-gray-100 overflow-hidden">
   <div class="flex h-full min-w-0">

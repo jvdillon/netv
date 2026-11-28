@@ -18,12 +18,12 @@ repos:
     name: end-of-file-fixer
     stages:
     - pre-commit
-    exclude: "(?x)^(\n  (.*/)?third_party/\n)\n"
+    exclude: "(?x)^(\n  (.*/)?third_party/\n  |netv/static/css/tailwind\\.css\n)\n"
   - id: trailing-whitespace
     name: trailing-whitespace
     stages:
     - pre-commit
-    exclude: "(?x)^(\n  (.*/)?third_party/\n)\n"
+    exclude: "(?x)^(\n  (.*/)?third_party/\n  |netv/static/css/tailwind\\.css\n)\n"
   - id: check-added-large-files
     name: check-added-large-files
     stages:
