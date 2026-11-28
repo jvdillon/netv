@@ -17,7 +17,7 @@ Examples:
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Callable, Coroutine, Mapping
+from collections.abc import AsyncGenerator, Callable, Coroutine, Mapping, Sized
 from concurrent import futures
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
@@ -270,14 +270,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         while True:
             movies, series = get_cache().get("vod_streams"), get_cache().get("series")
             # A build from half the catalog would stay fresh, missing the rest, for a week.
-            loaded = movies is not None and series is not None
-            if movies is not None and series is not None and imdb.is_stale(max_age_sec=7 * 86_400):
+            # So would one from an empty catalog, as on an install with no source yet.
+            loaded = _catalog_ready(movies, series)
+            if loaded and imdb.is_stale(max_age_sec=7 * 86_400):
                 try:
                     # TMDB only fills in networks Wikidata lacks; no key is needed.
-                    imdb.build([*movies, *series], tmdb_token=_tmdb_token())
+                    imdb.build([*(movies or []), *(series or [])], tmdb_token=_tmdb_token())
                 except Exception:
                     log.exception("IMDb index build failed")
-            # Each minute until the catalog loads, then hourly; fresh indexes are skipped.
+            # Each minute until the catalog has titles, then hourly; fresh indexes are skipped.
             if cleanup_stop.wait(3600 if loaded else 60):
                 return
 
@@ -4066,6 +4067,11 @@ async def _series_versions(
             },
         )
     return versions
+
+
+def _catalog_ready(movies: Sized | None, series: Sized | None) -> bool:
+    """Whether both catalogs have loaded and hold a title to index."""
+    return movies is not None and series is not None and bool(movies or series)
 
 
 def _tmdb_token() -> str:
